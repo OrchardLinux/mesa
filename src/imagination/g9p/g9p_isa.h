@@ -18,7 +18,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-#define G9P_MAX_CODE_WORDS 8192
+#define G9P_MAX_CODE_WORDS 65536
 
 struct g9p_code {
    uint16_t w[G9P_MAX_CODE_WORDS];
@@ -204,6 +204,26 @@ g9p_ffma(struct g9p_code *c, unsigned dst, unsigned a, unsigned b, unsigned cc)
 {
    G9P_EMIT(c, 0x399e, 0x0300 | 2 * dst, g9p_srcs(a, b, false), 0x0180 | cc << 2,
             0x004c);
+}
+
+/*
+ * Float unary ops (2198 03dd 01ss 00op, W0 219c without last-use bit):
+ * floor 0x40, rcp 0x80, rsqrt 0x81, log2 0x84, exp2 0x85; 0x82 and 0x86
+ * are the two steps of sin/cos (see g9p_compile.c). Checked on hardware
+ * against the host's math (ISA.md "Transcendentals").
+ */
+#define G9P_FFLOOR 0x40
+#define G9P_FRCP   0x80
+#define G9P_FRSQ   0x81
+#define G9P_FSIN1  0x82
+#define G9P_FLOG2  0x84
+#define G9P_FEXP2  0x85
+#define G9P_FSIN2  0x86
+
+static inline void
+g9p_funary(struct g9p_code *c, unsigned op, unsigned dst, unsigned src)
+{
+   G9P_EMIT(c, 0x219c, 0x0300 | 2 * dst, 0x0100 | src << 2, op);
 }
 
 /*

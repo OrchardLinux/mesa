@@ -21,12 +21,20 @@
 #include "compiler/nir/nir.h"
 #include "compiler/spirv/nir_spirv.h"
 #include "util/ralloc.h"
+#include "util/u_math.h"
 
 #include "g9p_compile.h"
 #include "g9p_isa.h"
 
-/* r0-r29 for values, the mask stack after them */
-#define G9P_NUM_REGS 30
+/* r0-r29 for values, the mask stack after them (G9P_REGS: debug override) */
+static unsigned
+g9p_num_regs(void)
+{
+   const char *e = getenv("G9P_REGS");
+
+   return e ? MIN2(atoi(e), 63) : 30;
+}
+#define G9P_NUM_REGS g9p_num_regs()
 #define G9P_MAX_LOOPS 64
 
 static const struct spirv_to_nir_options spirv_options = {
@@ -74,6 +82,7 @@ g9p_nir_options(void)
 }
 
 struct g9p_ctx {
+   unsigned num_keys;
    struct g9p_code *c;
    struct g9p_compute_shader *out;
 
@@ -83,9 +92,9 @@ struct g9p_ctx {
    /* Per SSA def: the instruction defining it */
    unsigned *def_ip;
 
-   uint32_t busy;   /* registers in use */
-   uint32_t pinned; /* NIR registers: never released */
-   uint32_t temps;  /* released after the current instruction */
+   uint64_t busy;   /* registers in use */
+   uint64_t pinned; /* NIR registers: never released */
+   uint64_t temps;  /* released after the current instruction */
    unsigned max_reg;
    unsigned st;     /* mask stack register */
    unsigned ip;
@@ -106,17 +115,31 @@ key(const nir_def *def, unsigned comp)
    return def->index * 4 + comp;
 }
 
+static void
+dump_busy(struct g9p_ctx *ctx)
+{
+   fprintf(stderr, "g9p: out of registers at instruction %u\n", ctx->ip);
+   if (!getenv("G9P_DEBUG"))
+      return;
+   for (unsigned k = 0; k < ctx->num_keys; k++) {
+      if (ctx->reg[k] >= 0 && (ctx->busy & BITFIELD64_BIT(ctx->reg[k])) &&
+          !(ctx->pinned & BITFIELD64_BIT(ctx->reg[k])))
+         fprintf(stderr, "  r%d: value %u.%u, last use %u\n", ctx->reg[k], k / 4, k % 4,
+                 ctx->last_use[k]);
+   }
+}
+
 static int
 alloc_reg(struct g9p_ctx *ctx)
 {
    for (unsigned r = 0; r < G9P_NUM_REGS; r++) {
-      if (!(ctx->busy & BITFIELD_BIT(r))) {
-         ctx->busy |= BITFIELD_BIT(r);
+      if (!(ctx->busy & BITFIELD64_BIT(r))) {
+         ctx->busy |= BITFIELD64_BIT(r);
          ctx->max_reg = MAX2(ctx->max_reg, r);
          return r;
       }
    }
-   fprintf(stderr, "g9p: out of registers\n");
+   dump_busy(ctx);
    return -1;
 }
 
@@ -124,13 +147,13 @@ static int
 alloc_pair(struct g9p_ctx *ctx)
 {
    for (unsigned r = 0; r + 1 < G9P_NUM_REGS; r++) {
-      if (!(ctx->busy & BITFIELD_RANGE(r, 2))) {
-         ctx->busy |= BITFIELD_RANGE(r, 2);
+      if (!(ctx->busy & BITFIELD64_RANGE(r, 2))) {
+         ctx->busy |= BITFIELD64_RANGE(r, 2);
          ctx->max_reg = MAX2(ctx->max_reg, r + 1);
          return r;
       }
    }
-   fprintf(stderr, "g9p: out of registers\n");
+   dump_busy(ctx);
    return -1;
 }
 
@@ -140,7 +163,7 @@ alloc_temp(struct g9p_ctx *ctx)
    int r = alloc_reg(ctx);
 
    if (r >= 0)
-      ctx->temps |= BITFIELD_BIT(r);
+      ctx->temps |= BITFIELD64_BIT(r);
    return r;
 }
 
@@ -200,8 +223,8 @@ release_scalar(struct g9p_ctx *ctx, nir_def *def, unsigned comp)
    unsigned k = key(def, comp);
 
    if (ctx->last_use[k] <= ctx->ip && ctx->reg[k] >= 0 &&
-       !(ctx->pinned & BITFIELD_BIT(ctx->reg[k])))
-      ctx->busy &= ~BITFIELD_BIT(ctx->reg[k]);
+       !(ctx->pinned & BITFIELD64_BIT(ctx->reg[k])))
+      ctx->busy &= ~BITFIELD64_BIT(ctx->reg[k]);
 }
 
 static bool
@@ -504,7 +527,10 @@ emit_alu(struct g9p_ctx *ctx, nir_alu_instr *alu)
    case nir_op_ieq32: case nir_op_ine32: case nir_op_b32csel:
    case nir_op_fmin: case nir_op_fmax: case nir_op_imin: case nir_op_imax:
    case nir_op_umin: case nir_op_umax:
-   case nir_op_fneg: case nir_op_fabs: case nir_op_inot: case nir_op_ineg: {
+   case nir_op_fneg: case nir_op_fabs: case nir_op_inot: case nir_op_ineg:
+   case nir_op_fsin: case nir_op_fcos: case nir_op_fsign: case nir_op_b2f32:
+   case nir_op_slt: case nir_op_sge: case nir_op_seq: case nir_op_sne:
+   case nir_op_flrp: {
       bool ok;
 
       dst = alloc_reg(ctx);
@@ -581,6 +607,89 @@ emit_alu_op(struct g9p_ctx *ctx, nir_alu_instr *alu, const int *r, int dst)
    case nir_op_f2i32:
       g9p_convert(ctx->c, dst, r[0], G9P_F2I);
       return true;
+
+   case nir_op_ffloor:
+      g9p_funary(ctx->c, G9P_FFLOOR, dst, r[0]);
+      return true;
+   case nir_op_frcp:
+      g9p_funary(ctx->c, G9P_FRCP, dst, r[0]);
+      return true;
+   case nir_op_frsq:
+      g9p_funary(ctx->c, G9P_FRSQ, dst, r[0]);
+      return true;
+   case nir_op_flog2:
+      g9p_funary(ctx->c, G9P_FLOG2, dst, r[0]);
+      return true;
+   case nir_op_fexp2:
+      g9p_funary(ctx->c, G9P_FEXP2, dst, r[0]);
+      return true;
+
+   case nir_op_fsin:
+   case nir_op_fcos: {
+      /*
+       * As Apple's compiler: turns = x / 2pi (+ 1/4 for cos), its fraction
+       * times 4, then the two hardware steps, multiplied.
+       */
+      int k = const_reg(ctx, fui(0.15915494309189535f));
+      int q = const_reg(ctx, fui(alu->op == nir_op_fcos ? 0.25f : 0.0f));
+      int t = alloc_temp(ctx);
+
+      if (k < 0 || q < 0 || t < 0)
+         return false;
+      g9p_ffma(ctx->c, dst, r[0], k, q);
+      g9p_funary(ctx->c, G9P_FFLOOR, t, dst);
+      g9p_alu2(ctx->c, G9P_FADD | G9P_NEG_B, dst, dst, t, false);
+      g9p_mov_imm(ctx->c, k, fui(4.0f));
+      g9p_alu2(ctx->c, G9P_FMUL, dst, dst, k, false);
+      g9p_funary(ctx->c, G9P_FSIN1, t, dst);
+      g9p_funary(ctx->c, G9P_FSIN2, k, t);
+      g9p_alu2(ctx->c, G9P_FMUL, dst, t, k, false);
+      return true;
+   }
+   case nir_op_fsign: {
+      /* 0, then 1 where x > 0, -1 where x < 0 */
+      int zero = const_reg(ctx, 0), one = const_reg(ctx, fui(1.0f)),
+          minus = const_reg(ctx, fui(-1.0f));
+
+      if (zero < 0 || one < 0 || minus < 0)
+         return false;
+      emit_select(ctx, G9P_FLT, true, zero, r[0], one, zero, dst);
+      g9p_cmp_reg(ctx->c, G9P_FLT, r[0], zero, true);
+      g9p_push_if(ctx->c, ctx->st, false);
+      g9p_add_imm(ctx->c, dst, minus, 0);
+      g9p_pop_levels(ctx->c, ctx->st, 1);
+      return true;
+   }
+   case nir_op_b2f32: {
+      /* booleans are 0 / ~0 */
+      int one = const_reg(ctx, fui(1.0f));
+
+      if (one < 0)
+         return false;
+      g9p_alu2(ctx->c, G9P_AND, dst, r[0], one, false);
+      return true;
+   }
+
+   case nir_op_flrp: {
+      /* a + (b - a) * t */
+      int t = alloc_temp(ctx);
+
+      if (t < 0)
+         return false;
+      g9p_alu2(ctx->c, G9P_FADD | G9P_NEG_B, t, r[1], r[0], false);
+      g9p_ffma(ctx->c, dst, t, r[2], r[0]);
+      return true;
+   }
+
+   /* float results 1.0 / 0.0 (step()) */
+   case nir_op_slt:
+      return emit_select_const(ctx, G9P_FLT, true, r[0], r[1], fui(1.0f), 0, dst);
+   case nir_op_sge:
+      return emit_select_const(ctx, G9P_FLT, true, r[0], r[1], 0, fui(1.0f), dst);
+   case nir_op_seq:
+      return emit_select_const(ctx, G9P_FEQ, true, r[0], r[1], fui(1.0f), 0, dst);
+   case nir_op_sne:
+      return emit_select_const(ctx, G9P_FEQ, true, r[0], r[1], 0, fui(1.0f), dst);
 
    case nir_op_flt32:
       return emit_select_const(ctx, G9P_FLT, true, r[0], r[1], ~0u, 0, dst);
@@ -687,7 +796,7 @@ emit_mem(struct g9p_ctx *ctx, nir_intrinsic_instr *intr, int slot, nir_scalar of
    pair = alloc_pair(ctx);
    if (pair < 0)
       return false;
-   ctx->temps |= BITFIELD_RANGE(pair, 2);
+   ctx->temps |= BITFIELD64_RANGE(pair, 2);
    /* byte offset: shift 0 */
    g9p_addr(ctx->c, pair, 2 * slot, off, 0, false);
 
@@ -699,7 +808,7 @@ emit_mem(struct g9p_ctx *ctx, nir_intrinsic_instr *intr, int slot, nir_scalar of
       release(ctx, &intr->instr);
    } else {
       /* the address pair stays busy until the load has read it */
-      uint32_t pair_bits = BITFIELD_RANGE(pair, 2);
+      uint64_t pair_bits = BITFIELD64_RANGE(pair, 2);
 
       ctx->temps &= ~pair_bits;
       release(ctx, &intr->instr);
@@ -709,7 +818,7 @@ emit_mem(struct g9p_ctx *ctx, nir_intrinsic_instr *intr, int slot, nir_scalar of
       g9p_mem_at(ctx->c, false, G9P_SIZE_U32, data, pair);
       g9p_wait(ctx->c);
       ctx->busy &= ~pair_bits;
-      ctx->busy |= BITFIELD_BIT(data);
+      ctx->busy |= BITFIELD64_BIT(data);
       ctx->reg[key(&intr->def, 0)] = data;
    }
    return true;
@@ -772,7 +881,7 @@ emit_intrinsic(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
       r = alloc_reg(ctx);
       if (r < 0)
          return false;
-      ctx->pinned |= BITFIELD_BIT(r);
+      ctx->pinned |= BITFIELD64_BIT(r);
       ctx->reg[key(&intr->def, 0)] = r;
       return true;
    }
@@ -1082,7 +1191,7 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
          if (instr->type == nir_instr_type_intrinsic &&
              nir_instr_as_intrinsic(instr)->intrinsic ==
                 nir_intrinsic_load_local_invocation_index)
-            ctx->busy |= BITFIELD_BIT(0);
+            ctx->busy |= BITFIELD64_BIT(0);
       }
    }
 
@@ -1123,6 +1232,8 @@ g9p_buffer_slot(struct g9p_compute_shader *out, unsigned set, unsigned binding)
    return k;
 }
 
+
+
 static void
 optimize(nir_shader *nir)
 {
@@ -1156,8 +1267,17 @@ g9p_compile_compute(nir_shader *nir, struct g9p_compute_shader *out, void *mem_c
 
    memset(out, 0, sizeof(*out));
 
+   /* One function, globals as locals */
+   NIR_PASS(_, nir, nir_lower_variable_initializers, nir_var_function_temp);
+   NIR_PASS(_, nir, nir_lower_returns);
+   NIR_PASS(_, nir, nir_inline_functions);
+   nir_remove_non_entrypoints(nir);
+   NIR_PASS(_, nir, nir_opt_deref);
+   NIR_PASS(_, nir, nir_lower_variable_initializers, ~0);
+   NIR_PASS(_, nir, nir_lower_global_vars_to_local);
    NIR_PASS(_, nir, nir_split_var_copies);
    NIR_PASS(_, nir, nir_lower_var_copies);
+   NIR_PASS(_, nir, nir_split_struct_vars, nir_var_function_temp);
    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
    NIR_PASS(_, nir, nir_lower_system_values);
    NIR_PASS(_, nir, nir_lower_compute_system_values, &csv);
@@ -1173,6 +1293,9 @@ g9p_compile_compute(nir_shader *nir, struct g9p_compute_shader *out, void *mem_c
    NIR_PASS(_, nir, nir_lower_bool_to_int32);
    NIR_PASS(_, nir, nir_opt_copy_prop);
    NIR_PASS(_, nir, nir_opt_dce);
+   /* values computed early for late uses: compute them right before */
+   NIR_PASS(_, nir, nir_opt_move, nir_move_alu | nir_move_const_undef |
+            nir_move_comparisons | nir_move_copies);
    NIR_PASS(_, nir, nir_convert_from_ssa, true, false);
    NIR_PASS(_, nir, nir_trivialize_registers);
 
@@ -1189,6 +1312,7 @@ g9p_compile_compute(nir_shader *nir, struct g9p_compute_shader *out, void *mem_c
    ctx.out = out;
    ctx.c = rzalloc(mem_ctx, struct g9p_code);
    ctx.reg = ralloc_array(mem_ctx, int8_t, impl->ssa_alloc * 4);
+   ctx.num_keys = impl->ssa_alloc * 4;
    ctx.last_use = rzalloc_array(mem_ctx, unsigned, impl->ssa_alloc * 4);
    ctx.def_ip = rzalloc_array(mem_ctx, unsigned, impl->ssa_alloc);
    ctx.max_exit_jumps = 256;
