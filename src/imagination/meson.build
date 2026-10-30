@@ -18,6 +18,7 @@ if with_imagination_vk or with_tools.contains('imagination')
   subdir('pco')
   subdir('ds')
   subdir('pdsc')
+  subdir('g9p')
 endif
 
 if with_imagination_vk

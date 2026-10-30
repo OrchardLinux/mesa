@@ -85,6 +85,7 @@
 #include "vk_object.h"
 #include "vk_pipeline_layout.h"
 #include "vk_synchronization.h"
+#include "pvr_g9p.h"
 #include "vk_util.h"
 
 /* Structure used to pass data into pvr_compute_generate_control_stream()
@@ -2583,7 +2584,10 @@ VkResult pvr_arch_cmd_buffer_end_sub_cmd(struct pvr_cmd_buffer *cmd_buffer)
    case PVR_SUB_CMD_TYPE_COMPUTE: {
       struct pvr_sub_cmd_compute *const compute_sub_cmd = &sub_cmd->compute;
 
-      pvr_arch_compute_generate_fence(cmd_buffer, compute_sub_cmd, true);
+      if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p))
+         pvr_arch_g9p_end_pass(cmd_buffer, compute_sub_cmd);
+      else
+         pvr_arch_compute_generate_fence(cmd_buffer, compute_sub_cmd, true);
 
       result = pvr_arch_csb_emit_terminate(&compute_sub_cmd->control_stream);
       if (result != VK_SUCCESS)
@@ -6667,6 +6671,14 @@ static void pvr_cmd_dispatch(
    pvr_arch_cmd_buffer_start_sub_cmd(cmd_buffer, PVR_SUB_CMD_TYPE_COMPUTE);
 
    sub_cmd = &state->current_sub_cmd->compute;
+
+   if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g9p)) {
+      /* Indirect dispatches and base groups are not supported yet */
+      result = pvr_arch_g9p_cmd_dispatch(cmd_buffer, sub_cmd, workgroup_size);
+      if (result != VK_SUCCESS)
+         pvr_cmd_buffer_set_error_unwarned(cmd_buffer, result);
+      goto end_cmd_dispatch;
+   }
    sub_cmd->uses_atomic_ops |= cs_data->common.uses.atomics;
    sub_cmd->uses_barrier |= cs_data->common.uses.barriers;
 

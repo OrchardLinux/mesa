@@ -69,6 +69,7 @@ pvr_deps = [
   dep_libdrm,
   dep_valgrind,
   idep_mesautil,
+  idep_powervr_g9p,
   idep_pco_uscgen_programs,
   idep_pdsc_precomp_programs,
   idep_pvr_driver_ds,
@@ -94,6 +95,7 @@ common_per_arch_files += files(
   'pvr_arch_cmd_query.c',
   'pvr_arch_csb.c',
   'pvr_arch_descriptor_set.c',
+  'pvr_arch_g9p.c',
   'pvr_arch_device.c',
   'pvr_arch_formats.c',
   'pvr_arch_framebuffer.c',
@@ -158,6 +160,7 @@ foreach arch : ['rogue']
       pvr_includes,
       inc_imagination,
       inc_include,
+      inc_powervr_g9p,
       inc_src,
     ],
     dependencies : [

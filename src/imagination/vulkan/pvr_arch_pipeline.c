@@ -71,6 +71,7 @@
 #include "vk_pipeline_layout.h"
 #include "vk_render_pass.h"
 #include "vk_util.h"
+#include "pvr_g9p.h"
 #include "vulkan/runtime/vk_pipeline.h"
 #include "vulkan/vulkan_core.h"
 
@@ -1155,11 +1156,16 @@ pvr_compute_pipeline_init(struct pvr_device *device,
                      pCreateInfo->layout,
                      &compute_pipeline->base);
 
-   result = pvr_compute_pipeline_compile(device,
-                                         cache,
-                                         pCreateInfo,
-                                         allocator,
-                                         compute_pipeline);
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p)) {
+      result = pvr_arch_g9p_compute_pipeline_compile(device, pCreateInfo,
+                                                     compute_pipeline);
+   } else {
+      result = pvr_compute_pipeline_compile(device,
+                                            cache,
+                                            pCreateInfo,
+                                            allocator,
+                                            compute_pipeline);
+   }
    if (result != VK_SUCCESS) {
       pvr_pipeline_finish(device, &compute_pipeline->base);
       return result;
@@ -1209,6 +1215,13 @@ static void pvr_compute_pipeline_destroy(
    const VkAllocationCallbacks *const allocator,
    struct pvr_compute_pipeline *const compute_pipeline)
 {
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p)) {
+      pvr_bo_suballoc_free(compute_pipeline->g9p.shader_bo);
+      pvr_pipeline_finish(device, &compute_pipeline->base);
+      vk_free2(&device->vk.alloc, allocator, compute_pipeline);
+      return;
+   }
+
    pvr_pds_compute_program_destroy(device,
                                    allocator,
                                    &compute_pipeline->pds_cs_program,

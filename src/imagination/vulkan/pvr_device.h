@@ -79,6 +79,13 @@ struct pvr_device {
    struct pvr_pds_upload pds_compute_fence_program;
    struct pvr_pds_upload pds_compute_empty_program;
 
+   /* Apple G9P: the programs every compute pass ends with (pvr_arch_g9p.c) */
+   struct {
+      struct pvr_suballoc_bo *empty_kernel;
+      struct pvr_pds_upload kick;
+      struct pvr_pds_upload fence;
+   } g9p;
+
    /* Compute shaders for queries. */
    struct pvr_compute_query_shader availability_shader;
    struct pvr_compute_query_shader reset_queries_shader;

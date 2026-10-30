@@ -117,8 +117,21 @@ struct pvr_pipeline {
    VkPipelineCreateFlags2KHR pipeline_flags;
 };
 
+/* Apple G9P (has_apple_g9p): the shader and what its dispatches load */
+struct pvr_g9p_compute_state {
+   struct pvr_suballoc_bo *shader_bo;
+   unsigned num_buffers;
+   struct {
+      unsigned set, binding;
+   } buffers[8];
+   bool uses_workgroup_id;
+   unsigned local_size[3];
+};
+
 struct pvr_compute_pipeline {
    struct pvr_pipeline base;
+
+   struct pvr_g9p_compute_state g9p;
 
    pco_data cs_data;
 
