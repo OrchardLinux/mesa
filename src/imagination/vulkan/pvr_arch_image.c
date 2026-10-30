@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "pvr_g9p.h"
 #include "pvr_image.h"
 
 #include <assert.h>
@@ -207,6 +208,12 @@ VkResult PVR_PER_ARCH(CreateImageView)(VkDevice _device,
                                     &iview->image_state[info.tex_state_type]);
    if (result != VK_SUCCESS)
       goto err_vk_image_view_destroy;
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p)) {
+      uint64_t words[2];
+
+      pvr_arch_g9p_pack_image_view(iview, words);
+      memcpy(iview->image_state[PVR_TEXTURE_STATE_SAMPLE].words, words, sizeof(words));
+   }
 
    /* Create an additional texture state for cube type if storage
     * usage flag is set.

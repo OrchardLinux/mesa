@@ -172,6 +172,21 @@ alloc_pair(struct g9p_ctx *ctx)
    return -1;
 }
 
+/* @n consecutive registers */
+static int
+alloc_range(struct g9p_ctx *ctx, unsigned n)
+{
+   for (unsigned r = 0; r + n <= G9P_NUM_REGS; r++) {
+      if (!(ctx->busy & BITFIELD64_RANGE(r, n))) {
+         ctx->busy |= BITFIELD64_RANGE(r, n);
+         ctx->max_reg = MAX2(ctx->max_reg, r + n - 1);
+         return r;
+      }
+   }
+   dump_busy(ctx);
+   return -1;
+}
+
 static int
 alloc_temp(struct g9p_ctx *ctx)
 {
@@ -465,6 +480,52 @@ static bool emit_alu_op(struct g9p_ctx *ctx, nir_alu_instr *alu, const int *r,
                         int dst);
 
 static bool
+only_tex_uses(nir_def *def)
+{
+   nir_foreach_use_including_if(src, def) {
+      if (nir_src_is_if(src) || nir_src_use_instr(src)->type != nir_instr_type_tex)
+         return false;
+   }
+   return true;
+}
+
+/*
+ * vecN: no code when only texture coordinates use it (emit_tex() reads
+ * the varyings itself), else each component copied into its own register
+ */
+static bool
+emit_vec(struct g9p_ctx *ctx, nir_alu_instr *alu)
+{
+   if (only_tex_uses(&alu->def)) {
+      release(ctx, &alu->instr);
+      return true;
+   }
+   for (unsigned c = 0; c < alu->def.num_components; c++) {
+      nir_scalar v = nir_get_scalar(alu->src[c].src.ssa, alu->src[c].swizzle[0]);
+      uint32_t imm;
+      int src, dst;
+
+      if (!ctx->last_use[key(&alu->def, c)])
+         continue;
+      if (is_const(v, &imm)) {
+         dst = alloc_reg(ctx);
+         if (dst < 0)
+            return false;
+         g9p_mov_imm(ctx->c, dst, imm);
+      } else {
+         src = src_reg(ctx, v);
+         dst = alloc_reg(ctx);
+         if (src < 0 || dst < 0)
+            return false;
+         g9p_alu2(ctx->c, G9P_OR, dst, src, src, false);
+      }
+      ctx->reg[key(&alu->def, c)] = dst;
+   }
+   release(ctx, &alu->instr);
+   return true;
+}
+
+static bool
 emit_alu(struct g9p_ctx *ctx, nir_alu_instr *alu)
 {
    const unsigned num_inputs = nir_op_infos[alu->op].num_inputs;
@@ -473,6 +534,8 @@ emit_alu(struct g9p_ctx *ctx, nir_alu_instr *alu)
    uint32_t imm;
    int dst;
 
+   if (nir_op_is_vec(alu->op) && alu->def.bit_size == 32)
+      return emit_vec(ctx, alu);
    if (alu->def.num_components != 1 || alu->def.bit_size != 32) {
       fprintf(stderr, "g9p: %s: only 32-bit scalar ALU\n", nir_op_infos[alu->op].name);
       return false;
@@ -991,6 +1054,93 @@ emit_output(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
    return true;
 }
 
+/* The texture slot of a combined image sampler deref, added if new */
+static int
+texture_slot(struct g9p_ctx *ctx, nir_tex_instr *tex)
+{
+   int i = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
+   nir_variable *var;
+   unsigned k;
+
+   if (i < 0)
+      return -1;
+   var = nir_deref_instr_get_variable(nir_src_as_deref(tex->src[i].src));
+   if (!var)
+      return -1;
+   for (k = 0; k < ctx->out->num_textures; k++) {
+      if (ctx->out->textures[k].set == var->data.descriptor_set &&
+          ctx->out->textures[k].binding == var->data.binding)
+         return k;
+   }
+   if (k == G9P_MAX_TEXTURES)
+      return -1;
+   ctx->out->textures[k].set = var->data.descriptor_set;
+   ctx->out->textures[k].binding = var->data.binding;
+   ctx->out->num_textures++;
+   return k;
+}
+
+/* The varying component an SSA scalar is a plain load of, or -1 */
+static int
+varying_component(nir_scalar s)
+{
+   nir_intrinsic_instr *intr;
+   nir_io_semantics sem;
+
+   s = nir_scalar_chase_movs(s);
+   if (!nir_scalar_is_intrinsic(s))
+      return -1;
+   intr = nir_def_as_intrinsic(s.def);
+   if (intr->intrinsic != nir_intrinsic_load_interpolated_input &&
+       intr->intrinsic != nir_intrinsic_load_input)
+      return -1;
+   sem = nir_intrinsic_io_semantics(intr);
+   if (sem.location < VARYING_SLOT_VAR0 || sem.location >= VARYING_SLOT_VAR0 + G9P_MAX_VARYINGS)
+      return -1;
+   return 4 * (sem.location - VARYING_SLOT_VAR0) + nir_intrinsic_component(intr) + s.comp;
+}
+
+/*
+ * A 2D sample whose coordinates are two consecutive varying components
+ * (texture(t, v_uv)): iterated straight to the sampler, the f32 result in
+ * four consecutive registers
+ */
+static bool
+emit_tex(struct g9p_ctx *ctx, nir_tex_instr *tex)
+{
+   int ci = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   int slot = texture_slot(ctx, tex);
+   int first, second, dst;
+
+   if (ctx->stage != MESA_SHADER_FRAGMENT || tex->sampler_dim != GLSL_SAMPLER_DIM_2D ||
+       tex->is_array || tex->is_shadow || ci < 0 || slot < 0 ||
+       (tex->op != nir_texop_tex && tex->op != nir_texop_txl) ||
+       nir_tex_instr_src_index(tex, nir_tex_src_offset) >= 0) {
+      fprintf(stderr, "g9p: only plain 2D samples of combined image samplers so far\n");
+      return false;
+   }
+   first = varying_component(nir_get_scalar(tex->src[ci].src.ssa, 0));
+   second = varying_component(nir_get_scalar(tex->src[ci].src.ssa, 1));
+   if (first < 0 || second != first + 1) {
+      fprintf(stderr, "g9p: texture coordinates must come straight from a varying so far\n");
+      return false;
+   }
+   release(ctx, &tex->instr);
+   dst = alloc_range(ctx, 4);
+   if (dst < 0)
+      return false;
+   g9p_sample_varying(ctx->c, dst, first, 2, G9P_TEX_STRIDE * slot,
+                      G9P_TEX_STRIDE * slot + 8);
+   g9p_wait(ctx->c);
+   for (unsigned c = 0; c < 4; c++) {
+      ctx->reg[key(&tex->def, c)] = dst + c;
+      if (c >= tex->def.num_components || !ctx->last_use[key(&tex->def, c)])
+         ctx->busy &= ~BITFIELD64_BIT(dst + c);
+   }
+   ctx->out->num_varyings = MAX2(ctx->out->num_varyings, first / 4 + 1);
+   return true;
+}
+
 static bool
 emit_intrinsic(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
 {
@@ -1119,6 +1269,11 @@ emit_instr(struct g9p_ctx *ctx, nir_instr *instr)
       return emit_alu(ctx, nir_instr_as_alu(instr));
    case nir_instr_type_intrinsic:
       return emit_intrinsic(ctx, nir_instr_as_intrinsic(instr));
+   case nir_instr_type_tex:
+      return emit_tex(ctx, nir_instr_as_tex(instr));
+   case nir_instr_type_deref:
+      /* texture derefs: resolved by emit_tex() */
+      return true;
    case nir_instr_type_jump:
       /* a break is emitted by the if whose branch it ends (emit_if()) */
       return nir_instr_as_jump(instr)->type == nir_jump_return ||
@@ -1379,6 +1534,7 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
    ctx->out->num_buffers = 0;
    ctx->out->uses_workgroup_id = false;
    ctx->out->num_varyings = 0;
+   ctx->out->num_textures = 0;
    ctx->num_exit_jumps = 0;
    ctx->num_outputs = 0;
    for (unsigned i = 0; i < 4; i++)

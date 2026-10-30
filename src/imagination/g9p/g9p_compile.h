@@ -16,6 +16,12 @@
 #define G9P_MAX_BUFFERS 8
 #define G9P_MAX_ATTRIBS 16
 #define G9P_MAX_VARYINGS 16
+#define G9P_MAX_TEXTURES 4
+/*
+ * Fragment common store per texture: its state (8 dwords) at dword 16t,
+ * its sampler (2 dwords) at 16t + 8, as the draw's texture DMA places them
+ */
+#define G9P_TEX_STRIDE 16
 
 /* The set of the push-constant slot (its address is loaded like a buffer's) */
 #define G9P_PUSH_CONSTANTS (~0u)
@@ -60,6 +66,12 @@ struct g9p_shader {
    bool varying_perspective[G9P_MAX_VARYINGS];
    /* Vertex: output dwords (4 + 4 x num_varyings) */
    unsigned num_outputs;
+
+   /* Fragment: the combined image samplers sampled, by common-store slot */
+   unsigned num_textures;
+   struct {
+      unsigned set, binding;
+   } textures[G9P_MAX_TEXTURES];
 };
 
 const struct spirv_to_nir_options *g9p_spirv_options(void);

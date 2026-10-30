@@ -396,6 +396,23 @@ g9p_iterate(struct g9p_code *c, unsigned dst, unsigned first, unsigned comps,
 }
 
 /*
+ * Texture sample, its coordinates straight from the varyings: an iterate of
+ * @comps components from component @first whose result goes to the sampler
+ * (W2 0x8000), then the sample with the texture state at common-store dword
+ * @state and the sampler at @sampler into f32 r[@dst]..r[@dst + 3] (W0
+ * f51a; f518 writes the colour halves). Follow with g9p_wait(). Computed
+ * coordinates are not supported yet: copying them to r0-r1 is unreliable
+ * (orchard gpu-001 RENDER.md "Textures in Mesa").
+ */
+static inline void
+g9p_sample_varying(struct g9p_code *c, unsigned dst, unsigned first, unsigned comps,
+                   unsigned state, unsigned sampler)
+{
+   G9P_EMIT(c, (4 - comps) << 11 | 0x0308, (1 + first) << 9 | 0x0100, 0x8000);
+   G9P_EMIT(c, 0xf51a, 0x0100 | 2 * dst, 0x8100 | state << 8 | sampler, 0x0700, 0x0200);
+}
+
+/*
  * Half @h of r0-r1 (the colour output) = f16 of f32 r[@src]: a multiply by
  * an f16 1.0 immediate writing a half register
  */

@@ -72,6 +72,12 @@ uint32_t PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
                                        const struct pvr_render_job *job, uint8_t *buf,
                                        uint32_t size);
 
+struct pvr_image_view;
+void PVR_PER_ARCH(g9p_pack_image_view)(const struct pvr_image_view *iview, uint64_t words[2]);
+uint64_t PVR_PER_ARCH(g9p_pack_sampler)(const VkSamplerCreateInfo *info);
+
+#   define pvr_arch_g9p_pack_image_view PVR_PER_ARCH(g9p_pack_image_view)
+#   define pvr_arch_g9p_pack_sampler PVR_PER_ARCH(g9p_pack_sampler)
 #   define pvr_arch_g9p_gfx_device_init PVR_PER_ARCH(g9p_gfx_device_init)
 #   define pvr_arch_g9p_gfx_device_finish PVR_PER_ARCH(g9p_gfx_device_finish)
 #   define pvr_arch_g9p_graphics_pipeline_compile \

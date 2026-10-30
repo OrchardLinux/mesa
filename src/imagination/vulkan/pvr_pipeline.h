@@ -146,6 +146,11 @@ struct pvr_g9p_graphics_state {
    struct {
       unsigned set, binding;
    } buffers[8];
+   /* the fragment shader's combined image samplers, by common-store slot */
+   unsigned num_textures;
+   struct {
+      unsigned set, binding;
+   } textures[4];
 };
 
 struct pvr_compute_pipeline {

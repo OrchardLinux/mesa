@@ -95,6 +95,8 @@ struct pvr_device {
          struct pvr_pds_upload stream_out;
          /* two VDM context state buffers */
          struct pvr_suballoc_bo *ctx_state;
+         /* zeros (texture state dwords 4-7) */
+         struct pvr_suballoc_bo *zeros;
       } gfx;
    } g9p;
 

@@ -218,6 +218,8 @@ PVR_PER_ARCH(g9p_gfx_device_init)(struct pvr_device *device)
    if (result == VK_SUCCESS)
       result = pvr_gpu_upload(device, device->heaps.general_heap, zeros, sizeof(zeros),
                               64, &p->ctx_state);
+   if (result == VK_SUCCESS)
+      result = pvr_gpu_upload(device, device->heaps.general_heap, zeros, 64, 64, &p->zeros);
 
 out:
    free(c);
@@ -229,6 +231,7 @@ PVR_PER_ARCH(g9p_gfx_device_finish)(struct pvr_device *device)
 {
    struct pvr_g9p_gfx_programs *p = &device->g9p.gfx;
 
+   pvr_bo_suballoc_free(p->zeros);
    pvr_bo_suballoc_free(p->ctx_state);
    if (p->stream_out.pvr_bo)
       pvr_bo_suballoc_free(p->stream_out.pvr_bo);
@@ -387,6 +390,11 @@ PVR_PER_ARCH(g9p_graphics_pipeline_compile)(struct pvr_device *device,
                          "G9P: fragment shader buffers not supported yet");
       goto out;
    }
+   state->num_textures = fs.num_textures;
+   for (unsigned i = 0; i < fs.num_textures; i++) {
+      state->textures[i].set = fs.textures[i].set;
+      state->textures[i].binding = fs.textures[i].binding;
+   }
 
    result = pvr_gpu_upload_usc(device, vs.code, vs.code_size, 64, &state->vs_bo);
    if (result != VK_SUCCESS)
@@ -492,6 +500,48 @@ hw_topology(VkPrimitiveTopology topology)
 }
 
 /*
+ * The fragment shader's textures (RENDER.md "Textures in Mesa"): per
+ * texture t, three DMAs into the common store, the texture state (4
+ * dwords from the descriptor, 4 zeros) at dword 16t and the sampler (2
+ * dwords) at 16t + 8. The program reads them by TEXUNICODEBASE, its data
+ * by UNIFORMDATABASE.
+ */
+static VkResult
+upload_textures(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state *state,
+                struct pvr_pds_upload *up)
+{
+   const struct pvr_g9p_gfx_programs *p = &cmd_buffer->device->g9p.gfx;
+   const struct pvr_descriptor_state *desc = &cmd_buffer->state.gfx_desc_state;
+   const unsigned n = 3 * state->num_textures;
+   uint32_t data[3 * 3 * 4 + 4] = { 0 }, code[3 * 4 + 1];
+   unsigned nc = 0;
+
+   for (unsigned t = 0; t < state->num_textures; t++) {
+      const struct pvr_descriptor_set *set = desc->sets[state->textures[t].set];
+      uint64_t src[3], addr = 0;
+
+      if (set)
+         addr = set->dev_addr.addr + set->layout->bindings[state->textures[t].binding].offset;
+      src[0] = addr;
+      src[1] = p->zeros->dev_addr.addr;
+      src[2] = addr + sizeof(struct pvr_image_descriptor);
+      for (unsigned k = 0; k < 3; k++) {
+         const unsigned i = 3 * t + k;
+         const unsigned dest = G9P_TEX_STRIDE * t + 4 * k;
+
+         data[2 * i] = src[k];
+         data[2 * i + 1] = src[k] >> 32;
+         data[2 * n + i] = doutd_ctrl(dest, k == 2 ? 2 : 4, i + 1 == n);
+         code[nc++] = g9p_pds_dout(G9P_DOUTD, i, G9P_PDS_DATA, 2 * n + i,
+                                   i + 1 == n ? G9P_PDS_END : 0);
+      }
+   }
+   code[nc++] = g9p_pds_halt();
+   return pvr_arch_cmd_buffer_upload_pds(cmd_buffer, data, ALIGN_POT(3 * n, 4), 16, code, nc,
+                                         16, 64, up);
+}
+
+/*
  * The common store of the vertex shader: the addresses of its buffers
  * (vertex buffers, push constants), loaded by the draw's DMA program.
  */
@@ -548,7 +598,7 @@ PVR_PER_ARCH(g9p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer,
    const struct pvr_render_pass_info *info = &cs->render_pass_info;
    const uint32_t width = info->render_area.offset.x + info->render_area.extent.width;
    const uint32_t height = info->render_area.offset.y + info->render_area.extent.height;
-   struct pvr_pds_upload dma;
+   struct pvr_pds_upload dma, tex = { 0 };
    struct pvr_suballoc_bo *ppp_bo;
    struct pvr_csb *csb;
    uint32_t ppp[64], at = 0, blocks[12][2], nb = 0;
@@ -573,6 +623,11 @@ PVR_PER_ARCH(g9p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer,
    result = upload_vs_uniforms(cmd_buffer, state, &dma);
    if (result != VK_SUCCESS)
       return result;
+   if (state->num_textures) {
+      result = upload_textures(cmd_buffer, state, &tex);
+      if (result != VK_SUCCESS)
+         return result;
+   }
 
    /*
     * PPP blocks, as iPadOS splits them (RENDER.md "Own programs"): each one
@@ -589,12 +644,22 @@ PVR_PER_ARCH(g9p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer,
 
    /* 0: varying words (f32_linear = the varyings' components) */
    PPP_BLOCK(0x001c0000, 4 * state->num_varyings, 0, 0);
-   /* 1: PDS state pointers 0-1 */
-   PPP_BLOCK(0xc0, state->fs_kick.data_offset, p->halt.code_offset,
-             0x00800000 | (state->num_varyings
-                              ? state->varying_units << 10 | (2 * state->num_varyings) << 4
-                              : 0),
-             0, state->num_varyings ? state->varyings.data_offset : p->halt.code_offset);
+   /*
+    * 1: PDS state pointers 0-1: shader base, texture/uniform program,
+    * SIZEINFO1 (uniform data in 16-byte units, varying sizes), SIZEINFO2
+    * (the USC common store, 64-byte units), varying base
+    */
+   PPP_BLOCK(0xc0, state->fs_kick.data_offset,
+             state->num_textures ? tex.code_offset : p->halt.code_offset,
+             (state->num_textures ? MAX2(tex.data_size / 4, 1) : 1) << 23 |
+                (state->num_varyings
+                    ? state->varying_units << 10 | (2 * state->num_varyings) << 4
+                    : 0),
+             DIV_ROUND_UP(G9P_TEX_STRIDE * 4 * state->num_textures, 64) << 23,
+             state->num_varyings ? state->varyings.data_offset : p->halt.code_offset);
+   /* 1b: PDS state pointer 3: the texture program's data */
+   if (state->num_textures)
+      PPP_BLOCK(0x200, tex.data_offset);
    /* 2: output selects: vertex size, rhw */
    PPP_BLOCK(0x00020000, state->vs_outputs << 24 | 0x00010000);
    /* 3: ISP control and front/back words (no depth, no culling yet) */
@@ -681,6 +746,82 @@ PVR_PER_ARCH(g9p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer,
       emit_words(csb, w, n);
    }
    return csb->status;
+}
+
+/* --- Image and sampler states ---------------------------------------------- */
+
+/*
+ * Bytes 1-2 of an image state's dword 0 by format (RENDER.md "Render target
+ * captures"; the RGBA8 texture of "Varyings and textures with our
+ * encodings"); 0 if not decoded yet
+ */
+static uint32_t
+image_format_bits(VkFormat format)
+{
+   switch (format) {
+   case VK_FORMAT_B8G8R8A8_UNORM:
+   case VK_FORMAT_B8G8R8A8_SRGB:
+      return 0x0505;
+   case VK_FORMAT_R8G8B8A8_UNORM:
+   case VK_FORMAT_R8G8B8A8_SRGB:
+      return 0x4405;
+   case VK_FORMAT_R16G16B16A16_SFLOAT:
+      return 0x4446;
+   default:
+      return 0;
+   }
+}
+
+/*
+ * The texture state of an image view's base level and layer (dwords 0-3;
+ * the draw's DMA zeroes 4-7): the image state layout of render targets
+ */
+void
+PVR_PER_ARCH(g9p_pack_image_view)(const struct pvr_image_view *iview, uint64_t words[2])
+{
+   const struct pvr_image *image = pvr_image_view_get_image(iview);
+   const struct pvr_image_plane *plane = pvr_single_plane_const(image);
+   const uint32_t fmt = image_format_bits(iview->vk.format);
+   const bool linear = image->memlayout == PVR_MEMLAYOUT_LINEAR;
+   const uint64_t addr = image->dev_addr.addr + plane->offset +
+                         plane->mip_levels[iview->vk.base_mip_level].offset +
+                         iview->vk.base_array_layer * plane->layer_size;
+   const uint32_t w = iview->vk.extent.width, h = iview->vk.extent.height;
+   uint32_t d[4];
+
+   if (!fmt)
+      mesa_logw("G9P: texture format %s not decoded yet", vk_Format_to_str(iview->vk.format));
+   d[0] = 0x03000000u | (fmt ? fmt : 0x0505) << 8 | (linear ? 0x02 : 0x0a) | (w - 1) << 27;
+   d[1] = (w - 1) >> 5 | (h - 1) << 9;
+   d[2] = (uint32_t)(addr >> 1);
+   d[3] = (uint32_t)(addr >> 33);
+   if (linear)
+      d[3] |= (plane->mip_levels[iview->vk.base_mip_level].pitch / 64 - 1) << 15;
+   words[0] = d[0] | (uint64_t)d[1] << 32;
+   words[1] = d[2] | (uint64_t)d[3] << 32;
+}
+
+/*
+ * Sampler words: nearest/clamp as captured (000e0000 00c00780); dword 0 bit
+ * 23 makes magnification linear (pvr-tri TRI_SAMPLER). Linear-filter-and-
+ * repeat as iPadOS writes it also sets dword 0 bits 25 and 29 and dword 1
+ * bit 0: minification and the wrap modes, not separated yet, so linear
+ * minification sets dword 1 bit 0 and repeat bits 25 and 29 (to verify).
+ */
+uint64_t
+PVR_PER_ARCH(g9p_pack_sampler)(const VkSamplerCreateInfo *info)
+{
+   uint32_t d0 = 0x000e0000u, d1 = 0x00c00780u;
+
+   if (info->magFilter == VK_FILTER_LINEAR)
+      d0 |= BITFIELD_BIT(23);
+   if (info->minFilter == VK_FILTER_LINEAR)
+      d1 |= 1;
+   if (info->addressModeU == VK_SAMPLER_ADDRESS_MODE_REPEAT)
+      d0 |= BITFIELD_BIT(25);
+   if (info->addressModeV == VK_SAMPLER_ADDRESS_MODE_REPEAT)
+      d0 |= BITFIELD_BIT(29);
+   return d0 | (uint64_t)d1 << 32;
 }
 
 /* --- Render jobs ---------------------------------------------------------- */

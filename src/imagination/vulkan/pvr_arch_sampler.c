@@ -11,6 +11,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "pvr_g9p.h"
 #include "pvr_sampler.h"
 
 #include "vk_log.h"
@@ -230,6 +231,11 @@ VkResult PVR_PER_ARCH(CreateSampler)(VkDevice _device,
    memcpy(&sampler->descriptor.gather_words[1],
           &sampler->descriptor.words[1],
           sizeof(sampler->descriptor.words[1]));
+
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p)) {
+      sampler->descriptor.words[0] = pvr_arch_g9p_pack_sampler(pCreateInfo);
+      sampler->descriptor.words[1] = 0;
+   }
 
    *pSampler = pvr_sampler_to_handle(sampler);
 
