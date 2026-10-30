@@ -127,6 +127,7 @@ PVR_PER_ARCH(g9p_compute_pipeline_compile)(
       state->buffers[i].set = shader.buffers[i].set;
       state->buffers[i].binding = shader.buffers[i].binding;
    }
+   state->num_regs = shader.num_regs;
    state->uses_workgroup_id = shader.uses_workgroup_id;
    memcpy(state->local_size, shader.local_size, sizeof(state->local_size));
 
@@ -163,7 +164,8 @@ PVR_PER_ARCH(g9p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
    const uint32_t threads =
       state->local_size[0] * state->local_size[1] * state->local_size[2];
    const uint32_t count = threads | threads << 16;
-   struct pvr_suballoc_bo *count_bo;
+   struct pvr_suballoc_bo *uniforms_bo;
+   uint32_t uniforms[2 * G9P_MAX_BUFFERS + 1] = { 0 };
    uint32_t bind_data[4 * (G9P_MAX_BUFFERS + 1) + 4] = { 0 };
    uint32_t bind_code[G9P_MAX_BUFFERS + 2];
    uint32_t kernel_data[G9P_KERNEL_DATA_DWORDS] = { 0 }, kernel_code[8];
@@ -171,8 +173,23 @@ PVR_PER_ARCH(g9p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
    unsigned bind_dwords, ctrl0, nc = 0;
    VkResult result;
 
-   result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, &count, sizeof(count),
-                                               &count_bo);
+   /*
+    * Values the DMA copies that are not in descriptor memory: the
+    * push-constant buffer's address and the thread count.
+    */
+   for (unsigned k = 0; k < n; k++) {
+      if (state->buffers[k].set == G9P_PUSH_CONSTANTS) {
+         const struct pvr_push_constants *pc =
+            &cmd_buffer->state.push_consts[PVR_STAGE_ALLOCATION_COMPUTE];
+
+         uniforms[2 * k] = pc->dev_addr.addr;
+         uniforms[2 * k + 1] = pc->dev_addr.addr >> 32;
+      }
+   }
+   uniforms[2 * n] = count;
+   result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, uniforms,
+                                               sizeof(uint32_t) * (2 * n + 1),
+                                               &uniforms_bo);
    if (result != VK_SUCCESS)
       return result;
 
@@ -186,7 +203,7 @@ PVR_PER_ARCH(g9p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
       uint64_t src;
       uint32_t dest = 2 * k, dwords = 2;
 
-      if (k < n) {
+      if (k < n && state->buffers[k].set != G9P_PUSH_CONSTANTS) {
          const struct pvr_descriptor_set *set = desc->sets[state->buffers[k].set];
          const struct pvr_descriptor_set_layout_binding *binding;
 
@@ -196,8 +213,9 @@ PVR_PER_ARCH(g9p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
          /* pvr_buffer_descriptor: the address comes first */
          src = set->dev_addr.addr + binding->offset;
       } else {
-         src = count_bo->dev_addr.addr;
-         dwords = 1;
+         src = uniforms_bo->dev_addr.addr + 8 * k;
+         if (k == n)
+            dwords = 1;
       }
       bind_data[2 * k] = src;
       bind_data[2 * k + 1] = src >> 32;
@@ -252,7 +270,7 @@ PVR_PER_ARCH(g9p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
          g9p_cdm_dma_task(G9P_CDM_DATA_BLOCKS(bind_dwords / 4), bind.data_offset,
                           bind.code_offset);
       const struct g9p_cdm_record kernel_rec = g9p_cdm_kernel(
-         G9P_CDM_KERNEL_SIZES | G9P_CDM_ANY_CLUSTER | G9P_CDM_FENCE |
+         G9P_CDM_KERNEL_REGS(state->num_regs) | G9P_CDM_ANY_CLUSTER | G9P_CDM_FENCE |
             G9P_CDM_DATA_BLOCKS(G9P_KERNEL_DATA_DWORDS / 4),
          kernel.data_offset, kernel.code_offset, group_count[0], group_count[1],
          group_count[2], threads, 1);

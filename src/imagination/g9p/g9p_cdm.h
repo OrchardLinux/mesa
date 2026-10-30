@@ -74,10 +74,13 @@ static inline uint32_t g9p_pds_bra_not_if1(uint32_t target)
 /* bits 2-7: PDS data size, 16-byte blocks minus one (decoded + tested) */
 #define G9P_CDM_DATA_BLOCKS(n)	((uint32_t)((n) - 1) << 2)
 /*
- * Bits 8 and 13, set by iPadOS on every kernel record (0x2103); meaning
- * open (observed). Rogue has PDS temp and USC unified sizes there.
+ * Bits 12-17: the per-thread register allocation (decoded + tested,
+ * COMPUTE.md "Register allocation"): field 2n holds 8n registers (field 1-2
+ * covers r0-r8, 3-4 r0-r16, 5-6 r0-r24, 8 r0-r32). Bit 8 observed set on
+ * every iPadOS kernel record, meaning open. iPadOS's 0x2100 is field 2.
  */
-#define G9P_CDM_KERNEL_SIZES	0x2100u
+#define G9P_CDM_KERNEL_REGS(n)	(0x100u | (2u * (((n) + 7) / 8)) << 12)
+#define G9P_CDM_KERNEL_SIZES	G9P_CDM_KERNEL_REGS(8)
 /*
  * Bits 30-31: block type. 0 = task, 2 = terminate (end of stream),
  * 3 = fence block (observed in iPadOS's pass ending, carries the DOUTC

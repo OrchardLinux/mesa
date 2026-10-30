@@ -6671,14 +6671,6 @@ static void pvr_cmd_dispatch(
    pvr_arch_cmd_buffer_start_sub_cmd(cmd_buffer, PVR_SUB_CMD_TYPE_COMPUTE);
 
    sub_cmd = &state->current_sub_cmd->compute;
-
-   if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g9p)) {
-      /* Indirect dispatches and base groups are not supported yet */
-      result = pvr_arch_g9p_cmd_dispatch(cmd_buffer, sub_cmd, workgroup_size);
-      if (result != VK_SUCCESS)
-         pvr_cmd_buffer_set_error_unwarned(cmd_buffer, result);
-      goto end_cmd_dispatch;
-   }
    sub_cmd->uses_atomic_ops |= cs_data->common.uses.atomics;
    sub_cmd->uses_barrier |= cs_data->common.uses.barriers;
 
@@ -6695,6 +6687,14 @@ static void pvr_cmd_dispatch(
    result = pvr_flush_push_descriptors(cmd_buffer, &state->compute_desc_state);
    if (result != VK_SUCCESS)
       return;
+
+   if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g9p)) {
+      /* Indirect dispatches and base groups are not supported yet */
+      result = pvr_arch_g9p_cmd_dispatch(cmd_buffer, sub_cmd, workgroup_size);
+      if (result != VK_SUCCESS)
+         pvr_cmd_buffer_set_error_unwarned(cmd_buffer, result);
+      goto end_cmd_dispatch;
+   }
    if (state->dirty.compute_desc_dirty ||
        state->dirty.compute_pipeline_binding) {
       result = pvr_setup_descriptor_mappings(

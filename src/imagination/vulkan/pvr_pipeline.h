@@ -124,6 +124,7 @@ struct pvr_g9p_compute_state {
    struct {
       unsigned set, binding;
    } buffers[8];
+   unsigned num_regs;
    bool uses_workgroup_id;
    unsigned local_size[3];
 };

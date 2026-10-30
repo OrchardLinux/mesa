@@ -6,9 +6,9 @@
  * on hardware in the orchard gpu-001 ISA.md (its tools/isa/g9p.py is the
  * reference assembler these mirror).
  *
- * Registers are 32-bit, r0-r7 verified (ISA.md "Register-indexed memory
- * access": the encoding above r7 is open). At entry r0 holds the thread's
- * index in its workgroup.
+ * Registers are 32-bit; how many a thread has is set by the CDM kernel
+ * record (G9P_CDM_KERNEL_REGS). At entry r0 holds the thread's index in its
+ * workgroup.
  */
 #ifndef G9P_ISA_H
 #define G9P_ISA_H
@@ -16,6 +16,7 @@
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 #define G9P_MAX_CODE_WORDS 8192
 
@@ -178,6 +179,152 @@ g9p_mem_at(struct g9p_code *c, bool store, unsigned size, unsigned reg,
 {
    G9P_EMIT(c, size << 11 | 0x0310,
             (1 | pair << 2) << 8 | (store ? 0x80 : 0) | reg << 1, 0x8800);
+}
+
+/* Float ops of the two-source form; bit 14 negates the second source */
+#define G9P_FADD 0x44
+#define G9P_FMUL 0x48
+#define G9P_NEG_B 0x4000
+/* Arithmetic shift right, two-source form */
+#define G9P_ISHR 0xfc
+
+/* Compare conditions (integer: ISA.md "Control flow"; float: "fops") */
+#define G9P_ULT 0xb6
+#define G9P_UGT 0xb7
+#define G9P_EQ  0xbd
+#define G9P_SLT 0xbe
+#define G9P_SGT 0xbf
+#define G9P_FLT 0x59
+#define G9P_FGT 0x5d
+#define G9P_FEQ 0x55
+
+/* dst = a * b + c */
+static inline void
+g9p_ffma(struct g9p_code *c, unsigned dst, unsigned a, unsigned b, unsigned cc)
+{
+   G9P_EMIT(c, 0x399e, 0x0300 | 2 * dst, g9p_srcs(a, b, false), 0x0180 | cc << 2,
+            0x004c);
+}
+
+/*
+ * Unary conversions: u2f 0x14, i2f 0x16 (to float, W4 0x0468), f2u 0x10,
+ * f2i 0x12 (to integer, W4 0x0460).
+ */
+#define G9P_U2F 0x14
+#define G9P_I2F 0x16
+#define G9P_F2U 0x10
+#define G9P_F2I 0x12
+
+static inline void
+g9p_convert(struct g9p_code *c, unsigned dst, unsigned src, unsigned op)
+{
+   G9P_EMIT(c, 0x1199, 0x0300 | 2 * dst, 0x0101 | op | src << 10, 0x0120,
+            (op & 4) ? 0x0468 : 0x0460);
+}
+
+/* dst = a << b (left) or a >> b (logical), b a register */
+static inline void
+g9p_shift(struct g9p_code *c, unsigned dst, unsigned a, unsigned b, bool right)
+{
+   G9P_EMIT(c, 0x199e, 0x0300 | 2 * dst, 0x0101 | a << 10, 0x0120, 0x0100 | b << 2,
+            right ? 0x04f4 : 0x04f0);
+}
+
+/*
+ * Select: dst = cc where (a COND b); g9p_movf() then sets the other lanes.
+ * Without last-use bits W0 is 399e.
+ */
+static inline void
+g9p_sel(struct g9p_code *c, unsigned cond, unsigned dst, unsigned a, unsigned b,
+        unsigned cc)
+{
+   G9P_EMIT(c, 0x399e, 0x0300 | 2 * dst, g9p_srcs(a, b, false), 0x0180 | cc << 2,
+            0x6000 | cond);
+}
+
+static inline void
+g9p_movf(struct g9p_code *c, unsigned dst, unsigned d)
+{
+   G9P_EMIT(c, 0x21f8, 0x0300 | 2 * dst, 0x0180 | d << 2, 0x0154, 0x0038);
+}
+
+/* Compare a register with an immediate (< 1024), for a following push */
+static inline void
+g9p_cmp_imm(struct g9p_code *c, unsigned cond, unsigned reg, unsigned imm)
+{
+   G9P_EMIT(c, 0x1181 | ((imm >> 9) & 1) << 13, 0x0101 | (imm & 0x3f) << 1 | reg << 10,
+            0x0120 | ((imm >> 6) & 7) << 1, 0xa100 | cond, 0x0070);
+}
+
+/*
+ * Compare two registers, for a following push or break: integer conditions
+ * (W2 a0cc) or float ones (60cc; Apple's compiler adds a word 0x1000 that
+ * negates, for NaN handling).
+ */
+static inline void
+g9p_cmp_reg(struct g9p_code *c, unsigned cond, unsigned a, unsigned b, bool is_float)
+{
+   G9P_EMIT(c, 0x3181, g9p_srcs(a, b, false), (is_float ? 0x6000 : 0xa000) | cond);
+}
+
+/* Mask stack: push (disable the lanes whose compare failed, or passed) */
+static inline void
+g9p_push_if(struct g9p_code *c, unsigned st, bool invert)
+{
+   G9P_EMIT(c, 0x21c8, 0x0300 | 2 * st, 0x0100 | st << 2, 0x46d1 | invert << 13);
+}
+
+static inline void
+g9p_else(struct g9p_code *c, unsigned st)
+{
+   G9P_EMIT(c, 0x21c8, 0x0300 | 2 * st, 0x0100 | st << 2, 0x46d4);
+}
+
+static inline void
+g9p_pop_levels(struct g9p_code *c, unsigned st, unsigned levels)
+{
+   G9P_EMIT(c, 0x21c8, 0x0300 | 2 * st, 0x0180 | st << 2, 0x06d2 | levels << 14);
+}
+
+/* Loops: start (two levels), break the lanes whose compare passed/failed */
+static inline void
+g9p_loop_begin(struct g9p_code *c, unsigned st)
+{
+   G9P_EMIT(c, 0x21c8, 0x0300 | 2 * st, 0x0100 | st << 2, 0x86d0);
+}
+
+static inline void
+g9p_loop_break(struct g9p_code *c, unsigned st, bool when_true)
+{
+   G9P_EMIT(c, 0x21c8, 0x0300 | 2 * st, 0x0100 | st << 2, 0x86d7 | when_true << 13);
+}
+
+/*
+ * Jumps: byte offset from the jump instruction, two words of 16 offset bits
+ * each. Bit 8 of a word is its continuation flag, so offset bit 8 (16 + 8 in
+ * the second word) sits in bit 0, which even offsets leave free (ISA.md
+ * "Jump offsets": e.g. 968 -> 03c9, -72 -> ffb9 feff).
+ */
+#define G9P_JMP_ANY  0x0101 /* back to a loop body while any lane is active */
+#define G9P_JMP_NONE 0x0900 /* forward when no lane is active */
+
+static inline void
+g9p_jump_patch(struct g9p_code *c, unsigned at, int offset)
+{
+   uint32_t off = (uint32_t)offset;
+
+   c->w[at + 1] = (off & 0xfefe) | 0x0100 | ((off >> 8) & 1);
+   c->w[at + 2] = ((off >> 16) & 0xfefe) | ((off >> 24) & 1);
+}
+
+static inline unsigned
+g9p_jump(struct g9p_code *c, uint16_t op, int offset)
+{
+   unsigned at = c->n;
+
+   G9P_EMIT(c, op, 0, 0);
+   g9p_jump_patch(c, at, offset);
+   return at;
 }
 
 #endif /* G9P_ISA_H */
