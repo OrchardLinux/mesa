@@ -23,6 +23,12 @@
 struct g9p_code {
    uint16_t w[G9P_MAX_CODE_WORDS];
    unsigned n;
+   /*
+    * Fragment shaders take move-immediates into 32-bit registers in the W1
+    * form 0x0100 | 2r; the compute/vertex form 0x0300 | 2r gives wrong
+    * pixels there (ISA.md "f32 registers and fragment outputs").
+    */
+   bool fragment;
 };
 
 static inline void
@@ -108,11 +114,12 @@ g9p_mov_imm(struct g9p_code *c, unsigned dst, uint32_t imm)
 
    if (imm >> 16) {
       w3 |= 1 | ((imm >> 24) & 1) << 15;
-      G9P_EMIT(c, w0, 0x0300 | 2 * dst, w2, w3,
+      G9P_EMIT(c, w0, (c->fragment ? 0x0100 : 0x0300) | 2 * dst, w2, w3,
                0x0100 | ((imm >> 16) & 0xff) | ((imm >> 25) & 0x7f) << 9,
                0x0154, 0x0038);
    } else {
-      G9P_EMIT(c, w0, 0x0300 | 2 * dst, w2, w3, 0x0154, 0x0038);
+      G9P_EMIT(c, w0, (c->fragment ? 0x0100 : 0x0300) | 2 * dst, w2, w3, 0x0154,
+               0x0038);
    }
 }
 
@@ -345,6 +352,68 @@ g9p_jump(struct g9p_code *c, uint16_t op, int offset)
    G9P_EMIT(c, op, 0, 0);
    g9p_jump_patch(c, at, offset);
    return at;
+}
+
+/* --- Graphics (orchard gpu-001 RENDER.md "Own programs", "Varyings ...") */
+
+/*
+ * Vertex output: slot @slot (0-3 the position, then the varyings'
+ * components) = r[@reg]. The last output write of a vertex shader takes the
+ * end word's place, at the start of a 64-byte block: g9p_end_vertex().
+ */
+static inline void
+g9p_vs_output(struct g9p_code *c, unsigned reg, unsigned slot)
+{
+   G9P_EMIT(c, 0x151e, 0x0100 | 2 * reg, slot);
+}
+
+static inline void
+g9p_end_vertex(struct g9p_code *c, unsigned reg, unsigned slot)
+{
+   unsigned jump = 2 * c->n;
+   unsigned end = (jump + 6 + 63) / 64 * 64;
+
+   G9P_EMIT(c, 0x0100, 0x0100 | (end - jump), 0x0000);
+   while (2 * c->n < end)
+      G9P_EMIT(c, 0xc000);
+   G9P_EMIT(c, 0x155e, 0xc100 | 2 * reg, slot);
+   while (c->n % 32)
+      G9P_EMIT(c, 0x0000);
+}
+
+/*
+ * Fragment iterate: @comps (1-4) components of the varyings, from component
+ * index @first (each varying's components in order; the DOUTI program
+ * places them), as f32 into r[@dst]...; perspective-correct or not (W0 bit
+ * 9). Follow with g9p_wait().
+ */
+static inline void
+g9p_iterate(struct g9p_code *c, unsigned dst, unsigned first, unsigned comps,
+            bool perspective)
+{
+   G9P_EMIT(c, (4 - comps) << 11 | (perspective ? 0x0308 : 0x0108),
+            (1 + first) << 9 | 0x0100 | 2 * dst, 0x0080);
+}
+
+/*
+ * Half @h of r0-r1 (the colour output) = f16 of f32 r[@src]: a multiply by
+ * an f16 1.0 immediate writing a half register
+ */
+static inline void
+g9p_to_half(struct g9p_code *c, unsigned h, unsigned src)
+{
+   G9P_EMIT(c, 0x0189, 0x0100 | h, 0x0101 | src << 10, 0x7130, 0x0b48, 0x0070);
+}
+
+/* Output the colour in r0-r1 (4 halves) and end the fragment shader */
+static inline void
+g9p_end_fragment(struct g9p_code *c, bool colour)
+{
+   if (colour)
+      G9P_EMIT(c, 0x211c, 0x0800);
+   G9P_EMIT(c, 0x8000);
+   while (c->n % 32)
+      G9P_EMIT(c, 0x0000);
 }
 
 #endif /* G9P_ISA_H */

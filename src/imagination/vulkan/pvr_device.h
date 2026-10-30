@@ -84,6 +84,18 @@ struct pvr_device {
       struct pvr_suballoc_bo *empty_kernel;
       struct pvr_pds_upload kick;
       struct pvr_pds_upload fence;
+      /* and the device-level graphics programs (pvr_arch_g9p_gfx.c) */
+      struct pvr_g9p_gfx_programs {
+         struct pvr_suballoc_bo *clear_usc, *eot_usc, *vdm_end_usc;
+         /* kick bundles (data, code at +0x20) */
+         struct pvr_pds_upload clear_kick, vdm_end;
+         /* code only: HALT, one DMA (data per use), the end of tile */
+         struct pvr_pds_upload halt, dma, eot;
+         /* stream out: 16 bytes of data, HALT after it */
+         struct pvr_pds_upload stream_out;
+         /* two VDM context state buffers */
+         struct pvr_suballoc_bo *ctx_state;
+      } gfx;
    } g9p;
 
    /* Compute shaders for queries. */

@@ -1658,7 +1658,11 @@ static VkResult pvr_sub_cmd_gfx_job_init(const struct pvr_device_info *dev_info,
     */
    job->view_state.view_index = 0;
 
-   if (sub_cmd->barrier_store) {
+   if (PVR_HAS_FEATURE(dev_info, apple_g9p)) {
+      result = pvr_arch_g9p_job_init(cmd_buffer, hw_render, job);
+      if (result != VK_SUCCESS)
+         return result;
+   } else if (sub_cmd->barrier_store) {
       /* Store to the SPM scratch buffer. */
 
       /* The scratch buffer is always needed and allocated to avoid data loss in
@@ -1725,7 +1729,9 @@ static VkResult pvr_sub_cmd_gfx_job_init(const struct pvr_device_info *dev_info,
              sizeof(job->pbe_reg_words));
    }
 
-   if (sub_cmd->barrier_load) {
+   if (PVR_HAS_FEATURE(dev_info, apple_g9p)) {
+      /* the background object: pvr_arch_g9p_job_init() */
+   } else if (sub_cmd->barrier_load) {
       job->enable_bg_tag = true;
       job->process_empty_tiles = true;
 
@@ -3529,6 +3535,10 @@ pvr_perform_start_of_render_attachment_clear(struct pvr_cmd_buffer *cmd_buffer,
    VkFormat vk_format;
    uint32_t iview_idx;
 
+   /* G9P: clears are background objects (pvr_arch_g9p_job_init()) */
+   if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g9p))
+      return;
+
    if (is_depth_stencil) {
       assert(hw_render->ds_attach_idx != VK_ATTACHMENT_UNUSED);
       iview_idx = hw_render->ds_attach_idx;
@@ -4221,7 +4231,9 @@ void PVR_PER_ARCH(CmdBeginRenderPass2)(
     * object.
     */
    hw_subpass = pvr_arch_get_hw_subpass(pass, 0);
-   if (hw_subpass->load_op) {
+   /* G9P: clears are background objects (pvr_arch_g9p_job_init()) */
+   if (hw_subpass->load_op &&
+       !PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g9p)) {
       result = pvr_cs_write_load_op(cmd_buffer,
                                     &cmd_buffer->state.current_sub_cmd->gfx,
                                     hw_subpass->load_op,
@@ -9221,6 +9233,19 @@ void PVR_PER_ARCH(CmdDraw)(VkCommandBuffer commandBuffer,
 
    PVR_TRACE_BEGIN_DRAW(cmd_buffer, PVR_DRAW);
 
+   if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g9p)) {
+      const struct pvr_g9p_draw draw = {
+         .count = vertexCount,
+         .instances = instanceCount,
+         .offset = firstVertex,
+      };
+
+      result = pvr_arch_g9p_cmd_draw(cmd_buffer, &draw);
+      if (result != VK_SUCCESS)
+         vk_command_buffer_set_error(&cmd_buffer->vk, result);
+      goto end_cmd_draw;
+   }
+
    pvr_update_draw_state(state, &draw_state);
 
    result = pvr_validate_draw_state(cmd_buffer);
@@ -9266,6 +9291,24 @@ void PVR_PER_ARCH(CmdDrawIndexed)(VkCommandBuffer commandBuffer,
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
 
    PVR_TRACE_BEGIN_DRAW(cmd_buffer, PVR_DRAW_INDEXED);
+
+   if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g9p)) {
+      const unsigned size = state->index_buffer_binding.type == VK_INDEX_TYPE_UINT16 ? 2 : 4;
+      const struct pvr_g9p_draw draw = {
+         .indexed = true,
+         .index_addr = state->index_buffer_binding.buffer->dev_addr.addr +
+                       state->index_buffer_binding.offset + (uint64_t)firstIndex * size,
+         .index_size = size,
+         .count = indexCount,
+         .instances = instanceCount,
+         .offset = vertexOffset,
+      };
+
+      result = pvr_arch_g9p_cmd_draw(cmd_buffer, &draw);
+      if (result != VK_SUCCESS)
+         vk_command_buffer_set_error(&cmd_buffer->vk, result);
+      goto end_cmd_draw_indexed;
+   }
 
    pvr_update_draw_state(state, &draw_state);
 
@@ -10133,7 +10176,8 @@ void PVR_PER_ARCH(CmdNextSubpass2)(VkCommandBuffer commandBuffer,
    hw_subpass = &next_hw_render->subpasses[next_map->subpass];
    hw_subpass_load_op = hw_subpass->load_op;
 
-   if (hw_subpass_load_op) {
+   if (hw_subpass_load_op &&
+       !PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g9p)) {
       result = pvr_cs_write_load_op(cmd_buffer,
                                     &state->current_sub_cmd->gfx,
                                     hw_subpass_load_op,

@@ -898,6 +898,11 @@ VkResult PVR_PER_ARCH(create_device)(struct pvr_physical_device *pdevice,
       result = pvr_arch_g9p_device_init(device);
       if (result != VK_SUCCESS)
          goto err_pvr_free_compute_empty;
+      result = pvr_arch_g9p_gfx_device_init(device);
+      if (result != VK_SUCCESS) {
+         pvr_arch_g9p_device_finish(device);
+         goto err_pvr_free_compute_empty;
+      }
    }
 
    result = pvr_device_init_view_index_init_programs(device);
@@ -993,8 +998,10 @@ err_pvr_free_view_index:
       pvr_bo_suballoc_free(device->view_index_init_programs[u].pvr_bo);
 
 err_pvr_finish_g9p:
-   if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g9p))
+   if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g9p)) {
+      pvr_arch_g9p_gfx_device_finish(device);
       pvr_arch_g9p_device_finish(device);
+   }
 
 err_pvr_free_compute_empty:
    pvr_bo_suballoc_free(device->pds_compute_empty_program.pvr_bo);
@@ -1068,8 +1075,10 @@ void PVR_PER_ARCH(destroy_device)(struct pvr_device *device,
    pvr_device_finish_graphics_static_clear_state(device);
    pvr_device_finish_compute_idfwdf_state(device);
    pvr_arch_device_destroy_compute_query_programs(device);
-   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p))
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p)) {
+      pvr_arch_g9p_gfx_device_finish(device);
       pvr_arch_g9p_device_finish(device);
+   }
    pvr_bo_suballoc_free(device->pds_compute_empty_program.pvr_bo);
 
    for (uint32_t u = 0; u < PVR_MAX_MULTIVIEW; ++u)

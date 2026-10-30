@@ -515,8 +515,9 @@ VkResult pvr_drm_winsys_render_submit(
       }
    };
 
+   /* No partial-render job when its stream is empty (Apple G9P) */
    struct drm_pvr_ioctl_submit_jobs_args args = {
-      .jobs = DRM_PVR_OBJ_ARRAY(2, jobs_args),
+      .jobs = DRM_PVR_OBJ_ARRAY(pr_state->fw_stream_len ? 2 : 1, jobs_args),
    };
 
    /* Geom syncs */

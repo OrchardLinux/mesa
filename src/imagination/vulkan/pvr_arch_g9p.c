@@ -99,7 +99,7 @@ PVR_PER_ARCH(g9p_compute_pipeline_compile)(
 {
    struct pvr_g9p_compute_state *state = &pipeline->g9p;
    void *mem_ctx = ralloc_context(NULL);
-   struct g9p_compute_shader shader;
+   struct g9p_shader shader;
    nir_shader *nir;
    VkResult result;
 

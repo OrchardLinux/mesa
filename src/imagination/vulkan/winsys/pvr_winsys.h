@@ -322,7 +322,7 @@ struct pvr_winsys_render_submit_info {
       /* Firmware stream buffer. This is the maximum possible size taking into
        * consideration all HW features, quirks and enhancements.
        */
-      uint8_t fw_stream[64];
+      uint8_t fw_stream[256];
       uint32_t fw_stream_len;
 
       struct pvr_winsys_geometry_state_flags {
@@ -338,7 +338,7 @@ struct pvr_winsys_render_submit_info {
       /* Firmware stream buffer. This is the maximum possible size taking into
        * consideration all HW features, quirks and enhancements.
        */
-      uint8_t fw_stream[440];
+      uint8_t fw_stream[640];
       uint32_t fw_stream_len;
 
       struct pvr_winsys_fragment_state_flags {

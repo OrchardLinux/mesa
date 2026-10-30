@@ -1311,6 +1311,13 @@ pvr_graphics_pipeline_destroy(struct pvr_device *const device,
    struct pvr_fragment_shader_state *fragment_state =
       &gfx_pipeline->shader_state.fragment;
 
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p)) {
+      pvr_arch_g9p_graphics_pipeline_destroy(gfx_pipeline);
+      pvr_pipeline_finish(device, &gfx_pipeline->base);
+      vk_free2(&device->vk.alloc, allocator, gfx_pipeline);
+      return;
+   }
+
    pvr_pds_descriptor_program_destroy(
       device,
       allocator,
@@ -3113,6 +3120,10 @@ pvr_graphics_pipeline_compile(struct pvr_device *const device,
    struct pvr_fragment_shader_state *fragment_state =
       &gfx_pipeline->shader_state.fragment;
    struct usc_mrt_setup mrt_setup = { 0 };
+
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p))
+      return pvr_arch_g9p_graphics_pipeline_compile(device, pCreateInfo, gfx_pipeline,
+                                                    state);
 
    if (!pCreateInfo->renderPass) {
       const struct vk_render_pass_state *rp = state->rp;

@@ -84,7 +84,22 @@ g9p_nir_options(void)
 struct g9p_ctx {
    unsigned num_keys;
    struct g9p_code *c;
-   struct g9p_compute_shader *out;
+   struct g9p_shader *out;
+   mesa_shader_stage stage;
+
+   /* Vertex: the attribute layout */
+   const struct g9p_vertex_attrib *attribs;
+   /*
+    * Outputs, written at the end (nir_lower_io_to_temporaries keeps their
+    * stores there): vertex slots, fragment colour components; their
+    * registers stay pinned from the store on
+    */
+   struct {
+      int reg;
+      unsigned slot;
+   } outputs[4 + 4 * G9P_MAX_VARYINGS];
+   unsigned num_outputs;
+   int colour[4];
 
    /* Per SSA scalar (def index * 4 + component) */
    int8_t *reg;
@@ -824,6 +839,158 @@ emit_mem(struct g9p_ctx *ctx, nir_intrinsic_instr *intr, int slot, nir_scalar of
    return true;
 }
 
+/* Keep r[@r] (a store's value) until the end of the program */
+static void
+pin(struct g9p_ctx *ctx, int r)
+{
+   ctx->pinned |= BITFIELD64_BIT(r);
+   ctx->temps &= ~BITFIELD64_BIT(r);
+   ctx->busy |= BITFIELD64_BIT(r);
+}
+
+/*
+ * Vertex attribute component: base address of its vertex buffer (common
+ * store) + vertex index (r0) x stride + offset + 4 x component.
+ */
+static bool
+emit_attrib_load(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
+{
+   const nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+   unsigned loc = sem.location - VERT_ATTRIB_GENERIC0;
+   const struct g9p_vertex_attrib *a;
+   int slot, rs, t, pair, data;
+   uint32_t offset;
+
+   if (loc >= G9P_MAX_ATTRIBS || !ctx->attribs[loc].present ||
+       intr->def.num_components != 1 || intr->def.bit_size != 32 ||
+       !nir_src_is_const(intr->src[0])) {
+      fprintf(stderr, "g9p: vertex input %u: not a 32-bit attribute component\n", loc);
+      return false;
+   }
+   a = &ctx->attribs[loc];
+   slot = g9p_buffer_slot(ctx->out, G9P_VERTEX_BUFFERS, a->binding);
+   if (slot < 0)
+      return false;
+   offset = a->offset + 4 * nir_intrinsic_component(intr) +
+            16 * nir_src_as_uint(intr->src[0]);
+
+   rs = const_reg(ctx, a->stride);
+   t = alloc_temp(ctx);
+   if (rs < 0 || t < 0)
+      return false;
+   g9p_alu2(ctx->c, G9P_IMUL, t, 0, rs, false);
+   if (offset) {
+      int ro = const_reg(ctx, offset);
+
+      if (ro < 0)
+         return false;
+      g9p_alu2(ctx->c, G9P_IADD, t, t, ro, false);
+   }
+   pair = alloc_pair(ctx);
+   if (pair < 0)
+      return false;
+   g9p_addr(ctx->c, pair, 2 * slot, t, 0, false);
+   ctx->busy &= ~ctx->temps;
+   ctx->temps = 0;
+   data = alloc_reg(ctx);
+   if (data < 0)
+      return false;
+   g9p_mem_at(ctx->c, false, G9P_SIZE_U32, data, pair);
+   g9p_wait(ctx->c);
+   ctx->busy &= ~BITFIELD64_RANGE(pair, 2);
+   ctx->busy |= BITFIELD64_BIT(data);
+   ctx->reg[key(&intr->def, 0)] = data;
+   return true;
+}
+
+static bool
+perspective(nir_intrinsic_instr *intr)
+{
+   nir_intrinsic_instr *bary = nir_src_as_intrinsic(intr->src[0]);
+
+   return !bary || nir_intrinsic_interp_mode(bary) != INTERP_MODE_NOPERSPECTIVE;
+}
+
+/*
+ * Fragment input component: varying VARn component c is component 4n + c
+ * of the varyings (each padded to a vec4; the pipeline's DOUTI program
+ * places them so), one f32 iterate per component.
+ */
+static bool
+emit_varying_load(struct g9p_ctx *ctx, nir_intrinsic_instr *intr, bool persp)
+{
+   const nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+   nir_src *offset = nir_get_io_offset_src(intr);
+   unsigned n = sem.location - VARYING_SLOT_VAR0;
+   int r;
+
+   if (sem.location < VARYING_SLOT_VAR0 || n >= G9P_MAX_VARYINGS ||
+       intr->def.num_components != 1 || intr->def.bit_size != 32 ||
+       !nir_src_is_const(*offset) || nir_src_as_uint(*offset)) {
+      fprintf(stderr, "g9p: fragment input %s not supported yet\n",
+              gl_varying_slot_name_for_stage(sem.location, MESA_SHADER_FRAGMENT));
+      return false;
+   }
+   r = alloc_reg(ctx);
+   if (r < 0)
+      return false;
+   g9p_iterate(ctx->c, r, 4 * n + nir_intrinsic_component(intr), 1, persp);
+   g9p_wait(ctx->c);
+   ctx->reg[key(&intr->def, 0)] = r;
+   ctx->out->num_varyings = MAX2(ctx->out->num_varyings, n + 1);
+   ctx->out->varying_perspective[n] = persp;
+   return true;
+}
+
+/* An output component: kept in its register until the end */
+static bool
+emit_output(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
+{
+   const nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+   nir_src *offset = nir_get_io_offset_src(intr);
+   unsigned comp = nir_intrinsic_component(intr);
+   nir_scalar v = nir_get_scalar(intr->src[0].ssa, 0);
+   int slot = -1, r;
+
+   if (nir_src_num_components(intr->src[0]) != 1 || nir_src_bit_size(intr->src[0]) != 32 ||
+       !nir_src_is_const(*offset) || nir_src_as_uint(*offset)) {
+      fprintf(stderr, "g9p: output: one 32-bit component at a time\n");
+      return false;
+   }
+   if (ctx->stage == MESA_SHADER_VERTEX) {
+      if (sem.location == VARYING_SLOT_POS) {
+         slot = comp;
+      } else if (sem.location >= VARYING_SLOT_VAR0 &&
+                 sem.location < VARYING_SLOT_VAR0 + G9P_MAX_VARYINGS) {
+         unsigned n = sem.location - VARYING_SLOT_VAR0;
+
+         slot = 4 + 4 * n + comp;
+         ctx->out->num_varyings = MAX2(ctx->out->num_varyings, n + 1);
+      } else {
+         /* point size, clip distances: not passed on yet */
+         release(ctx, &intr->instr);
+         return true;
+      }
+   } else if (sem.location != FRAG_RESULT_DATA0 && sem.location != FRAG_RESULT_COLOR) {
+      fprintf(stderr, "g9p: fragment output %u not supported yet\n", sem.location);
+      return false;
+   }
+
+   r = src_reg(ctx, v);
+   if (r < 0)
+      return false;
+   pin(ctx, r);
+   if (ctx->stage == MESA_SHADER_VERTEX) {
+      ctx->outputs[ctx->num_outputs].reg = r;
+      ctx->outputs[ctx->num_outputs].slot = slot;
+      ctx->num_outputs++;
+   } else {
+      ctx->colour[comp] = r;
+   }
+   release(ctx, &intr->instr);
+   return true;
+}
+
 static bool
 emit_intrinsic(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
 {
@@ -856,8 +1023,34 @@ emit_intrinsic(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
 
    case nir_intrinsic_vulkan_resource_index:
    case nir_intrinsic_load_vulkan_descriptor:
+   case nir_intrinsic_load_barycentric_pixel:
+   case nir_intrinsic_load_barycentric_centroid:
+   case nir_intrinsic_load_barycentric_sample:
       /* resolved where they are used */
       return true;
+
+   case nir_intrinsic_load_vertex_id:
+      /* r0 at entry (the vertex kick's DOUTW), pinned in vertex shaders */
+      ctx->reg[key(&intr->def, 0)] = 0;
+      return true;
+   case nir_intrinsic_load_instance_id: {
+      /* not passed in yet: single-instance draws */
+      int r = alloc_reg(ctx);
+
+      if (r < 0)
+         return false;
+      g9p_mov_imm(ctx->c, r, 0);
+      ctx->reg[key(&intr->def, 0)] = r;
+      return true;
+   }
+   case nir_intrinsic_load_input:
+      if (ctx->stage == MESA_SHADER_VERTEX)
+         return emit_attrib_load(ctx, intr);
+      return emit_varying_load(ctx, intr, true);
+   case nir_intrinsic_load_interpolated_input:
+      return emit_varying_load(ctx, intr, perspective(intr));
+   case nir_intrinsic_store_output:
+      return emit_output(ctx, intr);
 
    case nir_intrinsic_store_ssbo:
       return emit_mem(ctx, intr, buffer_slot(ctx, intr->src[1]),
@@ -1176,6 +1369,8 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
    uint16_t *body;
    unsigned body_n;
 
+   const bool cf = !exec_list_is_singular(&impl->body);
+
    memset(ctx->reg, -1, impl->ssa_alloc * 4);
    ctx->c->n = 0;
    ctx->busy = ctx->pinned = ctx->temps = 0;
@@ -1183,9 +1378,22 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
    ctx->st = st;
    ctx->out->num_buffers = 0;
    ctx->out->uses_workgroup_id = false;
+   ctx->out->num_varyings = 0;
    ctx->num_exit_jumps = 0;
+   ctx->num_outputs = 0;
+   for (unsigned i = 0; i < 4; i++)
+      ctx->colour[i] = -1;
 
-   /* r0 holds the local index from the start when it is used */
+   /*
+    * Vertex shaders: r0 is the vertex index throughout (attribute loads).
+    * Fragment shaders: r0-r1 take the colour output's halves at the end.
+    */
+   if (ctx->stage == MESA_SHADER_VERTEX)
+      ctx->busy = ctx->pinned = BITFIELD64_BIT(0);
+   else if (ctx->stage == MESA_SHADER_FRAGMENT)
+      ctx->busy = ctx->pinned = BITFIELD64_RANGE(0, 2);
+
+   /* compute: r0 holds the local index from the start when it is used */
    nir_foreach_block(block, impl) {
       nir_foreach_instr(instr, block) {
          if (instr->type == nir_instr_type_intrinsic &&
@@ -1199,24 +1407,68 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
    if (!emit_cf_list(ctx, &impl->body))
       return false;
 
-   /* Frame: prologue, mask stack, body, epilogue, end */
+   /*
+    * Frame. Compute: prologue (thread count), mask stack, body, epilogue,
+    * end. Vertex and fragment: the mask stack only with control flow, then
+    * the outputs; the last vertex output write is the end.
+    */
    body_n = ctx->c->n;
    body = malloc(body_n * sizeof(uint16_t) + 1);
    if (!body)
       return false;
    memcpy(body, ctx->c->w, body_n * sizeof(uint16_t));
    ctx->c->n = 0;
-   g9p_prologue(ctx->c, 4 * ctx->out->num_buffers);
-   g9p_push_init(ctx->c, st);
+   if (ctx->stage == MESA_SHADER_COMPUTE)
+      g9p_prologue(ctx->c, 4 * ctx->out->num_buffers);
+   if (ctx->stage == MESA_SHADER_COMPUTE || cf)
+      g9p_push_init(ctx->c, st);
    g9p_emit(ctx->c, body, body_n);
-   g9p_pop(ctx->c, st);
-   g9p_end(ctx->c);
+   if (ctx->stage == MESA_SHADER_COMPUTE || cf)
+      g9p_pop(ctx->c, st);
    free(body);
+
+   switch (ctx->stage) {
+   case MESA_SHADER_VERTEX:
+      if (!ctx->num_outputs) {
+         fprintf(stderr, "g9p: vertex shader without outputs\n");
+         return false;
+      }
+      for (unsigned i = 0; i + 1 < ctx->num_outputs; i++)
+         g9p_vs_output(ctx->c, ctx->outputs[i].reg, ctx->outputs[i].slot);
+      g9p_end_vertex(ctx->c, ctx->outputs[ctx->num_outputs - 1].reg,
+                     ctx->outputs[ctx->num_outputs - 1].slot);
+      ctx->out->num_outputs = 4 + 4 * ctx->out->num_varyings;
+      break;
+   case MESA_SHADER_FRAGMENT: {
+      bool colour = false;
+
+      for (unsigned i = 0; i < 4; i++)
+         colour |= ctx->colour[i] >= 0;
+      if (colour) {
+         /* unwritten components: 0 */
+         for (unsigned i = 0; i < 4; i++) {
+            if (ctx->colour[i] < 0) {
+               ctx->colour[i] = alloc_reg(ctx);
+               if (ctx->colour[i] < 0)
+                  return false;
+               g9p_mov_imm(ctx->c, ctx->colour[i], 0);
+            }
+         }
+         for (unsigned i = 0; i < 4; i++)
+            g9p_to_half(ctx->c, i, ctx->colour[i]);
+      }
+      g9p_end_fragment(ctx->c, colour);
+      break;
+   }
+   default:
+      g9p_end(ctx->c);
+      break;
+   }
    return true;
 }
 
 int
-g9p_buffer_slot(struct g9p_compute_shader *out, unsigned set, unsigned binding)
+g9p_buffer_slot(struct g9p_shader *out, unsigned set, unsigned binding)
 {
    unsigned k;
 
@@ -1254,20 +1506,16 @@ optimize(nir_shader *nir)
    } while (progress);
 }
 
-bool
-g9p_compile_compute(nir_shader *nir, struct g9p_compute_shader *out, void *mem_ctx)
+static unsigned
+type_size_vec4(const struct glsl_type *type, bool bindless)
 {
-   const nir_lower_compute_system_values_options csv = {
-      .lower_cs_local_id_to_index = true,
-      .global_id_is_32bit = true,
-   };
-   struct g9p_ctx ctx = { 0 };
-   nir_function_impl *impl;
-   unsigned st;
+   return glsl_count_attribute_slots(type, false);
+}
 
-   memset(out, 0, sizeof(*out));
-
-   /* One function, globals as locals */
+/* One function, globals as locals; buffers and push constants lowered */
+static void
+lower_front(nir_shader *nir)
+{
    NIR_PASS(_, nir, nir_lower_variable_initializers, nir_var_function_temp);
    NIR_PASS(_, nir, nir_lower_returns);
    NIR_PASS(_, nir, nir_inline_functions);
@@ -1280,13 +1528,45 @@ g9p_compile_compute(nir_shader *nir, struct g9p_compute_shader *out, void *mem_c
    NIR_PASS(_, nir, nir_split_struct_vars, nir_var_function_temp);
    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
    NIR_PASS(_, nir, nir_lower_system_values);
-   NIR_PASS(_, nir, nir_lower_compute_system_values, &csv);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo,
             nir_address_format_32bit_index_offset);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const,
             nir_address_format_32bit_offset);
+}
+
+/*
+ * Inputs and outputs: outputs through temporaries (their stores at the
+ * end), lowered to scalar load/store intrinsics with the location as base
+ */
+static void
+lower_io(nir_shader *nir)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+
+   NIR_PASS(_, nir, nir_lower_io_vars_to_temporaries, impl, nir_var_shader_out);
+   NIR_PASS(_, nir, nir_lower_global_vars_to_local);
+   NIR_PASS(_, nir, nir_split_var_copies);
+   NIR_PASS(_, nir, nir_lower_var_copies);
+   NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+   nir_foreach_variable_with_modes(var, nir, nir_var_shader_in | nir_var_shader_out)
+      var->data.driver_location = var->data.location;
+   NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in | nir_var_shader_out,
+            type_size_vec4, 0);
+}
+
+/* Optimization, out of SSA, then code for @ctx->stage */
+static bool
+compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
+             const struct g9p_vertex_attrib *attribs, void *mem_ctx)
+{
+   struct g9p_ctx ctx = { 0 };
+   nir_function_impl *impl;
+   unsigned st;
+
    optimize(nir);
-   NIR_PASS(_, nir, nir_lower_io_to_scalar, nir_var_mem_ssbo | nir_var_mem_push_const,
+   NIR_PASS(_, nir, nir_lower_io_to_scalar,
+            nir_var_mem_ssbo | nir_var_mem_push_const | nir_var_shader_in |
+               nir_var_shader_out,
             NULL, NULL);
    NIR_PASS(_, nir, nir_opt_algebraic_late);
    optimize(nir);
@@ -1306,11 +1586,17 @@ g9p_compile_compute(nir_shader *nir, struct g9p_compute_shader *out, void *mem_c
    if (getenv("G9P_DEBUG"))
       nir_print_shader(nir, stderr);
 
-   for (unsigned i = 0; i < 3; i++)
-      out->local_size[i] = nir->info.workgroup_size[i];
+   if (stage == MESA_SHADER_COMPUTE) {
+      for (unsigned i = 0; i < 3; i++)
+         out->local_size[i] = nir->info.workgroup_size[i];
+   }
 
+   out->stage = stage;
    ctx.out = out;
+   ctx.stage = stage;
+   ctx.attribs = attribs;
    ctx.c = rzalloc(mem_ctx, struct g9p_code);
+   ctx.c->fragment = stage == MESA_SHADER_FRAGMENT;
    ctx.reg = ralloc_array(mem_ctx, int8_t, impl->ssa_alloc * 4);
    ctx.num_keys = impl->ssa_alloc * 4;
    ctx.last_use = rzalloc_array(mem_ctx, unsigned, impl->ssa_alloc * 4);
@@ -1338,6 +1624,10 @@ g9p_compile_compute(nir_shader *nir, struct g9p_compute_shader *out, void *mem_c
    out->num_regs = st + 1;
    out->code = ctx.c->w;
    out->code_size = 2 * ctx.c->n;
+   if (stage != MESA_SHADER_COMPUTE && out->num_regs > 32) {
+      fprintf(stderr, "g9p: %u registers, a graphics task has 32\n", out->num_regs);
+      return false;
+   }
    if (getenv("G9P_DEBUG")) {
       fprintf(stderr, "g9p: %u registers, %u bytes of code\n", out->num_regs,
               out->code_size);
@@ -1345,4 +1635,37 @@ g9p_compile_compute(nir_shader *nir, struct g9p_compute_shader *out, void *mem_c
          fprintf(stderr, "%04x%c", ctx.c->w[i], (ctx.c->w[i] & 0x100) ? ' ' : '\n');
    }
    return true;
+}
+
+bool
+g9p_compile_compute(nir_shader *nir, struct g9p_shader *out, void *mem_ctx)
+{
+   const nir_lower_compute_system_values_options csv = {
+      .lower_cs_local_id_to_index = true,
+      .global_id_is_32bit = true,
+   };
+
+   memset(out, 0, sizeof(*out));
+   lower_front(nir);
+   NIR_PASS(_, nir, nir_lower_compute_system_values, &csv);
+   return compile_back(nir, out, MESA_SHADER_COMPUTE, NULL, mem_ctx);
+}
+
+bool
+g9p_compile_vertex(nir_shader *nir, const struct g9p_vertex_attrib *attribs,
+                   struct g9p_shader *out, void *mem_ctx)
+{
+   memset(out, 0, sizeof(*out));
+   lower_front(nir);
+   lower_io(nir);
+   return compile_back(nir, out, MESA_SHADER_VERTEX, attribs, mem_ctx);
+}
+
+bool
+g9p_compile_fragment(nir_shader *nir, struct g9p_shader *out, void *mem_ctx)
+{
+   memset(out, 0, sizeof(*out));
+   lower_front(nir);
+   lower_io(nir);
+   return compile_back(nir, out, MESA_SHADER_FRAGMENT, NULL, mem_ctx);
 }

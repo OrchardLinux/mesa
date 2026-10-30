@@ -1,8 +1,9 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * NIR -> G9P (Apple A10 shader ISA) compiler for compute shaders. First
- * version: one basic block, integer ALU, local/workgroup IDs and storage
- * buffers; everything else is rejected with a message.
+ * NIR -> G9P (Apple A10 shader ISA) compiler for compute, vertex and
+ * fragment shaders: control flow, integer and float ALU, storage buffers,
+ * push constants, vertex attributes from memory, vec4 varyings and one
+ * colour output; everything else is rejected with a message.
  */
 #ifndef G9P_COMPILE_H
 #define G9P_COMPILE_H
@@ -13,11 +14,23 @@
 #include "compiler/nir/nir.h"
 
 #define G9P_MAX_BUFFERS 8
+#define G9P_MAX_ATTRIBS 16
+#define G9P_MAX_VARYINGS 16
 
 /* The set of the push-constant slot (its address is loaded like a buffer's) */
 #define G9P_PUSH_CONSTANTS (~0u)
+/* The set of vertex buffer slots (binding = the vertex buffer binding) */
+#define G9P_VERTEX_BUFFERS (~1u)
 
-struct g9p_compute_shader {
+/* A vertex attribute: 32-bit components from a vertex buffer */
+struct g9p_vertex_attrib {
+   bool present;
+   unsigned binding, offset, stride;
+};
+
+struct g9p_shader {
+   mesa_shader_stage stage;
+
    /* USC code, a multiple of 64 bytes, ending with the end word */
    uint16_t *code;
    unsigned code_size;
@@ -35,23 +48,41 @@ struct g9p_compute_shader {
    /* Registers per thread, mask stack included (G9P_CDM_KERNEL_REGS) */
    unsigned num_regs;
 
-   /* The workgroup ID is read from threadgroup words 0-2 */
+   /* Compute: the workgroup ID is read from threadgroup words 0-2 */
    bool uses_workgroup_id;
    unsigned local_size[3];
+
+   /*
+    * Vertex: varyings written (VARn, each 4 components after the position);
+    * fragment: varyings read and whether perspective-correct
+    */
+   unsigned num_varyings;
+   bool varying_perspective[G9P_MAX_VARYINGS];
+   /* Vertex: output dwords (4 + 4 x num_varyings) */
+   unsigned num_outputs;
 };
 
 const struct spirv_to_nir_options *g9p_spirv_options(void);
 const nir_shader_compiler_options *g9p_nir_options(void);
 
 /* The common-store slot of a (set, binding), added if new; -1 when full */
-int g9p_buffer_slot(struct g9p_compute_shader *out, unsigned set, unsigned binding);
+int g9p_buffer_slot(struct g9p_shader *out, unsigned set, unsigned binding);
 
 /*
  * Lowers and compiles @nir (a compute shader fresh from SPIR-V) into @out;
  * @out->code is allocated on @mem_ctx. Returns false with a message on
  * stderr for anything the backend does not handle yet.
  */
-bool g9p_compile_compute(nir_shader *nir, struct g9p_compute_shader *out,
-                         void *mem_ctx);
+bool g9p_compile_compute(nir_shader *nir, struct g9p_shader *out, void *mem_ctx);
+
+/*
+ * Vertex shader: @attribs by attribute location (VERT_ATTRIB_GENERIC0 +
+ * n); the vertex index arrives in r0. Vertex buffer b's address is loaded
+ * into the common store as buffer (G9P_VERTEX_BUFFERS, b).
+ */
+bool g9p_compile_vertex(nir_shader *nir, const struct g9p_vertex_attrib *attribs,
+                        struct g9p_shader *out, void *mem_ctx);
+
+bool g9p_compile_fragment(nir_shader *nir, struct g9p_shader *out, void *mem_ctx);
 
 #endif /* G9P_COMPILE_H */

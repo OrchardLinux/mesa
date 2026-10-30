@@ -129,6 +129,25 @@ struct pvr_g9p_compute_state {
    unsigned local_size[3];
 };
 
+/* Apple G9P (has_apple_g9p): a graphics pipeline's programs (pvr_arch_g9p_gfx.c) */
+struct pvr_g9p_graphics_state {
+   struct pvr_suballoc_bo *vs_bo, *fs_bo;
+   /* vertex kick (code and data), fragment kick bundle, DOUTI program */
+   struct pvr_pds_upload vs_kick, fs_kick, varyings;
+   /* the DOUTI data in 16-byte units */
+   unsigned varying_units;
+   unsigned num_varyings;
+   /* vertex output dwords */
+   unsigned vs_outputs;
+   /* vertex shader registers (VDM_STATE5 sets their allocation) */
+   unsigned vs_regs;
+   /* the vertex shader's common-store slots: vertex buffers, push constants, buffers */
+   unsigned num_buffers;
+   struct {
+      unsigned set, binding;
+   } buffers[8];
+};
+
 struct pvr_compute_pipeline {
    struct pvr_pipeline base;
 
@@ -155,6 +174,8 @@ struct pvr_compute_pipeline {
 
 struct pvr_graphics_pipeline {
    struct pvr_pipeline base;
+
+   struct pvr_g9p_graphics_state g9p;
 
    struct vk_dynamic_graphics_state dynamic_state;
 

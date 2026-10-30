@@ -138,6 +138,16 @@ struct pvr_render_job {
    uint64_t pr_pbe_reg_words[PVR_MAX_COLOR_ATTACHMENTS]
                             [ROGUE_NUM_PBESTATE_REG_WORDS];
 
+   /* Apple G9P (pvr_arch_g9p_gfx.c): what the kernel's Apple register block takes */
+   struct {
+      bool enabled;
+      /* end-of-tile PDS code; its data is the view's pds_pixel_event_data_offset */
+      uint32_t eot_code;
+      /* PDS_BGRND0-3 in the Apple layout */
+      uint64_t bgnd[4];
+      uint32_t width, height;
+   } g9p;
+
    struct pvr_view_state {
       struct {
          uint32_t pds_pixel_event_data_offset;

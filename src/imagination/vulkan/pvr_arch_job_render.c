@@ -39,6 +39,7 @@
 #include "pvr_free_list.h"
 #include "pvr_job_common.h"
 #include "pvr_job_context.h"
+#include "pvr_g9p.h"
 #include "pvr_job_render.h"
 #include "pvr_macros.h"
 #include "pvr_physical_device.h"
@@ -842,8 +843,13 @@ pvr_render_job_ws_geometry_state_init(struct pvr_render_ctx *ctx,
                                       struct vk_sync *wait,
                                       struct pvr_winsys_geometry_state *state)
 {
-   pvr_geom_state_stream_init(ctx, job, state);
-   pvr_geom_state_stream_ext_init(ctx, job, state);
+   if (job->g9p.enabled) {
+      state->fw_stream_len = pvr_arch_g9p_geom_stream(ctx->device, job, state->fw_stream,
+                                                      sizeof(state->fw_stream));
+   } else {
+      pvr_geom_state_stream_init(ctx, job, state);
+      pvr_geom_state_stream_ext_init(ctx, job, state);
+   }
 
    state->wait = wait;
    pvr_geom_state_flags_init(job, &state->flags);
@@ -1343,8 +1349,13 @@ pvr_render_job_ws_fragment_state_init(struct pvr_render_ctx *ctx,
                                       struct vk_sync *wait,
                                       struct pvr_winsys_fragment_state *state)
 {
-   pvr_frag_state_stream_init(ctx, job, state);
-   pvr_frag_state_stream_ext_init(ctx, job, state);
+   if (job->g9p.enabled) {
+      state->fw_stream_len = pvr_arch_g9p_frag_stream(ctx->device, job, state->fw_stream,
+                                                      sizeof(state->fw_stream));
+   } else {
+      pvr_frag_state_stream_init(ctx, job, state);
+      pvr_frag_state_stream_ext_init(ctx, job, state);
+   }
 
    state->wait = wait;
    pvr_frag_state_flags_init(job, &state->flags);
@@ -1444,12 +1455,18 @@ static void pvr_render_job_ws_submit_info_init(
     * case we enter SPM. There's likely some performance improvement to be had
     * there. For now we'll always setup the pr.
     */
-   pvr_render_job_ws_fragment_pr_init_based_on_fragment_state(
-      ctx,
-      job,
-      wait_frag,
-      &submit_info->fragment,
-      &submit_info->fragment_pr);
+   /* G9P: no partial renders (the kernel's Apple path has none yet) */
+   if (job->g9p.enabled) {
+      submit_info->fragment_pr.fw_stream_len = 0;
+      submit_info->fragment_pr.wait = wait_frag;
+   } else {
+      pvr_render_job_ws_fragment_pr_init_based_on_fragment_state(
+         ctx,
+         job,
+         wait_frag,
+         &submit_info->fragment,
+         &submit_info->fragment_pr);
+   }
 }
 
 VkResult pvr_arch_render_job_submit(struct pvr_render_ctx *ctx,
