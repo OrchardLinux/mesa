@@ -254,6 +254,12 @@ struct pvr_device_ident {
 };
 
 struct pvr_device_features {
+   /*
+    * Apple A-chip GPUs (G9P on the A10): Rogue-like data masters, PDS and
+    * firmware interface, but Apple's shader ISA, PDS DOUT layout and kernel
+    * UAPI behaviour (no transfer contexts).
+    */
+   bool has_apple_g9p : 1;
    bool has_astc : 1;
    bool has_cluster_grouping : 1;
    bool has_common_store_size_in_dwords : 1;

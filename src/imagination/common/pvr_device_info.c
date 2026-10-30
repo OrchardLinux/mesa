@@ -41,6 +41,7 @@
 #include "device_info/bxe-4-32.h"
 #include "device_info/bxm-4-64.h"
 #include "device_info/bxs-4-64.h"
+#include "device_info/apple-a10.h"
 
 #include "util/u_string.h"
 
@@ -50,6 +51,7 @@ static const struct pvr_device_info *device_infos[] = {
    &pvr_device_info_4_45_2_58,
    &pvr_device_info_4_46_6_62,
    &pvr_device_info_5_9_1_46,
+   &pvr_device_info_13_10_6_2,
    &pvr_device_info_15_5_1_64,
    &pvr_device_info_22_67_54_30,
    &pvr_device_info_22_68_54_30,
@@ -84,6 +86,7 @@ int pvr_device_info_init(struct pvr_device_info *info, uint64_t bvnc)
       CASE_PACKED_BVNC_DEVICE_INFO(4, 45, 2, 58);
       CASE_PACKED_BVNC_DEVICE_INFO(4, 46, 6, 62);
       CASE_PACKED_BVNC_DEVICE_INFO(5, 9, 1, 46);
+      CASE_PACKED_BVNC_DEVICE_INFO(13, 10, 6, 2);
       CASE_PACKED_BVNC_DEVICE_INFO(15, 5, 1, 64);
       CASE_PACKED_BVNC_DEVICE_INFO(22, 67, 54, 30);
       CASE_PACKED_BVNC_DEVICE_INFO(22, 68, 54, 30);

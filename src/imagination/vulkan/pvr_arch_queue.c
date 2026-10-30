@@ -83,7 +83,7 @@ static VkResult pvr_queue_init(struct pvr_device *device,
                                const VkDeviceQueueCreateInfo *pCreateInfo,
                                uint32_t index_in_family)
 {
-   struct pvr_transfer_ctx *transfer_ctx;
+   struct pvr_transfer_ctx *transfer_ctx = NULL;
    struct pvr_compute_ctx *compute_ctx;
    struct pvr_compute_ctx *query_ctx;
    struct pvr_render_ctx *gfx_ctx;
@@ -114,12 +114,15 @@ static VkResult pvr_queue_init(struct pvr_device *device,
          goto err_vk_queue_finish;
    }
 
-   result = pvr_arch_transfer_ctx_create(
-      device,
-      pvr_winsys_from_vk_queue_priority(global_priority),
-      &transfer_ctx);
-   if (result != VK_SUCCESS)
-      goto err_vk_queue_finish;
+   /* Apple's firmware has no transfer engine; the kernel refuses the context. */
+   if (!PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p)) {
+      result = pvr_arch_transfer_ctx_create(
+         device,
+         pvr_winsys_from_vk_queue_priority(global_priority),
+         &transfer_ctx);
+      if (result != VK_SUCCESS)
+         goto err_vk_queue_finish;
+   }
 
    result = pvr_arch_compute_ctx_create(
       device,
@@ -159,7 +162,8 @@ err_compute_ctx_destroy:
    pvr_arch_compute_ctx_destroy(compute_ctx);
 
 err_transfer_ctx_destroy:
-   pvr_arch_transfer_ctx_destroy(transfer_ctx);
+   if (transfer_ctx)
+      pvr_arch_transfer_ctx_destroy(transfer_ctx);
 
 err_vk_queue_finish:
    vk_queue_finish(&queue->vk);
@@ -219,7 +223,8 @@ static void pvr_queue_finish(struct pvr_queue *queue)
    pvr_arch_render_ctx_destroy(queue->gfx_ctx);
    pvr_arch_compute_ctx_destroy(queue->query_ctx);
    pvr_arch_compute_ctx_destroy(queue->compute_ctx);
-   pvr_arch_transfer_ctx_destroy(queue->transfer_ctx);
+   if (queue->transfer_ctx)
+      pvr_arch_transfer_ctx_destroy(queue->transfer_ctx);
 
    vk_queue_finish(&queue->vk);
 }
