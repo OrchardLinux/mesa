@@ -22,6 +22,7 @@
 #include "vk_pipeline.h"
 
 #include "hwdef/pvr_hw_utils.h"
+#include "hwdef/rogue_hw_utils.h"
 
 #include "util/format/u_format.h"
 #include "util/ralloc.h"
@@ -686,17 +687,25 @@ PVR_PER_ARCH(g9p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer,
 
 /*
  * Image state of a BGRA8 render target (RENDER.md "A triangle from
- * scratch"): format bits as captured, width - 1 at bit 27, height - 1 at
- * bit 41, the address >> 1 with bit 63 set.
+ * scratch", "Render target captures"): format bits as captured, width - 1
+ * at bit 27, height - 1 at bit 41 (the real size, also for twiddled NPOT
+ * images), the address >> 1 with bit 63 set. Linear: layout bits 0x2
+ * instead of 0xa, the row pitch in 64-byte units minus one at bit 111, and
+ * dword 5 0xc0000000, as iPadOS writes them.
  */
 static void
-pack_image_state(uint32_t *w, uint64_t addr, uint32_t width, uint32_t height)
+pack_image_state(uint32_t *w, uint64_t addr, uint32_t width, uint32_t height,
+                 bool linear, uint32_t pitch)
 {
    memset(w, 0, 8 * 4);
-   w[0] = 0x0305050au | (width - 1) << 27;
+   w[0] = (linear ? 0x03050502u : 0x0305050au) | (width - 1) << 27;
    w[1] = (width - 1) >> 5 | (height - 1) << 9;
    w[2] = (uint32_t)(addr >> 1);
    w[3] = 0x80000000u | (uint32_t)(addr >> 33);
+   if (linear) {
+      w[3] |= (pitch / 64 - 1) << 15;
+      w[5] = 0xc0000000u;
+   }
 }
 
 VkResult
@@ -729,10 +738,15 @@ PVR_PER_ARCH(g9p_job_init)(struct pvr_cmd_buffer *cmd_buffer,
           image_obj->vk.format != VK_FORMAT_B8G8R8A8_SRGB)
          mesa_logw_once("G9P: render target format %s stored as BGRA8",
                         vk_Format_to_str(image_obj->vk.format));
-      pack_image_state(image, addr, plane->physical_extent.width,
-                       plane->physical_extent.height);
-      job->g9p.width = plane->physical_extent.width;
-      job->g9p.height = plane->physical_extent.height;
+      const bool linear = image_obj->memlayout == PVR_MEMLAYOUT_LINEAR;
+      const uint32_t pitch = plane->mip_levels[iview->vk.base_mip_level].pitch;
+
+      if (linear && pitch % 64)
+         mesa_logw("G9P: linear render target pitch %u is not a multiple of 64", pitch);
+      pack_image_state(image, addr, iview->vk.extent.width, iview->vk.extent.height, linear,
+                       pitch);
+      job->g9p.width = iview->vk.extent.width;
+      job->g9p.height = iview->vk.extent.height;
    } else {
       memset(image, 0, sizeof(image));
    }
@@ -884,7 +898,12 @@ PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
    put32(&s, 0x3f800000); /* ISP_BGOBJDEPTH */
    put32(&s, 0x300);      /* ISP_BGOBJVALS */
    put32(&s, 0);
-   put32(&s, 0x21000f); /* ISP_CTL */
+   /*
+    * ISP_CTL: bit 17 (Rogue's process_empty_tiles) runs the background object
+    * on tiles without geometry too; without it a render's clear reaches
+    * only the tiles a primitive touched (pvr-tri TRI_NODRAW)
+    */
+   put32(&s, 0x23000f);
    put32(&s, 0x402);    /* EVENT_PIXEL_PDS_INFO */
    put32(&s, 0);
    put32(&s, job->view_state.view[0].pds_pixel_event_data_offset);
@@ -902,7 +921,20 @@ PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
       put64(&s, 0x1d3); /* cluster 1 */
    put64(&s, 0);        /* 0xfd0 */
    put32(&s, job->g9p.eot_code);
-   put32(&s, 0x14); /* ISP_RGN */
+   /*
+    * ISP_RGN: the dwords of one macrotile's region array: tiles per
+    * macrotile (32x32 tiles, macrotiles of round_up(ceil(tiles / 4), 4) as
+    * the kernel's HWRT dataset) x the region header size. iPadOS's 0x14 is
+    * 4x4 tiles of 5 bytes; a fixed 0x14 hangs above 512 pixels.
+    */
+   {
+      const uint32_t mx = ALIGN_POT(DIV_ROUND_UP(DIV_ROUND_UP(w, 32), 4), 4);
+      const uint32_t my = ALIGN_POT(DIV_ROUND_UP(DIV_ROUND_UP(h, 32), 4), 4);
+
+      put32(&s, DIV_ROUND_UP(mx * my *
+                                rogue_get_region_header_size(&device->pdevice->dev_info),
+                             4));
+   }
    put32(&s, 0x1f); /* 0x6d0 */
    put32(&s, 0x408);
    put32(&s, 4);
@@ -914,7 +946,6 @@ PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
    put32(&s, fui(t60 / h));
    put32(&s, fui(16.0f * w));
    put32(&s, fui(t15 / w));
-   (void)device;
    dump32("frag stream", 0, (const uint32_t *)buf, s.len / 4);
    return s.len;
 }

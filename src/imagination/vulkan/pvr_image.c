@@ -466,6 +466,12 @@ void pvr_GetDeviceImageSubresourceLayout(
 
 static unsigned get_pbe_stride_align(const struct pvr_device_info *dev_info)
 {
+   /*
+    * G9P: the image state holds the row pitch in 64-byte units (orchard
+    * gpu-001 RENDER.md "Render target captures"): 16 pixels at 4 bytes
+    */
+   if (PVR_HAS_FEATURE(dev_info, apple_g9p))
+      return 16;
    return PVR_HAS_FEATURE(dev_info, pbe_stride_align_1pixel)
              ? 1
              : ROGUE_PBESTATE_REG_WORD0_LINESTRIDE_UNIT_SIZE;
