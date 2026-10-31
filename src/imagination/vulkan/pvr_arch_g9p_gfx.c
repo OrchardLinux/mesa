@@ -1065,6 +1065,11 @@ emit_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state
     * registers in bits 10-15, units of 2 (the kick's DOUTU temps do not
     * allocate them; ISA.md "Register allocation"), PDS temps 2, PDS data 1
     */
+   /*
+    * The draw's words move whole into the next buffer when the stream fills
+    * up mid-draw (pvr_csb_buffer_extend(); ~150 draws in one render)
+    */
+   pvr_csb_set_relocation_mark(csb);
    {
       const uint32_t w[4] = { 0x44002f80, state->vs_kick.code_offset, state->vs_outputs,
                               DIV_ROUND_UP(MAX2(state->vs_regs, 8), 2) << 10 | 2 << 6 | 1 };
@@ -1114,6 +1119,7 @@ emit_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state
       w[n++] = 0xaa;
       emit_words(csb, w, n);
    }
+   pvr_csb_clear_relocation_mark(csb);
    return csb->status;
 }
 
