@@ -404,8 +404,16 @@ pvr_process_graphics_cmd_for_view(struct pvr_device *device,
          for (unsigned b = 0; b < 2; b++) {
             const uint32_t *w;
 
-            if (!bos[b] || (!bos[b]->bo->map && pvr_bo_cpu_map(device, bos[b]) != VK_SUCCESS))
+            if (!bos[b])
                continue;
+            if (!bos[b]->bo->map) {
+               VkResult r = pvr_bo_cpu_map(device, bos[b]);
+
+               if (r != VK_SUCCESS) {
+                  fprintf(stderr, "g9p: pm %u %s: no CPU mapping (%d)\n", n, names[b], r);
+                  continue;
+               }
+            }
             w = bos[b]->bo->map;
             fprintf(stderr, "g9p: pm %u rt %p data %u %s:", n, (void *)rt, rt->rt_data_idx,
                     names[b]);

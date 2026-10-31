@@ -230,7 +230,8 @@ static VkResult pvr_rt_vheap_rtc_data_init(struct pvr_device *device,
                          device->heaps.general_heap,
                          vheap_size + rtc_size,
                          alignment,
-                         PVR_BO_ALLOC_FLAG_GPU_UNCACHED,
+                         PVR_BO_ALLOC_FLAG_GPU_UNCACHED |
+                            (getenv("G9P_PMDUMP") ? PVR_BO_ALLOC_FLAG_CPU_MAPPED : 0),
                          &rt_dataset->vheap_rtc_bo);
    if (result != VK_SUCCESS)
       return result;
@@ -412,7 +413,8 @@ static VkResult pvr_rt_mta_data_init(struct pvr_device *device,
                          device->heaps.general_heap,
                          mta_size * num_rt_datas,
                          ROGUE_CR_PM_MTILE_ARRAY_BASE_ADDR_ALIGNMENT,
-                         PVR_BO_ALLOC_FLAG_GPU_UNCACHED,
+                         PVR_BO_ALLOC_FLAG_GPU_UNCACHED |
+                            (getenv("G9P_PMDUMP") ? PVR_BO_ALLOC_FLAG_CPU_MAPPED : 0),
                          &rt_dataset->mta_bo);
    if (result != VK_SUCCESS)
       return result;
