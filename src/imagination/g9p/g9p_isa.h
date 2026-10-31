@@ -422,6 +422,23 @@ g9p_to_half(struct g9p_code *c, unsigned h, unsigned src)
    G9P_EMIT(c, 0x0189, 0x0100 | h, 0x0101 | src << 10, 0x7130, 0x0b48, 0x0070);
 }
 
+/*
+ * Discard the active lanes (`6804`; Apple's compiler emits it alone for an
+ * unconditional discard and `6004` after a compare for a conditional one)
+ */
+static inline void
+g9p_discard(struct g9p_code *c)
+{
+   G9P_EMIT(c, 0x6804);
+}
+
+/* Discard the lanes whose last compare passed (`6004`) */
+static inline void
+g9p_discard_cmp(struct g9p_code *c)
+{
+   G9P_EMIT(c, 0x6004);
+}
+
 /* Output the colour in r0-r1 (4 halves) and end the fragment shader */
 static inline void
 g9p_end_fragment(struct g9p_code *c, bool colour)

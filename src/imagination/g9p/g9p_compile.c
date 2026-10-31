@@ -23,6 +23,9 @@
 #include "util/ralloc.h"
 #include "util/u_math.h"
 
+#include <vulkan/vulkan_core.h>
+
+#include "compiler/nir/nir_builder.h"
 #include "g9p_compile.h"
 #include "g9p_isa.h"
 
@@ -106,6 +109,11 @@ struct g9p_ctx {
    unsigned *last_use;
    /* Per SSA def: the instruction defining it */
    unsigned *def_ip;
+   /* Per decl_reg def: its first use (live range start) */
+   unsigned *reg_first;
+   /* The decl_reg defs */
+   nir_def **decls;
+   unsigned num_decls;
 
    uint64_t busy;   /* registers in use */
    uint64_t pinned; /* NIR registers: never released */
@@ -252,9 +260,33 @@ release_scalar(struct g9p_ctx *ctx, nir_def *def, unsigned comp)
 {
    unsigned k = key(def, comp);
 
-   if (ctx->last_use[k] <= ctx->ip && ctx->reg[k] >= 0 &&
-       !(ctx->pinned & BITFIELD64_BIT(ctx->reg[k])))
+   if (ctx->last_use[k] > ctx->ip || ctx->reg[k] < 0)
+      return;
+   /* a NIR register's last use: unpinned and free */
+   if (nir_def_is_intrinsic(def) &&
+       nir_def_as_intrinsic(def)->intrinsic == nir_intrinsic_decl_reg) {
+      ctx->pinned &= ~BITFIELD64_BIT(ctx->reg[k]);
       ctx->busy &= ~BITFIELD64_BIT(ctx->reg[k]);
+      return;
+   }
+   if (!(ctx->pinned & BITFIELD64_BIT(ctx->reg[k])))
+      ctx->busy &= ~BITFIELD64_BIT(ctx->reg[k]);
+}
+
+/* A NIR register's hardware register, taken at its first use */
+static int
+nir_reg(struct g9p_ctx *ctx, nir_def *decl)
+{
+   int r = ctx->reg[key(decl, 0)];
+
+   if (r < 0) {
+      r = alloc_reg(ctx);
+      if (r < 0)
+         return -1;
+      ctx->pinned |= BITFIELD64_BIT(r);
+      ctx->reg[key(decl, 0)] = r;
+   }
+   return r;
 }
 
 static bool
@@ -327,6 +359,29 @@ use_scalar(struct g9p_ctx *ctx, nir_def *def, unsigned comp)
          end = MAX2(end, ctx->loops[l].end);
    }
    ctx->last_use[key(def, comp)] = MAX2(ctx->last_use[key(def, comp)], end);
+
+   /*
+    * NIR registers (decl_reg, all at the start) take a hardware register
+    * only from their first use (from the start of a loop using them) to
+    * their last; a load_reg's value keeps its register alive too.
+    */
+   if (nir_def_is_intrinsic(def)) {
+      nir_intrinsic_instr *intr = nir_def_as_intrinsic(def);
+
+      if (intr->intrinsic == nir_intrinsic_decl_reg) {
+         unsigned start = ctx->ip;
+
+         for (unsigned l = 0; l < ctx->num_loops; l++) {
+            if (ctx->loops[l].start <= ctx->ip && ctx->ip <= ctx->loops[l].end)
+               start = MIN2(start, ctx->loops[l].start);
+         }
+         ctx->reg_first[def->index] = MIN2(ctx->reg_first[def->index], start);
+      } else if (intr->intrinsic == nir_intrinsic_load_reg) {
+         nir_def *decl = intr->src[0].ssa;
+
+         ctx->last_use[key(decl, 0)] = MAX2(ctx->last_use[key(decl, 0)], end);
+      }
+   }
 }
 
 static bool
@@ -359,6 +414,9 @@ record_def(nir_def *def, void *data)
    struct g9p_ctx *ctx = data;
 
    ctx->def_ip[def->index] = ctx->ip;
+   if (nir_def_is_intrinsic(def) &&
+       nir_def_as_intrinsic(def)->intrinsic == nir_intrinsic_decl_reg)
+      ctx->decls[ctx->num_decls++] = def;
    return true;
 }
 
@@ -496,6 +554,14 @@ only_tex_uses(nir_def *def)
 static bool
 emit_vec(struct g9p_ctx *ctx, nir_alu_instr *alu)
 {
+   nir_scalar s0 = nir_scalar_chase_movs(nir_get_scalar(alu->src[0].src.ssa,
+                                                         alu->src[0].swizzle[0]));
+
+   /* a buffer descriptor with its offset zeroed: resolved where it is used */
+   if (nir_scalar_is_intrinsic(s0) &&
+       (nir_def_as_intrinsic(s0.def)->intrinsic == nir_intrinsic_load_vulkan_descriptor ||
+        nir_def_as_intrinsic(s0.def)->intrinsic == nir_intrinsic_vulkan_resource_index))
+      return true;
    if (only_tex_uses(&alu->def)) {
       release(ctx, &alu->instr);
       return true;
@@ -876,7 +942,8 @@ emit_mem(struct g9p_ctx *ctx, nir_intrinsic_instr *intr, int slot, nir_scalar of
       return false;
    ctx->temps |= BITFIELD64_RANGE(pair, 2);
    /* byte offset: shift 0 */
-   g9p_addr(ctx->c, pair, 2 * slot, off, 0, false);
+   g9p_addr(ctx->c, pair, (ctx->stage == MESA_SHADER_FRAGMENT ? G9P_FS_BUF_BASE : 0) + 2 * slot,
+            off, 0, false);
 
    if (value) {
       data = src_reg(ctx, nir_get_scalar(value->ssa, 0));
@@ -1005,6 +1072,30 @@ emit_varying_load(struct g9p_ctx *ctx, nir_intrinsic_instr *intr, bool persp)
    return true;
 }
 
+/* gl_FragCoord: G9P_FRAG_COORD_VARYING, iterated without perspective */
+static bool
+emit_frag_coord(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
+{
+   const unsigned n = G9P_FRAG_COORD_VARYING;
+
+   for (unsigned c = 0; c < intr->def.num_components; c++) {
+      int r;
+
+      if (!ctx->last_use[key(&intr->def, c)])
+         continue;
+      r = alloc_reg(ctx);
+      if (r < 0)
+         return false;
+      g9p_iterate(ctx->c, r, 4 * n + c, 1, false);
+      ctx->reg[key(&intr->def, c)] = r;
+   }
+   g9p_wait(ctx->c);
+   ctx->out->num_varyings = MAX2(ctx->out->num_varyings, n + 1);
+   ctx->out->varying_perspective[n] = false;
+   ctx->out->uses_frag_coord = true;
+   return true;
+}
+
 /* An output component: kept in its register until the end */
 static bool
 emit_output(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
@@ -1076,8 +1167,10 @@ texture_slot(struct g9p_ctx *ctx, nir_tex_instr *tex)
           ctx->out->textures[k].binding == var->data.binding)
          return k;
    }
-   if (k == G9P_MAX_TEXTURES)
+   if (k == 1) {
+      fprintf(stderr, "g9p: one texture per fragment shader so far\n");
       return -1;
+   }
    ctx->out->textures[k].set = var->data.descriptor_set;
    ctx->out->textures[k].binding = var->data.binding;
    ctx->out->num_textures++;
@@ -1133,8 +1226,8 @@ emit_tex(struct g9p_ctx *ctx, nir_tex_instr *tex)
    dst = alloc_range(ctx, 4);
    if (dst < 0)
       return false;
-   g9p_sample_varying(ctx->c, dst, first, 2, G9P_TEX_STRIDE * slot,
-                      G9P_TEX_STRIDE * slot + 8);
+   g9p_sample_varying(ctx->c, dst, first, 2, G9P_FS_TEX_BASE + G9P_TEX_STRIDE * slot,
+                      G9P_FS_TEX_BASE + G9P_TEX_STRIDE * slot + 8);
    g9p_wait(ctx->c);
    for (unsigned c = 0; c < 4; c++) {
       ctx->reg[key(&tex->def, c)] = dst + c;
@@ -1201,6 +1294,35 @@ emit_intrinsic(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
       if (ctx->stage == MESA_SHADER_VERTEX)
          return emit_attrib_load(ctx, intr);
       return emit_varying_load(ctx, intr, true);
+   case nir_intrinsic_load_frag_coord:
+      return emit_frag_coord(ctx, intr);
+   case nir_intrinsic_demote:
+   case nir_intrinsic_terminate:
+      /*
+       * `6804` discards every lane, the mask stack notwithstanding: only
+       * outside control flow (conditional ones are discard_if, see
+       * discards_to_if())
+       */
+      if (intr->instr.block->cf_node.parent->type != nir_cf_node_function) {
+         fprintf(stderr, "g9p: discard inside control flow not supported yet\n");
+         return false;
+      }
+      g9p_discard(ctx->c);
+      ctx->out->uses_discard = true;
+      return true;
+   case nir_intrinsic_demote_if:
+   case nir_intrinsic_terminate_if: {
+      /* compare the condition with 0, discard where it is set (`6004`) */
+      int r = src_reg(ctx, nir_get_scalar(intr->src[0].ssa, 0));
+
+      if (r < 0)
+         return false;
+      g9p_cmp_imm(ctx->c, G9P_UGT, r, 0);
+      g9p_discard_cmp(ctx->c);
+      release(ctx, &intr->instr);
+      ctx->out->uses_discard = true;
+      return true;
+   }
    case nir_intrinsic_load_interpolated_input:
       return emit_varying_load(ctx, intr, perspective(intr));
    case nir_intrinsic_store_output:
@@ -1227,19 +1349,22 @@ emit_intrinsic(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
          fprintf(stderr, "g9p: only scalar 32-bit NIR registers\n");
          return false;
       }
-      r = alloc_reg(ctx);
-      if (r < 0)
-         return false;
-      ctx->pinned |= BITFIELD64_BIT(r);
-      ctx->reg[key(&intr->def, 0)] = r;
+      /* allocated at its first use (nir_reg()) */
+      (void)r;
       return true;
    }
-   case nir_intrinsic_load_reg:
+   case nir_intrinsic_load_reg: {
       /* nir_trivialize_registers: read right before its uses */
-      ctx->reg[key(&intr->def, 0)] = ctx->reg[key(intr->src[0].ssa, 0)];
+      int r = nir_reg(ctx, intr->src[0].ssa);
+
+      if (r < 0)
+         return false;
+      ctx->reg[key(&intr->def, 0)] = r;
+      release(ctx, &intr->instr);
       return true;
+   }
    case nir_intrinsic_store_reg: {
-      int dst = ctx->reg[key(intr->src[1].ssa, 0)];
+      int dst = nir_reg(ctx, intr->src[1].ssa);
       nir_scalar v = nir_get_scalar(intr->src[0].ssa, 0);
       uint32_t imm;
       int src;
@@ -1499,6 +1624,12 @@ emit_cf_list(struct g9p_ctx *ctx, struct exec_list *list)
       case nir_cf_node_block:
          nir_foreach_instr(instr, nir_cf_node_as_block(node)) {
             ctx->ip++;
+            /* NIR registers whose live range starts here (a loop's start) */
+            for (unsigned d = 0; d < ctx->num_decls; d++) {
+               if (ctx->reg_first[ctx->decls[d]->index] == ctx->ip &&
+                   nir_reg(ctx, ctx->decls[d]) < 0)
+                  return false;
+            }
             if (!emit_instr(ctx, instr)) {
                fprintf(stderr, "g9p: cannot compile: ");
                nir_print_instr(instr, stderr);
@@ -1541,6 +1672,7 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
    ctx->out->uses_workgroup_id = false;
    ctx->out->num_varyings = 0;
    ctx->out->num_textures = 0;
+   ctx->out->uses_discard = false;
    ctx->num_exit_jumps = 0;
    ctx->num_outputs = 0;
    for (unsigned i = 0; i < 4; i++)
@@ -1674,6 +1806,28 @@ type_size_vec4(const struct glsl_type *type, bool bindless)
    return glsl_count_attribute_slots(type, false);
 }
 
+/*
+ * A buffer descriptor's second component (the offset of the
+ * 32bit_index_offset address format) is always 0 here: the descriptor
+ * address already includes the buffer offset. A literal 0 lets the
+ * offsets of every buffer load fold to constants.
+ */
+static bool
+zero_descriptor_offset(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   nir_def *v;
+
+   if (intr->intrinsic != nir_intrinsic_load_vulkan_descriptor &&
+       intr->intrinsic != nir_intrinsic_vulkan_resource_index)
+      return false;
+   if (intr->def.num_components != 2)
+      return false;
+   b->cursor = nir_after_instr(&intr->instr);
+   v = nir_vec2(b, nir_channel(b, &intr->def, 0), nir_imm_int(b, 0));
+   nir_def_rewrite_uses_after(&intr->def, v);
+   return true;
+}
+
 /* One function, globals as locals; buffers and push constants lowered */
 static void
 lower_front(nir_shader *nir)
@@ -1688,12 +1842,16 @@ lower_front(nir_shader *nir)
    NIR_PASS(_, nir, nir_split_var_copies);
    NIR_PASS(_, nir, nir_lower_var_copies);
    NIR_PASS(_, nir, nir_split_struct_vars, nir_var_function_temp);
+   /* local arrays indexed dynamically: if-ladders, then SSA */
+   NIR_PASS(_, nir, nir_lower_indirect_derefs_to_if_else_trees, nir_var_function_temp, UINT32_MAX);
    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
    NIR_PASS(_, nir, nir_lower_system_values);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo | nir_var_mem_ubo,
             nir_address_format_32bit_index_offset);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const,
             nir_address_format_32bit_offset);
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, zero_descriptor_offset,
+            nir_metadata_control_flow, NULL);
 }
 
 /*
@@ -1716,6 +1874,50 @@ lower_io(nir_shader *nir)
             type_size_vec4, 0);
 }
 
+/*
+ * Loads that are cheap to repeat (uniform buffers, push constants,
+ * varyings, the fragment position): a copy right before each use in another
+ * block, instead of one value live across branches (graphics shaders have
+ * 32 registers; Hyprland's rounded-rectangle shader kept dozens of uniforms
+ * live from its first block)
+ */
+static bool
+rematerialize_loads(nir_shader *nir)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   bool progress = false;
+
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr_safe(instr, block) {
+         nir_intrinsic_instr *intr;
+
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic != nir_intrinsic_load_ubo &&
+             intr->intrinsic != nir_intrinsic_load_push_constant &&
+             intr->intrinsic != nir_intrinsic_load_interpolated_input &&
+             intr->intrinsic != nir_intrinsic_load_frag_coord &&
+             !(intr->intrinsic == nir_intrinsic_load_input &&
+               nir->info.stage == MESA_SHADER_FRAGMENT))
+            continue;
+         nir_foreach_use_safe(src, &intr->def) {
+            nir_instr *user = nir_src_use_instr(src);
+            nir_instr *copy;
+
+            if (nir_src_is_if(src) || user->type == nir_instr_type_phi ||
+                user->block == instr->block)
+               continue;
+            copy = nir_instr_clone(nir, instr);
+            nir_instr_insert_before(user, copy);
+            nir_src_rewrite(src, &nir_instr_as_intrinsic(copy)->def);
+            progress = true;
+         }
+      }
+   }
+   return nir_progress(progress, impl, nir_metadata_control_flow);
+}
+
 /* Optimization, out of SSA, then code for @ctx->stage */
 static bool
 compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
@@ -1735,9 +1937,12 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
    NIR_PASS(_, nir, nir_lower_bool_to_int32);
    NIR_PASS(_, nir, nir_opt_copy_prop);
    NIR_PASS(_, nir, nir_opt_dce);
+   NIR_PASS(_, nir, rematerialize_loads);
+   NIR_PASS(_, nir, nir_opt_dce);
    /* values computed early for late uses: compute them right before */
    NIR_PASS(_, nir, nir_opt_move, nir_move_alu | nir_move_const_undef |
-            nir_move_comparisons | nir_move_copies);
+            nir_move_comparisons | nir_move_copies | nir_move_load_ubo |
+            nir_move_load_input);
    NIR_PASS(_, nir, nir_convert_from_ssa, true, false);
    NIR_PASS(_, nir, nir_trivialize_registers);
 
@@ -1763,6 +1968,9 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
    ctx.num_keys = impl->ssa_alloc * 4;
    ctx.last_use = rzalloc_array(mem_ctx, unsigned, impl->ssa_alloc * 4);
    ctx.def_ip = rzalloc_array(mem_ctx, unsigned, impl->ssa_alloc);
+   ctx.reg_first = ralloc_array(mem_ctx, unsigned, impl->ssa_alloc);
+   memset(ctx.reg_first, 0xff, impl->ssa_alloc * sizeof(unsigned));
+   ctx.decls = ralloc_array(mem_ctx, nir_def *, impl->ssa_alloc);
    ctx.max_exit_jumps = 256;
    ctx.exit_jumps = ralloc_array(mem_ctx, unsigned, ctx.max_exit_jumps);
 
@@ -1813,14 +2021,94 @@ g9p_compile_compute(nir_shader *nir, struct g9p_shader *out, void *mem_ctx)
    return compile_back(nir, out, MESA_SHADER_COMPUTE, NULL, mem_ctx);
 }
 
+/*
+ * The fragment position as a varying: window coordinates from gl_Position
+ * and the viewport (G9P_VIEWPORT buffer), written to
+ * G9P_FRAG_COORD_VARYING
+ */
+static void
+add_frag_coord_output(nir_shader *nir)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_variable *pos = nir_find_variable_with_location(nir, nir_var_shader_out,
+                                                       VARYING_SLOT_POS);
+   nir_variable *out;
+   nir_builder b;
+   nir_def *p, *vp[6], *inv_w, *index;
+
+   if (!pos)
+      return;
+   out = nir_variable_create(nir, nir_var_shader_out, glsl_vec4_type(), "g9p_frag_coord");
+   out->data.location = VARYING_SLOT_VAR0 + G9P_FRAG_COORD_VARYING;
+   out->data.interpolation = INTERP_MODE_NOPERSPECTIVE;
+
+   b = nir_builder_at(nir_after_impl(impl));
+   p = nir_load_var(&b, pos);
+   index = nir_vulkan_resource_index(&b, 2, 32, nir_imm_int(&b, 0),
+                                     .desc_set = G9P_VIEWPORT, .binding = 0,
+                                     .desc_type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
+   for (unsigned i = 0; i < 6; i++)
+      vp[i] = nir_load_ubo(&b, 1, 32, index, nir_imm_int(&b, 4 * i), .align_mul = 4,
+                           .range = ~0);
+   inv_w = nir_frcp(&b, nir_channel(&b, p, 3));
+   nir_store_var(&b, out,
+                 nir_vec4(&b,
+                          nir_ffma(&b, nir_fmul(&b, nir_channel(&b, p, 0), inv_w), vp[0], vp[1]),
+                          nir_ffma(&b, nir_fmul(&b, nir_channel(&b, p, 1), inv_w), vp[2], vp[3]),
+                          nir_ffma(&b, nir_fmul(&b, nir_channel(&b, p, 2), inv_w), vp[4], vp[5]),
+                          inv_w),
+                 0xf);
+}
+
 bool
 g9p_compile_vertex(nir_shader *nir, const struct g9p_vertex_attrib *attribs,
-                   struct g9p_shader *out, void *mem_ctx)
+                   bool frag_coord, struct g9p_shader *out, void *mem_ctx)
 {
    memset(out, 0, sizeof(*out));
    lower_front(nir);
+   if (frag_coord)
+      add_frag_coord_output(nir);
    lower_io(nir);
    return compile_back(nir, out, MESA_SHADER_VERTEX, attribs, mem_ctx);
+}
+
+/*
+ * `if (c) discard;` (an if with only a demote/terminate in its then-branch
+ * and an empty else) to demote_if(c)/terminate_if(c), which compile to a
+ * compare and `6004`
+ */
+static bool
+discards_to_if(nir_shader *nir)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   bool progress = false;
+
+   nir_foreach_block_safe(block, impl) {
+      nir_if *nif = nir_block_get_following_if(block);
+      nir_block *then_block;
+      nir_intrinsic_instr *intr;
+      nir_builder b;
+
+      if (!nif || !exec_list_is_singular(&nif->then_list) ||
+          !nir_cf_list_is_empty_block(&nif->else_list))
+         continue;
+      then_block = nir_if_first_then_block(nif);
+      if (exec_list_length(&then_block->instr_list) != 1)
+         continue;
+      if (nir_block_first_instr(then_block)->type != nir_instr_type_intrinsic)
+         continue;
+      intr = nir_instr_as_intrinsic(nir_block_first_instr(then_block));
+      if (intr->intrinsic != nir_intrinsic_demote && intr->intrinsic != nir_intrinsic_terminate)
+         continue;
+      b = nir_builder_at(nir_before_cf_node(&nif->cf_node));
+      if (intr->intrinsic == nir_intrinsic_demote)
+         nir_demote_if(&b, nif->condition.ssa);
+      else
+         nir_terminate_if(&b, nif->condition.ssa);
+      nir_cf_node_remove(&nif->cf_node);
+      progress = true;
+   }
+   return nir_progress(progress, impl, nir_metadata_none);
 }
 
 bool
@@ -1828,6 +2116,7 @@ g9p_compile_fragment(nir_shader *nir, struct g9p_shader *out, void *mem_ctx)
 {
    memset(out, 0, sizeof(*out));
    lower_front(nir);
+   NIR_PASS(_, nir, discards_to_if);
    lower_io(nir);
    return compile_back(nir, out, MESA_SHADER_FRAGMENT, NULL, mem_ctx);
 }

@@ -22,11 +22,32 @@
  * its sampler (2 dwords) at 16t + 8, as the draw's texture DMA places them
  */
 #define G9P_TEX_STRIDE 16
+/*
+ * In fragment shaders the texture takes common-store dwords 0-9 (only state
+ * at dword 0 samples correctly so far: RENDER.md "Textures in Mesa") and
+ * the buffers' addresses follow from dword 16 (buffer k at 16 + 2k; the
+ * address instruction reaches dword 31)
+ */
+#define G9P_FS_TEX_BASE 0
+#define G9P_FS_BUF_BASE 16
 
 /* The set of the push-constant slot (its address is loaded like a buffer's) */
 #define G9P_PUSH_CONSTANTS (~0u)
 /* The set of vertex buffer slots (binding = the vertex buffer binding) */
 #define G9P_VERTEX_BUFFERS (~1u)
+/*
+ * The set of the viewport buffer (binding 0): 8 floats, x/y/z scale and
+ * offset (scale x, offset x, scale y, offset y, scale z, offset z), read by
+ * vertex shaders that pass the fragment position on
+ */
+#define G9P_VIEWPORT (~2u)
+/*
+ * The varying carrying the fragment position (window x, y, z, 1/w),
+ * written by the vertex shader and iterated without perspective
+ * correction: gl_FragCoord without the position read (whose 16-bit
+ * results are not decoded for f32 use yet)
+ */
+#define G9P_FRAG_COORD_VARYING (G9P_MAX_VARYINGS - 1)
 
 /* A vertex attribute: 32-bit components from a vertex buffer */
 struct g9p_vertex_attrib {
@@ -67,6 +88,11 @@ struct g9p_shader {
    /* Vertex: output dwords (4 + 4 x num_varyings) */
    unsigned num_outputs;
 
+   /* Fragment: reads gl_FragCoord (G9P_FRAG_COORD_VARYING) */
+   bool uses_frag_coord;
+   /* Fragment: may discard (punch-through pass type) */
+   bool uses_discard;
+
    /* Fragment: the combined image samplers sampled, by common-store slot */
    unsigned num_textures;
    struct {
@@ -93,7 +119,7 @@ bool g9p_compile_compute(nir_shader *nir, struct g9p_shader *out, void *mem_ctx)
  * into the common store as buffer (G9P_VERTEX_BUFFERS, b).
  */
 bool g9p_compile_vertex(nir_shader *nir, const struct g9p_vertex_attrib *attribs,
-                        struct g9p_shader *out, void *mem_ctx);
+                        bool frag_coord, struct g9p_shader *out, void *mem_ctx);
 
 bool g9p_compile_fragment(nir_shader *nir, struct g9p_shader *out, void *mem_ctx);
 

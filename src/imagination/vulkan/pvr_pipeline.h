@@ -141,11 +141,18 @@ struct pvr_g9p_graphics_state {
    unsigned vs_outputs;
    /* vertex shader registers (VDM_STATE5 sets their allocation) */
    unsigned vs_regs;
+   /* the fragment shader may discard: punch-through pass type */
+   bool uses_discard;
    /* the vertex shader's common-store slots: vertex buffers, push constants, buffers */
    unsigned num_buffers;
    struct {
       unsigned set, binding;
    } buffers[8];
+   /* the fragment shader's buffers (uniform buffers, push constants), by slot */
+   unsigned fs_num_buffers;
+   struct {
+      unsigned set, binding;
+   } fs_buffers[8];
    /* the fragment shader's combined image samplers, by common-store slot */
    unsigned num_textures;
    struct {

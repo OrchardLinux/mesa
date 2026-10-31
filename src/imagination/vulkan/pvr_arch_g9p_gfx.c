@@ -44,6 +44,11 @@
 #include "pvr_physical_device.h"
 #include "pvr_pipeline.h"
 
+/* A pipeline the G9P backend cannot build yet: said on stderr too */
+#define g9p_error(device, ...)                                                \
+   (fprintf(stderr, "g9p: " __VA_ARGS__), fprintf(stderr, "\n"),              \
+    vk_errorf(device, VK_ERROR_UNKNOWN, __VA_ARGS__))
+
 /* DOUT type 4: iterator issue (DOUTI) */
 #define G9P_DOUTI 4u
 
@@ -270,8 +275,8 @@ attrib_format_ok(VkFormat format)
 static VkResult
 compile_stage(struct pvr_device *device, struct pvr_graphics_pipeline *pipeline,
               const VkPipelineShaderStageCreateInfo *stage,
-              const struct g9p_vertex_attrib *attribs, struct g9p_shader *out,
-              void *mem_ctx)
+              const struct g9p_vertex_attrib *attribs, bool frag_coord,
+              struct g9p_shader *out, void *mem_ctx)
 {
    nir_shader *nir;
    VkResult result;
@@ -284,11 +289,11 @@ compile_stage(struct pvr_device *device, struct pvr_graphics_pipeline *pipeline,
       return result;
 
    if (stage->stage == VK_SHADER_STAGE_VERTEX_BIT)
-      ok = g9p_compile_vertex(nir, attribs, out, mem_ctx);
+      ok = g9p_compile_vertex(nir, attribs, frag_coord, out, mem_ctx);
    else
       ok = g9p_compile_fragment(nir, out, mem_ctx);
    if (!ok)
-      return vk_errorf(device, VK_ERROR_UNKNOWN,
+      return g9p_error(device,
                        "G9P: %s shader not supported by the backend yet",
                        stage->stage == VK_SHADER_STAGE_VERTEX_BIT ? "vertex" : "fragment");
    return VK_SUCCESS;
@@ -350,7 +355,7 @@ PVR_PER_ARCH(g9p_graphics_pipeline_compile)(struct pvr_device *device,
          fs_info = &create_info->pStages[i];
    }
    if (!vs_info || !fs_info) {
-      result = vk_errorf(device, VK_ERROR_UNKNOWN,
+      result = g9p_error(device,
                          "G9P: pipelines need a vertex and a fragment shader so far");
       goto out;
    }
@@ -360,7 +365,7 @@ PVR_PER_ARCH(g9p_graphics_pipeline_compile)(struct pvr_device *device,
          const struct vk_vertex_attribute_state *a = &vk_state->vi->attributes[loc];
 
          if (loc >= G9P_MAX_ATTRIBS || !attrib_format_ok(a->format)) {
-            result = vk_errorf(device, VK_ERROR_UNKNOWN,
+            result = g9p_error(device,
                                "G9P: vertex attribute %u: only 32-bit components so far",
                                loc);
             goto out;
@@ -374,21 +379,22 @@ PVR_PER_ARCH(g9p_graphics_pipeline_compile)(struct pvr_device *device,
       }
    }
 
-   result = compile_stage(device, pipeline, fs_info, NULL, &fs, mem_ctx);
+   result = compile_stage(device, pipeline, fs_info, NULL, false, &fs, mem_ctx);
    if (result == VK_SUCCESS)
-      result = compile_stage(device, pipeline, vs_info, attribs, &vs, mem_ctx);
+      result = compile_stage(device, pipeline, vs_info, attribs, fs.uses_frag_coord, &vs,
+                             mem_ctx);
    if (result != VK_SUCCESS)
       goto out;
    if (fs.num_varyings > vs.num_varyings) {
-      result = vk_errorf(device, VK_ERROR_UNKNOWN,
+      result = g9p_error(device,
                          "G9P: the fragment shader reads varyings the vertex shader "
                          "does not write");
       goto out;
    }
-   if (fs.num_buffers) {
-      result = vk_errorf(device, VK_ERROR_UNKNOWN,
-                         "G9P: fragment shader buffers not supported yet");
-      goto out;
+   state->fs_num_buffers = fs.num_buffers;
+   for (unsigned i = 0; i < fs.num_buffers; i++) {
+      state->fs_buffers[i].set = fs.buffers[i].set;
+      state->fs_buffers[i].binding = fs.buffers[i].binding;
    }
    state->num_textures = fs.num_textures;
    for (unsigned i = 0; i < fs.num_textures; i++) {
@@ -405,6 +411,7 @@ PVR_PER_ARCH(g9p_graphics_pipeline_compile)(struct pvr_device *device,
 
    state->num_varyings = vs.num_varyings;
    state->vs_outputs = vs.num_outputs;
+   state->uses_discard = fs.uses_discard;
    state->vs_regs = vs.num_regs;
    state->num_buffers = vs.num_buffers;
    for (unsigned i = 0; i < vs.num_buffers; i++) {
@@ -499,6 +506,10 @@ hw_topology(VkPrimitiveTopology topology)
    }
 }
 
+static VkResult upload_buffer_addrs(struct pvr_cmd_buffer *cmd_buffer, unsigned n,
+                                    const unsigned (*sets)[2],
+                                    enum pvr_stage_allocation stage, uint64_t *addr_out);
+
 /*
  * The fragment shader's textures (RENDER.md "Textures in Mesa"): per
  * texture t, three DMAs into the common store, the texture state (4
@@ -512,9 +523,30 @@ upload_textures(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics
 {
    const struct pvr_g9p_gfx_programs *p = &cmd_buffer->device->g9p.gfx;
    const struct pvr_descriptor_state *desc = &cmd_buffer->state.gfx_desc_state;
-   const unsigned n = 3 * state->num_textures;
-   uint32_t data[3 * 3 * 4 + 4] = { 0 }, code[3 * 4 + 1];
+   /* the buffer addresses (one DMA), then three per texture */
+   const unsigned nb = state->fs_num_buffers ? 1 : 0;
+   const unsigned n = nb + 3 * state->num_textures;
+   uint32_t data[2 * (1 + 3 * 4) + (1 + 3 * 4) + 4] = { 0 }, code[1 + 3 * 4 + 1];
    unsigned nc = 0;
+
+   if (nb) {
+      unsigned sets[G9P_MAX_BUFFERS][2];
+      uint64_t addr;
+      VkResult result;
+
+      for (unsigned k = 0; k < state->fs_num_buffers; k++) {
+         sets[k][0] = state->fs_buffers[k].set;
+         sets[k][1] = state->fs_buffers[k].binding;
+      }
+      result = upload_buffer_addrs(cmd_buffer, state->fs_num_buffers, sets,
+                                   PVR_STAGE_ALLOCATION_FRAGMENT, &addr);
+      if (result != VK_SUCCESS)
+         return result;
+      data[0] = addr;
+      data[1] = addr >> 32;
+      data[2 * n] = doutd_ctrl(G9P_FS_BUF_BASE, 2 * state->fs_num_buffers, n == 1);
+      code[nc++] = g9p_pds_dout(G9P_DOUTD, 0, G9P_PDS_DATA, 2 * n, n == 1 ? G9P_PDS_END : 0);
+   }
 
    for (unsigned t = 0; t < state->num_textures; t++) {
       const struct pvr_descriptor_set *set = desc->sets[state->textures[t].set];
@@ -526,8 +558,8 @@ upload_textures(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics
       src[1] = p->zeros->dev_addr.addr;
       src[2] = addr + sizeof(struct pvr_image_descriptor);
       for (unsigned k = 0; k < 3; k++) {
-         const unsigned i = 3 * t + k;
-         const unsigned dest = G9P_TEX_STRIDE * t + 4 * k;
+         const unsigned i = nb + 3 * t + k;
+         const unsigned dest = G9P_FS_TEX_BASE + G9P_TEX_STRIDE * t + 4 * k;
 
          data[2 * i] = src[k];
          data[2 * i + 1] = src[k] >> 32;
@@ -565,18 +597,22 @@ descriptor_buffer_addr(const struct pvr_descriptor_set *ds, unsigned binding)
  * The common store of the vertex shader: the addresses of its buffers
  * (vertex buffers, push constants), loaded by the draw's DMA program.
  */
+/*
+ * The addresses of a stage's buffers by common-store slot, uploaded: the
+ * DMA of the stage's program copies them into the common store
+ */
 static VkResult
-upload_vs_uniforms(struct pvr_cmd_buffer *cmd_buffer,
-                   const struct pvr_g9p_graphics_state *state, struct pvr_pds_upload *dma)
+upload_buffer_addrs(struct pvr_cmd_buffer *cmd_buffer, unsigned n,
+                    const unsigned (*sets)[2], enum pvr_stage_allocation stage,
+                    uint64_t *addr_out)
 {
    struct pvr_cmd_buffer_state *cs = &cmd_buffer->state;
    uint64_t addrs[G9P_MAX_BUFFERS] = { 0 };
    struct pvr_suballoc_bo *bo;
-   uint32_t data[4];
    VkResult result;
 
-   for (unsigned k = 0; k < state->num_buffers; k++) {
-      const unsigned set = state->buffers[k].set, binding = state->buffers[k].binding;
+   for (unsigned k = 0; k < n; k++) {
+      const unsigned set = sets[k][0], binding = sets[k][1];
 
       if (set == G9P_VERTEX_BUFFERS) {
          const struct pvr_vertex_binding *vb = &cs->vertex_bindings[binding];
@@ -584,7 +620,32 @@ upload_vs_uniforms(struct pvr_cmd_buffer *cmd_buffer,
          if (vb->buffer)
             addrs[k] = vb->buffer->dev_addr.addr + vb->offset;
       } else if (set == G9P_PUSH_CONSTANTS) {
-         addrs[k] = cs->push_consts[PVR_STAGE_ALLOCATION_VERTEX_GEOMETRY].dev_addr.addr;
+         struct pvr_push_constants *pc = &cs->push_consts[stage];
+
+         if (pc->dirty || !pc->dev_addr.addr) {
+            struct pvr_suballoc_bo *pbo;
+
+            result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, pc->data,
+                                                        MAX2(pc->bytes_updated, 4), &pbo);
+            if (result != VK_SUCCESS)
+               return result;
+            pc->dev_addr = pbo->dev_addr;
+            pc->dirty = false;
+         }
+         addrs[k] = pc->dev_addr.addr;
+      } else if (set == G9P_VIEWPORT) {
+         /* scale/offset x, y, z of viewport 0 (gl_FragCoord's varying) */
+         const struct vk_dynamic_graphics_state *dyn = &cmd_buffer->vk.dynamic_graphics_state;
+         const VkViewport *vp = &dyn->vp.viewports[0];
+         const float v[8] = { vp->width / 2, vp->x + vp->width / 2, vp->height / 2,
+                              vp->y + vp->height / 2, vp->maxDepth - vp->minDepth,
+                              vp->minDepth, 0, 0 };
+         struct pvr_suballoc_bo *vbo;
+
+         result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, v, sizeof(v), &vbo);
+         if (result != VK_SUCCESS)
+            return result;
+         addrs[k] = vbo->dev_addr.addr;
       } else {
          const struct pvr_descriptor_set *ds = cs->gfx_desc_state.sets[set];
 
@@ -593,12 +654,33 @@ upload_vs_uniforms(struct pvr_cmd_buffer *cmd_buffer,
       }
    }
 
-   result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, addrs,
-                                               MAX2(8 * state->num_buffers, 8), &bo);
+   result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, addrs, MAX2(8 * n, 8), &bo);
    if (result != VK_SUCCESS)
       return result;
-   data[0] = bo->dev_addr.addr;
-   data[1] = bo->dev_addr.addr >> 32;
+   *addr_out = bo->dev_addr.addr;
+   return VK_SUCCESS;
+}
+
+/* The vertex shader's common store: its buffer addresses, by the draw's DMA */
+static VkResult
+upload_vs_uniforms(struct pvr_cmd_buffer *cmd_buffer,
+                   const struct pvr_g9p_graphics_state *state, struct pvr_pds_upload *dma)
+{
+   unsigned sets[G9P_MAX_BUFFERS][2];
+   uint32_t data[4];
+   uint64_t addr;
+   VkResult result;
+
+   for (unsigned k = 0; k < state->num_buffers; k++) {
+      sets[k][0] = state->buffers[k].set;
+      sets[k][1] = state->buffers[k].binding;
+   }
+   result = upload_buffer_addrs(cmd_buffer, state->num_buffers, sets,
+                                PVR_STAGE_ALLOCATION_VERTEX_GEOMETRY, &addr);
+   if (result != VK_SUCCESS)
+      return result;
+   data[0] = addr;
+   data[1] = addr >> 32;
    data[2] = doutd_ctrl(0, MAX2(2 * state->num_buffers, 2), true);
    data[3] = 0;
    return pvr_arch_cmd_buffer_upload_pds(cmd_buffer, data, ARRAY_SIZE(data), 16, NULL, 0,
@@ -643,7 +725,9 @@ PVR_PER_ARCH(g9p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer,
    result = upload_vs_uniforms(cmd_buffer, state, &dma);
    if (result != VK_SUCCESS)
       return result;
-   if (state->num_textures) {
+   const bool fs_program = state->num_textures || state->fs_num_buffers;
+
+   if (fs_program) {
       result = upload_textures(cmd_buffer, state, &tex);
       if (result != VK_SUCCESS)
          return result;
@@ -670,20 +754,29 @@ PVR_PER_ARCH(g9p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer,
     * (the USC common store, 64-byte units), varying base
     */
    PPP_BLOCK(0xc0, state->fs_kick.data_offset,
-             state->num_textures ? tex.code_offset : p->halt.code_offset,
-             (state->num_textures ? MAX2(tex.data_size / 4, 1) : 1) << 23 |
+             fs_program ? tex.code_offset : p->halt.code_offset,
+             (fs_program ? MAX2(tex.data_size / 4, 1) : 1) << 23 |
                 (state->num_varyings
                     ? state->varying_units << 10 | (2 * state->num_varyings) << 4
                     : 0),
-             DIV_ROUND_UP(G9P_TEX_STRIDE * 4 * state->num_textures, 64) << 23,
+             DIV_ROUND_UP(4 * (state->fs_num_buffers
+                                     ? G9P_FS_BUF_BASE + 2 * state->fs_num_buffers
+                                     : G9P_TEX_STRIDE * state->num_textures),
+                          64) << 23 |
+                (state->uses_discard ? BITFIELD_BIT(14) : 0),
              state->num_varyings ? state->varyings.data_offset : p->halt.code_offset);
-   /* 1b: PDS state pointer 3: the texture program's data */
-   if (state->num_textures)
+   /* 1b: PDS state pointer 3: the texture/buffer program's data */
+   if (fs_program)
       PPP_BLOCK(0x200, tex.data_offset);
    /* 2: output selects: vertex size, rhw */
    PPP_BLOCK(0x00020000, state->vs_outputs << 24 | 0x00010000);
-   /* 3: ISP control and front/back words (no depth, no culling yet) */
-   PPP_BLOCK(0x1f, 0x03c40000, 0x003e0f00, 0x0e000000, 0x00100f00, 0);
+   /*
+    * 3: ISP control and front/back words (no depth, no culling yet); pass
+    * type in ISPA/BA bits 24-26: 4 punch-through for discarding shaders
+    * (`discard` capture)
+    */
+   PPP_BLOCK(0x1f, 0x03c40000, 0x003e0f00 | (state->uses_discard ? 4u << 24 : 0), 0x0e000000,
+             0x00100f00 | (state->uses_discard ? 4u << 24 : 0), 0);
    /* 4: region clip (32-pixel units) and the viewport (a0 m0 a1 m1 a2 m2) */
    {
       const VkViewport *vp = &dyn->vp.viewports[0];
@@ -854,12 +947,16 @@ PVR_PER_ARCH(g9p_pack_sampler)(const VkSamplerCreateInfo *info)
  * instead of 0xa, the row pitch in 64-byte units minus one at bit 111, and
  * dword 5 0xc0000000, as iPadOS writes them.
  */
+static uint32_t image_format_bits(VkFormat format);
+
 static void
 pack_image_state(uint32_t *w, uint64_t addr, uint32_t width, uint32_t height,
-                 bool linear, uint32_t pitch)
+                 bool linear, uint32_t pitch, VkFormat format)
 {
+   const uint32_t fmt = image_format_bits(format);
+
    memset(w, 0, 8 * 4);
-   w[0] = (linear ? 0x03050502u : 0x0305050au) | (width - 1) << 27;
+   w[0] = 0x03000000u | (fmt ? fmt : 0x0505) << 8 | (linear ? 0x02 : 0x0a) | (width - 1) << 27;
    w[1] = (width - 1) >> 5 | (height - 1) << 9;
    w[2] = (uint32_t)(addr >> 1);
    w[3] = 0x80000000u | (uint32_t)(addr >> 33);
@@ -895,17 +992,16 @@ PVR_PER_ARCH(g9p_job_init)(struct pvr_cmd_buffer *cmd_buffer,
                             plane->mip_levels[iview->vk.base_mip_level].offset +
                             iview->vk.base_array_layer * plane->layer_size;
 
-      if (image_obj->vk.format != VK_FORMAT_B8G8R8A8_UNORM &&
-          image_obj->vk.format != VK_FORMAT_B8G8R8A8_SRGB)
+      if (!image_format_bits(iview->vk.format))
          mesa_logw_once("G9P: render target format %s stored as BGRA8",
-                        vk_Format_to_str(image_obj->vk.format));
+                        vk_Format_to_str(iview->vk.format));
       const bool linear = image_obj->memlayout == PVR_MEMLAYOUT_LINEAR;
       const uint32_t pitch = plane->mip_levels[iview->vk.base_mip_level].pitch;
 
       if (linear && pitch % 64)
          mesa_logw("G9P: linear render target pitch %u is not a multiple of 64", pitch);
       pack_image_state(image, addr, iview->vk.extent.width, iview->vk.extent.height, linear,
-                       pitch);
+                       pitch, iview->vk.format);
       job->g9p.width = iview->vk.extent.width;
       job->g9p.height = iview->vk.extent.height;
    } else {
