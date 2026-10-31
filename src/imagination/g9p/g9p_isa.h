@@ -74,6 +74,7 @@ g9p_emit(struct g9p_code *c, const uint16_t *w, unsigned count)
 #define G9P_SIZE_U8  1
 #define G9P_SIZE_U16 2
 #define G9P_SIZE_U32 4
+#define G9P_SIZE_2X32 5
 
 /*
  * Program entry: compares the thread count in the common store (uniform
@@ -213,12 +214,16 @@ g9p_addr(struct g9p_code *c, unsigned dst, unsigned base_dword, unsigned idx,
             0x4100, 0x01a1, 0x0600 | shift << 13);
 }
 
-/* Load (store) @size bytes at address pair r[pair] into (from) r[reg] */
+/*
+ * Load (store) @size bytes at address pair r[pair] into (from) r[reg]. W0
+ * bits 8-9 are the load's bank bits: fragment code clears them (Apple's
+ * fragment loads are 2012/3812 where compute has 2312, probes/fsload.metal)
+ */
 static inline void
 g9p_mem_at(struct g9p_code *c, bool store, unsigned size, unsigned reg,
            unsigned pair)
 {
-   G9P_EMIT(c, size << 11 | 0x0310,
+   G9P_EMIT(c, size << 11 | (c->fragment ? 0x0010 : 0x0310),
             (1 | pair << 2) << 8 | (store ? 0x80 : 0) | reg << 1, 0x8800);
 }
 
@@ -238,6 +243,18 @@ g9p_mem_at(struct g9p_code *c, bool store, unsigned size, unsigned reg,
 #define G9P_FLT 0x59
 #define G9P_FGT 0x5d
 #define G9P_FEQ 0x55
+
+/*
+ * dst = common-store dword @u (a uniform operand, Apple's 0x81 | u << 2 with
+ * the high bits in the extension word 0x4100 | (u >> 5) << 1) + r[zero]: a
+ * move from the common store (probes/fsuni*.metal)
+ */
+static inline void
+g9p_mov_uniform(struct g9p_code *c, unsigned dst, unsigned u, unsigned zero)
+{
+   G9P_EMIT(c, g9p_w0(c, 0x3199), g9p_dst(c, dst), 0x0181 | (u & 31) << 2 | zero << 10,
+            0x4100 | (u >> 5) << 1, G9P_IADD);
+}
 
 /* dst = a * b + c */
 static inline void

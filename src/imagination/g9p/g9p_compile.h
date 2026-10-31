@@ -24,12 +24,15 @@
 #define G9P_TEX_STRIDE 16
 /*
  * In fragment shaders the texture takes common-store dwords 0-9 (only state
- * at dword 0 samples correctly so far: RENDER.md "Textures in Mesa") and
- * the buffers' addresses follow from dword 16 (buffer k at 16 + 2k; the
- * address instruction reaches dword 31)
+ * at dword 0 samples correctly so far: RENDER.md "Textures in Mesa") and the
+ * buffers' contents follow from dword 16: buffer k's first
+ * G9P_FS_BUF_DWORDS dwords at 16 + G9P_FS_BUF_DWORDS k, which the shader
+ * reads as uniform operands (as Apple's fragment code does; memory loads
+ * there do not work yet: ISA.md "Fragment uniforms")
  */
 #define G9P_FS_TEX_BASE 0
 #define G9P_FS_BUF_BASE 16
+#define G9P_FS_BUF_DWORDS 128
 
 /* The set of the push-constant slot (its address is loaded like a buffer's) */
 #define G9P_PUSH_CONSTANTS (~0u)
@@ -42,6 +45,12 @@
  */
 #define G9P_VIEWPORT (~2u)
 /*
+ * The set of vertex buffer stride slots (binding = the vertex buffer
+ * binding): the stride as a 64-bit value, filled per draw (strides can be
+ * dynamic state)
+ */
+#define G9P_VERTEX_STRIDES (~3u)
+/*
  * gl_FragCoord comes in a varying (window x, y, z, 1/w) the vertex shader
  * writes after its own (g9p_frag_coord_slot()), iterated without
  * perspective correction: the position read's 16-bit results are not
@@ -51,7 +60,7 @@
 /* A vertex attribute: 32-bit components from a vertex buffer */
 struct g9p_vertex_attrib {
    bool present;
-   unsigned binding, offset, stride;
+   unsigned binding, offset;
 };
 
 struct g9p_shader {
@@ -69,6 +78,8 @@ struct g9p_shader {
    unsigned num_buffers;
    struct {
       unsigned set, binding;
+      /* fragment: how many dwords of it the shader reads (from its start) */
+      unsigned dwords;
    } buffers[G9P_MAX_BUFFERS];
 
    /* Registers per thread, mask stack included (G9P_CDM_KERNEL_REGS) */

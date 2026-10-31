@@ -35,6 +35,7 @@
 #include "pvr_device.h"
 #include "pvr_entrypoints.h"
 #include "pvr_formats.h"
+#include "pvr_g9p.h"
 #include "pvr_hw_pass.h"
 #include "pvr_image.h"
 #include "pvr_job_transfer.h"
@@ -2521,6 +2522,16 @@ void pvr_rogue_CmdClearAttachments(VkCommandBuffer commandBuffer,
 
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
    assert(state->current_sub_cmd->type == PVR_SUB_CMD_TYPE_GRAPHICS);
+
+   /* G9P: Rogue's clear programs do not run there (they hung the geometry job) */
+   if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g9p)) {
+      VkResult result = PVR_PER_ARCH(g9p_clear_attachments)(cmd_buffer, attachmentCount,
+                                                             pAttachments, rectCount, pRects);
+
+      if (result != VK_SUCCESS)
+         pvr_cmd_buffer_set_error_unwarned(cmd_buffer, result);
+      return;
+   }
 
    /* TODO: There are some optimizations that can be made here:
     *  - For a full screen clear, update the clear values for the corresponding

@@ -930,6 +930,28 @@ emit_mem(struct g9p_ctx *ctx, nir_intrinsic_instr *intr, int slot, nir_scalar of
       return false;
    }
 
+   /* fragment shaders: the buffer's contents in the common store */
+   if (ctx->stage == MESA_SHADER_FRAGMENT) {
+      const unsigned byte = base + (nir_scalar_is_const(offset) ? nir_scalar_as_uint(offset) : 0);
+      int zero;
+
+      if (value || !nir_scalar_is_const(offset) || byte % 4 ||
+          byte / 4 >= G9P_FS_BUF_DWORDS) {
+         fprintf(stderr, "g9p: %s in a fragment shader: only constant offsets below %u\n",
+                 nir_intrinsic_infos[intr->intrinsic].name, 4 * G9P_FS_BUF_DWORDS);
+         return false;
+      }
+      ctx->out->buffers[slot].dwords = MAX2(ctx->out->buffers[slot].dwords, byte / 4 + 1);
+      zero = const_reg(ctx, 0);
+      release(ctx, &intr->instr);
+      data = alloc_reg(ctx);
+      if (zero < 0 || data < 0)
+         return false;
+      g9p_mov_uniform(ctx->c, data, G9P_FS_BUF_BASE + G9P_FS_BUF_DWORDS * slot + byte / 4, zero);
+      ctx->reg[key(&intr->def, 0)] = data;
+      return true;
+   }
+
    off = src_reg(ctx, offset);
    if (off < 0)
       return false;
@@ -947,8 +969,7 @@ emit_mem(struct g9p_ctx *ctx, nir_intrinsic_instr *intr, int slot, nir_scalar of
       return false;
    ctx->temps |= BITFIELD64_RANGE(pair, 2);
    /* byte offset: shift 0 */
-   g9p_addr(ctx->c, pair, (ctx->stage == MESA_SHADER_FRAGMENT ? G9P_FS_BUF_BASE : 0) + 2 * slot,
-            off, 0, false);
+   g9p_addr(ctx->c, pair, 2 * slot, off, 0, false);
 
    if (value) {
       data = src_reg(ctx, nir_get_scalar(value->ssa, 0));
@@ -993,7 +1014,7 @@ emit_attrib_load(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
    const nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
    unsigned loc = sem.location - VERT_ATTRIB_GENERIC0;
    const struct g9p_vertex_attrib *a;
-   int slot, rs, t, pair, data;
+   int slot, stride_slot, zero, rs, t, pair, data;
    uint32_t offset;
 
    if (loc >= G9P_MAX_ATTRIBS || !ctx->attribs[loc].present ||
@@ -1004,16 +1025,21 @@ emit_attrib_load(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
    }
    a = &ctx->attribs[loc];
    slot = g9p_buffer_slot(ctx->out, G9P_VERTEX_BUFFERS, a->binding);
-   if (slot < 0)
+   stride_slot = g9p_buffer_slot(ctx->out, G9P_VERTEX_STRIDES, a->binding);
+   if (slot < 0 || stride_slot < 0)
       return false;
    offset = a->offset + 4 * nir_intrinsic_component(intr) +
             16 * nir_src_as_uint(intr->src[0]);
 
-   rs = const_reg(ctx, a->stride);
+   /* the stride from its slot: the address form with 0 added (rs:rs+1) */
+   zero = const_reg(ctx, 0);
+   rs = alloc_pair(ctx);
    t = alloc_temp(ctx);
-   if (rs < 0 || t < 0)
+   if (zero < 0 || rs < 0 || t < 0)
       return false;
+   g9p_addr(ctx->c, rs, 2 * stride_slot, zero, 0, false);
    g9p_alu2(ctx->c, G9P_IMUL, t, 0, rs, false);
+   ctx->busy &= ~BITFIELD64_RANGE(rs, 2);
    if (offset) {
       int ro = const_reg(ctx, offset);
 
@@ -1784,6 +1810,7 @@ g9p_buffer_slot(struct g9p_shader *out, unsigned set, unsigned binding)
       return -1;
    out->buffers[k].set = set;
    out->buffers[k].binding = binding;
+   out->buffers[k].dwords = 0;
    out->num_buffers++;
    return k;
 }

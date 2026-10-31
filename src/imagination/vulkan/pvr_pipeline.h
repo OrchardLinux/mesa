@@ -131,6 +131,8 @@ struct pvr_g9p_compute_state {
 
 /* Apple G9P (has_apple_g9p): a graphics pipeline's programs (pvr_arch_g9p_gfx.c) */
 struct pvr_g9p_graphics_state {
+   /* a number for debug output (G9P_DEBUG prints it before its shaders) */
+   unsigned id;
    struct pvr_suballoc_bo *vs_bo, *fs_bo;
    /* vertex kick (code and data), fragment kick bundle, DOUTI program */
    struct pvr_pds_upload vs_kick, fs_kick, varyings;
@@ -148,11 +150,16 @@ struct pvr_g9p_graphics_state {
    struct {
       unsigned set, binding;
    } buffers[8];
-   /* the fragment shader's buffers (uniform buffers, push constants), by slot */
+   /*
+    * the fragment shader's buffers (uniform buffers, push constants), by
+    * slot: their first dwords are DMA'd into the common store
+    */
    unsigned fs_num_buffers;
    struct {
-      unsigned set, binding;
+      unsigned set, binding, dwords;
    } fs_buffers[8];
+   /* the fragment shader's common store in dwords */
+   unsigned fs_common_dwords;
    /* the fragment shader's combined image samplers, by common-store slot */
    unsigned num_textures;
    struct {

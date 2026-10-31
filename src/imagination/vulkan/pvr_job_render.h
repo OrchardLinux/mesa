@@ -146,7 +146,17 @@ struct pvr_render_job {
       /* PDS_BGRND0-3 in the Apple layout */
       uint64_t bgnd[4];
       uint32_t width, height;
+      /* the colour target (G9P_GRAB writes it out after the render) */
+      uint64_t target_addr;
+      uint32_t target_pitch;
+      bool target_linear;
    } g9p;
+
+   /* G9P_SYNC: the pipelines of the job's first draws, reported on a timeout */
+   struct {
+      unsigned num_draws;
+      unsigned pipelines[16];
+   } g9p_draws;
 
    struct pvr_view_state {
       struct {

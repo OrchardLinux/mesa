@@ -652,14 +652,28 @@ VkResult pvr_arch_render_target_dataset_create(
     * freelist (the "local" freelist) is always the minimum size required by
     * the hardware. See the documentation of ROGUE_FREE_LIST_MAX_SIZE for more
     * details.
+    *
+    * Apple G9P: the firmware's parameter manager takes this list alone, never
+    * grows it (the kernel passes its pages as they are) and reloads it only
+    * when the command's free-list index changes, which the kernel keeps at 0.
+    * So every dataset shares the device's list (pvr_arch_g9p_device_init()),
+    * which holds the whole parameter buffer. At the minimum size the geometry
+    * job ran out of pages after two draws with their own state or 32
+    * instances of one triangle; with a list per dataset, Hyprland's first
+    * render to a second target hung.
     */
-   result = pvr_free_list_create(device,
-                                 runtime_info->min_free_list_size,
-                                 runtime_info->min_free_list_size,
-                                 0 /* grow_size */,
-                                 0 /* grow_threshold */,
-                                 rt_dataset->global_free_list,
-                                 &rt_dataset->local_free_list);
+   if (PVR_HAS_FEATURE(dev_info, apple_g9p)) {
+      rt_dataset->local_free_list = device->g9p.free_list;
+      result = VK_SUCCESS;
+   } else {
+      result = pvr_free_list_create(device,
+                                    runtime_info->min_free_list_size,
+                                    runtime_info->min_free_list_size,
+                                    0 /* grow_size */,
+                                    0 /* grow_threshold */,
+                                    rt_dataset->global_free_list,
+                                    &rt_dataset->local_free_list);
+   }
    if (result != VK_SUCCESS)
       goto err_vk_free_rt_dataset;
 
@@ -696,6 +710,12 @@ VkResult pvr_arch_render_target_dataset_create(
       goto err_pvr_rt_datas_fini;
 
    *rt_dataset_out = rt_dataset;
+   if (PVR_HAS_FEATURE(dev_info, apple_g9p) && getenv("G9P_SYNC")) {
+      static unsigned n;
+
+      fprintf(stderr, "g9p: device %p: render target dataset %u: %ux%u\n", (void *)device, ++n,
+              width, height);
+   }
 
    return VK_SUCCESS;
 
@@ -709,7 +729,8 @@ err_pvr_rt_vheap_rtc_data_fini:
    pvr_rt_vheap_rtc_data_fini(rt_dataset);
 
 err_pvr_free_list_destroy:
-   pvr_free_list_destroy(rt_dataset->local_free_list);
+   if (rt_dataset->local_free_list != device->g9p.free_list)
+      pvr_free_list_destroy(rt_dataset->local_free_list);
 
 err_vk_free_rt_dataset:
    vk_free(&device->vk.alloc, rt_dataset);

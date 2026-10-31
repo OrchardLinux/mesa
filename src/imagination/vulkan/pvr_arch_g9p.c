@@ -23,6 +23,7 @@
 #include "pvr_descriptor_set.h"
 #include "pvr_device.h"
 #include "pvr_entrypoints.h"
+#include "pvr_free_list.h"
 #include "pvr_g9p.h"
 #include "pvr_physical_device.h"
 #include "pvr_pipeline.h"
@@ -77,8 +78,15 @@ PVR_PER_ARCH(g9p_device_init)(struct pvr_device *device)
    if (result != VK_SUCCESS)
       goto err_free_kick;
 
+   result = pvr_free_list_create(device, G9P_FREE_LIST_SIZE, G9P_FREE_LIST_SIZE, 0, 0,
+                                 device->global_free_list, &device->g9p.free_list);
+   if (result != VK_SUCCESS)
+      goto err_free_fence;
+
    return VK_SUCCESS;
 
+err_free_fence:
+   pvr_bo_suballoc_free(device->g9p.fence.pvr_bo);
 err_free_kick:
    pvr_bo_suballoc_free(device->g9p.kick.pvr_bo);
 err_free_empty:
@@ -89,6 +97,7 @@ err_free_empty:
 void
 PVR_PER_ARCH(g9p_device_finish)(struct pvr_device *device)
 {
+   pvr_free_list_destroy(device->g9p.free_list);
    pvr_bo_suballoc_free(device->g9p.fence.pvr_bo);
    pvr_bo_suballoc_free(device->g9p.kick.pvr_bo);
    pvr_bo_suballoc_free(device->g9p.empty_kernel);

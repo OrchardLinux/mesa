@@ -98,6 +98,9 @@ struct pvr_device {
       /* and the device-level graphics programs (pvr_arch_g9p_gfx.c) */
       struct pvr_g9p_gfx_programs {
          struct pvr_suballoc_bo *clear_usc, *eot_usc, *vdm_end_usc;
+         /* vkCmdClearAttachments: a vertex shader of (x, y) pairs and its kick */
+         struct pvr_suballoc_bo *clear_vs_usc;
+         struct pvr_pds_upload clear_vs_kick;
          /* kick bundles (data, code at +0x20) */
          struct pvr_pds_upload clear_kick, vdm_end;
          /* code only: HALT, one DMA (data per use), the end of tile */
@@ -109,6 +112,11 @@ struct pvr_device {
          /* zeros (texture state dwords 4-7) */
          struct pvr_suballoc_bo *zeros;
       } gfx;
+      /*
+       * The parameter buffer every render-target dataset shares as its local
+       * free list (pvr_arch_render_target_dataset_create())
+       */
+      struct pvr_free_list *free_list;
    } g9p;
 
    /* Compute shaders for queries. */

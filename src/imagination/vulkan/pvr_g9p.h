@@ -22,6 +22,12 @@ struct pvr_renderpass_hwsetup_render;
 struct pvr_sub_cmd_compute;
 struct vk_graphics_pipeline_state;
 
+/*
+ * The parameter buffer of a render (its local free list, bytes): the Apple
+ * firmware does not grow it (pvr_arch_render_target_dataset_create())
+ */
+#define G9P_FREE_LIST_SIZE (8U * 1024U * 1024U)
+
 /* One draw: vertices (or indices) from @offset (vertexOffset when indexed) */
 struct pvr_g9p_draw {
    bool indexed;
@@ -32,7 +38,15 @@ struct pvr_g9p_draw {
 
 #ifdef PVR_PER_ARCH
 
+VkResult PVR_PER_ARCH(g9p_clear_attachments)(struct pvr_cmd_buffer *cmd_buffer,
+                                             uint32_t attachment_count,
+                                             const VkClearAttachment *attachments,
+                                             uint32_t rect_count, const VkClearRect *rects);
+
 VkResult PVR_PER_ARCH(g9p_device_init)(struct pvr_device *device);
+
+/* The CPU address of a device address in a bound buffer or image, or NULL */
+uint8_t *PVR_PER_ARCH(g9p_cpu_addr)(struct pvr_device *device, uint64_t addr);
 void PVR_PER_ARCH(g9p_device_finish)(struct pvr_device *device);
 
 VkResult PVR_PER_ARCH(g9p_compute_pipeline_compile)(

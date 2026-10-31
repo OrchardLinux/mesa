@@ -340,6 +340,18 @@ pvr_process_graphics_cmd_for_view(struct pvr_device *device,
          (view_index * PVR_DW_TO_BYTES(sub_cmd->multiview_ctrl_stream_stride));
    }
 
+   /* G9P_SYNC: is what the render waits for done? */
+   if (job->g9p.enabled && getenv("G9P_SYNC")) {
+      for (unsigned t = 0; t < 2; t++) {
+         struct vk_sync *w = queue->next_job_wait_sync[t ? PVR_JOB_TYPE_FRAG : PVR_JOB_TYPE_GEOM];
+
+         if (w && vk_sync_wait(&device->vk, w, 0, VK_SYNC_WAIT_COMPLETE,
+                               os_time_get_absolute_timeout(2000000000ull)) != VK_SUCCESS)
+            fprintf(stderr, "g9p: render %ux%u: its %s wait is not signalled\n",
+                    job->g9p.width, job->g9p.height, t ? "fragment" : "geometry");
+      }
+   }
+
    result =
       pvr_arch_render_job_submit(queue->gfx_ctx,
                                  &sub_cmd->job,
@@ -353,6 +365,49 @@ pvr_process_graphics_cmd_for_view(struct pvr_device *device,
 
    if (result != VK_SUCCESS)
       goto err_destroy_frag_sync;
+
+   /* G9P_SYNC: wait for each render and report the draws of one that hangs */
+   if (job->g9p.enabled && getenv("G9P_SYNC")) {
+      fprintf(stderr, "g9p: device %p: render %ux%u submitted, %u draws\n", (void *)device,
+              job->g9p.width, job->g9p.height, job->g9p_draws.num_draws);
+      const bool geom = vk_sync_wait(&device->vk, geom_signal_sync, 0, VK_SYNC_WAIT_COMPLETE,
+                                     os_time_get_absolute_timeout(3000000000ull)) == VK_SUCCESS;
+
+      if (!geom || (frag_signal_sync &&
+                    vk_sync_wait(&device->vk, frag_signal_sync, 0, VK_SYNC_WAIT_COMPLETE,
+                                 os_time_get_absolute_timeout(3000000000ull)) != VK_SUCCESS)) {
+         fprintf(stderr, "g9p: device %p: render %ux%u: %s timed out; %u draws, pipelines:",
+                 (void *)device, job->g9p.width, job->g9p.height,
+                 geom ? "fragment job" : "geometry job", job->g9p_draws.num_draws);
+         for (unsigned i = 0; i < MIN2(job->g9p_draws.num_draws, 16); i++)
+            fprintf(stderr, " %u", job->g9p_draws.pipelines[i]);
+         fprintf(stderr, "\n");
+      } else if (getenv("G9P_GRAB")) {
+         /* G9P_GRAB=N: the first N renders' targets to /tmp/g9p-grab-K.raw */
+         static unsigned grabbed;
+         const uint8_t *px = PVR_PER_ARCH(g9p_cpu_addr)(device, job->g9p.target_addr);
+         const size_t size =
+            job->g9p.target_linear
+               ? (size_t)job->g9p.target_pitch * job->g9p.height
+               : (size_t)4 * util_next_power_of_two(job->g9p.width) *
+                    util_next_power_of_two(job->g9p.height);
+
+         if (px && grabbed < (unsigned)atoi(getenv("G9P_GRAB"))) {
+            char path[64];
+            FILE *f;
+
+            snprintf(path, sizeof(path), "/tmp/g9p-grab-%u.raw", grabbed++);
+            f = fopen(path, "wb");
+            if (f) {
+               fwrite(px, 1, size, f);
+               fclose(f);
+               fprintf(stderr, "g9p: %s: %ux%u %s pitch %u, %u draws\n", path, job->g9p.width,
+                       job->g9p.height, job->g9p.target_linear ? "linear" : "twiddled",
+                       job->g9p.target_pitch, job->g9p_draws.num_draws);
+            }
+         }
+      }
+   }
 
    pvr_update_job_syncs(device, queue, geom_signal_sync, PVR_JOB_TYPE_GEOM);
 
@@ -420,6 +475,14 @@ static VkResult pvr_process_compute_cmd(struct pvr_device *device,
       vk_sync_destroy(&device->vk, sync);
       return result;
    }
+
+   /* G9P_SYNC: wait for each compute job too */
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p) && getenv("G9P_SYNC") &&
+       vk_sync_wait(&device->vk, sync, 0, VK_SYNC_WAIT_COMPLETE,
+                    os_time_get_absolute_timeout(3000000000ull)) != VK_SUCCESS)
+      fprintf(stderr, "g9p: compute job timed out\n");
+   else if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p) && getenv("G9P_SYNC"))
+      fprintf(stderr, "g9p: compute job done\n");
 
    pvr_update_job_syncs(device, queue, sync, PVR_JOB_TYPE_COMPUTE);
 

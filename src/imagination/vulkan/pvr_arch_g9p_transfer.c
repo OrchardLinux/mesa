@@ -29,8 +29,8 @@
 #include "pvr_winsys.h"
 
 /* The CPU address of a device address in a bound buffer or image, or NULL */
-static uint8_t *
-cpu_addr(struct pvr_device *device, uint64_t addr)
+uint8_t *
+PVR_PER_ARCH(g9p_cpu_addr)(struct pvr_device *device, uint64_t addr)
 {
    uint8_t *ptr = NULL;
 
@@ -60,7 +60,7 @@ static bool
 surface_init(struct pvr_device *device, const struct pvr_transfer_cmd_surface *s,
              struct surface *out)
 {
-   out->base = cpu_addr(device, s->dev_addr.addr);
+   out->base = PVR_PER_ARCH(g9p_cpu_addr)(device, s->dev_addr.addr);
    out->format = vk_format_to_pipe_format(s->vk_format);
    out->bpp = vk_format_get_blocksize(s->vk_format);
    out->stride = s->stride ? s->stride : s->width;
