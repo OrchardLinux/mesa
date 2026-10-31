@@ -32,6 +32,7 @@
 #include "util/os_time.h"
 #include "pvr_g9p.h"
 #include "pvr_queue.h"
+#include "pvr_rt_dataset.h"
 
 #include <assert.h>
 #include <stdbool.h>
@@ -384,6 +385,36 @@ pvr_process_graphics_cmd_for_view(struct pvr_device *device,
 
    if (result != VK_SUCCESS)
       goto err_destroy_frag_sync;
+
+   /*
+    * G9P_PMDUMP=N: every Nth render, the start of its render target's
+    * parameter-manager memory (VHEAP table and RTC, the macrotile array of
+    * the data set in use) as the previous scene left it: what grows from
+    * scene to scene shows where parameter memory is lost
+    */
+   if (job->g9p.enabled && getenv("G9P_PMDUMP")) {
+      static unsigned n;
+      struct pvr_rt_dataset *rt = job->view_state.rt_datasets[job->view_state.view_index];
+      const unsigned every = MAX2(atoi(getenv("G9P_PMDUMP")), 1);
+
+      if (!(++n % every)) {
+         struct pvr_bo *bos[2] = { rt->vheap_rtc_bo, rt->mta_bo };
+         static const char *const names[2] = { "vheap", "mta" };
+
+         for (unsigned b = 0; b < 2; b++) {
+            const uint32_t *w;
+
+            if (!bos[b] || (!bos[b]->bo->map && pvr_bo_cpu_map(device, bos[b]) != VK_SUCCESS))
+               continue;
+            w = bos[b]->bo->map;
+            fprintf(stderr, "g9p: pm %u rt %p data %u %s:", n, (void *)rt, rt->rt_data_idx,
+                    names[b]);
+            for (unsigned i = 0; i < 16; i++)
+               fprintf(stderr, " %08x", w[i]);
+            fprintf(stderr, "\n");
+         }
+      }
+   }
 
    /* G9P_TRACE: each render as submitted, to find the one a hang stops at */
    if (job->g9p.enabled && getenv("G9P_TRACE")) {
