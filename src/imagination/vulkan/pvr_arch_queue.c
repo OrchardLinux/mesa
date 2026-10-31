@@ -29,6 +29,8 @@
  * This file implements VkQueue, VkFence, and VkSemaphore
  */
 
+#include "util/os_time.h"
+#include "pvr_g9p.h"
 #include "pvr_queue.h"
 
 #include <assert.h>
@@ -439,11 +441,19 @@ static VkResult pvr_process_transfer_cmds(struct pvr_device *device,
    if (result != VK_SUCCESS)
       return result;
 
-   result = pvr_arch_transfer_job_submit(
-      queue->transfer_ctx,
-      sub_cmd,
-      queue->next_job_wait_sync[PVR_JOB_TYPE_TRANSFER],
-      sync);
+   /* G9P: no GPU transfer path yet; done by the CPU */
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p))
+      result = pvr_arch_g9p_transfer_submit(
+         device,
+         sub_cmd,
+         queue->next_job_wait_sync[PVR_JOB_TYPE_TRANSFER],
+         sync);
+   else
+      result = pvr_arch_transfer_job_submit(
+         queue->transfer_ctx,
+         sub_cmd,
+         queue->next_job_wait_sync[PVR_JOB_TYPE_TRANSFER],
+         sync);
    if (result != VK_SUCCESS) {
       vk_sync_destroy(&device->vk, sync);
       return result;
@@ -924,6 +934,22 @@ static VkResult pvr_clear_last_submits_syncs(struct pvr_queue *queue)
             .stage_mask = ~(VkPipelineStageFlags2)0,
             .wait_value = 0,
          };
+      }
+   }
+
+   /* G9P_DUMP: which of the last submit's syncs are still pending */
+   if (getenv("G9P_DUMP")) {
+      for (uint32_t i = 0; i < PVR_JOB_TYPE_MAX; i++) {
+         struct vk_sync *s[2] = { queue->next_job_wait_sync[i],
+                                  queue->last_job_signal_sync[i] };
+
+         for (unsigned k = 0; k < 2; k++) {
+            if (s[k] && vk_sync_wait(&queue->device->vk, s[k], 0, VK_SYNC_WAIT_COMPLETE,
+                                     os_time_get_absolute_timeout(500000000)) !=
+                           VK_SUCCESS)
+               fprintf(stderr, "g9p: job type %u %s sync still pending\n", i,
+                       k ? "last signal" : "next wait");
+         }
       }
    }
 

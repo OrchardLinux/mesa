@@ -1,0 +1,206 @@
+/* SPDX-License-Identifier: MIT */
+/*
+ * Transfers (copies, blits, fills, buffer updates) on Apple's G9P, done by
+ * the CPU: the A10's memory is all CPU-visible, and its GPU transfer path
+ * (the TQ, Rogue USC shaders) does not exist here yet. A transfer sub-command
+ * waits for its dependencies, runs its commands on the mapped memory and
+ * signals its sync from the CPU.
+ *
+ * Surfaces are linear (row stride in texels) or twiddled: Morton order with
+ * the y bit first over the power-of-two padded size, interleaving while both
+ * dimensions have bits (orchard gpu-001 RENDER.md "Textures with our
+ * encodings"). Copies convert formats through util_format when they differ
+ * and scale with nearest sampling; MSAA resolves and YUV are not handled.
+ */
+
+#include <string.h>
+
+#include "vk_format.h"
+#include "vk_sync.h"
+
+#include "util/format/u_format.h"
+#include "util/u_dynarray.h"
+#include "util/u_math.h"
+
+#include "pvr_cmd_buffer.h"
+#include "pvr_device.h"
+#include "pvr_g9p.h"
+#include "pvr_job_transfer.h"
+#include "pvr_winsys.h"
+
+/* The CPU address of a device address in a bound buffer or image, or NULL */
+static uint8_t *
+cpu_addr(struct pvr_device *device, uint64_t addr)
+{
+   uint8_t *ptr = NULL;
+
+   simple_mtx_lock(&device->g9p_vmas.lock);
+   util_dynarray_foreach (&device->g9p_vmas.vmas, struct pvr_winsys_vma *, v) {
+      struct pvr_winsys_vma *vma = *v;
+
+      if (addr < vma->dev_addr.addr || addr >= vma->dev_addr.addr + vma->size)
+         continue;
+      if (!vma->bo->map && device->ws->ops->buffer_map(vma->bo, NULL) != VK_SUCCESS)
+         break;
+      ptr = (uint8_t *)vma->bo->map + vma->bo_offset + (addr - vma->dev_addr.addr);
+      break;
+   }
+   simple_mtx_unlock(&device->g9p_vmas.lock);
+   return ptr;
+}
+
+struct surface {
+   uint8_t *base;
+   enum pipe_format format;
+   unsigned bpp, stride, width, height;
+   bool twiddled;
+};
+
+static bool
+surface_init(struct pvr_device *device, const struct pvr_transfer_cmd_surface *s,
+             struct surface *out)
+{
+   out->base = cpu_addr(device, s->dev_addr.addr);
+   out->format = vk_format_to_pipe_format(s->vk_format);
+   out->bpp = vk_format_get_blocksize(s->vk_format);
+   out->stride = s->stride ? s->stride : s->width;
+   out->width = s->width;
+   out->height = s->height;
+   out->twiddled = s->mem_layout == PVR_MEMLAYOUT_TWIDDLED;
+   if (!out->base)
+      mesa_loge("G9P transfer: no CPU mapping for %#" PRIx64, s->dev_addr.addr);
+   return out->base != NULL;
+}
+
+static unsigned
+twiddle(unsigned x, unsigned y, unsigned w, unsigned h)
+{
+   const unsigned pw = util_next_power_of_two(MAX2(w, 1));
+   const unsigned ph = util_next_power_of_two(MAX2(h, 1));
+   unsigned m = 0, bit = 0;
+
+   for (unsigned i = 0; (1u << i) < pw || (1u << i) < ph; i++) {
+      if ((1u << i) < ph)
+         m |= ((y >> i) & 1) << bit++;
+      if ((1u << i) < pw)
+         m |= ((x >> i) & 1) << bit++;
+   }
+   return m;
+}
+
+static uint8_t *
+texel(const struct surface *s, unsigned x, unsigned y)
+{
+   if (s->twiddled)
+      return s->base + (size_t)twiddle(x, y, s->width, s->height) * s->bpp;
+   return s->base + ((size_t)y * s->stride + x) * s->bpp;
+}
+
+static void
+fill(const struct pvr_transfer_cmd *cmd, const struct surface *dst)
+{
+   const VkRect2D *r = &cmd->scissor;
+   uint8_t packed[16] = { 0 };
+
+   if (util_format_is_pure_integer(dst->format))
+      util_format_pack_rgba(dst->format, packed, (const uint32_t[4]){ cmd->clear_color[0].ui,
+                                                                       cmd->clear_color[1].ui,
+                                                                       cmd->clear_color[2].ui,
+                                                                       cmd->clear_color[3].ui },
+                            1);
+   else
+      util_format_pack_rgba(dst->format, packed, (const float[4]){ cmd->clear_color[0].f,
+                                                                    cmd->clear_color[1].f,
+                                                                    cmd->clear_color[2].f,
+                                                                    cmd->clear_color[3].f },
+                            1);
+   for (int y = r->offset.y; y < r->offset.y + (int)r->extent.height; y++) {
+      for (int x = r->offset.x; x < r->offset.x + (int)r->extent.width; x++)
+         memcpy(texel(dst, x, y), packed, dst->bpp);
+   }
+}
+
+static void
+copy(const struct pvr_rect_mapping *m, const struct surface *src, const struct surface *dst)
+{
+   const bool same = src->format == dst->format ||
+                     (src->bpp == dst->bpp && util_format_is_compressed(src->format));
+   const bool integer = util_format_is_pure_integer(src->format);
+   const unsigned dw = m->dst_rect.extent.width, dh = m->dst_rect.extent.height;
+   const unsigned sw = m->src_rect.extent.width, sh = m->src_rect.extent.height;
+
+   for (unsigned y = 0; y < dh; y++) {
+      for (unsigned x = 0; x < dw; x++) {
+         unsigned sx = sw == dw ? x : x * sw / dw;
+         unsigned sy = sh == dh ? y : y * sh / dh;
+         const uint8_t *from;
+         uint8_t *to;
+
+         if (m->flip_x)
+            sx = sw - 1 - sx;
+         if (m->flip_y)
+            sy = sh - 1 - sy;
+         from = texel(src, m->src_rect.offset.x + sx, m->src_rect.offset.y + sy);
+         to = texel(dst, m->dst_rect.offset.x + x, m->dst_rect.offset.y + y);
+         if (same) {
+            memcpy(to, from, dst->bpp);
+         } else if (integer) {
+            uint32_t v[4];
+
+            util_format_unpack_rgba(src->format, v, from, 1);
+            util_format_pack_rgba(dst->format, to, v, 1);
+         } else {
+            float v[4];
+
+            util_format_unpack_rgba(src->format, v, from, 1);
+            util_format_pack_rgba(dst->format, to, v, 1);
+         }
+      }
+   }
+}
+
+static void
+run(struct pvr_device *device, const struct pvr_transfer_cmd *cmd)
+{
+   struct surface dst;
+
+   if (!surface_init(device, &cmd->dst, &dst))
+      return;
+   if (cmd->flags & PVR_TRANSFER_CMD_FLAGS_FILL) {
+      fill(cmd, &dst);
+      return;
+   }
+   for (unsigned i = 0; i < cmd->source_count; i++) {
+      const struct pvr_transfer_cmd_source *source = &cmd->sources[i];
+      struct surface src;
+
+      if (!surface_init(device, &source->surface, &src))
+         continue;
+      if (!source->mapping_count) {
+         /* the whole destination scissor, 1:1 */
+         const struct pvr_rect_mapping m = { .src_rect = cmd->scissor,
+                                             .dst_rect = cmd->scissor };
+
+         copy(&m, &src, &dst);
+      }
+      for (unsigned k = 0; k < source->mapping_count; k++)
+         copy(&source->mappings[k], &src, &dst);
+   }
+}
+
+VkResult
+PVR_PER_ARCH(g9p_transfer_submit)(struct pvr_device *device,
+                                  struct pvr_sub_cmd_transfer *sub_cmd,
+                                  struct vk_sync *wait_sync, struct vk_sync *signal_sync)
+{
+   VkResult result;
+
+   if (wait_sync) {
+      result = vk_sync_wait(&device->vk, wait_sync, 0, VK_SYNC_WAIT_COMPLETE, UINT64_MAX);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+   list_for_each_entry (struct pvr_transfer_cmd, cmd, sub_cmd->transfer_cmds, link)
+      run(device, cmd);
+   return vk_sync_signal(&device->vk, signal_sync, 0);
+}

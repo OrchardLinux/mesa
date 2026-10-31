@@ -1034,6 +1034,10 @@ emit_output(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
          release(ctx, &intr->instr);
          return true;
       }
+   } else if (sem.location > FRAG_RESULT_DATA0 && sem.location < FRAG_RESULT_DATA0 + 8) {
+      /* one colour attachment so far: the others' outputs are dropped */
+      release(ctx, &intr->instr);
+      return true;
    } else if (sem.location != FRAG_RESULT_DATA0 && sem.location != FRAG_RESULT_COLOR) {
       fprintf(stderr, "g9p: fragment output %u not supported yet\n", sem.location);
       return false;
@@ -1206,6 +1210,8 @@ emit_intrinsic(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
       return emit_mem(ctx, intr, buffer_slot(ctx, intr->src[1]),
                       nir_get_scalar(intr->src[2].ssa, 0), 0, &intr->src[0]);
    case nir_intrinsic_load_ssbo:
+   case nir_intrinsic_load_ubo:
+      /* uniform buffers: the same descriptor (address first) and loads */
       return emit_mem(ctx, intr, buffer_slot(ctx, intr->src[0]),
                       nir_get_scalar(intr->src[1].ssa, 0), 0, NULL);
    case nir_intrinsic_load_push_constant:
@@ -1684,7 +1690,7 @@ lower_front(nir_shader *nir)
    NIR_PASS(_, nir, nir_split_struct_vars, nir_var_function_temp);
    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
    NIR_PASS(_, nir, nir_lower_system_values);
-   NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo,
+   NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo | nir_var_mem_ubo,
             nir_address_format_32bit_index_offset);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const,
             nir_address_format_32bit_offset);
@@ -1721,8 +1727,8 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
 
    optimize(nir);
    NIR_PASS(_, nir, nir_lower_io_to_scalar,
-            nir_var_mem_ssbo | nir_var_mem_push_const | nir_var_shader_in |
-               nir_var_shader_out,
+            nir_var_mem_ssbo | nir_var_mem_ubo | nir_var_mem_push_const |
+               nir_var_shader_in | nir_var_shader_out,
             NULL, NULL);
    NIR_PASS(_, nir, nir_opt_algebraic_late);
    optimize(nir);

@@ -617,10 +617,12 @@ VkResult pvr_drm_winsys_render_submit(
    }
 
    jobs_args[0].sync_ops.count = num_geom_syncs;
-   jobs_args[1].sync_ops.count = num_pr_syncs;
+   /* the fragment job follows the partial-render job, or the geometry job without one */
+   if (pr_state->fw_stream_len)
+      jobs_args[1].sync_ops.count = num_pr_syncs;
 
    if (submit_info->has_fragment_job)
-      jobs_args[2].sync_ops.count = num_frag_syncs;
+      jobs_args[args.jobs.count - 1].sync_ops.count = num_frag_syncs;
 
    /* Returns VK_ERROR_OUT_OF_DEVICE_MEMORY to match pvrsrv. */
    return pvr_ioctlf(drm_ws->base.render_fd,

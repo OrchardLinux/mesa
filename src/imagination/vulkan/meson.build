@@ -97,6 +97,7 @@ common_per_arch_files += files(
   'pvr_arch_descriptor_set.c',
   'pvr_arch_g9p.c',
   'pvr_arch_g9p_gfx.c',
+  'pvr_arch_g9p_transfer.c',
   'pvr_arch_device.c',
   'pvr_arch_formats.c',
   'pvr_arch_framebuffer.c',

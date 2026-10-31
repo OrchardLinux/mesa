@@ -542,6 +542,26 @@ upload_textures(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics
 }
 
 /*
+ * The address of the buffer a descriptor set binding holds: read from the
+ * descriptor (its address comes first) or, for dynamic buffers, the set's
+ * dynamic buffer plus its bound offset
+ */
+static uint64_t
+descriptor_buffer_addr(const struct pvr_descriptor_set *ds, unsigned binding)
+{
+   const struct pvr_descriptor_set_layout_binding *b = &ds->layout->bindings[binding];
+
+   if (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC ||
+       b->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) {
+      const struct pvr_buffer_descriptor *d = &ds->dynamic_buffers[b->dynamic_buffer_idx];
+
+      return d->addr + d->offset;
+   }
+   return ((const struct pvr_buffer_descriptor *)((const uint8_t *)ds->mapping + b->offset))
+      ->addr;
+}
+
+/*
  * The common store of the vertex shader: the addresses of its buffers
  * (vertex buffers, push constants), loaded by the draw's DMA program.
  */
@@ -568,8 +588,8 @@ upload_vs_uniforms(struct pvr_cmd_buffer *cmd_buffer,
       } else {
          const struct pvr_descriptor_set *ds = cs->gfx_desc_state.sets[set];
 
-         if (ds)
-            addrs[k] = ds->dev_addr.addr + ds->layout->bindings[binding].offset;
+         if (ds && ds->layout)
+            addrs[k] = descriptor_buffer_addr(ds, binding);
       }
    }
 

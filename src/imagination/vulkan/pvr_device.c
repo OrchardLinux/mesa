@@ -551,6 +551,12 @@ VkResult pvr_bind_memory(struct pvr_device *device,
    *dev_addr_out = dev_addr;
    *vma_out = vma;
 
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p)) {
+      simple_mtx_lock(&device->g9p_vmas.lock);
+      util_dynarray_append_typed(&device->g9p_vmas.vmas, struct pvr_winsys_vma *, vma);
+      simple_mtx_unlock(&device->g9p_vmas.lock);
+   }
+
    return VK_SUCCESS;
 
 err_free_vma:
@@ -562,6 +568,12 @@ err_out:
 
 void pvr_unbind_memory(struct pvr_device *device, struct pvr_winsys_vma *vma)
 {
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p)) {
+      simple_mtx_lock(&device->g9p_vmas.lock);
+      util_dynarray_delete_unordered(&device->g9p_vmas.vmas, struct pvr_winsys_vma *, vma);
+      simple_mtx_unlock(&device->g9p_vmas.lock);
+   }
+
    device->ws->ops->vma_unmap(vma);
    device->ws->ops->heap_free(vma);
 }

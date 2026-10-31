@@ -76,6 +76,14 @@ struct pvr_image_view;
 void PVR_PER_ARCH(g9p_pack_image_view)(const struct pvr_image_view *iview, uint64_t words[2]);
 uint64_t PVR_PER_ARCH(g9p_pack_sampler)(const VkSamplerCreateInfo *info);
 
+struct pvr_sub_cmd_transfer;
+struct vk_sync;
+VkResult PVR_PER_ARCH(g9p_transfer_submit)(struct pvr_device *device,
+                                           struct pvr_sub_cmd_transfer *sub_cmd,
+                                           struct vk_sync *wait_sync,
+                                           struct vk_sync *signal_sync);
+
+#   define pvr_arch_g9p_transfer_submit PVR_PER_ARCH(g9p_transfer_submit)
 #   define pvr_arch_g9p_pack_image_view PVR_PER_ARCH(g9p_pack_image_view)
 #   define pvr_arch_g9p_pack_sampler PVR_PER_ARCH(g9p_pack_sampler)
 #   define pvr_arch_g9p_gfx_device_init PVR_PER_ARCH(g9p_gfx_device_init)

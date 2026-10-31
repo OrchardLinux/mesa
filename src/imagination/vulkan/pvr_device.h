@@ -23,6 +23,8 @@
 #include "wsi_common.h"
 
 #include "util/mesa-blake3.h"
+#include "util/simple_mtx.h"
+#include "util/u_dynarray.h"
 
 #include "ds/pvr_driver_ds.h"
 #include "pvr_bo.h"
@@ -65,6 +67,15 @@ struct pvr_device {
 
    struct pvr_queue *queues;
    uint32_t queue_count;
+
+   /*
+    * Apple G9P: the bound buffer/image ranges, to find device addresses'
+    * memory for transfers done on the CPU (pvr_arch_g9p_transfer.c)
+    */
+   struct {
+      simple_mtx_t lock;
+      struct util_dynarray vmas; /* struct pvr_winsys_vma * */
+   } g9p_vmas;
 
    /* Running count of the number of job submissions across all queue. */
    uint32_t global_cmd_buffer_submit_count;

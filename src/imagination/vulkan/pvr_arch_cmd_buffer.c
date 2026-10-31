@@ -9240,7 +9240,9 @@ void PVR_PER_ARCH(CmdDraw)(VkCommandBuffer commandBuffer,
          .offset = firstVertex,
       };
 
-      result = pvr_arch_g9p_cmd_draw(cmd_buffer, &draw);
+      result = pvr_flush_push_descriptors(cmd_buffer, &state->gfx_desc_state);
+      if (result == VK_SUCCESS)
+         result = pvr_arch_g9p_cmd_draw(cmd_buffer, &draw);
       if (result != VK_SUCCESS)
          vk_command_buffer_set_error(&cmd_buffer->vk, result);
       goto end_cmd_draw;
@@ -9304,7 +9306,9 @@ void PVR_PER_ARCH(CmdDrawIndexed)(VkCommandBuffer commandBuffer,
          .offset = vertexOffset,
       };
 
-      result = pvr_arch_g9p_cmd_draw(cmd_buffer, &draw);
+      result = pvr_flush_push_descriptors(cmd_buffer, &state->gfx_desc_state);
+      if (result == VK_SUCCESS)
+         result = pvr_arch_g9p_cmd_draw(cmd_buffer, &draw);
       if (result != VK_SUCCESS)
          vk_command_buffer_set_error(&cmd_buffer->vk, result);
       goto end_cmd_draw_indexed;

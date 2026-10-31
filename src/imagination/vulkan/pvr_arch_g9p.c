@@ -45,6 +45,9 @@ PVR_PER_ARCH(g9p_device_init)(struct pvr_device *device)
    uint32_t data[4] = { 0 }, code[4];
    VkResult result;
 
+   simple_mtx_init(&device->g9p_vmas.lock, mtx_plain);
+   util_dynarray_init(&device->g9p_vmas.vmas, NULL);
+
    for (unsigned i = 0; i < ARRAY_SIZE(empty); i++)
       empty[i] = 0xc000;
    g9p_usc_empty_kernel(empty);
@@ -89,6 +92,8 @@ PVR_PER_ARCH(g9p_device_finish)(struct pvr_device *device)
    pvr_bo_suballoc_free(device->g9p.fence.pvr_bo);
    pvr_bo_suballoc_free(device->g9p.kick.pvr_bo);
    pvr_bo_suballoc_free(device->g9p.empty_kernel);
+   util_dynarray_fini(&device->g9p_vmas.vmas);
+   simple_mtx_destroy(&device->g9p_vmas.lock);
 }
 
 VkResult
