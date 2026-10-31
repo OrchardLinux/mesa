@@ -145,6 +145,7 @@ struct pvr_g9p_graphics_state {
    unsigned vs_regs;
    /* the fragment shader may discard: punch-through pass type */
    bool uses_discard;
+   bool uses_fbfetch;
    /* the vertex shader's common-store slots: vertex buffers, push constants, buffers */
    unsigned num_buffers;
    struct {

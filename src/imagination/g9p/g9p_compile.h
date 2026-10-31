@@ -12,6 +12,7 @@
 #include <stdint.h>
 
 #include "compiler/nir/nir.h"
+#include "compiler/nir/nir_lower_blend.h"
 
 #define G9P_MAX_BUFFERS 8
 #define G9P_MAX_ATTRIBS 16
@@ -102,6 +103,7 @@ struct g9p_shader {
    bool uses_frag_coord;
    /* Fragment: may discard (punch-through pass type) */
    bool uses_discard;
+   bool uses_fbfetch;
 
    /* Fragment: the combined image samplers sampled, by common-store slot */
    unsigned num_textures;
@@ -135,7 +137,13 @@ unsigned g9p_frag_coord_slot(const nir_shader *vs);
 bool g9p_compile_vertex(nir_shader *nir, const struct g9p_vertex_attrib *attribs,
                         int frag_coord_slot, struct g9p_shader *out, void *mem_ctx);
 
-bool g9p_compile_fragment(nir_shader *nir, unsigned frag_coord_slot, struct g9p_shader *out,
+/*
+ * Fragment shader: @blend, if not NULL, is done in the shader (Apple's way:
+ * nir_lower_blend, reading the tile's colour); out->uses_fbfetch tells the
+ * pipeline to mark its draws translucent.
+ */
+bool g9p_compile_fragment(nir_shader *nir, unsigned frag_coord_slot,
+                          const nir_lower_blend_options *blend, struct g9p_shader *out,
                           void *mem_ctx);
 
 #endif /* G9P_COMPILE_H */

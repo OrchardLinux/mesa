@@ -1180,6 +1180,46 @@ emit_output(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
    return true;
 }
 
+/*
+ * One 32-bit word of the colour attachment's current value (two halves;
+ * lower_fb_fetch() makes the f32 components from it): the tile's four
+ * halves into an even register pair, the word's register kept. Apple's
+ * half-to-f32 conversion (0189 81dd 8hh1 01a0 0304 0070) only writes r0-r2,
+ * so the conversion is integer code instead.
+ */
+static bool
+emit_fb_fetch(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
+{
+   nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+   unsigned word = nir_intrinsic_component(intr);
+   int pair = -1;
+
+   if (ctx->stage != MESA_SHADER_FRAGMENT || word > 1 ||
+       (sem.location != FRAG_RESULT_DATA0 && sem.location != FRAG_RESULT_COLOR)) {
+      fprintf(stderr, "g9p: only the first colour attachment can be read so far\n");
+      return false;
+   }
+   release(ctx, &intr->instr);
+   for (unsigned r = 0; r + 1 < G9P_NUM_REGS; r += 2) {
+      if (!(ctx->busy & BITFIELD64_RANGE(r, 2))) {
+         pair = r;
+         break;
+      }
+   }
+   if (pair < 0) {
+      dump_busy(ctx);
+      return false;
+   }
+   ctx->max_reg = MAX2(ctx->max_reg, pair + 1);
+   g9p_tile_read(ctx->c, pair);
+   g9p_wait(ctx->c);
+   if (ctx->last_use[key(&intr->def, 0)]) {
+      ctx->reg[key(&intr->def, 0)] = pair + word;
+      ctx->busy |= BITFIELD64_BIT(pair + word);
+   }
+   return true;
+}
+
 /* The texture slot of a combined image sampler deref, added if new */
 static int
 texture_slot(struct g9p_ctx *ctx, nir_tex_instr *tex)
@@ -1357,6 +1397,8 @@ emit_intrinsic(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
       return emit_varying_load(ctx, intr, perspective(intr));
    case nir_intrinsic_store_output:
       return emit_output(ctx, intr);
+   case nir_intrinsic_load_output:
+      return emit_fb_fetch(ctx, intr);
 
    case nir_intrinsic_store_ssbo:
       return emit_mem(ctx, intr, buffer_slot(ctx, intr->src[1]),
@@ -1865,6 +1907,38 @@ zero_descriptor_offset(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return true;
 }
 
+/*
+ * Framebuffer fetch (nir_lower_blend's load_output): each f32 component
+ * from a raw 32-bit word of the tile (emit_fb_fetch(), dest_type uint32),
+ * f16 to f32 in integer code: h ? (h & 0x7fff) << 13 + 0x38000000 : 0,
+ * exact for the zero and normal values of unorm attachments (no denormals,
+ * infinities or NaNs there)
+ */
+static bool
+lower_fb_fetch_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   nir_def *comps[4];
+
+   if (intr->intrinsic != nir_intrinsic_load_output ||
+       nir_intrinsic_dest_type(intr) == nir_type_uint32)
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   for (unsigned i = 0; i < intr->def.num_components; i++) {
+      const unsigned k = nir_intrinsic_component(intr) + i;
+      nir_def *word = nir_load_output(b, 1, 32, nir_imm_int(b, 0),
+                                      .base = nir_intrinsic_base(intr), .component = k / 2,
+                                      .dest_type = nir_type_uint32,
+                                      .io_semantics = nir_intrinsic_io_semantics(intr));
+      nir_def *h = k & 1 ? nir_ushr_imm(b, word, 16) : nir_iand_imm(b, word, 0xffff);
+      nir_def *bits = nir_iadd_imm(b, nir_ishl_imm(b, nir_iand_imm(b, h, 0x7fff), 13),
+                                   0x38000000);
+
+      comps[i] = nir_bcsel(b, nir_ieq_imm(b, h, 0), nir_imm_int(b, 0), bits);
+   }
+   nir_def_replace(&intr->def, nir_vec(b, comps, intr->def.num_components));
+   return true;
+}
+
 /* One function, globals as locals; buffers and push constants lowered */
 static void
 lower_front(nir_shader *nir)
@@ -2163,12 +2237,18 @@ discards_to_if(nir_shader *nir)
 }
 
 bool
-g9p_compile_fragment(nir_shader *nir, unsigned frag_coord_slot, struct g9p_shader *out,
+g9p_compile_fragment(nir_shader *nir, unsigned frag_coord_slot,
+                     const nir_lower_blend_options *blend, struct g9p_shader *out,
                      void *mem_ctx)
 {
    memset(out, 0, sizeof(*out));
    lower_front(nir);
    NIR_PASS(_, nir, discards_to_if);
    lower_io(nir);
+   if (blend)
+      NIR_PASS(_, nir, nir_lower_blend, blend);
+   out->uses_fbfetch = nir->info.fs.uses_fbfetch_output;
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_fb_fetch_instr, nir_metadata_control_flow,
+            NULL);
    return compile_back(nir, out, MESA_SHADER_FRAGMENT, NULL, frag_coord_slot, mem_ctx);
 }

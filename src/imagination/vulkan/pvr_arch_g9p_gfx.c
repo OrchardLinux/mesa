@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "vk_blend.h"
 #include "vk_format.h"
 #include "vk_pipeline.h"
 
@@ -342,18 +343,57 @@ stage_nir(struct pvr_device *device, struct pvr_graphics_pipeline *pipeline,
                                           nir);
 }
 
+/*
+ * Blending of the first colour attachment, done in the fragment shader as
+ * Apple's compiler does (it reads the tile's colour, `blend` capture and
+ * offline probes); false when the attachment is written as is
+ */
+static bool
+blend_options(const struct vk_graphics_pipeline_state *vk_state, nir_lower_blend_options *opts)
+{
+   const struct vk_color_blend_state *cb = vk_state->cb;
+   const struct vk_color_blend_attachment_state *rt;
+
+   if (!cb || !cb->attachment_count || !vk_state->rp ||
+       !vk_state->rp->color_attachment_count)
+      return false;
+   rt = &cb->attachments[0];
+   if (!rt->blend_enable && !cb->logic_op_enable && (rt->write_mask & 0xf) == 0xf)
+      return false;
+
+   memset(opts, 0, sizeof(*opts));
+   opts->scalar_blend_const = true;
+   opts->logicop_enable = cb->logic_op_enable;
+   opts->logicop_func = vk_logic_op_to_pipe(cb->logic_op);
+   opts->rt[0].format = vk_format_to_pipe_format(vk_state->rp->color_attachment_formats[0]);
+   opts->rt[0].colormask = rt->write_mask;
+   if (rt->blend_enable && !cb->logic_op_enable) {
+      opts->rt[0].rgb.func = vk_blend_op_to_pipe(rt->color_blend_op);
+      opts->rt[0].rgb.src_factor = vk_blend_factor_to_pipe(rt->src_color_blend_factor);
+      opts->rt[0].rgb.dst_factor = vk_blend_factor_to_pipe(rt->dst_color_blend_factor);
+      opts->rt[0].alpha.func = vk_blend_op_to_pipe(rt->alpha_blend_op);
+      opts->rt[0].alpha.src_factor = vk_blend_factor_to_pipe(rt->src_alpha_blend_factor);
+      opts->rt[0].alpha.dst_factor = vk_blend_factor_to_pipe(rt->dst_alpha_blend_factor);
+   } else {
+      opts->rt[0].rgb.func = opts->rt[0].alpha.func = PIPE_BLEND_ADD;
+      opts->rt[0].rgb.src_factor = opts->rt[0].alpha.src_factor = PIPE_BLENDFACTOR_ONE;
+      opts->rt[0].rgb.dst_factor = opts->rt[0].alpha.dst_factor = PIPE_BLENDFACTOR_ZERO;
+   }
+   return true;
+}
+
 static VkResult
 compile_stage(struct pvr_device *device, nir_shader *nir,
               const VkPipelineShaderStageCreateInfo *stage,
               const struct g9p_vertex_attrib *attribs, int frag_coord_slot,
-              struct g9p_shader *out, void *mem_ctx)
+              const nir_lower_blend_options *blend, struct g9p_shader *out, void *mem_ctx)
 {
    bool ok;
 
    if (stage->stage == VK_SHADER_STAGE_VERTEX_BIT)
       ok = g9p_compile_vertex(nir, attribs, frag_coord_slot, out, mem_ctx);
    else
-      ok = g9p_compile_fragment(nir, frag_coord_slot, out, mem_ctx);
+      ok = g9p_compile_fragment(nir, frag_coord_slot, blend, out, mem_ctx);
    if (!ok)
       return g9p_error(device,
                        "G9P: %s shader not supported by the backend yet",
@@ -448,6 +488,7 @@ PVR_PER_ARCH(g9p_graphics_pipeline_compile)(struct pvr_device *device,
    {
       /* gl_FragCoord's varying follows the vertex shader's own */
       nir_shader *vs_nir, *fs_nir;
+      nir_lower_blend_options blend;
       unsigned slot;
 
       result = stage_nir(device, pipeline, vs_info, mem_ctx, &vs_nir);
@@ -456,10 +497,11 @@ PVR_PER_ARCH(g9p_graphics_pipeline_compile)(struct pvr_device *device,
       if (result != VK_SUCCESS)
          goto out;
       slot = g9p_frag_coord_slot(vs_nir);
-      result = compile_stage(device, fs_nir, fs_info, NULL, slot, &fs, mem_ctx);
+      result = compile_stage(device, fs_nir, fs_info, NULL, slot,
+                             blend_options(vk_state, &blend) ? &blend : NULL, &fs, mem_ctx);
       if (result == VK_SUCCESS)
          result = compile_stage(device, vs_nir, vs_info, attribs,
-                                fs.uses_frag_coord ? (int)slot : -1, &vs, mem_ctx);
+                                fs.uses_frag_coord ? (int)slot : -1, NULL, &vs, mem_ctx);
    }
    if (result != VK_SUCCESS)
       goto out;
@@ -495,6 +537,7 @@ PVR_PER_ARCH(g9p_graphics_pipeline_compile)(struct pvr_device *device,
    state->num_varyings = vs.num_varyings;
    state->vs_outputs = vs.num_outputs;
    state->uses_discard = fs.uses_discard;
+   state->uses_fbfetch = fs.uses_fbfetch;
    state->vs_regs = vs.num_regs;
    state->num_buffers = vs.num_buffers;
    for (unsigned i = 0; i < vs.num_buffers; i++) {
@@ -953,7 +996,7 @@ emit_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state
    const struct pvr_pds_upload *dma = dp->dma, *tex = dp->tex;
    struct pvr_csb *csb = &cs->current_sub_cmd->gfx.control_stream;
    struct pvr_suballoc_bo *ppp_bo;
-   uint32_t ppp[64], at = 0, blocks[12][2], nb = 0;
+   uint32_t ppp[64], at = 0, blocks[12][2], nb = 0, pass;
    VkResult result;
 
    /*
@@ -991,12 +1034,13 @@ emit_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state
    PPP_BLOCK(0x00020000, state->vs_outputs << 24 | 0x00010000);
    /*
     * 3: ISP control and front/back words (no depth, no culling yet); pass
-    * type in ISPA/BA bits 24-26: 4 punch-through for discarding shaders
-    * (`discard` capture)
+    * type in ISPA/BA bits 24-26: 1 translucent for shaders that read the
+    * tile (blending, `blend` capture), else 4 punch-through for discarding
+    * shaders (`discard` capture)
     */
+   pass = state->uses_fbfetch ? 1u : state->uses_discard ? 4u : 0u;
    PPP_BLOCK(0x1f, 0x03c40000 | (dp->scissor >= 0 ? BITFIELD_BIT(16) : 0),
-             0x003e0f00 | (state->uses_discard ? 4u << 24 : 0), 0x0e000000,
-             0x00100f00 | (state->uses_discard ? 4u << 24 : 0), 0);
+             0x003e0f00 | pass << 24, 0x0e000000, 0x00100f00 | pass << 24, 0);
    /* 4: region clip (32-pixel units) and the viewport (a0 m0 a1 m1 a2 m2) */
    PPP_BLOCK(0xc00, 0x80000000u | (DIV_ROUND_UP(width, 32) - 1), DIV_ROUND_UP(height, 32) - 1,
              fui(dp->vp[0]), fui(dp->vp[1]), fui(dp->vp[2]), fui(dp->vp[3]), fui(dp->vp[4]),

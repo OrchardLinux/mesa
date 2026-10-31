@@ -479,6 +479,18 @@ g9p_to_half(struct g9p_code *c, unsigned h, unsigned src)
 }
 
 /*
+ * Read the tile's colour (framebuffer fetch) as four halves into r[dst] and
+ * r[dst + 1]; follow with g9p_wait(). The operand is the first half's index
+ * (`2804`: halves 4-7, r2-r3, in Apple's source-over blend; offline probes
+ * with Metal's [[color(0)]] input).
+ */
+static inline void
+g9p_tile_read(struct g9p_code *c, unsigned dst)
+{
+   G9P_EMIT(c, 0x211c, 0x2800 | 2 * dst);
+}
+
+/*
  * Discard the active lanes (`6804`; Apple's compiler emits it alone for an
  * unconditional discard and `6004` after a compare for a conditional one)
  */
