@@ -206,6 +206,28 @@ PVR_PER_ARCH(g9p_gfx_device_init)(struct pvr_device *device)
       goto out;
 
    /*
+    * Load op (iPadOS's `load` capture): the pixel position (211c 6800, x
+    * and y as u16 halves in 1/16 pixels, the sample centre), u2f each,
+    * times 1/(16 width) and 1/(16 height) (common-store dwords 12-13) into
+    * r0-r1, the texture sample with the state at dword 0 and the sampler at
+    * 8 into the colour halves, output
+    */
+   c->n = 0;
+   c->fragment = true;
+   G9P_EMIT(c, 0x211c, 0x6800);
+   g9p_wait(c);
+   g9p_convert(c, 2, 0, G9P_U2F);
+   g9p_convert(c, 3, 1, G9P_U2F);
+   G9P_EMIT(c, 0x0199, g9p_dst(c, 0), 0x0181 | 12 << 2 | 2 << 10, 0x4100, G9P_FMUL);
+   G9P_EMIT(c, 0x0199, g9p_dst(c, 1), 0x0181 | 13 << 2 | 3 << 10, 0x4100, G9P_FMUL);
+   G9P_EMIT(c, 0xf518, 0x0100, 0x8108, 0x0700, 0x0200);
+   g9p_wait(c);
+   g9p_end_fragment(c, true);
+   result = upload_usc(device, c, &p->load_usc);
+   if (result != VK_SUCCESS)
+      goto out;
+
+   /*
     * Clear rectangles' vertex shader (pvr-tri's): (x, y) at common-store
     * dwords 0-1's address + 8 x the vertex index, z 0, w 1
     */
@@ -238,6 +260,8 @@ PVR_PER_ARCH(g9p_gfx_device_init)(struct pvr_device *device)
    }
 
    result = upload_kick(device, p->clear_usc, 8, 0, &p->clear_kick);
+   if (result == VK_SUCCESS)
+      result = upload_kick(device, p->load_usc, 8, 0, &p->load_kick);
    if (result == VK_SUCCESS)
       result = upload_kick(device, p->vdm_end_usc, 8, 0, &p->vdm_end);
    if (result == VK_SUCCESS)
@@ -287,6 +311,8 @@ PVR_PER_ARCH(g9p_gfx_device_finish)(struct pvr_device *device)
    pvr_bo_suballoc_free(p->eot_usc);
    pvr_bo_suballoc_free(p->clear_usc);
    pvr_bo_suballoc_free(p->clear_vs_usc);
+   pvr_bo_suballoc_free(p->load_usc);
+   pvr_bo_suballoc_free(p->load_kick.pvr_bo);
    pvr_bo_suballoc_free(p->clear_vs_kick.pvr_bo);
 }
 
@@ -692,6 +718,13 @@ buffer_addrs(struct pvr_cmd_buffer *cmd_buffer, unsigned n, const unsigned (*set
 
          if (vb->buffer)
             addrs[k] = vb->buffer->dev_addr.addr + vb->offset;
+         if (vb->buffer && dumping()) {
+            const uint32_t *v = (const uint32_t *)PVR_PER_ARCH(g9p_cpu_addr)(cmd_buffer->device,
+                                                                            addrs[k]);
+
+            if (v)
+               dump32("vertex buffer", addrs[k], v, 16);
+         }
       } else if (set == G9P_VERTEX_STRIDES) {
          addrs[k] = cmd_buffer->vk.dynamic_graphics_state.vi_binding_strides[binding];
       } else if (set == G9P_PUSH_CONSTANTS) {
@@ -726,6 +759,14 @@ buffer_addrs(struct pvr_cmd_buffer *cmd_buffer, unsigned n, const unsigned (*set
 
          if (ds && ds->layout)
             addrs[k] = descriptor_buffer_addr(ds, binding);
+         if (addrs[k] && dumping()) {
+            const uint32_t *v = (const uint32_t *)PVR_PER_ARCH(g9p_cpu_addr)(cmd_buffer->device,
+                                                                            addrs[k]);
+
+            if (v)
+               dump32(stage == PVR_STAGE_ALLOCATION_FRAGMENT ? "fs buffer" : "vs buffer",
+                      addrs[k], v, 16);
+         }
       }
    }
    return VK_SUCCESS;
@@ -790,7 +831,30 @@ struct g9p_draw_programs {
    const struct pvr_pds_upload *dma, *tex;
    unsigned fs_common_dwords;
    float vp[6]; /* a0 m0 a1 m1 a2 m2 */
+   /* the draw's entry in the render's scissor table, or -1 for none */
+   int scissor;
 };
+
+/*
+ * A scissor table entry for the render (the scissor capture: {left << 16 |
+ * right, top << 16 | bottom}, right and bottom exclusive), reusing the
+ * previous one when equal; its index
+ */
+static int
+scissor_index(struct pvr_cmd_buffer *cmd_buffer, VkRect2D r)
+{
+   struct util_dynarray *a = &cmd_buffer->scissor_array;
+   const struct pvr_scissor_words w = {
+      .w0 = (uint32_t)r.offset.x << 16 | (r.offset.x + r.extent.width),
+      .w1 = (uint32_t)r.offset.y << 16 | (r.offset.y + r.extent.height),
+   };
+   const unsigned n = util_dynarray_num_elements(a, struct pvr_scissor_words);
+
+   if (n && !memcmp(util_dynarray_element(a, struct pvr_scissor_words, n - 1), &w, sizeof(w)))
+      return n - 1;
+   util_dynarray_append_typed(a, struct pvr_scissor_words, w);
+   return n;
+}
 
 static VkResult emit_draw(struct pvr_cmd_buffer *cmd_buffer,
                           const struct pvr_g9p_graphics_state *state,
@@ -813,6 +877,19 @@ PVR_PER_ARCH(g9p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer,
    VkResult result;
 
    result = pvr_arch_cmd_buffer_start_sub_cmd(cmd_buffer, PVR_SUB_CMD_TYPE_GRAPHICS);
+   /* the scissor (all of the render area without one), within the render area */
+   {
+      const VkRect2D *ra = &info->render_area;
+      VkRect2D sc = dyn->vp.scissor_count ? dyn->vp.scissors[0] : *ra;
+      const int32_t x0 = MAX2(sc.offset.x, ra->offset.x), y0 = MAX2(sc.offset.y, ra->offset.y);
+      const int32_t x1 = MIN2((int64_t)sc.offset.x + sc.extent.width, (int64_t)width);
+      const int32_t y1 = MIN2((int64_t)sc.offset.y + sc.extent.height, (int64_t)height);
+
+      if (x1 <= x0 || y1 <= y0)
+         return VK_SUCCESS; /* nothing passes */
+      sc = (VkRect2D){ { x0, y0 }, { x1 - x0, y1 - y0 } };
+      dp.scissor = scissor_index(cmd_buffer, sc);
+   }
    if (result != VK_SUCCESS)
       return result;
    {
@@ -917,7 +994,8 @@ emit_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state
     * type in ISPA/BA bits 24-26: 4 punch-through for discarding shaders
     * (`discard` capture)
     */
-   PPP_BLOCK(0x1f, 0x03c40000, 0x003e0f00 | (state->uses_discard ? 4u << 24 : 0), 0x0e000000,
+   PPP_BLOCK(0x1f, 0x03c40000 | (dp->scissor >= 0 ? BITFIELD_BIT(16) : 0),
+             0x003e0f00 | (state->uses_discard ? 4u << 24 : 0), 0x0e000000,
              0x00100f00 | (state->uses_discard ? 4u << 24 : 0), 0);
    /* 4: region clip (32-pixel units) and the viewport (a0 m0 a1 m1 a2 m2) */
    PPP_BLOCK(0xc00, 0x80000000u | (DIV_ROUND_UP(width, 32) - 1), DIV_ROUND_UP(height, 32) - 1,
@@ -925,8 +1003,8 @@ emit_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state
              fui(dp->vp[5]));
    /* 5: w clamp (1e-20) and PPP control */
    PPP_BLOCK(0x00210000, 0x1e3ce508, 0x4a0);
-   /* 6: depth bias / scissor index */
-   PPP_BLOCK(0x20, 0);
+   /* 6: depth bias / scissor index (ISPCTL bit 16 enables the scissor) */
+   PPP_BLOCK(0x20, dp->scissor >= 0 ? (uint32_t)dp->scissor : 0);
    /* 7: stream out (the data's address; HALT after it) */
    PPP_BLOCK(0x00c00000, 1, 0x4022, p->stream_out.data_offset);
 #undef PPP_BLOCK
@@ -1022,6 +1100,7 @@ PVR_PER_ARCH(g9p_clear_attachments)(struct pvr_cmd_buffer *cmd_buffer, uint32_t 
    struct g9p_draw_programs dp = {
       .dma = &dma, .tex = &colour_dma, .fs_common_dwords = 4,
       .vp = { w / 2, w / 2, h / 2, h / 2, 0, 1 },
+      .scissor = -1,
    };
    struct pvr_suballoc_bo *verts_bo, *table_bo, *colour_bo;
    float *verts;
@@ -1260,28 +1339,52 @@ PVR_PER_ARCH(g9p_job_init)(struct pvr_cmd_buffer *cmd_buffer,
    job->g9p.eot_code = p->eot.code_offset;
 
    /*
-    * Background object: the clear colour of the first colour attachment,
-    * loaded into the common store and output by the clear shader. Load ops
-    * other than clear still clear (to transparent black).
+    * Background object. Load op load: the load shader with the target's own
+    * texture state (dwords 0-7), a nearest/clamp sampler (8-9) and its
+    * coordinate scale (12-13) in the common store. Otherwise the clear
+    * colour of the first colour attachment (dwords 0-3) and the clear
+    * shader; load ops other than these clear to transparent black.
     */
-   if (hw_render->color_init_count &&
-       hw_render->color_init[0].op == VK_ATTACHMENT_LOAD_OP_CLEAR &&
-       hw_render->color_init[0].index < info->clear_value_count)
+   const bool load = hw_render->eot_surface_count && hw_render->color_init_count &&
+                     hw_render->color_init[0].op == VK_ATTACHMENT_LOAD_OP_LOAD;
+   uint32_t bg[16] = { 0 };
+   unsigned bg_dwords = 4;
+
+   if (load) {
+      const struct pvr_image_view *iview =
+         info->attachments[hw_render->eot_surfaces[0].attachment_idx];
+      uint64_t tex[2];
+
+      PVR_PER_ARCH(g9p_pack_image_view)(iview, tex);
+      memcpy(bg, tex, sizeof(tex));
+      bg[8] = 0x000e0000;
+      bg[9] = 0x00c00780;
+      bg[12] = fui(1.0f / (16 * iview->vk.extent.width));
+      bg[13] = fui(1.0f / (16 * iview->vk.extent.height));
+      bg_dwords = 16;
+   } else if (hw_render->color_init_count &&
+              hw_render->color_init[0].op == VK_ATTACHMENT_LOAD_OP_CLEAR &&
+              hw_render->color_init[0].index < info->clear_value_count) {
       memcpy(clear, info->clear_values[hw_render->color_init[0].index].color.float32,
              sizeof(clear));
-   result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, clear, sizeof(clear), &bo);
+   }
+   job->g9p.load = load;
+   if (!load)
+      memcpy(bg, clear, sizeof(clear));
+   result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, bg, 4 * bg_dwords, &bo);
    if (result != VK_SUCCESS)
       return result;
    {
       const uint32_t data[4] = { bo->dev_addr.addr, bo->dev_addr.addr >> 32,
-                                 doutd_ctrl(0, 4, true), 0 };
+                                 doutd_ctrl(0, bg_dwords, true), 0 };
 
       result = pvr_arch_cmd_buffer_upload_pds(cmd_buffer, data, ARRAY_SIZE(data), 16, NULL,
                                               0, 0, 64, &up);
       if (result != VK_SUCCESS)
          return result;
    }
-   job->g9p.bgnd[0] = (uint64_t)p->dma.code_offset << 32 | p->clear_kick.data_offset;
+   job->g9p.bgnd[0] = (uint64_t)p->dma.code_offset << 32 |
+                      (load ? p->load_kick.data_offset : p->clear_kick.data_offset);
    job->g9p.bgnd[1] = 0;
    job->g9p.bgnd[2] = up.data_offset;
    job->g9p.bgnd[3] = 0x0080000000800000ull;
@@ -1378,8 +1481,10 @@ PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
    struct g9p_stream s = { .buf = buf, .len = 8, .size = size };
    const float t15 = tanf(15.0f * M_PI / 180.0f), t60 = tanf(60.0f * M_PI / 180.0f);
 
-   for (unsigned i = 0; i < 6; i++)
-      put64(&s, 0); /* ISP scissor/dbias/oclqry/zls bases */
+   /* ISP scissor table base, then the dbias/oclqry/zls bases */
+   put64(&s, job->scissor_table_addr.addr);
+   for (unsigned i = 1; i < 6; i++)
+      put64(&s, 0);
    for (unsigned i = 0; i < 8 * 3; i++)
       put64(&s, 0); /* PBE words: in the image state instead */
    put64(&s, 0);

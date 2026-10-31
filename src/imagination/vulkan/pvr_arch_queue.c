@@ -382,6 +382,34 @@ pvr_process_graphics_cmd_for_view(struct pvr_device *device,
          for (unsigned i = 0; i < MIN2(job->g9p_draws.num_draws, 16); i++)
             fprintf(stderr, " %u", job->g9p_draws.pipelines[i]);
          fprintf(stderr, "\n");
+      } else if (getenv("G9P_PROBE")) {
+         /* G9P_PROBE=1: eight pixels down the target's diagonal after each render */
+         const uint8_t *px = PVR_PER_ARCH(g9p_cpu_addr)(device, job->g9p.target_addr);
+         const unsigned pw = util_next_power_of_two(job->g9p.width);
+         const unsigned ph = util_next_power_of_two(job->g9p.height);
+
+         fprintf(stderr, "g9p: probe %#" PRIx64 " %s %u draws (pipelines %u %u):",
+                 job->g9p.target_addr, job->g9p.load ? "loaded" : "cleared",
+                 job->g9p_draws.num_draws, job->g9p_draws.pipelines[0],
+                 job->g9p_draws.pipelines[1]);
+         for (unsigned i = 0; px && i < 8; i++) {
+            const unsigned x = job->g9p.width * (2 * i + 1) / 16;
+            const unsigned y = job->g9p.height * (2 * i + 1) / 16;
+            unsigned m = 0, bit = 0;
+
+            if (job->g9p.target_linear) {
+               m = y * (job->g9p.target_pitch / 4) + x;
+            } else {
+               for (unsigned b = 0; (1u << b) < pw || (1u << b) < ph; b++) {
+                  if ((1u << b) < ph)
+                     m |= ((y >> b) & 1) << bit++;
+                  if ((1u << b) < pw)
+                     m |= ((x >> b) & 1) << bit++;
+               }
+            }
+            fprintf(stderr, " %08x", ((const uint32_t *)px)[m]);
+         }
+         fprintf(stderr, "\n");
       } else if (getenv("G9P_GRAB")) {
          /* G9P_GRAB=N: the first N renders' targets to /tmp/g9p-grab-K.raw */
          static unsigned grabbed;
@@ -392,7 +420,16 @@ pvr_process_graphics_cmd_for_view(struct pvr_device *device,
                : (size_t)4 * util_next_power_of_two(job->g9p.width) *
                     util_next_power_of_two(job->g9p.height);
 
-         if (px && grabbed < (unsigned)atoi(getenv("G9P_GRAB"))) {
+         /*
+          * G9P_GRAB_LOADED=1: only renders whose background loads the
+          * target; G9P_GRAB_SKIP=K: not the first K (of the twiddled ones)
+          */
+         static unsigned seen;
+
+         if (px && !job->g9p.target_linear && seen++ < (unsigned)atoi(getenv("G9P_GRAB_SKIP") ?: "0"))
+            px = NULL;
+         if (px && grabbed < (unsigned)atoi(getenv("G9P_GRAB")) &&
+             (job->g9p.load || !getenv("G9P_GRAB_LOADED"))) {
             char path[64];
             FILE *f;
 
@@ -401,9 +438,11 @@ pvr_process_graphics_cmd_for_view(struct pvr_device *device,
             if (f) {
                fwrite(px, 1, size, f);
                fclose(f);
-               fprintf(stderr, "g9p: %s: %ux%u %s pitch %u, %u draws\n", path, job->g9p.width,
-                       job->g9p.height, job->g9p.target_linear ? "linear" : "twiddled",
-                       job->g9p.target_pitch, job->g9p_draws.num_draws);
+               fprintf(stderr, "g9p: %s: %ux%u %s pitch %u at %#" PRIx64 ", %s, %u draws\n",
+                       path, job->g9p.width, job->g9p.height,
+                       job->g9p.target_linear ? "linear" : "twiddled", job->g9p.target_pitch,
+                       job->g9p.target_addr, job->g9p.load ? "loaded" : "cleared",
+                       job->g9p_draws.num_draws);
             }
          }
       }

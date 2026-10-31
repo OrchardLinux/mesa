@@ -98,6 +98,9 @@ struct pvr_device {
       /* and the device-level graphics programs (pvr_arch_g9p_gfx.c) */
       struct pvr_g9p_gfx_programs {
          struct pvr_suballoc_bo *clear_usc, *eot_usc, *vdm_end_usc;
+         /* load op: the old target sampled at the pixel position, and its kick */
+         struct pvr_suballoc_bo *load_usc;
+         struct pvr_pds_upload load_kick;
          /* vkCmdClearAttachments: a vertex shader of (x, y) pairs and its kick */
          struct pvr_suballoc_bo *clear_vs_usc;
          struct pvr_pds_upload clear_vs_kick;

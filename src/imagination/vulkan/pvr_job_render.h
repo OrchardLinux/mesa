@@ -150,6 +150,8 @@ struct pvr_render_job {
       uint64_t target_addr;
       uint32_t target_pitch;
       bool target_linear;
+      /* the background loads the target (load op load) */
+      bool load;
    } g9p;
 
    /* G9P_SYNC: the pipelines of the job's first draws, reported on a timeout */
