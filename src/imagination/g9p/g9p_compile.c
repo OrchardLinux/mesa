@@ -58,6 +58,9 @@ static const nir_shader_compiler_options nir_options = {
    .lower_fpow = true,
    .lower_fsqrt = true,
    .lower_ffract = true,
+   .lower_fceil = true,
+   .lower_ftrunc = true,
+   .lower_fround_even = true,
    .lower_flrp32 = true,
    .lower_fsat = true,
    .lower_find_lsb = true,
@@ -89,6 +92,8 @@ struct g9p_ctx {
    struct g9p_code *c;
    struct g9p_shader *out;
    mesa_shader_stage stage;
+   /* Fragment: gl_FragCoord's varying */
+   unsigned frag_coord_slot;
 
    /* Vertex: the attribute layout */
    const struct g9p_vertex_attrib *attribs;
@@ -1072,11 +1077,11 @@ emit_varying_load(struct g9p_ctx *ctx, nir_intrinsic_instr *intr, bool persp)
    return true;
 }
 
-/* gl_FragCoord: G9P_FRAG_COORD_VARYING, iterated without perspective */
+/* gl_FragCoord: the frag_coord_slot varying, iterated without perspective */
 static bool
 emit_frag_coord(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
 {
-   const unsigned n = G9P_FRAG_COORD_VARYING;
+   const unsigned n = ctx->frag_coord_slot;
 
    for (unsigned c = 0; c < intr->def.num_components; c++) {
       int r;
@@ -1312,13 +1317,12 @@ emit_intrinsic(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
       return true;
    case nir_intrinsic_demote_if:
    case nir_intrinsic_terminate_if: {
-      /* compare the condition with 0, discard where it is set (`6004`) */
-      int r = src_reg(ctx, nir_get_scalar(intr->src[0].ssa, 0));
+      /* discard where the condition (0 or ~0) is not 0 */
+      int r = src_reg(ctx, nir_get_scalar(intr->src[0].ssa, 0)), zero = const_reg(ctx, 0);
 
-      if (r < 0)
+      if (r < 0 || zero < 0)
          return false;
-      g9p_cmp_imm(ctx->c, G9P_UGT, r, 0);
-      g9p_discard_cmp(ctx->c);
+      g9p_discard_cmp(ctx->c, G9P_DISCARD_INE, r, zero);
       release(ctx, &intr->instr);
       ctx->out->uses_discard = true;
       return true;
@@ -1661,16 +1665,20 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
    uint16_t *body;
    unsigned body_n;
 
-   const bool cf = !exec_list_is_singular(&impl->body);
+   bool stack;
 
    memset(ctx->reg, -1, impl->ssa_alloc * 4);
    ctx->c->n = 0;
+   ctx->c->uses_stack = false;
    ctx->busy = ctx->pinned = ctx->temps = 0;
    ctx->max_reg = 0;
    ctx->st = st;
    ctx->out->num_buffers = 0;
    ctx->out->uses_workgroup_id = false;
    ctx->out->num_varyings = 0;
+   /* varyings the shader does not read are iterated with perspective */
+   for (unsigned i = 0; i < G9P_MAX_VARYINGS; i++)
+      ctx->out->varying_perspective[i] = true;
    ctx->out->num_textures = 0;
    ctx->out->uses_discard = false;
    ctx->num_exit_jumps = 0;
@@ -1703,9 +1711,11 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
 
    /*
     * Frame. Compute: prologue (thread count), mask stack, body, epilogue,
-    * end. Vertex and fragment: the mask stack only with control flow, then
-    * the outputs; the last vertex output write is the end.
+    * end. Vertex and fragment: the mask stack only when the body pushes
+    * (control flow, selects), then the outputs; the last vertex output
+    * write is the end.
     */
+   stack = ctx->stage == MESA_SHADER_COMPUTE || ctx->c->uses_stack;
    body_n = ctx->c->n;
    body = malloc(body_n * sizeof(uint16_t) + 1);
    if (!body)
@@ -1714,10 +1724,10 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
    ctx->c->n = 0;
    if (ctx->stage == MESA_SHADER_COMPUTE)
       g9p_prologue(ctx->c, 4 * ctx->out->num_buffers);
-   if (ctx->stage == MESA_SHADER_COMPUTE || cf)
+   if (stack)
       g9p_push_init(ctx->c, st);
    g9p_emit(ctx->c, body, body_n);
-   if (ctx->stage == MESA_SHADER_COMPUTE || cf)
+   if (stack)
       g9p_pop(ctx->c, st);
    free(body);
 
@@ -1921,7 +1931,8 @@ rematerialize_loads(nir_shader *nir)
 /* Optimization, out of SSA, then code for @ctx->stage */
 static bool
 compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
-             const struct g9p_vertex_attrib *attribs, void *mem_ctx)
+             const struct g9p_vertex_attrib *attribs, unsigned frag_coord_slot,
+             void *mem_ctx)
 {
    struct g9p_ctx ctx = { 0 };
    nir_function_impl *impl;
@@ -1962,6 +1973,7 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
    ctx.out = out;
    ctx.stage = stage;
    ctx.attribs = attribs;
+   ctx.frag_coord_slot = frag_coord_slot;
    ctx.c = rzalloc(mem_ctx, struct g9p_code);
    ctx.c->fragment = stage == MESA_SHADER_FRAGMENT;
    ctx.reg = ralloc_array(mem_ctx, int8_t, impl->ssa_alloc * 4);
@@ -2018,16 +2030,15 @@ g9p_compile_compute(nir_shader *nir, struct g9p_shader *out, void *mem_ctx)
    memset(out, 0, sizeof(*out));
    lower_front(nir);
    NIR_PASS(_, nir, nir_lower_compute_system_values, &csv);
-   return compile_back(nir, out, MESA_SHADER_COMPUTE, NULL, mem_ctx);
+   return compile_back(nir, out, MESA_SHADER_COMPUTE, NULL, 0, mem_ctx);
 }
 
 /*
  * The fragment position as a varying: window coordinates from gl_Position
- * and the viewport (G9P_VIEWPORT buffer), written to
- * G9P_FRAG_COORD_VARYING
+ * and the viewport (G9P_VIEWPORT buffer), written to varying @slot
  */
 static void
-add_frag_coord_output(nir_shader *nir)
+add_frag_coord_output(nir_shader *nir, unsigned slot)
 {
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
    nir_variable *pos = nir_find_variable_with_location(nir, nir_var_shader_out,
@@ -2039,7 +2050,7 @@ add_frag_coord_output(nir_shader *nir)
    if (!pos)
       return;
    out = nir_variable_create(nir, nir_var_shader_out, glsl_vec4_type(), "g9p_frag_coord");
-   out->data.location = VARYING_SLOT_VAR0 + G9P_FRAG_COORD_VARYING;
+   out->data.location = VARYING_SLOT_VAR0 + slot;
    out->data.interpolation = INTERP_MODE_NOPERSPECTIVE;
 
    b = nir_builder_at(nir_after_impl(impl));
@@ -2060,16 +2071,29 @@ add_frag_coord_output(nir_shader *nir)
                  0xf);
 }
 
+unsigned
+g9p_frag_coord_slot(const nir_shader *vs)
+{
+   unsigned slot = 0;
+
+   nir_foreach_variable_with_modes(var, vs, nir_var_shader_out) {
+      if (var->data.location >= VARYING_SLOT_VAR0)
+         slot = MAX2(slot, var->data.location - VARYING_SLOT_VAR0 +
+                              glsl_count_attribute_slots(var->type, false));
+   }
+   return MIN2(slot, G9P_MAX_VARYINGS - 1);
+}
+
 bool
 g9p_compile_vertex(nir_shader *nir, const struct g9p_vertex_attrib *attribs,
-                   bool frag_coord, struct g9p_shader *out, void *mem_ctx)
+                   int frag_coord_slot, struct g9p_shader *out, void *mem_ctx)
 {
    memset(out, 0, sizeof(*out));
    lower_front(nir);
-   if (frag_coord)
-      add_frag_coord_output(nir);
+   if (frag_coord_slot >= 0)
+      add_frag_coord_output(nir, frag_coord_slot);
    lower_io(nir);
-   return compile_back(nir, out, MESA_SHADER_VERTEX, attribs, mem_ctx);
+   return compile_back(nir, out, MESA_SHADER_VERTEX, attribs, 0, mem_ctx);
 }
 
 /*
@@ -2112,11 +2136,12 @@ discards_to_if(nir_shader *nir)
 }
 
 bool
-g9p_compile_fragment(nir_shader *nir, struct g9p_shader *out, void *mem_ctx)
+g9p_compile_fragment(nir_shader *nir, unsigned frag_coord_slot, struct g9p_shader *out,
+                     void *mem_ctx)
 {
    memset(out, 0, sizeof(*out));
    lower_front(nir);
    NIR_PASS(_, nir, discards_to_if);
    lower_io(nir);
-   return compile_back(nir, out, MESA_SHADER_FRAGMENT, NULL, mem_ctx);
+   return compile_back(nir, out, MESA_SHADER_FRAGMENT, NULL, frag_coord_slot, mem_ctx);
 }

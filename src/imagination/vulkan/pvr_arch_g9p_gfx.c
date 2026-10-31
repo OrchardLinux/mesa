@@ -273,25 +273,26 @@ attrib_format_ok(VkFormat format)
 }
 
 static VkResult
-compile_stage(struct pvr_device *device, struct pvr_graphics_pipeline *pipeline,
+stage_nir(struct pvr_device *device, struct pvr_graphics_pipeline *pipeline,
+          const VkPipelineShaderStageCreateInfo *stage, void *mem_ctx, nir_shader **nir)
+{
+   return vk_pipeline_shader_stage_to_nir(&device->vk, pipeline->base.pipeline_flags, stage,
+                                          g9p_spirv_options(), g9p_nir_options(), mem_ctx,
+                                          nir);
+}
+
+static VkResult
+compile_stage(struct pvr_device *device, nir_shader *nir,
               const VkPipelineShaderStageCreateInfo *stage,
-              const struct g9p_vertex_attrib *attribs, bool frag_coord,
+              const struct g9p_vertex_attrib *attribs, int frag_coord_slot,
               struct g9p_shader *out, void *mem_ctx)
 {
-   nir_shader *nir;
-   VkResult result;
    bool ok;
 
-   result = vk_pipeline_shader_stage_to_nir(&device->vk, pipeline->base.pipeline_flags,
-                                            stage, g9p_spirv_options(),
-                                            g9p_nir_options(), mem_ctx, &nir);
-   if (result != VK_SUCCESS)
-      return result;
-
    if (stage->stage == VK_SHADER_STAGE_VERTEX_BIT)
-      ok = g9p_compile_vertex(nir, attribs, frag_coord, out, mem_ctx);
+      ok = g9p_compile_vertex(nir, attribs, frag_coord_slot, out, mem_ctx);
    else
-      ok = g9p_compile_fragment(nir, out, mem_ctx);
+      ok = g9p_compile_fragment(nir, frag_coord_slot, out, mem_ctx);
    if (!ok)
       return g9p_error(device,
                        "G9P: %s shader not supported by the backend yet",
@@ -379,10 +380,22 @@ PVR_PER_ARCH(g9p_graphics_pipeline_compile)(struct pvr_device *device,
       }
    }
 
-   result = compile_stage(device, pipeline, fs_info, NULL, false, &fs, mem_ctx);
-   if (result == VK_SUCCESS)
-      result = compile_stage(device, pipeline, vs_info, attribs, fs.uses_frag_coord, &vs,
-                             mem_ctx);
+   {
+      /* gl_FragCoord's varying follows the vertex shader's own */
+      nir_shader *vs_nir, *fs_nir;
+      unsigned slot;
+
+      result = stage_nir(device, pipeline, vs_info, mem_ctx, &vs_nir);
+      if (result == VK_SUCCESS)
+         result = stage_nir(device, pipeline, fs_info, mem_ctx, &fs_nir);
+      if (result != VK_SUCCESS)
+         goto out;
+      slot = g9p_frag_coord_slot(vs_nir);
+      result = compile_stage(device, fs_nir, fs_info, NULL, slot, &fs, mem_ctx);
+      if (result == VK_SUCCESS)
+         result = compile_stage(device, vs_nir, vs_info, attribs,
+                                fs.uses_frag_coord ? (int)slot : -1, &vs, mem_ctx);
+   }
    if (result != VK_SUCCESS)
       goto out;
    if (fs.num_varyings > vs.num_varyings) {

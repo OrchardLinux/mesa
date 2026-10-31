@@ -16,20 +16,37 @@
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
-#include <stdlib.h>
 
 #define G9P_MAX_CODE_WORDS 65536
 
 struct g9p_code {
    uint16_t w[G9P_MAX_CODE_WORDS];
    unsigned n;
-   /*
-    * Fragment shaders take move-immediates into 32-bit registers in the W1
-    * form 0x0100 | 2r; the compute/vertex form 0x0300 | 2r gives wrong
-    * pixels there (ISA.md "f32 registers and fragment outputs").
-    */
+   /* a fragment shader: registers in the other bank, see g9p_w0() */
    bool fragment;
+   /* the code pushes onto the mask stack (needs g9p_push_init()) */
+   bool uses_stack;
 };
+
+/*
+ * Register bank. Compute and vertex code (Apple's too) names its registers
+ * with W0 bits 11-13 and W1 bit 9 set (3199 03dd, 1199 03dd, 399e 03dd);
+ * fragment code, whose iterates, immediates and colour output live in the
+ * other bank, with them clear (0199 01dd, 019e 01dd). Mixing the two in a
+ * fragment shader reads and writes registers nothing else sees (ISA.md
+ * "Fragment register bank"). The mask stack follows (g9p_st_dst()).
+ */
+static inline uint16_t
+g9p_w0(const struct g9p_code *c, uint16_t w0)
+{
+   return c->fragment ? w0 & ~0x3800 : w0;
+}
+
+static inline uint16_t
+g9p_dst(const struct g9p_code *c, unsigned r)
+{
+   return (c->fragment ? 0x0100 : 0x0300) | 2 * r;
+}
 
 static inline void
 g9p_emit(struct g9p_code *c, const uint16_t *w, unsigned count)
@@ -69,18 +86,35 @@ g9p_prologue(struct g9p_code *c, unsigned count_half)
    G9P_EMIT(c, 0x1181, 0x8181 | 2 * count_half, 0x4100, 0xacb7);
 }
 
+/*
+ * The execution-mask stack register @st as destination (W1) and source
+ * (W2): in compute and vertex code r@st; in fragment code, like Apple's
+ * (01c8 010d 011a 86d0), the upper half of r@st in the fragment bank
+ */
+static inline uint16_t
+g9p_st_dst(const struct g9p_code *c, unsigned st)
+{
+   return c->fragment ? 0x0100 | (2 * st + 1) : 0x0300 | 2 * st;
+}
+
+static inline uint16_t
+g9p_st_src(const struct g9p_code *c, unsigned st)
+{
+   return c->fragment ? 0x0100 | (2 * st + 1) << 1 : 0x0100 | st << 2;
+}
+
 /* Start the execution-mask stack in register @st (first one after ours) */
 static inline void
 g9p_push_init(struct g9p_code *c, unsigned st)
 {
-   G9P_EMIT(c, 0x01c8, 0x0300 | 2 * st, 0x0101, 0x0120, 0x46d1);
+   G9P_EMIT(c, 0x01c8, g9p_st_dst(c, st), 0x0101, 0x0120, 0x46d1);
 }
 
 /* Pop the mask stack before the end */
 static inline void
 g9p_pop(struct g9p_code *c, unsigned st)
 {
-   G9P_EMIT(c, 0x21c8, 0x0300 | 2 * st, 0x0180 | st << 2, 0x46d2);
+   G9P_EMIT(c, g9p_w0(c, 0x21c8), g9p_st_dst(c, st), 0x0080 | g9p_st_src(c, st), 0x46d2);
 }
 
 /*
@@ -114,11 +148,11 @@ g9p_mov_imm(struct g9p_code *c, unsigned dst, uint32_t imm)
 
    if (imm >> 16) {
       w3 |= 1 | ((imm >> 24) & 1) << 15;
-      G9P_EMIT(c, w0, (c->fragment ? 0x0100 : 0x0300) | 2 * dst, w2, w3,
+      G9P_EMIT(c, w0, g9p_dst(c, dst), w2, w3,
                0x0100 | ((imm >> 16) & 0xff) | ((imm >> 25) & 0x7f) << 9,
                0x0154, 0x0038);
    } else {
-      G9P_EMIT(c, w0, (c->fragment ? 0x0100 : 0x0300) | 2 * dst, w2, w3, 0x0154,
+      G9P_EMIT(c, w0, g9p_dst(c, dst), w2, w3, 0x0154,
                0x0038);
    }
 }
@@ -135,7 +169,7 @@ static inline void
 g9p_alu2(struct g9p_code *c, unsigned op, unsigned dst, unsigned a, unsigned b,
          bool kill)
 {
-   G9P_EMIT(c, 0x3199, 0x0300 | 2 * dst, g9p_srcs(a, b, kill), op);
+   G9P_EMIT(c, g9p_w0(c, 0x3199), g9p_dst(c, dst), g9p_srcs(a, b, kill), op);
 }
 
 /* dst = src + imm, 0 <= imm < 64 */
@@ -143,7 +177,7 @@ static inline void
 g9p_add_imm(struct g9p_code *c, unsigned dst, unsigned src, unsigned imm)
 {
    assert(imm < 0x40);
-   G9P_EMIT(c, 0x1199, 0x0300 | 2 * dst, 0x0101 | imm << 1 | src << 10, 0x0120,
+   G9P_EMIT(c, g9p_w0(c, 0x1199), g9p_dst(c, dst), 0x0101 | imm << 1 | src << 10, 0x0120,
             0x09a1, 0x0070);
 }
 
@@ -174,7 +208,7 @@ static inline void
 g9p_addr(struct g9p_code *c, unsigned dst, unsigned base_dword, unsigned idx,
          unsigned shift, bool kill)
 {
-   G9P_EMIT(c, 0x1189, 0x0300 | 2 * dst,
+   G9P_EMIT(c, g9p_w0(c, 0x1189), g9p_dst(c, dst),
             (kill ? 0x8000 : 0) | (1 | idx << 2) << 8 | 0x81 | 4 * base_dword,
             0x4100, 0x01a1, 0x0600 | shift << 13);
 }
@@ -209,7 +243,7 @@ g9p_mem_at(struct g9p_code *c, bool store, unsigned size, unsigned reg,
 static inline void
 g9p_ffma(struct g9p_code *c, unsigned dst, unsigned a, unsigned b, unsigned cc)
 {
-   G9P_EMIT(c, 0x399e, 0x0300 | 2 * dst, g9p_srcs(a, b, false), 0x0180 | cc << 2,
+   G9P_EMIT(c, g9p_w0(c, 0x399e), g9p_dst(c, dst), g9p_srcs(a, b, false), 0x0180 | cc << 2,
             0x004c);
 }
 
@@ -230,7 +264,7 @@ g9p_ffma(struct g9p_code *c, unsigned dst, unsigned a, unsigned b, unsigned cc)
 static inline void
 g9p_funary(struct g9p_code *c, unsigned op, unsigned dst, unsigned src)
 {
-   G9P_EMIT(c, 0x219c, 0x0300 | 2 * dst, 0x0100 | src << 2, op);
+   G9P_EMIT(c, g9p_w0(c, 0x219c), g9p_dst(c, dst), 0x0100 | src << 2, op);
 }
 
 /*
@@ -245,7 +279,7 @@ g9p_funary(struct g9p_code *c, unsigned op, unsigned dst, unsigned src)
 static inline void
 g9p_convert(struct g9p_code *c, unsigned dst, unsigned src, unsigned op)
 {
-   G9P_EMIT(c, 0x1199, 0x0300 | 2 * dst, 0x0101 | op | src << 10, 0x0120,
+   G9P_EMIT(c, g9p_w0(c, 0x1199), g9p_dst(c, dst), 0x0101 | op | src << 10, 0x0120,
             (op & 4) ? 0x0468 : 0x0460);
 }
 
@@ -253,7 +287,7 @@ g9p_convert(struct g9p_code *c, unsigned dst, unsigned src, unsigned op)
 static inline void
 g9p_shift(struct g9p_code *c, unsigned dst, unsigned a, unsigned b, bool right)
 {
-   G9P_EMIT(c, 0x199e, 0x0300 | 2 * dst, 0x0101 | a << 10, 0x0120, 0x0100 | b << 2,
+   G9P_EMIT(c, g9p_w0(c, 0x199e), g9p_dst(c, dst), 0x0101 | a << 10, 0x0120, 0x0100 | b << 2,
             right ? 0x04f4 : 0x04f0);
 }
 
@@ -265,21 +299,21 @@ static inline void
 g9p_sel(struct g9p_code *c, unsigned cond, unsigned dst, unsigned a, unsigned b,
         unsigned cc)
 {
-   G9P_EMIT(c, 0x399e, 0x0300 | 2 * dst, g9p_srcs(a, b, false), 0x0180 | cc << 2,
+   G9P_EMIT(c, g9p_w0(c, 0x399e), g9p_dst(c, dst), g9p_srcs(a, b, false), 0x0180 | cc << 2,
             0x6000 | cond);
 }
 
 static inline void
 g9p_movf(struct g9p_code *c, unsigned dst, unsigned d)
 {
-   G9P_EMIT(c, 0x21f8, 0x0300 | 2 * dst, 0x0180 | d << 2, 0x0154, 0x0038);
+   G9P_EMIT(c, g9p_w0(c, 0x21f8), g9p_dst(c, dst), 0x0180 | d << 2, 0x0154, 0x0038);
 }
 
 /* Compare a register with an immediate (< 1024), for a following push */
 static inline void
 g9p_cmp_imm(struct g9p_code *c, unsigned cond, unsigned reg, unsigned imm)
 {
-   G9P_EMIT(c, 0x1181 | ((imm >> 9) & 1) << 13, 0x0101 | (imm & 0x3f) << 1 | reg << 10,
+   G9P_EMIT(c, g9p_w0(c, 0x1181) | ((imm >> 9) & 1) << 13, 0x0101 | (imm & 0x3f) << 1 | reg << 10,
             0x0120 | ((imm >> 6) & 7) << 1, 0xa100 | cond, 0x0070);
 }
 
@@ -291,39 +325,41 @@ g9p_cmp_imm(struct g9p_code *c, unsigned cond, unsigned reg, unsigned imm)
 static inline void
 g9p_cmp_reg(struct g9p_code *c, unsigned cond, unsigned a, unsigned b, bool is_float)
 {
-   G9P_EMIT(c, 0x3181, g9p_srcs(a, b, false), (is_float ? 0x6000 : 0xa000) | cond);
+   G9P_EMIT(c, g9p_w0(c, 0x3181), g9p_srcs(a, b, false), (is_float ? 0x6000 : 0xa000) | cond);
 }
 
 /* Mask stack: push (disable the lanes whose compare failed, or passed) */
 static inline void
 g9p_push_if(struct g9p_code *c, unsigned st, bool invert)
 {
-   G9P_EMIT(c, 0x21c8, 0x0300 | 2 * st, 0x0100 | st << 2, 0x46d1 | invert << 13);
+   c->uses_stack = true;
+   G9P_EMIT(c, g9p_w0(c, 0x21c8), g9p_st_dst(c, st), g9p_st_src(c, st), 0x46d1 | invert << 13);
 }
 
 static inline void
 g9p_else(struct g9p_code *c, unsigned st)
 {
-   G9P_EMIT(c, 0x21c8, 0x0300 | 2 * st, 0x0100 | st << 2, 0x46d4);
+   G9P_EMIT(c, g9p_w0(c, 0x21c8), g9p_st_dst(c, st), g9p_st_src(c, st), 0x46d4);
 }
 
 static inline void
 g9p_pop_levels(struct g9p_code *c, unsigned st, unsigned levels)
 {
-   G9P_EMIT(c, 0x21c8, 0x0300 | 2 * st, 0x0180 | st << 2, 0x06d2 | levels << 14);
+   G9P_EMIT(c, g9p_w0(c, 0x21c8), g9p_st_dst(c, st), 0x0080 | g9p_st_src(c, st), 0x06d2 | levels << 14);
 }
 
 /* Loops: start (two levels), break the lanes whose compare passed/failed */
 static inline void
 g9p_loop_begin(struct g9p_code *c, unsigned st)
 {
-   G9P_EMIT(c, 0x21c8, 0x0300 | 2 * st, 0x0100 | st << 2, 0x86d0);
+   c->uses_stack = true;
+   G9P_EMIT(c, g9p_w0(c, 0x21c8), g9p_st_dst(c, st), g9p_st_src(c, st), 0x86d0);
 }
 
 static inline void
 g9p_loop_break(struct g9p_code *c, unsigned st, bool when_true)
 {
-   G9P_EMIT(c, 0x21c8, 0x0300 | 2 * st, 0x0100 | st << 2, 0x86d7 | when_true << 13);
+   G9P_EMIT(c, g9p_w0(c, 0x21c8), g9p_st_dst(c, st), g9p_st_src(c, st), 0x86d7 | when_true << 13);
 }
 
 /*
@@ -385,14 +421,17 @@ g9p_end_vertex(struct g9p_code *c, unsigned reg, unsigned slot)
  * Fragment iterate: @comps (1-4) components of the varyings, from component
  * index @first (each varying's components in order; the DOUTI program
  * places them), as f32 into r[@dst]...; perspective-correct or not (W0 bit
- * 9). Follow with g9p_wait().
+ * 9). W0 bits 11-12 are the count modulo 4 (Apple: 0b08 one, 1308 two,
+ * 0308 four). A perspective iterate's index counts the W the DOUTI program
+ * places first (1 + @first); a non-perspective one's does not (@first).
+ * Follow with g9p_wait().
  */
 static inline void
 g9p_iterate(struct g9p_code *c, unsigned dst, unsigned first, unsigned comps,
             bool perspective)
 {
-   G9P_EMIT(c, (4 - comps) << 11 | (perspective ? 0x0308 : 0x0108),
-            (1 + first) << 9 | 0x0100 | 2 * dst, 0x0080);
+   G9P_EMIT(c, (comps & 3) << 11 | (perspective ? 0x0308 : 0x0108),
+            (perspective + first) << 9 | 0x0100 | 2 * dst, 0x0080);
 }
 
 /*
@@ -408,7 +447,7 @@ static inline void
 g9p_sample_varying(struct g9p_code *c, unsigned dst, unsigned first, unsigned comps,
                    unsigned state, unsigned sampler)
 {
-   G9P_EMIT(c, (4 - comps) << 11 | 0x0308, (1 + first) << 9 | 0x0100, 0x8000);
+   G9P_EMIT(c, (comps & 3) << 11 | 0x0308, (1 + first) << 9 | 0x0100, 0x8000);
    G9P_EMIT(c, 0xf51a, 0x0100 | 2 * dst, 0x8100 | state << 8 | sampler, 0x0700, 0x0200);
 }
 
@@ -432,10 +471,22 @@ g9p_discard(struct g9p_code *c)
    G9P_EMIT(c, 0x6804);
 }
 
-/* Discard the lanes whose last compare passed (`6004`) */
+/*
+ * Conditional discard: Apple's compare form `0189 0100 SSSS W3 [1000]`, then
+ * `6004`. W3: integer a2b9 a != b, e2b9 a == b, e2b2 unsigned <, e2b3
+ * unsigned >, e2ba signed <; float 435a a < b, 435e a > b, 4356 a == b, and
+ * with bit 8 clear (and no fifth word) their negations, e.g. 425a a >= b
+ * (probes/discard2.metal, discard3.metal)
+ */
+#define G9P_DISCARD_INE 0xa2b9
+
 static inline void
-g9p_discard_cmp(struct g9p_code *c)
+g9p_discard_cmp(struct g9p_code *c, unsigned w3, unsigned a, unsigned b)
 {
+   if (w3 & 0x0100)
+      G9P_EMIT(c, 0x0189, 0x0100, g9p_srcs(a, b, false), w3, 0x1000);
+   else
+      G9P_EMIT(c, 0x0189, 0x0100, g9p_srcs(a, b, false), w3);
    G9P_EMIT(c, 0x6004);
 }
 

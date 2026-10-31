@@ -42,12 +42,11 @@
  */
 #define G9P_VIEWPORT (~2u)
 /*
- * The varying carrying the fragment position (window x, y, z, 1/w),
- * written by the vertex shader and iterated without perspective
- * correction: gl_FragCoord without the position read (whose 16-bit
- * results are not decoded for f32 use yet)
+ * gl_FragCoord comes in a varying (window x, y, z, 1/w) the vertex shader
+ * writes after its own (g9p_frag_coord_slot()), iterated without
+ * perspective correction: the position read's 16-bit results are not
+ * decoded for f32 use yet
  */
-#define G9P_FRAG_COORD_VARYING (G9P_MAX_VARYINGS - 1)
 
 /* A vertex attribute: 32-bit components from a vertex buffer */
 struct g9p_vertex_attrib {
@@ -88,7 +87,7 @@ struct g9p_shader {
    /* Vertex: output dwords (4 + 4 x num_varyings) */
    unsigned num_outputs;
 
-   /* Fragment: reads gl_FragCoord (G9P_FRAG_COORD_VARYING) */
+   /* Fragment: reads gl_FragCoord (the frag_coord_slot varying) */
    bool uses_frag_coord;
    /* Fragment: may discard (punch-through pass type) */
    bool uses_discard;
@@ -113,14 +112,19 @@ int g9p_buffer_slot(struct g9p_shader *out, unsigned set, unsigned binding);
  */
 bool g9p_compile_compute(nir_shader *nir, struct g9p_shader *out, void *mem_ctx);
 
+/* The varying slot after the vertex shader's own: gl_FragCoord's */
+unsigned g9p_frag_coord_slot(const nir_shader *vs);
+
 /*
  * Vertex shader: @attribs by attribute location (VERT_ATTRIB_GENERIC0 +
  * n); the vertex index arrives in r0. Vertex buffer b's address is loaded
- * into the common store as buffer (G9P_VERTEX_BUFFERS, b).
+ * into the common store as buffer (G9P_VERTEX_BUFFERS, b). It writes
+ * gl_FragCoord's varying at @frag_coord_slot, or not with -1.
  */
 bool g9p_compile_vertex(nir_shader *nir, const struct g9p_vertex_attrib *attribs,
-                        bool frag_coord, struct g9p_shader *out, void *mem_ctx);
+                        int frag_coord_slot, struct g9p_shader *out, void *mem_ctx);
 
-bool g9p_compile_fragment(nir_shader *nir, struct g9p_shader *out, void *mem_ctx);
+bool g9p_compile_fragment(nir_shader *nir, unsigned frag_coord_slot, struct g9p_shader *out,
+                          void *mem_ctx);
 
 #endif /* G9P_COMPILE_H */
