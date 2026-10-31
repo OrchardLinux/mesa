@@ -385,6 +385,17 @@ pvr_process_graphics_cmd_for_view(struct pvr_device *device,
    if (result != VK_SUCCESS)
       goto err_destroy_frag_sync;
 
+   /* G9P_TRACE: each render as submitted, to find the one a hang stops at */
+   if (job->g9p.enabled && getenv("G9P_TRACE")) {
+      static unsigned n;
+
+      fprintf(stderr, "g9p: trace %u: %ux%u %s, %u draws, pipelines", ++n, job->g9p.width,
+              job->g9p.height, job->g9p.load ? "loaded" : "cleared", job->g9p_draws.num_draws);
+      for (unsigned i = 0; i < MIN2(job->g9p_draws.num_draws, 12); i++)
+         fprintf(stderr, " %u", job->g9p_draws.pipelines[i]);
+      fprintf(stderr, "\n");
+   }
+
    /*
     * G9P_SYNC: wait for each render and report the draws of one that hangs
     * (0.5 s: renders take milliseconds, and the kernel's own timeout signals
