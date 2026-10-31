@@ -14,6 +14,7 @@
  * are allocated by liveness, extended over the loops they are used in.
  */
 
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -149,9 +150,12 @@ dump_busy(struct g9p_ctx *ctx)
    fprintf(stderr, "g9p: out of registers at instruction %u\n", ctx->ip);
    if (!getenv("G9P_DEBUG"))
       return;
+   /* NIR registers are pinned: the busy ones not listed below */
+   fprintf(stderr, "  busy %#" PRIx64 " pinned %#" PRIx64 " temps %#" PRIx64 "\n", ctx->busy,
+           ctx->pinned, ctx->temps);
    for (unsigned k = 0; k < ctx->num_keys; k++) {
       if (ctx->reg[k] >= 0 && (ctx->busy & BITFIELD64_BIT(ctx->reg[k])) &&
-          !(ctx->pinned & BITFIELD64_BIT(ctx->reg[k])))
+          !(ctx->pinned & BITFIELD64_BIT(ctx->reg[k])) && ctx->last_use[k] >= ctx->ip)
          fprintf(stderr, "  r%d: value %u.%u, last use %u\n", ctx->reg[k], k / 4, k % 4,
                  ctx->last_use[k]);
    }

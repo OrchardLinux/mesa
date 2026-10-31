@@ -352,10 +352,29 @@ pvr_process_graphics_cmd_for_view(struct pvr_device *device,
       }
    }
 
+   /*
+    * Apple A10: a render's geometry job waits for the previous render's
+    * fragment job. Every render shares the device's one free list
+    * (pvr_arch_g9p_device_init()); with overlapping renders Hyprland at
+    * scale 2 had job timeouts in most 20 s runs, with this ordering in about
+    * one in four (another cause remains; G9P_SYNC, waiting for every job,
+    * has none). The job takes one wait: with a semaphore to wait for as
+    * well, the CPU waits instead.
+    */
+   struct vk_sync *geom_wait = queue->next_job_wait_sync[PVR_JOB_TYPE_GEOM];
+
+   if (job->g9p.enabled && queue->last_job_signal_sync[PVR_JOB_TYPE_FRAG]) {
+      if (!geom_wait)
+         geom_wait = queue->last_job_signal_sync[PVR_JOB_TYPE_FRAG];
+      else
+         vk_sync_wait(&device->vk, queue->last_job_signal_sync[PVR_JOB_TYPE_FRAG], 0,
+                      VK_SYNC_WAIT_COMPLETE, UINT64_MAX);
+   }
+
    result =
       pvr_arch_render_job_submit(queue->gfx_ctx,
                                  &sub_cmd->job,
-                                 queue->next_job_wait_sync[PVR_JOB_TYPE_GEOM],
+                                 geom_wait,
                                  queue->next_job_wait_sync[PVR_JOB_TYPE_FRAG],
                                  geom_signal_sync,
                                  frag_signal_sync);
@@ -366,16 +385,20 @@ pvr_process_graphics_cmd_for_view(struct pvr_device *device,
    if (result != VK_SUCCESS)
       goto err_destroy_frag_sync;
 
-   /* G9P_SYNC: wait for each render and report the draws of one that hangs */
+   /*
+    * G9P_SYNC: wait for each render and report the draws of one that hangs
+    * (0.5 s: renders take milliseconds, and the kernel's own timeout signals
+    * the fence of a hung job before a longer wait would notice)
+    */
    if (job->g9p.enabled && getenv("G9P_SYNC")) {
       fprintf(stderr, "g9p: device %p: render %ux%u submitted, %u draws\n", (void *)device,
               job->g9p.width, job->g9p.height, job->g9p_draws.num_draws);
       const bool geom = vk_sync_wait(&device->vk, geom_signal_sync, 0, VK_SYNC_WAIT_COMPLETE,
-                                     os_time_get_absolute_timeout(3000000000ull)) == VK_SUCCESS;
+                                     os_time_get_absolute_timeout(500000000ull)) == VK_SUCCESS;
 
       if (!geom || (frag_signal_sync &&
                     vk_sync_wait(&device->vk, frag_signal_sync, 0, VK_SYNC_WAIT_COMPLETE,
-                                 os_time_get_absolute_timeout(3000000000ull)) != VK_SUCCESS)) {
+                                 os_time_get_absolute_timeout(500000000ull)) != VK_SUCCESS)) {
          fprintf(stderr, "g9p: device %p: render %ux%u: %s timed out; %u draws, pipelines:",
                  (void *)device, job->g9p.width, job->g9p.height,
                  geom ? "fragment job" : "geometry job", job->g9p_draws.num_draws);
