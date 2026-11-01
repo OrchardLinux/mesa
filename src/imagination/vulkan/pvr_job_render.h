@@ -138,7 +138,9 @@ struct pvr_render_job {
    uint64_t pr_pbe_reg_words[PVR_MAX_COLOR_ATTACHMENTS]
                             [ROGUE_NUM_PBESTATE_REG_WORDS];
 
-   /* Apple G9P (pvr_arch_g9p_gfx.c): what the kernel's Apple register block takes */
+   #define G9P_LOAD_OP_NONE (-1)
+
+/* Apple G9P (pvr_arch_g9p_gfx.c): what the kernel's Apple register block takes */
    struct {
       bool enabled;
       /* end-of-tile PDS code; its data is the view's pds_pixel_event_data_offset */
@@ -152,12 +154,23 @@ struct pvr_render_job {
       bool target_linear;
       /* the background loads the target (load op load) */
       bool load;
+      /*
+       * the first colour attachment's load op, G9P_LOAD_OP_NONE without one
+       * (don't care: the render pass setup initializes nothing)
+       */
+      int load_op;
    } g9p;
 
-   /* G9P_SYNC: the pipelines of the job's first draws, reported on a timeout */
+   /*
+    * G9P_SYNC: the pipelines of the job's first draws, reported on a timeout;
+    * G9P_TRACE: also the render area and the 32-pixel tiles the draws' region
+    * clips cover (x0, y0, x1, y1, inclusive)
+    */
    struct {
       unsigned num_draws;
       unsigned pipelines[16];
+      VkRect2D render_area;
+      uint32_t tiles[4];
    } g9p_draws;
 
    struct pvr_view_state {

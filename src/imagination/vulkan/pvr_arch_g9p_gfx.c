@@ -953,8 +953,19 @@ PVR_PER_ARCH(g9p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer,
    {
       struct pvr_render_job *job = &cs->current_sub_cmd->gfx.job;
 
+      uint32_t *t = job->g9p_draws.tiles;
+
       if (job->g9p_draws.num_draws < ARRAY_SIZE(job->g9p_draws.pipelines))
          job->g9p_draws.pipelines[job->g9p_draws.num_draws] = state->id;
+      if (!job->g9p_draws.num_draws) {
+         job->g9p_draws.render_area = info->render_area;
+         memcpy(t, dp.region, sizeof(dp.region));
+      } else {
+         t[0] = MIN2(t[0], dp.region[0]);
+         t[1] = MIN2(t[1], dp.region[1]);
+         t[2] = MAX2(t[2], dp.region[2]);
+         t[3] = MAX2(t[3], dp.region[3]);
+      }
       job->g9p_draws.num_draws++;
    }
 
@@ -1461,6 +1472,9 @@ PVR_PER_ARCH(g9p_job_init)(struct pvr_cmd_buffer *cmd_buffer,
              sizeof(clear));
    }
    job->g9p.load = load;
+   job->g9p.load_op = !hw_render->eot_surface_count ? VK_ATTACHMENT_LOAD_OP_CLEAR
+                      : hw_render->color_init_count ? (int)hw_render->color_init[0].op
+                                                    : G9P_LOAD_OP_NONE;
    if (!load)
       memcpy(bg, clear, sizeof(clear));
    result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, bg, 4 * bg_dwords, &bo);
@@ -1594,9 +1608,14 @@ PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
     * only the tiles a primitive touched (pvr-tri TRI_NODRAW). A render that
     * loads its target leaves it off: tiles no draw reaches (outside every
     * draw's region clip) are neither loaded nor stored and keep their
-    * memory, which is the load's result anyway. G9P_ALL_TILES=1 keeps it on.
+    * memory, which is the load's result anyway. So does a render whose
+    * target has no load op (don't care): its old contents are undefined,
+    * and Hyprland's blur renders this way over the whole screen to draw a
+    * small damaged part. G9P_ALL_TILES=1 keeps it on.
     */
-   put32(&s, job->g9p.load && !getenv("G9P_ALL_TILES") ? 0x21000f : 0x23000f);
+   put32(&s, (job->g9p.load || job->g9p.load_op == G9P_LOAD_OP_NONE) && !getenv("G9P_ALL_TILES")
+                ? 0x21000f
+                : 0x23000f);
    put32(&s, 0x402);    /* EVENT_PIXEL_PDS_INFO */
    put32(&s, 0);
    put32(&s, job->view_state.view[0].pds_pixel_event_data_offset);
