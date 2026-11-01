@@ -28,6 +28,9 @@
 #include <vulkan/vulkan_core.h>
 
 #include "compiler/nir/nir_builder.h"
+#include "compiler/nir/nir_builtin_builder.h"
+#include "compiler/nir/nir_format_convert.h"
+#include "util/format/u_format.h"
 #include "g9p_compile.h"
 #include "g9p_isa.h"
 
@@ -1334,6 +1337,57 @@ varying_component(nir_scalar s)
 }
 
 /*
+ * The size of a 2D texture's base level (txs), from its texture state in
+ * the common store (dwords 0-1 of its slot): width - 1 at bit 27, height - 1
+ * at bit 41
+ */
+static bool
+emit_txs(struct g9p_ctx *ctx, nir_tex_instr *tex)
+{
+   const int slot = texture_slot(ctx, tex);
+   const unsigned u = G9P_FS_TEX_BASE + G9P_TEX_STRIDE * slot;
+   int w, h, d0, d1, t, zero;
+
+   if (ctx->stage != MESA_SHADER_FRAGMENT || tex->sampler_dim != GLSL_SAMPLER_DIM_2D ||
+       tex->is_array || slot < 0) {
+      fprintf(stderr, "g9p: only sizes of 2D combined image samplers so far\n");
+      return false;
+   }
+   release(ctx, &tex->instr);
+   w = alloc_reg(ctx);
+   h = alloc_reg(ctx);
+   zero = const_reg(ctx, 0);
+   d0 = alloc_temp(ctx);
+   d1 = alloc_temp(ctx);
+   t = alloc_temp(ctx);
+   if (w < 0 || h < 0 || zero < 0 || d0 < 0 || d1 < 0 || t < 0)
+      return false;
+   g9p_mov_uniform(ctx->c, d0, u, zero);
+   g9p_mov_uniform(ctx->c, d1, u + 1, zero);
+   /* width: (d1 & 0x1ff) << 5 | d0 >> 27, plus one */
+   g9p_mov_imm(ctx->c, t, 0x1ff);
+   g9p_alu2(ctx->c, G9P_AND, w, d1, t, false);
+   g9p_mov_imm(ctx->c, t, 5);
+   g9p_shift(ctx->c, w, w, t, false);
+   g9p_mov_imm(ctx->c, t, 27);
+   g9p_shift(ctx->c, d0, d0, t, true);
+   g9p_alu2(ctx->c, G9P_OR, w, w, d0, false);
+   /* height: (d1 >> 9) & 0x3fff, plus one */
+   g9p_mov_imm(ctx->c, t, 9);
+   g9p_shift(ctx->c, h, d1, t, true);
+   g9p_mov_imm(ctx->c, t, 0x3fff);
+   g9p_alu2(ctx->c, G9P_AND, h, h, t, false);
+   g9p_mov_imm(ctx->c, t, 1);
+   g9p_alu2(ctx->c, G9P_IADD, w, w, t, false);
+   g9p_alu2(ctx->c, G9P_IADD, h, h, t, false);
+   ctx->busy &= ~ctx->temps;
+   ctx->temps = 0;
+   ctx->reg[key(&tex->def, 0)] = w;
+   ctx->reg[key(&tex->def, 1)] = h;
+   return true;
+}
+
+/*
  * A 2D sample, the f32 result in four consecutive registers. Coordinates
  * that are two consecutive varying components (texture(t, v_uv)) are
  * iterated straight to the sampler; computed ones are copied to r0-r1,
@@ -1347,6 +1401,8 @@ emit_tex(struct g9p_ctx *ctx, nir_tex_instr *tex)
    int slot = texture_slot(ctx, tex);
    int first, second, dst;
 
+   if (tex->op == nir_texop_txs)
+      return emit_txs(ctx, tex);
    if (ctx->stage != MESA_SHADER_FRAGMENT || tex->sampler_dim != GLSL_SAMPLER_DIM_2D ||
        tex->is_array || tex->is_shadow || ci < 0 || slot < 0 ||
        (tex->op != nir_texop_tex && tex->op != nir_texop_txl) ||
@@ -2321,6 +2377,53 @@ g9p_frag_coord_slot(const nir_shader *vs)
    return MIN2(slot, G9P_MAX_VARYINGS - 1);
 }
 
+/*
+ * Attributes of formats with channels other than 32 bits: their packed
+ * words (a 32-bit load each), unpacked to the components the shader reads
+ * (nir_format_unpack_rgba() fills missing ones with 0, 0, 0, 1). Attributes without a buffer read 0, 0, 0, 1,
+ * GL's value for a disabled array (Zink binds none for Qt Quick's _qt_order).
+ */
+static bool
+lower_attrib_format(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   const struct g9p_vertex_attrib *attribs = data;
+   const struct util_format_description *desc;
+   nir_def *packed, *rgba, *comps[4];
+   nir_io_semantics sem;
+   unsigned loc;
+
+   if (intr->intrinsic != nir_intrinsic_load_input)
+      return false;
+   sem = nir_intrinsic_io_semantics(intr);
+   loc = sem.location - VERT_ATTRIB_GENERIC0;
+   if (loc >= G9P_MAX_ATTRIBS)
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   if (!attribs[loc].present) {
+      for (unsigned i = 0; i < intr->def.num_components; i++) {
+         const bool w = nir_intrinsic_component(intr) + i == 3;
+         const bool is_int = nir_alu_type_get_base_type(nir_intrinsic_dest_type(intr)) !=
+                             nir_type_float;
+
+         comps[i] = w ? (is_int ? nir_imm_int(b, 1) : nir_imm_float(b, 1.0f)) : nir_imm_int(b, 0);
+      }
+      nir_def_replace(&intr->def, nir_vec(b, comps, intr->def.num_components));
+      return true;
+   }
+   desc = util_format_description(attribs[loc].format);
+   if (!desc || desc->channel[0].size == 32)
+      return false;
+
+   packed = nir_load_input(b, DIV_ROUND_UP(desc->block.bits, 32), 32, intr->src[0].ssa,
+                           .base = nir_intrinsic_base(intr),
+                           .range = nir_intrinsic_range(intr), .component = 0,
+                           .dest_type = nir_type_uint32, .io_semantics = sem);
+   rgba = nir_format_unpack_rgba(b, packed, attribs[loc].format);
+   nir_def_replace(&intr->def, nir_channels(b, rgba, nir_component_mask(intr->def.num_components)
+                                                        << nir_intrinsic_component(intr)));
+   return true;
+}
+
 bool
 g9p_compile_vertex(nir_shader *nir, const struct g9p_vertex_attrib *attribs,
                    int frag_coord_slot, struct g9p_shader *out, void *mem_ctx)
@@ -2330,6 +2433,8 @@ g9p_compile_vertex(nir_shader *nir, const struct g9p_vertex_attrib *attribs,
    if (frag_coord_slot >= 0)
       add_frag_coord_output(nir, frag_coord_slot);
    lower_io(nir);
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_attrib_format,
+            nir_metadata_control_flow, (void *)attribs);
    return compile_back(nir, out, MESA_SHADER_VERTEX, attribs, 0, mem_ctx);
 }
 
@@ -2530,6 +2635,33 @@ is_src_over(const nir_lower_blend_options *blend)
    return true;
 }
 
+/*
+ * texelFetch of a 2D texture (Zink's blits): an explicit-level sample at
+ * the texel's centre, (i + 0.5) / size, which reads that texel alone with
+ * nearest and linear filtering. The size is the base level's (txs), right
+ * for the single-level views blits read.
+ */
+static bool
+lower_txf(nir_builder *b, nir_tex_instr *tex, void *data)
+{
+   const int ci = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   const int li = nir_tex_instr_src_index(tex, nir_tex_src_lod);
+   nir_def *size, *coord;
+
+   if (tex->op != nir_texop_txf || tex->sampler_dim != GLSL_SAMPLER_DIM_2D || tex->is_array ||
+       ci < 0)
+      return false;
+   size = nir_i2f32(b, nir_get_texture_size(b, tex));
+   coord = nir_fdiv(b, nir_fadd_imm(b, nir_i2f32(b, tex->src[ci].src.ssa), 0.5), size);
+   nir_src_rewrite(&tex->src[ci].src, coord);
+   if (li >= 0)
+      nir_src_rewrite(&tex->src[li].src, nir_i2f32(b, tex->src[li].src.ssa));
+   else
+      nir_tex_instr_add_src(tex, nir_tex_src_lod, nir_imm_float(b, 0.0f));
+   tex->op = nir_texop_txl;
+   return true;
+}
+
 bool
 g9p_compile_fragment(nir_shader *nir, unsigned frag_coord_slot,
                      const nir_lower_blend_options *blend, struct g9p_shader *out,
@@ -2539,6 +2671,7 @@ g9p_compile_fragment(nir_shader *nir, unsigned frag_coord_slot,
    lower_front(nir);
    NIR_PASS(_, nir, discards_to_if);
    NIR_PASS(_, nir, discards_to_flag);
+   NIR_PASS(_, nir, nir_shader_tex_pass, lower_txf, nir_metadata_control_flow, NULL);
    lower_io(nir);
    out->native_blend = blend && is_src_over(blend) && !getenv("G9P_NO_NATIVE_BLEND");
    if (blend && !out->native_blend)

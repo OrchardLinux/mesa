@@ -13,8 +13,13 @@
 
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_lower_blend.h"
+#include "util/format/u_formats.h"
 
-#define G9P_MAX_BUFFERS 8
+/*
+ * Common-store buffer slots per shader; a vertex binding takes two (its
+ * address and stride), and Zink gives each attribute its own binding
+ */
+#define G9P_MAX_BUFFERS 16
 #define G9P_MAX_ATTRIBS 16
 #define G9P_MAX_VARYINGS 16
 #define G9P_MAX_TEXTURES 4
@@ -60,10 +65,15 @@
  * decoded for f32 use yet
  */
 
-/* A vertex attribute: 32-bit components from a vertex buffer */
+/*
+ * A vertex attribute from a vertex buffer: loaded as 32-bit words, and
+ * formats with smaller channels (Qt Quick's 8-bit colours) unpacked in the
+ * shader
+ */
 struct g9p_vertex_attrib {
    bool present;
    unsigned binding, offset;
+   enum pipe_format format;
 };
 
 struct g9p_shader {

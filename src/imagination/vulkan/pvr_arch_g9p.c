@@ -28,6 +28,9 @@
 #include "pvr_physical_device.h"
 #include "pvr_pipeline.h"
 
+static_assert(ARRAY_SIZE(((struct pvr_g9p_compute_state *)0)->buffers) == G9P_MAX_BUFFERS,
+              "pvr_pipeline.h sizes the shader's buffer slots by G9P_MAX_BUFFERS");
+
 /* Kernel task data: DOUTU source, local-ID and workgroup-ID control words */
 #define G9P_KERNEL_DATA_DWORDS 8
 

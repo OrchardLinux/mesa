@@ -45,6 +45,10 @@
 #include "pvr_physical_device.h"
 #include "pvr_pipeline.h"
 
+static_assert(ARRAY_SIZE(((struct pvr_g9p_graphics_state *)0)->buffers) == G9P_MAX_BUFFERS &&
+                 ARRAY_SIZE(((struct pvr_g9p_graphics_state *)0)->fs_buffers) == G9P_MAX_BUFFERS,
+              "pvr_pipeline.h sizes the shaders' buffer slots by G9P_MAX_BUFFERS");
+
 /* A pipeline the G9P backend cannot build yet: said on stderr too */
 #define g9p_error(device, ...)                                                \
    (fprintf(stderr, "g9p: " __VA_ARGS__), fprintf(stderr, "\n"),              \
@@ -318,19 +322,28 @@ PVR_PER_ARCH(g9p_gfx_device_finish)(struct pvr_device *device)
 
 /* --- Pipelines ------------------------------------------------------------ */
 
+/*
+ * Vertex attribute formats the shader loads: word-aligned, and either
+ * 32-bit channels or channels the vertex shader unpacks from its words
+ * (g9p_compile_vertex())
+ */
 static bool
-attrib_format_ok(VkFormat format)
+attrib_format_ok(VkFormat format, unsigned offset)
 {
    const struct util_format_description *desc =
       util_format_description(vk_format_to_pipe_format(format));
+   bool all32 = true;
 
-   if (!desc || desc->layout != UTIL_FORMAT_LAYOUT_PLAIN)
+   if (!desc || desc->layout != UTIL_FORMAT_LAYOUT_PLAIN || offset % 4)
       return false;
    for (unsigned i = 0; i < desc->nr_channels; i++) {
-      if (desc->channel[i].size != 32)
+      /* fixed point, and half floats (16-bit ALU work), not yet */
+      if (desc->channel[i].type == UTIL_FORMAT_TYPE_FIXED ||
+          (desc->channel[i].type == UTIL_FORMAT_TYPE_FLOAT && desc->channel[i].size != 32))
          return false;
+      all32 &= desc->channel[i].size == 32;
    }
-   return true;
+   return all32 || desc->block.bits <= 32 || desc->is_array;
 }
 
 static VkResult
@@ -470,16 +483,16 @@ PVR_PER_ARCH(g9p_graphics_pipeline_compile)(struct pvr_device *device,
       u_foreach_bit (loc, vk_state->vi->attributes_valid) {
          const struct vk_vertex_attribute_state *a = &vk_state->vi->attributes[loc];
 
-         if (loc >= G9P_MAX_ATTRIBS || !attrib_format_ok(a->format)) {
-            result = g9p_error(device,
-                               "G9P: vertex attribute %u: only 32-bit components so far",
-                               loc);
+         if (loc >= G9P_MAX_ATTRIBS || !attrib_format_ok(a->format, a->offset)) {
+            result = g9p_error(device, "G9P: vertex attribute %u: format %s not supported yet",
+                               loc, vk_Format_to_str(a->format));
             goto out;
          }
          attribs[loc] = (struct g9p_vertex_attrib){
             .present = true,
             .binding = a->binding,
             .offset = a->offset,
+            .format = vk_format_to_pipe_format(a->format),
          };
       }
    }
