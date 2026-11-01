@@ -424,8 +424,10 @@ pvr_process_graphics_cmd_for_view(struct pvr_device *device,
    if (job->g9p.enabled && getenv("G9P_SYNC")) {
       fprintf(stderr, "g9p: device %p: render %ux%u submitted, %u draws\n", (void *)device,
               job->g9p.width, job->g9p.height, job->g9p_draws.num_draws);
+      const int64_t t0 = os_time_get_nano();
       const bool geom = vk_sync_wait(&device->vk, geom_signal_sync, 0, VK_SYNC_WAIT_COMPLETE,
                                      os_time_get_absolute_timeout(500000000ull)) == VK_SUCCESS;
+      const int64_t t1 = os_time_get_nano();
 
       if (!geom || (frag_signal_sync &&
                     vk_sync_wait(&device->vk, frag_signal_sync, 0, VK_SYNC_WAIT_COMPLETE,
@@ -434,6 +436,17 @@ pvr_process_graphics_cmd_for_view(struct pvr_device *device,
                  (void *)device, job->g9p.width, job->g9p.height,
                  geom ? "fragment job" : "geometry job", job->g9p_draws.num_draws);
          for (unsigned i = 0; i < MIN2(job->g9p_draws.num_draws, 16); i++)
+            fprintf(stderr, " %u", job->g9p_draws.pipelines[i]);
+         fprintf(stderr, "\n");
+      } else if (getenv("G9P_TIME")) {
+         /* G9P_TIME=1: each render's geometry and fragment time (waited for in turn) */
+         const int64_t t2 = os_time_get_nano();
+
+         fprintf(stderr, "g9p: time %s %u draws: geometry %" PRId64 " us, fragment %" PRId64
+                         " us, pipelines",
+                 job->g9p.load ? "loaded" : "cleared", job->g9p_draws.num_draws,
+                 (t1 - t0) / 1000, (t2 - t1) / 1000);
+         for (unsigned i = 0; i < MIN2(job->g9p_draws.num_draws, 12); i++)
             fprintf(stderr, " %u", job->g9p_draws.pipelines[i]);
          fprintf(stderr, "\n");
       } else if (getenv("G9P_PROBE")) {
