@@ -2396,6 +2396,93 @@ discards_to_flag(nir_shader *nir)
    return nir_progress(true, impl, nir_metadata_none);
 }
 
+/*
+ * Discards of a shader that reads the tile (blending): each colour output
+ * keeps the tile's value where the pixel is discarded, instead of a
+ * hardware discard. Hyprland's border shader (blending, discarding inside
+ * the window) lost its border in random 32x32 tiles with the hardware
+ * discard in the translucent pass, while the same draw alone (vk-tri) was
+ * right. A discarded pixel writes nothing wherever the discard is, so
+ * the outputs are stored at the end, selected on all discard conditions.
+ * Needs every discard and colour store outside control flow (after
+ * discards_to_if and discards_to_flag); otherwise the hardware discard
+ * stays.
+ */
+static bool
+discards_to_select(nir_shader *nir)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_intrinsic_instr *discards[16], *stores[8];
+   unsigned num_discards = 0, num_stores = 0;
+   nir_def *cond = NULL;
+   nir_builder b;
+
+   nir_foreach_block(block, impl) {
+      const bool top = block->cf_node.parent->type == nir_cf_node_function;
+
+      nir_foreach_instr(instr, block) {
+         nir_intrinsic_instr *intr;
+
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         intr = nir_instr_as_intrinsic(instr);
+         switch (intr->intrinsic) {
+         case nir_intrinsic_demote:
+         case nir_intrinsic_terminate:
+         case nir_intrinsic_demote_if:
+         case nir_intrinsic_terminate_if:
+            if (!top || num_discards == ARRAY_SIZE(discards))
+               return nir_no_progress(impl);
+            discards[num_discards++] = intr;
+            break;
+         case nir_intrinsic_store_output:
+            if (!top || num_stores == ARRAY_SIZE(stores) ||
+                nir_intrinsic_io_semantics(intr).location < FRAG_RESULT_DATA0 ||
+                intr->src[0].ssa->bit_size != 32)
+               return nir_no_progress(impl);
+            stores[num_stores++] = intr;
+            break;
+         default:
+            break;
+         }
+      }
+   }
+   if (!num_discards || !num_stores)
+      return nir_no_progress(impl);
+
+   b = nir_builder_at(nir_after_impl(impl));
+   for (unsigned i = 0; i < num_discards; i++) {
+      nir_intrinsic_instr *intr = discards[i];
+      nir_def *c = intr->intrinsic == nir_intrinsic_demote_if ||
+                         intr->intrinsic == nir_intrinsic_terminate_if
+                      ? intr->src[0].ssa
+                      : nir_imm_true(&b);
+
+      cond = cond ? nir_ior(&b, cond, c) : c;
+      nir_instr_remove(&intr->instr);
+   }
+   for (unsigned i = 0; i < num_stores; i++) {
+      nir_intrinsic_instr *st = stores[i];
+      nir_io_semantics sem = nir_intrinsic_io_semantics(st);
+      nir_def *value = st->src[0].ssa;
+      nir_def *fb;
+
+      sem.fb_fetch_output = 1;
+      fb = nir_load_output(&b, value->num_components, 32, nir_imm_int(&b, 0),
+                           .base = nir_intrinsic_base(st),
+                           .component = nir_intrinsic_component(st),
+                           .dest_type = nir_type_float32, .io_semantics = sem);
+      nir_store_output(&b, nir_bcsel(&b, cond, fb, value), nir_imm_int(&b, 0),
+                       .base = nir_intrinsic_base(st),
+                       .write_mask = nir_intrinsic_write_mask(st),
+                       .component = nir_intrinsic_component(st),
+                       .src_type = nir_intrinsic_src_type(st),
+                       .io_semantics = nir_intrinsic_io_semantics(st));
+      nir_instr_remove(&st->instr);
+   }
+   return nir_progress(true, impl, nir_metadata_none);
+}
+
 bool
 g9p_compile_fragment(nir_shader *nir, unsigned frag_coord_slot,
                      const nir_lower_blend_options *blend, struct g9p_shader *out,
@@ -2409,6 +2496,8 @@ g9p_compile_fragment(nir_shader *nir, unsigned frag_coord_slot,
    if (blend)
       NIR_PASS(_, nir, nir_lower_blend, blend);
    out->uses_fbfetch = nir->info.fs.uses_fbfetch_output;
+   if (out->uses_fbfetch)
+      NIR_PASS(_, nir, discards_to_select);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_fb_fetch_instr, nir_metadata_control_flow,
             NULL);
    return compile_back(nir, out, MESA_SHADER_FRAGMENT, NULL, frag_coord_slot, mem_ctx);
