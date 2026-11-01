@@ -8,7 +8,7 @@
  *
  * Surfaces are linear (row stride in texels) or twiddled: Morton order with
  * the y bit first over the power-of-two padded size, interleaving while both
- * dimensions have bits (orchard gpu-001 RENDER.md "Textures with our
+ * dimensions have bits (the A10 notes' RENDER.md "Textures with our
  * encodings"). Copies convert formats through util_format when they differ
  * and scale with nearest sampling; MSAA resolves and YUV are not handled.
  */

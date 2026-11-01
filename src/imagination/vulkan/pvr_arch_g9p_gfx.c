@@ -4,13 +4,12 @@
  * draws as Rogue VDM/PPP words with G9P PDS programs, the end-of-tile and
  * background programs of a render, and the Apple register block of the
  * render job streams. Each piece follows a layout tested on hardware without
- * Mesa (orchard examples/gpu-001: tools/pvr-tri.c, RENDER.md "A triangle
- * from scratch", "Varyings and textures with our encodings").
+ * Mesa (the A10 notes, see g9p/README.md: tools/pvr-tri.c, RENDER.md "A
+ * triangle from scratch", "Varyings and textures with our encodings").
  *
- * What this does not do yet: depth/stencil, blending, culling state from the
- * pipeline, MSAA, multiple colour attachments, load ops other than clear,
- * non-32-bit vertex formats, indirect draws, textures and uniform buffers in
- * shaders.
+ * What this does not do yet: depth/stencil, culling state from the
+ * pipeline, MSAA, multiple colour attachments, more than one texture per
+ * fragment shader, non-32-bit vertex formats, indirect draws.
  */
 
 #include <inttypes.h>

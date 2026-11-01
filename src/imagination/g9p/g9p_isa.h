@@ -3,7 +3,7 @@
  * USC instruction encoders for the Apple A10 GPU's shader ISA
  * (applegpu_g9p). Each instruction is a run of 16-bit words; bit 8 of a word
  * means another word follows. The encodings are the ones decoded and tested
- * on hardware in the orchard gpu-001 ISA.md (its tools/isa/g9p.py is the
+ * on hardware in the A10 notes' ISA.md (g9p/README.md; its tools/isa/g9p.py is the
  * reference assembler these mirror).
  *
  * Registers are 32-bit; how many a thread has is set by the CDM kernel
@@ -435,7 +435,7 @@ g9p_jump(struct g9p_code *c, uint16_t op, int offset)
    return at;
 }
 
-/* --- Graphics (orchard gpu-001 RENDER.md "Own programs", "Varyings ...") */
+/* --- Graphics (RENDER.md "Own programs", "Varyings ...") */
 
 /*
  * Vertex output: slot @slot (0-3 the position, then the varyings'

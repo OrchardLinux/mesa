@@ -468,7 +468,7 @@ static unsigned get_pbe_stride_align(const struct pvr_device_info *dev_info)
 {
    /*
     * G9P: the image state holds the row pitch in 64-byte units (orchard
-    * gpu-001 RENDER.md "Render target captures"): 16 pixels at 4 bytes
+    * the A10 notes' RENDER.md "Render target captures"): 16 pixels at 4 bytes
     */
    if (PVR_HAS_FEATURE(dev_info, apple_g9p))
       return 16;

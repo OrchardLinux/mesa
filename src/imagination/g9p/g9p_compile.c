@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * NIR -> G9P compiler for compute shaders (see g9p_compile.h).
+ * NIR -> G9P compiler for compute, vertex and fragment shaders (see
+ * g9p_compile.h).
  *
  * Code layout follows Apple's compiler: prologue (mask lanes past the thread
  * count), execution-mask stack in the register after the program's own,

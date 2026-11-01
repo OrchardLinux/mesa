@@ -1,6 +1,16 @@
 `Mesa <https://mesa3d.org>`_ - The 3D Graphics Library
 ======================================================
 
+.. note::
+
+   This is `OrchardLinux <https://github.com/OrchardLinux>`_'s fork of Mesa,
+   for the GPUs of Apple's A-series chips (A10 first). It is not affiliated
+   with the Mesa project, and none of its changes are proposed upstream. Its
+   ``src/imagination`` work (the G9P backend, see
+   ``src/imagination/g9p/README.md``) was written with AI assistance and is
+   labelled so in its commits. Report problems with it at
+   https://github.com/OrchardLinux/mesa, not to Mesa.
+
 
 Source
 ------

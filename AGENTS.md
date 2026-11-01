@@ -1,5 +1,24 @@
 # AGENTS.md
 
+## This repository: OrchardLinux's fork
+
+This is OrchardLinux's fork of Mesa (github.com/OrchardLinux/mesa), for the
+GPUs of Apple's A-series chips. Its `main` branch carries the G9P backend
+for the Apple A10 in `src/imagination` (see `src/imagination/g9p/README.md`).
+In this fork:
+
+- The G9P work in `src/imagination` is done here, with AI assistance:
+  change it as needed. The `src/imagination` entry in upstream's list of
+  restricted directories below does not apply in this fork. Every such
+  commit carries the trailer `Generated-by: LLM` (or `Assisted-by: LLM`,
+  as below).
+- Nothing goes to upstream Mesa: no merge requests, issues or comments on
+  gitlab.freedesktop.org. The `upstream` remote is for fetching only.
+- Everything else below still applies, including the other restricted
+  directories (asahi, nouveau, panfrost, intel jay): don't change them.
+
+## Upstream Mesa's instructions
+
 Mesa is a community of humans. Do not open merge requests or post comments to
 [Mesa's upstream GitLab repository](https://gitlab.freedesktop.org/mesa/mesa).
 

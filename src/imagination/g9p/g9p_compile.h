@@ -25,8 +25,10 @@
 #define G9P_TEX_STRIDE 16
 /*
  * In fragment shaders the texture takes common-store dwords 0-9 (only state
- * at dword 0 samples correctly so far: RENDER.md "Textures in Mesa") and the
- * buffers' contents follow from dword 16: buffer k's first
+ * at dword 0 samples correctly so far: RENDER.md "Textures in Mesa"). The
+ * compiler accepts one texture per shader: a second one, at dword 16 by
+ * G9P_TEX_STRIDE, would overlap the buffers, so the layout has to change
+ * before it does. The buffers' contents follow from dword 16: buffer k's first
  * G9P_FS_BUF_DWORDS dwords at 16 + G9P_FS_BUF_DWORDS k, which the shader
  * reads as uniform operands (as Apple's fragment code does; memory loads
  * there do not work yet: ISA.md "Fragment uniforms")

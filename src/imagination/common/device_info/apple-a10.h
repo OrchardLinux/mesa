@@ -9,7 +9,7 @@
  * registers.
  *
  * Values marked "A10" are established on the hardware or from Apple's
- * drivers (see the orchard gpu-001 notes, PROVENANCE.md); the others are
+ * drivers (see g9p/README.md for the A10 notes: PROVENANCE.md); the others are
  * placeholders copied from GX6650, the closest 6-cluster Rogue, and are not
  * verified for this GPU.
  */

@@ -2,10 +2,10 @@
 /*
  * Compute data master (CDM) control-stream records and PDS instructions of
  * the Apple A10 GPU (applegpu_g9p), encoded from decoded fields. Header-only;
- * shared with the orchard gpu-001 test tools (tools/g9p-cdm.h).
+ * shared with the A10 test tools (tools/g9p-cdm.h; g9p/README.md).
  *
  * Field sources, so that other A-chip bring-ups can tell what is known
- * (sections of the orchard gpu-001 COMPUTE.md unless stated):
+ * (sections of the A10 notes' COMPUTE.md unless stated):
  *   - decoded + tested: the field's meaning was varied on hardware;
  *   - observed: the value is what iPadOS writes (captures), meaning open;
  *   - Rogue: the meaning follows PowerVR Rogue (Mesa), not tested on A10.
