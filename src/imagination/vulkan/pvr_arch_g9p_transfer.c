@@ -13,6 +13,7 @@
  * and scale with nearest sampling; MSAA resolves and YUV are not handled.
  */
 
+#include <stdlib.h>
 #include <string.h>
 
 #include "vk_format.h"
@@ -88,12 +89,24 @@ twiddle(unsigned x, unsigned y, unsigned w, unsigned h)
    return m;
 }
 
-static uint8_t *
-texel(const struct surface *s, unsigned x, unsigned y)
+/*
+ * A texel's byte offset is a column part plus a row part: in twiddled
+ * surfaces the x and y bits of the index are interleaved, disjoint
+ */
+static size_t
+column_offset(const struct surface *s, unsigned x)
 {
    if (s->twiddled)
-      return s->base + (size_t)twiddle(x, y, s->width, s->height) * s->bpp;
-   return s->base + ((size_t)y * s->stride + x) * s->bpp;
+      return (size_t)twiddle(x, 0, s->width, s->height) * s->bpp;
+   return (size_t)x * s->bpp;
+}
+
+static size_t
+row_offset(const struct surface *s, unsigned y)
+{
+   if (s->twiddled)
+      return (size_t)twiddle(0, y, s->width, s->height) * s->bpp;
+   return (size_t)y * s->stride * s->bpp;
 }
 
 static void
@@ -114,10 +127,19 @@ fill(const struct pvr_transfer_cmd *cmd, const struct surface *dst)
                                                                     cmd->clear_color[2].f,
                                                                     cmd->clear_color[3].f },
                             1);
-   for (int y = r->offset.y; y < r->offset.y + (int)r->extent.height; y++) {
-      for (int x = r->offset.x; x < r->offset.x + (int)r->extent.width; x++)
-         memcpy(texel(dst, x, y), packed, dst->bpp);
+   size_t *cols = malloc(r->extent.width * sizeof(*cols));
+
+   if (!cols)
+      return;
+   for (unsigned x = 0; x < r->extent.width; x++)
+      cols[x] = column_offset(dst, r->offset.x + x);
+   for (unsigned y = 0; y < r->extent.height; y++) {
+      uint8_t *row = dst->base + row_offset(dst, r->offset.y + y);
+
+      for (unsigned x = 0; x < r->extent.width; x++)
+         memcpy(row + cols[x], packed, dst->bpp);
    }
+   free(cols);
 }
 
 static void
@@ -129,19 +151,37 @@ copy(const struct pvr_rect_mapping *m, const struct surface *src, const struct s
    const unsigned dw = m->dst_rect.extent.width, dh = m->dst_rect.extent.height;
    const unsigned sw = m->src_rect.extent.width, sh = m->src_rect.extent.height;
 
-   for (unsigned y = 0; y < dh; y++) {
-      for (unsigned x = 0; x < dw; x++) {
-         unsigned sx = sw == dw ? x : x * sw / dw;
-         unsigned sy = sh == dh ? y : y * sh / dh;
-         const uint8_t *from;
-         uint8_t *to;
+   /* each destination column's source and destination offsets */
+   size_t *cols = malloc(2 * dw * sizeof(*cols));
 
-         if (m->flip_x)
-            sx = sw - 1 - sx;
-         if (m->flip_y)
-            sy = sh - 1 - sy;
-         from = texel(src, m->src_rect.offset.x + sx, m->src_rect.offset.y + sy);
-         to = texel(dst, m->dst_rect.offset.x + x, m->dst_rect.offset.y + y);
+   if (!cols)
+      return;
+   for (unsigned x = 0; x < dw; x++) {
+      unsigned sx = sw == dw ? x : x * sw / dw;
+
+      if (m->flip_x)
+         sx = sw - 1 - sx;
+      cols[2 * x] = column_offset(src, m->src_rect.offset.x + sx);
+      cols[2 * x + 1] = column_offset(dst, m->dst_rect.offset.x + x);
+   }
+   for (unsigned y = 0; y < dh; y++) {
+      unsigned sy = sh == dh ? y : y * sh / dh;
+
+      if (m->flip_y)
+         sy = sh - 1 - sy;
+
+      const uint8_t *src_row = src->base + row_offset(src, m->src_rect.offset.y + sy);
+      uint8_t *dst_row = dst->base + row_offset(dst, m->dst_rect.offset.y + y);
+
+      if (same && dst->bpp == 4) {
+         for (unsigned x = 0; x < dw; x++)
+            *(uint32_t *)(dst_row + cols[2 * x + 1]) = *(const uint32_t *)(src_row + cols[2 * x]);
+         continue;
+      }
+      for (unsigned x = 0; x < dw; x++) {
+         const uint8_t *from = src_row + cols[2 * x];
+         uint8_t *to = dst_row + cols[2 * x + 1];
+
          if (same) {
             memcpy(to, from, dst->bpp);
          } else if (integer) {
@@ -157,6 +197,7 @@ copy(const struct pvr_rect_mapping *m, const struct surface *src, const struct s
          }
       }
    }
+   free(cols);
 }
 
 static void
