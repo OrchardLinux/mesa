@@ -1330,11 +1330,12 @@ PVR_PER_ARCH(g9p_pack_image_view)(const struct pvr_image_view *iview, uint64_t w
 }
 
 /*
- * Sampler words: nearest/clamp as captured (000e0000 00c00780); dword 0 bit
- * 23 makes magnification linear (pvr-tri TRI_SAMPLER). Linear-filter-and-
- * repeat as iPadOS writes it also sets dword 0 bits 25 and 29 and dword 1
- * bit 0: minification and the wrap modes, not separated yet, so linear
- * minification sets dword 1 bit 0 and repeat bits 25 and 29 (to verify).
+ * Sampler words: nearest/clamp as captured (000e0000 00c00780). iPadOS's
+ * linear-filter-and-repeat sampler (`texfilter` capture) adds dword 0 bits
+ * 23, 25 and 29 and dword 1 bit 0; on hardware (vk-tri with coordinates
+ * past 1) bit 29 repeats u, dword 1 bit 0 repeats v, bit 23 makes
+ * magnification linear (pvr-tri TRI_SAMPLER), which leaves bit 25 for
+ * minification. Mirrored and border modes are not decoded: they clamp.
  */
 uint64_t
 PVR_PER_ARCH(g9p_pack_sampler)(const VkSamplerCreateInfo *info)
@@ -1344,11 +1345,21 @@ PVR_PER_ARCH(g9p_pack_sampler)(const VkSamplerCreateInfo *info)
    if (info->magFilter == VK_FILTER_LINEAR)
       d0 |= BITFIELD_BIT(23);
    if (info->minFilter == VK_FILTER_LINEAR)
-      d1 |= 1;
-   if (info->addressModeU == VK_SAMPLER_ADDRESS_MODE_REPEAT)
       d0 |= BITFIELD_BIT(25);
-   if (info->addressModeV == VK_SAMPLER_ADDRESS_MODE_REPEAT)
+   if (info->addressModeU == VK_SAMPLER_ADDRESS_MODE_REPEAT)
       d0 |= BITFIELD_BIT(29);
+   if (info->addressModeV == VK_SAMPLER_ADDRESS_MODE_REPEAT)
+      d1 |= BITFIELD_BIT(0);
+   if ((info->addressModeU != VK_SAMPLER_ADDRESS_MODE_REPEAT &&
+        info->addressModeU != VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE) ||
+       (info->addressModeV != VK_SAMPLER_ADDRESS_MODE_REPEAT &&
+        info->addressModeV != VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE))
+      mesa_logw_once("G9P: sampler address modes %u/%u not decoded yet: clamping",
+                     info->addressModeU, info->addressModeV);
+   if (getenv("G9P_DEBUG"))
+      fprintf(stderr, "g9p: sampler filter %u/%u address %u/%u/%u: %08x %08x\n",
+              info->magFilter, info->minFilter, info->addressModeU, info->addressModeV,
+              info->addressModeW, d0, d1);
    return d0 | (uint64_t)d1 << 32;
 }
 
