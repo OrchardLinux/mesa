@@ -1261,7 +1261,8 @@ PVR_PER_ARCH(g9p_pack_image_view)(const struct pvr_image_view *iview, uint64_t w
 {
    const struct pvr_image *image = pvr_image_view_get_image(iview);
    const struct pvr_image_plane *plane = pvr_single_plane_const(image);
-   const uint32_t fmt = image_format_bits(iview->vk.format);
+   const VkComponentMapping *sw = &iview->vk.swizzle;
+   uint32_t fmt = image_format_bits(iview->vk.format);
    const bool linear = image->memlayout == PVR_MEMLAYOUT_LINEAR;
    const uint64_t addr = image->dev_addr.addr + plane->offset +
                          plane->mip_levels[iview->vk.base_mip_level].offset +
@@ -1271,6 +1272,20 @@ PVR_PER_ARCH(g9p_pack_image_view)(const struct pvr_image_view *iview, uint64_t w
 
    if (!fmt)
       mesa_logw("G9P: texture format %s not decoded yet", vk_Format_to_str(iview->vk.format));
+   /*
+    * A view swapping red and blue (Zink's BGRA formats on RGBA images):
+    * the 8-bit formats' other byte order. Other swizzles are not decoded
+    * in the image state yet; alpha ONE (X formats) reads the stored alpha,
+    * right for clients that write it opaque.
+    */
+   if (sw->r == VK_COMPONENT_SWIZZLE_B && sw->b == VK_COMPONENT_SWIZZLE_R &&
+       (fmt == 0x0505 || fmt == 0x4405))
+      fmt ^= 0x0505 ^ 0x4405;
+   else if (sw->r != VK_COMPONENT_SWIZZLE_R || sw->g != VK_COMPONENT_SWIZZLE_G ||
+            sw->b != VK_COMPONENT_SWIZZLE_B ||
+            (sw->a != VK_COMPONENT_SWIZZLE_A && sw->a != VK_COMPONENT_SWIZZLE_ONE))
+      mesa_logw("G9P: texture swizzle %u %u %u %u of %s not decoded yet", sw->r, sw->g, sw->b,
+                sw->a, vk_Format_to_str(iview->vk.format));
    d[0] = 0x03000000u | (fmt ? fmt : 0x0505) << 8 | (linear ? 0x02 : 0x0a) | (w - 1) << 27;
    d[1] = (w - 1) >> 5 | (h - 1) << 9;
    d[2] = (uint32_t)(addr >> 1);
