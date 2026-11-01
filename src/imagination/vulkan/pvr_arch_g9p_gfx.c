@@ -668,6 +668,10 @@ upload_textures(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics
          sets[k][0] = state->fs_buffers[k].set;
          sets[k][1] = state->fs_buffers[k].binding;
       }
+      if (dumping())
+         fprintf(stderr, "g9p: fs buffers of pipeline %u (%u dwords at set %u binding %u)\n",
+                 state->id, state->fs_buffers[0].dwords, state->fs_buffers[0].set,
+                 state->fs_buffers[0].binding);
       result = buffer_addrs(cmd_buffer, state->fs_num_buffers, sets,
                             PVR_STAGE_ALLOCATION_FRAGMENT, addrs);
       if (result != VK_SUCCESS)
@@ -806,9 +810,10 @@ buffer_addrs(struct pvr_cmd_buffer *cmd_buffer, unsigned n, const unsigned (*set
             const uint32_t *v = (const uint32_t *)PVR_PER_ARCH(g9p_cpu_addr)(cmd_buffer->device,
                                                                             addrs[k]);
 
+            /* G9P_DUMP_FULL: whole buffers (128 dwords), for replaying a draw */
             if (v)
                dump32(stage == PVR_STAGE_ALLOCATION_FRAGMENT ? "fs buffer" : "vs buffer",
-                      addrs[k], v, 16);
+                      addrs[k], v, getenv("G9P_DUMP_FULL") ? 128 : 16);
          }
       }
    }
