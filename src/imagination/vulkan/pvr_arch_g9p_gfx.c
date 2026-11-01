@@ -881,6 +881,12 @@ struct g9p_draw_programs {
    float vp[6]; /* a0 m0 a1 m1 a2 m2 */
    /* the draw's entry in the render's scissor table, or -1 for none */
    int scissor;
+   /*
+    * Region clip in 32-pixel tiles, inclusive (left, top, right, bottom):
+    * the tiler bins the draw into these tiles only. All zero: the whole
+    * render area.
+    */
+   uint32_t region[4];
 };
 
 /*
@@ -937,6 +943,10 @@ PVR_PER_ARCH(g9p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer,
          return VK_SUCCESS; /* nothing passes */
       sc = (VkRect2D){ { x0, y0 }, { x1 - x0, y1 - y0 } };
       dp.scissor = scissor_index(cmd_buffer, sc);
+      dp.region[0] = x0 / 32;
+      dp.region[1] = y0 / 32;
+      dp.region[2] = (x1 - 1) / 32;
+      dp.region[3] = (y1 - 1) / 32;
    }
    if (result != VK_SUCCESS)
       return result;
@@ -1046,10 +1056,22 @@ emit_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state
    pass = state->uses_fbfetch ? 1u : state->uses_discard ? 4u : 0u;
    PPP_BLOCK(0x1f, 0x03c40000 | (dp->scissor >= 0 ? BITFIELD_BIT(16) : 0),
              0x003e0f00 | pass << 24, 0x0e000000, 0x00100f00 | pass << 24, 0);
-   /* 4: region clip (32-pixel units) and the viewport (a0 m0 a1 m1 a2 m2) */
-   PPP_BLOCK(0xc00, 0x80000000u | (DIV_ROUND_UP(width, 32) - 1), DIV_ROUND_UP(height, 32) - 1,
-             fui(dp->vp[0]), fui(dp->vp[1]), fui(dp->vp[2]), fui(dp->vp[3]), fui(dp->vp[4]),
-             fui(dp->vp[5]));
+   /*
+    * 4: region clip (32-pixel tiles, inclusive; mode OUTSIDE drops what lies
+    * outside) and the viewport (a0 m0 a1 m1 a2 m2). The clip is the draw's
+    * scissor, so the tiler bins a scissored draw (Hyprland's damage, its
+    * blur passes) into its own tiles only, and a render that loads its
+    * target skips the others (ISP_CTL in g9p_frag_stream())
+    */
+   {
+      const bool all = !(dp->region[0] | dp->region[1] | dp->region[2] | dp->region[3]);
+      const uint32_t right = all ? DIV_ROUND_UP(width, 32) - 1 : dp->region[2];
+      const uint32_t bottom = all ? DIV_ROUND_UP(height, 32) - 1 : dp->region[3];
+
+      PPP_BLOCK(0xc00, 0x80000000u | dp->region[0] << 16 | right, dp->region[1] << 16 | bottom,
+                fui(dp->vp[0]), fui(dp->vp[1]), fui(dp->vp[2]), fui(dp->vp[3]),
+                fui(dp->vp[4]), fui(dp->vp[5]));
+   }
    /* 5: w clamp (1e-20) and PPP control */
    PPP_BLOCK(0x00210000, 0x1e3ce508, 0x4a0);
    /* 6: depth bias / scissor index (ISPCTL bit 16 enables the scissor) */
@@ -1569,9 +1591,12 @@ PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
    /*
     * ISP_CTL: bit 17 (Rogue's process_empty_tiles) runs the background object
     * on tiles without geometry too; without it a render's clear reaches
-    * only the tiles a primitive touched (pvr-tri TRI_NODRAW)
+    * only the tiles a primitive touched (pvr-tri TRI_NODRAW). A render that
+    * loads its target leaves it off: tiles no draw reaches (outside every
+    * draw's region clip) are neither loaded nor stored and keep their
+    * memory, which is the load's result anyway. G9P_ALL_TILES=1 keeps it on.
     */
-   put32(&s, 0x23000f);
+   put32(&s, job->g9p.load && !getenv("G9P_ALL_TILES") ? 0x21000f : 0x23000f);
    put32(&s, 0x402);    /* EVENT_PIXEL_PDS_INFO */
    put32(&s, 0);
    put32(&s, job->view_state.view[0].pds_pixel_event_data_offset);
