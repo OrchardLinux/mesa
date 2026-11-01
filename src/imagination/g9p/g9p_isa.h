@@ -280,11 +280,15 @@ g9p_mov_uniform(struct g9p_code *c, unsigned dst, unsigned u, unsigned zero)
             0x4100 | (u >> 5) << 1, G9P_IADD);
 }
 
-/* dst = a * b + c */
+/*
+ * dst = a * b + c. The third operand word is 0x0100 | c << 2; bit 7 is its
+ * last-use (kill) flag, as in g9p_srcs(), and must stay clear while c is
+ * read again later
+ */
 static inline void
 g9p_ffma(struct g9p_code *c, unsigned dst, unsigned a, unsigned b, unsigned cc)
 {
-   G9P_EMIT(c, g9p_w0(c, 0x399e), g9p_dst(c, dst), g9p_srcs(a, b, false), 0x0180 | cc << 2,
+   G9P_EMIT(c, g9p_w0(c, 0x399e), g9p_dst(c, dst), g9p_srcs(a, b, false), 0x0100 | cc << 2,
             0x004c);
 }
 
