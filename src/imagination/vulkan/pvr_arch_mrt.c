@@ -498,6 +498,14 @@ VkResult pvr_arch_mrt_load_ops_setup(struct pvr_cmd_buffer *cmd_buffer,
    struct pvr_device *device = cmd_buffer->device;
    VkResult result = VK_SUCCESS;
 
+   /*
+    * G9P loads and clears through its background object
+    * (pvr_arch_g9p_job_init()), so the load-op programs, a shader compile and
+    * upload per vkCmdBeginRendering, are not needed.
+    */
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p))
+      return VK_SUCCESS;
+
    if (dr_info->mrt_setup->num_tile_buffers) {
       result = pvr_device_tile_buffer_ensure_cap(
          device,

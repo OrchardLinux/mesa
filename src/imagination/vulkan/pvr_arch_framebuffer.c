@@ -154,6 +154,16 @@ pvr_arch_render_state_setup(struct pvr_device *device,
       goto err_release_scratch_buffer;
 
    for (uint32_t i = 0; i < render_count; i++) {
+      /*
+       * G9P has no SPM: a scene that outgrows the parameter buffer is not
+       * spilled and reloaded. Its end-of-tile and background programs come
+       * from pvr_arch_g9p_job_init(), and skipping these saves a shader
+       * compile and buffer allocations per render (per vkCmdBeginRendering
+       * with dynamic rendering).
+       */
+      if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p))
+         continue;
+
       result = pvr_arch_spm_init_eot_state(device,
                                            &spm_eot_state_per_render[i],
                                            rstate,
