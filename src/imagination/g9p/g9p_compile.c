@@ -121,6 +121,15 @@ struct g9p_ctx {
    nir_def **decls;
    unsigned num_decls;
 
+   /*
+    * Fragment NIR registers parked above r31 (per decl_reg key, -1: none),
+    * chosen across generate() attempts when registers run out
+    */
+   int8_t *home;
+   unsigned num_homes;
+   bool oom;          /* the last generate() ran out of registers */
+   unsigned oom_ip;
+
    uint64_t busy;   /* registers in use */
    uint64_t pinned; /* NIR registers: never released */
    uint64_t temps;  /* released after the current instruction */
@@ -147,7 +156,10 @@ key(const nir_def *def, unsigned comp)
 static void
 dump_busy(struct g9p_ctx *ctx)
 {
-   fprintf(stderr, "g9p: out of registers at instruction %u\n", ctx->ip);
+   ctx->oom = true;
+   ctx->oom_ip = ctx->ip;
+   if (getenv("G9P_DEBUG"))
+      fprintf(stderr, "g9p: out of registers at instruction %u\n", ctx->ip);
    if (!getenv("G9P_DEBUG"))
       return;
    /* NIR registers are pinned: the busy ones not listed below */
@@ -259,6 +271,13 @@ src_reg(struct g9p_ctx *ctx, nir_scalar s)
    if (is_const(s, &value))
       return const_reg(ctx, value);
    r = ctx->reg[key(s.def, s.comp)];
+   if (r < 0 && ctx->home && ctx->home[key(s.def, s.comp)] >= 0) {
+      /* parked above r31: back into a temporary for this instruction */
+      r = alloc_temp(ctx);
+      if (r >= 0)
+         g9p_mov_from_high(ctx->c, r, ctx->home[key(s.def, s.comp)]);
+      return r;
+   }
    if (r < 0)
       fprintf(stderr, "g9p: value %u has no register\n", s.def->index);
    return r;
@@ -282,11 +301,35 @@ release_scalar(struct g9p_ctx *ctx, nir_def *def, unsigned comp)
       ctx->busy &= ~BITFIELD64_BIT(ctx->reg[k]);
 }
 
+/* A result with a home above r31: copied there, its register freed */
+static bool
+park_def(nir_def *def, void *data)
+{
+   struct g9p_ctx *ctx = data;
+
+   if (!ctx->home)
+      return true;
+   for (unsigned c = 0; c < def->num_components; c++) {
+      const unsigned k = key(def, c);
+      const int r = ctx->reg[k];
+
+      if (ctx->home[k] < 0 || r < 0 || (ctx->pinned & BITFIELD64_BIT(r)))
+         continue;
+      g9p_mov_to_high(ctx->c, ctx->home[k], r);
+      ctx->busy &= ~BITFIELD64_BIT(r);
+      ctx->reg[k] = -1;
+   }
+   return true;
+}
+
 /* A NIR register's hardware register, taken at its first use */
 static int
 nir_reg(struct g9p_ctx *ctx, nir_def *decl)
 {
    int r = ctx->reg[key(decl, 0)];
+
+   if (ctx->home && ctx->home[key(decl, 0)] >= 0)
+      return ctx->home[key(decl, 0)];
 
    if (r < 0) {
       r = alloc_reg(ctx);
@@ -1172,6 +1215,15 @@ emit_output(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
    r = src_reg(ctx, v);
    if (r < 0)
       return false;
+   if (ctx->temps & BITFIELD64_BIT(r)) {
+      /* reloaded from above r31 into a temporary: an output keeps its own */
+      int own = alloc_reg(ctx);
+
+      if (own < 0)
+         return false;
+      g9p_alu2(ctx->c, G9P_OR, own, r, r, false);
+      r = own;
+   }
    pin(ctx, r);
    if (ctx->stage == MESA_SHADER_VERTEX) {
       ctx->outputs[ctx->num_outputs].reg = r;
@@ -1435,6 +1487,15 @@ emit_intrinsic(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
 
       if (r < 0)
          return false;
+      if (r >= 32) {
+         /* parked above r31: into a register of the load's own */
+         int low = alloc_reg(ctx);
+
+         if (low < 0)
+            return false;
+         g9p_mov_from_high(ctx->c, low, r);
+         r = low;
+      }
       ctx->reg[key(&intr->def, 0)] = r;
       release(ctx, &intr->instr);
       return true;
@@ -1451,7 +1512,9 @@ emit_intrinsic(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
          src = src_reg(ctx, v);
          if (src < 0)
             return false;
-         if (src != dst)
+         if (dst >= 32)
+            g9p_mov_to_high(ctx->c, dst, src);
+         else if (src != dst)
             g9p_add_imm(ctx->c, dst, src, 0);
       }
       release(ctx, &intr->instr);
@@ -1707,11 +1770,14 @@ emit_cf_list(struct g9p_ctx *ctx, struct exec_list *list)
                   return false;
             }
             if (!emit_instr(ctx, instr)) {
-               fprintf(stderr, "g9p: cannot compile: ");
-               nir_print_instr(instr, stderr);
-               fprintf(stderr, "\n");
+               if (getenv("G9P_DEBUG") || !ctx->oom) {
+                  fprintf(stderr, "g9p: cannot compile: ");
+                  nir_print_instr(instr, stderr);
+                  fprintf(stderr, "\n");
+               }
                return false;
             }
+            nir_foreach_def(instr, park_def, ctx);
          }
          break;
       case nir_cf_node_if:
@@ -2101,17 +2167,58 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
    ctx.loop_index = 0;
    walk_liveness(&ctx, &impl->body, true);
 
-   /* Twice: to find the register count, then with the mask stack after it */
-   if (!generate(&ctx, impl, G9P_NUM_REGS))
-      return false;
+   /*
+    * Twice: to find the register count, then with the mask stack after it.
+    * Fragment shaders that run out of registers park the NIR register live
+    * at that point with the furthest last use above r31 and try again.
+    */
+   ctx.home = ralloc_array(mem_ctx, int8_t, impl->ssa_alloc * 4);
+   memset(ctx.home, -1, impl->ssa_alloc * 4);
+   for (;;) {
+      unsigned best = 0;
+      int victim = -1;
+
+      ctx.oom = false;
+      if (generate(&ctx, impl, G9P_NUM_REGS))
+         break;
+      if (!ctx.oom || stage != MESA_SHADER_FRAGMENT || ctx.num_homes >= 96)
+         return false;
+      for (unsigned d = 0; d < ctx.num_decls; d++) {
+         const unsigned k = key(ctx.decls[d], 0);
+
+         if (ctx.home[k] < 0 && ctx.reg_first[ctx.decls[d]->index] <= ctx.oom_ip &&
+             ctx.last_use[k] >= ctx.oom_ip && ctx.last_use[k] > best) {
+            best = ctx.last_use[k];
+            victim = k;
+         }
+      }
+      /* else the live value (not a NIR register's) with the furthest last use */
+      for (unsigned k = 0, ssa_best = 0; victim < 0 && k < ctx.num_keys; k++) {
+         const int r = ctx.reg[k];
+
+         if (r < 0 || r >= 32 || ctx.home[k] >= 0 || ctx.last_use[k] <= ctx.oom_ip ||
+             (ctx.pinned | ctx.temps) & BITFIELD64_BIT(r) || ctx.last_use[k] <= ssa_best)
+            continue;
+         ssa_best = ctx.last_use[k];
+         best = k + 1;
+      }
+      if (victim < 0 && best && best <= ctx.num_keys && ctx.home[best - 1] < 0 &&
+          ctx.reg[best - 1] >= 0)
+         victim = best - 1;
+      if (victim < 0) {
+         fprintf(stderr, "g9p: out of registers at instruction %u\n", ctx.oom_ip);
+         return false;
+      }
+      ctx.home[victim] = 32 + ctx.num_homes++;
+   }
    st = ctx.max_reg + 1;
    if (!generate(&ctx, impl, st))
       return false;
 
-   out->num_regs = st + 1;
+   out->num_regs = MAX2(st + 1, ctx.num_homes ? 32 + ctx.num_homes : 0);
    out->code = ctx.c->w;
    out->code_size = 2 * ctx.c->n;
-   if (stage != MESA_SHADER_COMPUTE && out->num_regs > 32) {
+   if (stage != MESA_SHADER_COMPUTE && st + 1 > 32) {
       fprintf(stderr, "g9p: %u registers, a graphics task has 32\n", out->num_regs);
       return false;
    }
@@ -2240,6 +2347,55 @@ discards_to_if(nir_shader *nir)
    return nir_progress(progress, impl, nir_metadata_none);
 }
 
+/*
+ * Discards left inside control flow (nested, or with more around them):
+ * each sets a flag instead, and one discard_if on it ends the shader. The
+ * shader runs on for such pixels, which only matters for side effects
+ * (none in the shaders seen so far).
+ */
+static bool
+discards_to_flag(nir_shader *nir)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_variable *flag = NULL;
+   nir_builder b;
+
+   nir_foreach_block_safe(block, impl) {
+      if (block->cf_node.parent->type == nir_cf_node_function)
+         continue;
+      nir_foreach_instr_safe(instr, block) {
+         nir_intrinsic_instr *intr;
+         nir_def *cond;
+
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic != nir_intrinsic_demote &&
+             intr->intrinsic != nir_intrinsic_terminate &&
+             intr->intrinsic != nir_intrinsic_demote_if &&
+             intr->intrinsic != nir_intrinsic_terminate_if)
+            continue;
+         if (!flag) {
+            flag = nir_local_variable_create(impl, glsl_bool_type(), "discarded");
+            b = nir_builder_at(nir_before_impl(impl));
+            nir_store_var(&b, flag, nir_imm_false(&b), 1);
+         }
+         b = nir_builder_at(nir_before_instr(instr));
+         cond = intr->intrinsic == nir_intrinsic_demote ||
+                      intr->intrinsic == nir_intrinsic_terminate
+                   ? nir_imm_true(&b)
+                   : nir_ior(&b, nir_load_var(&b, flag), intr->src[0].ssa);
+         nir_store_var(&b, flag, cond, 1);
+         nir_instr_remove(instr);
+      }
+   }
+   if (!flag)
+      return nir_no_progress(impl);
+   b = nir_builder_at(nir_after_impl(impl));
+   nir_demote_if(&b, nir_load_var(&b, flag));
+   return nir_progress(true, impl, nir_metadata_none);
+}
+
 bool
 g9p_compile_fragment(nir_shader *nir, unsigned frag_coord_slot,
                      const nir_lower_blend_options *blend, struct g9p_shader *out,
@@ -2248,6 +2404,7 @@ g9p_compile_fragment(nir_shader *nir, unsigned frag_coord_slot,
    memset(out, 0, sizeof(*out));
    lower_front(nir);
    NIR_PASS(_, nir, discards_to_if);
+   NIR_PASS(_, nir, discards_to_flag);
    lower_io(nir);
    if (blend)
       NIR_PASS(_, nir, nir_lower_blend, blend);

@@ -173,6 +173,30 @@ g9p_alu2(struct g9p_code *c, unsigned op, unsigned dst, unsigned a, unsigned b,
    G9P_EMIT(c, g9p_w0(c, 0x3199), g9p_dst(c, dst), g9p_srcs(a, b, kill), op);
 }
 
+/*
+ * Fragment registers above r31 (Apple's compiler uses up to r101 in fragment
+ * code): as a destination the usual 0x0100 | 2r; as a source the operand
+ * word's 5-bit fields hold r & 31, bit 0 is set, and an extension word after
+ * it holds r >> 5 (first operand at bit 1, second at bit 9), as for uniform
+ * operands. Tested with pvr-tri (r40, r77, r100: ISA.md "Registers above
+ * r31"). The compiler parks NIR registers there ("homes") and moves them
+ * with OR, which copies any bit pattern.
+ */
+static inline void
+g9p_mov_to_high(struct g9p_code *c, unsigned hi, unsigned src)
+{
+   assert(c->fragment && src < 32 && hi < 128);
+   G9P_EMIT(c, 0x0199, 0x0100 | 2 * hi, 0x0100 | src << 2 | src << 10, 0x00ce);
+}
+
+static inline void
+g9p_mov_from_high(struct g9p_code *c, unsigned dst, unsigned hi)
+{
+   assert(c->fragment && dst < 32 && hi < 128);
+   G9P_EMIT(c, 0x0199, 0x0100 | 2 * dst, 0x0101 | (hi & 31) << 2 | (hi & 31) << 10,
+            0x0100 | (hi >> 5) << 1 | (hi >> 5) << 9, 0x00ce);
+}
+
 /* dst = src + imm, 0 <= imm < 64 */
 static inline void
 g9p_add_imm(struct g9p_code *c, unsigned dst, unsigned src, unsigned imm)
