@@ -409,8 +409,9 @@ pvr_process_graphics_cmd_for_view(struct pvr_device *device,
    if (job->g9p.enabled && getenv("G9P_TRACE")) {
       static unsigned n;
 
-      fprintf(stderr, "g9p: trace %u: %ux%u %s, %u draws, pipelines", ++n, job->g9p.width,
-              job->g9p.height, job->g9p.load ? "loaded" : "cleared", job->g9p_draws.num_draws);
+      fprintf(stderr, "g9p: trace %u: %ux%u %s, %u draws, at %.1f ms, pipelines", ++n,
+              job->g9p.width, job->g9p.height, job->g9p.load ? "loaded" : "cleared",
+              job->g9p_draws.num_draws, os_time_get_nano() / 1e6);
       for (unsigned i = 0; i < MIN2(job->g9p_draws.num_draws, 12); i++)
          fprintf(stderr, " %u", job->g9p_draws.pipelines[i]);
       fprintf(stderr, "\n");
