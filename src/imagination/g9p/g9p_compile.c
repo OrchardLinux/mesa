@@ -1918,6 +1918,8 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
          }
          for (unsigned i = 0; i < 4; i++)
             g9p_to_half(ctx->c, i, ctx->colour[i]);
+         if (ctx->out->native_blend)
+            g9p_blend_src_over(ctx->c);
       }
       g9p_end_fragment(ctx->c, colour);
       break;
@@ -2429,7 +2431,7 @@ discards_to_flag(nir_shader *nir)
  * stays.
  */
 static bool
-discards_to_select(nir_shader *nir)
+discards_to_select(nir_shader *nir, bool zero)
 {
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
    nir_intrinsic_instr *discards[16], *stores[8];
@@ -2488,10 +2490,12 @@ discards_to_select(nir_shader *nir)
       nir_def *fb;
 
       sem.fb_fetch_output = 1;
-      fb = nir_load_output(&b, value->num_components, 32, nir_imm_int(&b, 0),
-                           .base = nir_intrinsic_base(st),
-                           .component = nir_intrinsic_component(st),
-                           .dest_type = nir_type_float32, .io_semantics = sem);
+      /* native source-over: transparent black keeps the tile's colour */
+      fb = zero ? nir_imm_zero(&b, value->num_components, 32)
+                : nir_load_output(&b, value->num_components, 32, nir_imm_int(&b, 0),
+                                  .base = nir_intrinsic_base(st),
+                                  .component = nir_intrinsic_component(st),
+                                  .dest_type = nir_type_float32, .io_semantics = sem);
       nir_store_output(&b, nir_bcsel(&b, cond, fb, value), nir_imm_int(&b, 0),
                        .base = nir_intrinsic_base(st),
                        .write_mask = nir_intrinsic_write_mask(st),
@@ -2501,6 +2505,26 @@ discards_to_select(nir_shader *nir)
       nir_instr_remove(&st->instr);
    }
    return nir_progress(true, impl, nir_metadata_none);
+}
+
+/*
+ * Premultiplied source-over on all four channels of a colour attachment
+ * (Hyprland's and Zink's usual blend): done natively at the end
+ */
+static bool
+is_src_over(const nir_lower_blend_options *blend)
+{
+   const nir_lower_blend_rt *rt = &blend->rt[0];
+   const nir_lower_blend_channel *ch[2] = { &rt->rgb, &rt->alpha };
+
+   if (blend->logicop_enable || rt->colormask != 0xf)
+      return false;
+   for (unsigned i = 0; i < 2; i++) {
+      if (ch[i]->func != PIPE_BLEND_ADD || ch[i]->src_factor != PIPE_BLENDFACTOR_ONE ||
+          ch[i]->dst_factor != PIPE_BLENDFACTOR_INV_SRC_ALPHA)
+         return false;
+   }
+   return true;
 }
 
 bool
@@ -2513,11 +2537,12 @@ g9p_compile_fragment(nir_shader *nir, unsigned frag_coord_slot,
    NIR_PASS(_, nir, discards_to_if);
    NIR_PASS(_, nir, discards_to_flag);
    lower_io(nir);
-   if (blend)
+   out->native_blend = blend && is_src_over(blend) && !getenv("G9P_NO_NATIVE_BLEND");
+   if (blend && !out->native_blend)
       NIR_PASS(_, nir, nir_lower_blend, blend);
-   out->uses_fbfetch = nir->info.fs.uses_fbfetch_output;
+   out->uses_fbfetch = nir->info.fs.uses_fbfetch_output || out->native_blend;
    if (out->uses_fbfetch)
-      NIR_PASS(_, nir, discards_to_select);
+      NIR_PASS(_, nir, discards_to_select, out->native_blend);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_fb_fetch_instr, nir_metadata_control_flow,
             NULL);
    return compile_back(nir, out, MESA_SHADER_FRAGMENT, NULL, frag_coord_slot, mem_ctx);

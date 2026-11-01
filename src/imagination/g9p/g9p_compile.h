@@ -104,6 +104,12 @@ struct g9p_shader {
    /* Fragment: may discard (punch-through pass type) */
    bool uses_discard;
    bool uses_fbfetch;
+   /*
+    * Fragment: premultiplied source-over blended at the end with Apple's
+    * half-precision sequence (g9p_blend_src_over()) instead of
+    * nir_lower_blend's f32 code
+    */
+   bool native_blend;
 
    /* Fragment: the combined image samplers sampled, by common-store slot */
    unsigned num_textures;

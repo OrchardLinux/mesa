@@ -554,6 +554,24 @@ g9p_discard_cmp(struct g9p_code *c, unsigned w3, unsigned a, unsigned b)
 }
 
 /* Output the colour in r0-r1 (4 halves) and end the fragment shader */
+/*
+ * Premultiplied source-over on the colour in halves 0-3 (r0-r1), as Apple's
+ * compiler appends it (`blend.metal` with One / OneMinusSourceAlpha, ISA.md
+ * "Tile read and blending"): the tile into halves 4-7 (r2-r3), half 10 (r5)
+ * = 1 - half 3, then half i = half (4 + i) x half 10 + half i
+ */
+static inline void
+g9p_blend_src_over(struct g9p_code *c)
+{
+   G9P_EMIT(c, 0x211c, 0x2804);
+   G9P_EMIT(c, 0x004d);
+   G9P_EMIT(c, 0x418d, 0x810a, 0x0701, 0x7130, 0x8104, 0x0070);
+   G9P_EMIT(c, 0x418e, 0x0100, 0x1588, 0x0180, 0x010c, 0x8000);
+   G9P_EMIT(c, 0x418e, 0x0101, 0x158a, 0x0182, 0x010c, 0x8000);
+   G9P_EMIT(c, 0x418e, 0x0102, 0x158c, 0x0184, 0x010c, 0x8000);
+   G9P_EMIT(c, 0x018a, 0x0103, 0x958e, 0x0186, 0x010c, 0x8000);
+}
+
 static inline void
 g9p_end_fragment(struct g9p_code *c, bool colour)
 {
