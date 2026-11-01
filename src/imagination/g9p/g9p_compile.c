@@ -599,9 +599,12 @@ only_tex_uses(nir_def *def)
    return true;
 }
 
+static int varying_component(nir_scalar s);
+
 /*
- * vecN: no code when only texture coordinates use it (emit_tex() reads
- * the varyings itself), else each component copied into its own register
+ * vecN: no code when only texture coordinates read straight from two
+ * consecutive varying components use it (emit_tex() iterates them itself),
+ * else each component copied into its own register
  */
 static bool
 emit_vec(struct g9p_ctx *ctx, nir_alu_instr *alu)
@@ -614,7 +617,10 @@ emit_vec(struct g9p_ctx *ctx, nir_alu_instr *alu)
        (nir_def_as_intrinsic(s0.def)->intrinsic == nir_intrinsic_load_vulkan_descriptor ||
         nir_def_as_intrinsic(s0.def)->intrinsic == nir_intrinsic_vulkan_resource_index))
       return true;
-   if (only_tex_uses(&alu->def)) {
+   if (only_tex_uses(&alu->def) && alu->def.num_components >= 2 &&
+       varying_component(nir_get_scalar(&alu->def, 0)) >= 0 &&
+       varying_component(nir_get_scalar(&alu->def, 1)) ==
+          varying_component(nir_get_scalar(&alu->def, 0)) + 1) {
       release(ctx, &alu->instr);
       return true;
    }
@@ -1325,9 +1331,11 @@ varying_component(nir_scalar s)
 }
 
 /*
- * A 2D sample whose coordinates are two consecutive varying components
- * (texture(t, v_uv)): iterated straight to the sampler, the f32 result in
- * four consecutive registers
+ * A 2D sample, the f32 result in four consecutive registers. Coordinates
+ * that are two consecutive varying components (texture(t, v_uv)) are
+ * iterated straight to the sampler; computed ones are copied to r0-r1,
+ * where the sample reads them (as Apple's code for t.sample(s, uv * 2.0 +
+ * 0.25) does; r0-r1 are free until the colour output).
  */
 static bool
 emit_tex(struct g9p_ctx *ctx, nir_tex_instr *tex)
@@ -1345,23 +1353,35 @@ emit_tex(struct g9p_ctx *ctx, nir_tex_instr *tex)
    }
    first = varying_component(nir_get_scalar(tex->src[ci].src.ssa, 0));
    second = varying_component(nir_get_scalar(tex->src[ci].src.ssa, 1));
-   if (first < 0 || second != first + 1) {
-      fprintf(stderr, "g9p: texture coordinates must come straight from a varying so far\n");
-      return false;
-   }
-   release(ctx, &tex->instr);
-   dst = alloc_range(ctx, 4);
-   if (dst < 0)
-      return false;
-   g9p_sample_varying(ctx->c, dst, first, 2, G9P_FS_TEX_BASE + G9P_TEX_STRIDE * slot,
+   if (first >= 0 && second == first + 1) {
+      release(ctx, &tex->instr);
+      dst = alloc_range(ctx, 4);
+      if (dst < 0)
+         return false;
+      g9p_sample_varying(ctx->c, dst, first, 2, G9P_FS_TEX_BASE + G9P_TEX_STRIDE * slot,
+                         G9P_FS_TEX_BASE + G9P_TEX_STRIDE * slot + 8);
+      ctx->out->num_varyings = MAX2(ctx->out->num_varyings, first / 4 + 1);
+   } else {
+      for (unsigned c = 0; c < 2; c++) {
+         const int r = src_reg(ctx, nir_get_scalar(tex->src[ci].src.ssa, c));
+
+         if (r < 0)
+            return false;
+         g9p_alu2(ctx->c, G9P_OR, c, r, r, false);
+      }
+      release(ctx, &tex->instr);
+      dst = alloc_range(ctx, 4);
+      if (dst < 0)
+         return false;
+      g9p_sample_regs(ctx->c, dst, G9P_FS_TEX_BASE + G9P_TEX_STRIDE * slot,
                       G9P_FS_TEX_BASE + G9P_TEX_STRIDE * slot + 8);
+   }
    g9p_wait(ctx->c);
    for (unsigned c = 0; c < 4; c++) {
       ctx->reg[key(&tex->def, c)] = dst + c;
       if (c >= tex->def.num_components || !ctx->last_use[key(&tex->def, c)])
          ctx->busy &= ~BITFIELD64_BIT(dst + c);
    }
-   ctx->out->num_varyings = MAX2(ctx->out->num_varyings, first / 4 + 1);
    return true;
 }
 

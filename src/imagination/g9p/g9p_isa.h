@@ -481,14 +481,24 @@ g9p_iterate(struct g9p_code *c, unsigned dst, unsigned first, unsigned comps,
  * (W2 0x8000), then the sample with the texture state at common-store dword
  * @state and the sampler at @sampler into f32 r[@dst]..r[@dst + 3] (W0
  * f51a; f518 writes the colour halves). Follow with g9p_wait(). Computed
- * coordinates are not supported yet: copying them to r0-r1 is unreliable
- * (orchard gpu-001 RENDER.md "Textures in Mesa").
+ * coordinates: g9p_sample_regs().
  */
 static inline void
 g9p_sample_varying(struct g9p_code *c, unsigned dst, unsigned first, unsigned comps,
                    unsigned state, unsigned sampler)
 {
    G9P_EMIT(c, (comps & 3) << 11 | 0x0308, (1 + first) << 9 | 0x0100, 0x8000);
+   G9P_EMIT(c, 0xf51a, 0x0100 | 2 * dst, 0x8100 | state << 8 | sampler, 0x0700, 0x0200);
+}
+
+/*
+ * Texture sample with the coordinates in f32 r0-r1 (Apple's code for
+ * computed coordinates: the same sample word after an iterate into r0-r1
+ * and arithmetic on them); otherwise as g9p_sample_varying()
+ */
+static inline void
+g9p_sample_regs(struct g9p_code *c, unsigned dst, unsigned state, unsigned sampler)
+{
    G9P_EMIT(c, 0xf51a, 0x0100 | 2 * dst, 0x8100 | state << 8 | sampler, 0x0700, 0x0200);
 }
 
