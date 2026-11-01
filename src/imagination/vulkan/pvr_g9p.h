@@ -26,7 +26,7 @@ struct vk_graphics_pipeline_state;
  * The parameter buffer of a render (its local free list, bytes): the Apple
  * firmware does not grow it (pvr_arch_render_target_dataset_create())
  */
-#define G9P_FREE_LIST_SIZE (8U * 1024U * 1024U)
+#define G9P_FREE_LIST_SIZE (32U * 1024U * 1024U)
 
 /* One draw: vertices (or indices) from @offset (vertexOffset when indexed) */
 struct pvr_g9p_draw {
