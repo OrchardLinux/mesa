@@ -53,6 +53,8 @@ static const struct spirv_to_nir_options spirv_options = {
 };
 
 static const nir_shader_compiler_options nir_options = {
+   /* multiply-adds as one instruction (g9p_ffma()), not a mul and an add */
+   .float_mul_add32 = nir_float_muladd_support_has_ffma | nir_float_muladd_support_fuse,
    .lower_int64_options = ~0U,
    .lower_fdiv = true,
    .lower_fmod = true,
