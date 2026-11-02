@@ -151,6 +151,18 @@ copy(const struct pvr_rect_mapping *m, const struct surface *src, const struct s
    const unsigned dw = m->dst_rect.extent.width, dh = m->dst_rect.extent.height;
    const unsigned sw = m->src_rect.extent.width, sh = m->src_rect.extent.height;
 
+   /* linear to linear, unscaled and unflipped: whole rows */
+   if (same && !src->twiddled && !dst->twiddled && sw == dw && sh == dh && !m->flip_x &&
+       !m->flip_y) {
+      for (unsigned y = 0; y < dh; y++)
+         memcpy(dst->base + row_offset(dst, m->dst_rect.offset.y + y) +
+                   column_offset(dst, m->dst_rect.offset.x),
+                src->base + row_offset(src, m->src_rect.offset.y + y) +
+                   column_offset(src, m->src_rect.offset.x),
+                (size_t)dw * dst->bpp);
+      return;
+   }
+
    /* each destination column's source and destination offsets */
    size_t *cols = malloc(2 * dw * sizeof(*cols));
 

@@ -46,7 +46,8 @@
 #include "vk_util.h"
 #include "wsi_common.h"
 
-static void pvr_image_init_memlayout(struct pvr_image *image)
+static void pvr_image_init_memlayout(const struct pvr_device *device,
+                                     struct pvr_image *image)
 {
    switch (image->vk.tiling) {
    default:
@@ -54,6 +55,19 @@ static void pvr_image_init_memlayout(struct pvr_image *image)
    case VK_IMAGE_TILING_OPTIMAL:
       if (image->vk.wsi_legacy_scanout ||
           vk_format_get_ycbcr_info(image->vk.format))
+         image->memlayout = PVR_MEMLAYOUT_LINEAR;
+      /*
+       * G9P: single-level 2D colour images linear. Their uploads (a
+       * compositor's window contents through Zink) are then row copies
+       * instead of texel-by-texel twiddling on the CPU, which took a
+       * quarter of Labwc's time on a scrolling Firefox window (A10 notes,
+       * MESA.md "The GPU desktop against pixman"); the GPU samples and
+       * renders linear images as well.
+       */
+      else if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p) &&
+               image->vk.image_type == VK_IMAGE_TYPE_2D && image->vk.mip_levels == 1 &&
+               image->vk.samples == VK_SAMPLE_COUNT_1_BIT &&
+               !vk_format_is_depth_or_stencil(image->vk.format))
          image->memlayout = PVR_MEMLAYOUT_LINEAR;
       else if (image->vk.image_type == VK_IMAGE_TYPE_3D)
          image->memlayout = PVR_MEMLAYOUT_3DTWIDDLED;
@@ -317,7 +331,7 @@ void pvr_image_init(struct pvr_device *device,
       assert(image->vk.drm_format_mod == DRM_FORMAT_MOD_LINEAR);
    }
 
-   pvr_image_init_memlayout(image);
+   pvr_image_init_memlayout(device, image);
    pvr_image_init_physical_extent(image, pCreateInfo, pbe_stride_align);
    pvr_image_setup_mip_levels(image);
 }
