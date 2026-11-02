@@ -11,6 +11,7 @@
 #include <stdbool.h>
 
 #include "util/bitscan.h"
+#include "util/list.h"
 
 #include "pvr_framebuffer.h"
 #include "pvr_rogue_fw.h"
@@ -23,6 +24,9 @@ struct pvr_winsys_rt_dataset;
 
 struct pvr_rt_dataset {
    struct pvr_device *device;
+
+   /* In pvr_device::rt_dataset_cache while unused. */
+   struct list_head cache_link;
 
    /* RT dataset information */
    uint32_t width;
@@ -70,6 +74,15 @@ void pvr_rt_vheap_rtc_data_fini(struct pvr_rt_dataset *rt_dataset);
 
 void pvr_render_target_dataset_destroy(struct pvr_rt_dataset *rt_dataset);
 
+struct pvr_rt_dataset *
+pvr_render_target_dataset_cache_take(struct pvr_device *device,
+                                     uint32_t width,
+                                     uint32_t height,
+                                     uint32_t samples,
+                                     uint32_t layers);
+void pvr_render_target_dataset_release(struct pvr_rt_dataset *rt_dataset);
+void pvr_render_target_dataset_cache_finish(struct pvr_device *device);
+
 static inline void
 pvr_render_targets_datasets_destroy(struct pvr_render_target *render_target)
 {
@@ -77,7 +90,7 @@ pvr_render_targets_datasets_destroy(struct pvr_render_target *render_target)
       struct pvr_rt_dataset *rt_dataset = render_target->rt_dataset[valid_idx];
 
       if (rt_dataset && render_target->valid_mask & BITFIELD_BIT(valid_idx))
-         pvr_render_target_dataset_destroy(rt_dataset);
+         pvr_render_target_dataset_release(rt_dataset);
 
       render_target->rt_dataset[valid_idx] = NULL;
       render_target->valid_mask &= ~BITFIELD_BIT(valid_idx);

@@ -634,6 +634,16 @@ VkResult pvr_arch_render_target_dataset_create(
    assert(height <= rogue_get_render_size_max_y(dev_info));
    assert(layers > 0 && layers <= PVR_MAX_FRAMEBUFFER_LAYERS);
 
+   rt_dataset = pvr_render_target_dataset_cache_take(device,
+                                                     width,
+                                                     height,
+                                                     samples,
+                                                     layers);
+   if (rt_dataset) {
+      *rt_dataset_out = rt_dataset;
+      return VK_SUCCESS;
+   }
+
    pvr_arch_rt_mtile_info_init(dev_info, &mtile_info, width, height, samples);
 
    rt_dataset = vk_zalloc(&device->vk.alloc,

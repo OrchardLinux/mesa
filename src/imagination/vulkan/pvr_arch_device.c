@@ -824,6 +824,10 @@ VkResult PVR_PER_ARCH(create_device)(struct pvr_physical_device *pdevice,
    device->pdevice = pdevice;
    device->ws = ws;
 
+   /* Before anything that creates a render target dataset. */
+   simple_mtx_init(&device->rt_cache_mtx, mtx_plain);
+   list_inithead(&device->rt_dataset_cache);
+
    vk_device_set_drm_fd(&device->vk, ws->render_fd);
 
    if (ws->features.supports_threaded_submit) {
@@ -1064,6 +1068,8 @@ void PVR_PER_ARCH(destroy_device)(struct pvr_device *device,
    }
    simple_mtx_unlock(&device->rs_mtx);
    simple_mtx_destroy(&device->rs_mtx);
+
+   pvr_render_target_dataset_cache_finish(device);
 
    pvr_device_dummy_rt_finish(device);
    pvr_arch_border_color_table_finish(device);

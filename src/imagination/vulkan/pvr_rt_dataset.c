@@ -76,3 +76,71 @@ void pvr_render_target_dataset_destroy(struct pvr_rt_dataset *rt_dataset)
 
    vk_free(&device->vk.alloc, rt_dataset);
 }
+
+/* Unused datasets kept per device: enough for a compositor's outputs and
+ * the offscreen sizes it renders at, bounded so that memory stays small.
+ */
+#define PVR_RT_DATASET_CACHE_MAX 4
+
+struct pvr_rt_dataset *
+pvr_render_target_dataset_cache_take(struct pvr_device *device,
+                                     uint32_t width,
+                                     uint32_t height,
+                                     uint32_t samples,
+                                     uint32_t layers)
+{
+   struct pvr_rt_dataset *found = NULL;
+
+   simple_mtx_lock(&device->rt_cache_mtx);
+   list_for_each_entry (struct pvr_rt_dataset,
+                        rt_dataset,
+                        &device->rt_dataset_cache,
+                        cache_link) {
+      if (rt_dataset->width == width && rt_dataset->height == height &&
+          rt_dataset->samples == samples && rt_dataset->layers == layers) {
+         list_del(&rt_dataset->cache_link);
+         device->rt_dataset_cache_count--;
+         found = rt_dataset;
+         break;
+      }
+   }
+   simple_mtx_unlock(&device->rt_cache_mtx);
+
+   return found;
+}
+
+/* The caller is done with the dataset: its render state is being destroyed,
+ * which Vulkan allows only once no pending command buffer uses it.
+ */
+void pvr_render_target_dataset_release(struct pvr_rt_dataset *rt_dataset)
+{
+   struct pvr_device *device = rt_dataset->device;
+   struct pvr_rt_dataset *evict = NULL;
+
+   simple_mtx_lock(&device->rt_cache_mtx);
+   list_add(&rt_dataset->cache_link, &device->rt_dataset_cache);
+   if (++device->rt_dataset_cache_count > PVR_RT_DATASET_CACHE_MAX) {
+      evict = list_last_entry(&device->rt_dataset_cache,
+                              struct pvr_rt_dataset,
+                              cache_link);
+      list_del(&evict->cache_link);
+      device->rt_dataset_cache_count--;
+   }
+   simple_mtx_unlock(&device->rt_cache_mtx);
+
+   if (evict)
+      pvr_render_target_dataset_destroy(evict);
+}
+
+void pvr_render_target_dataset_cache_finish(struct pvr_device *device)
+{
+   list_for_each_entry_safe (struct pvr_rt_dataset,
+                             rt_dataset,
+                             &device->rt_dataset_cache,
+                             cache_link) {
+      list_del(&rt_dataset->cache_link);
+      pvr_render_target_dataset_destroy(rt_dataset);
+   }
+   device->rt_dataset_cache_count = 0;
+   simple_mtx_destroy(&device->rt_cache_mtx);
+}

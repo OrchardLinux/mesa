@@ -213,6 +213,16 @@ struct pvr_device {
    simple_mtx_t rs_mtx;
    struct list_head render_states;
 
+   /* Render target datasets no longer in use, kept for the next render of
+    * the same size (pvr_render_target_dataset_release()). Dynamic rendering
+    * sets up a new render state per vkCmdBeginRendering, so without this
+    * every frame created and destroyed a dataset: several GPU buffers and a
+    * kernel HWRT dataset.
+    */
+   simple_mtx_t rt_cache_mtx;
+   struct list_head rt_dataset_cache;
+   uint32_t rt_dataset_cache_count;
+
    /* Data Source for GPU tracing */
    struct pvr_ds_device ds;
 };
