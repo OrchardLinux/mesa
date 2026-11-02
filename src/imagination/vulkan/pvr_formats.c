@@ -292,6 +292,14 @@ pvr_get_image_format_features2(struct pvr_physical_device *pdevice,
              !vk_format_is_depth_or_stencil(vk_format) &&
              first_component_size < 32) {
             flags |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_2D_BIT_IMG;
+
+            /* G9P: linear images are single-layer 1D/2D (see
+             * pvr_get_image_format_properties()), so the 2D-only limit of
+             * linear filtering never applies: report the core bit, which
+             * compositors require of dma-buf textures.
+             */
+            if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g9p))
+               flags |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
          }
 
          if (ycbcr_info) {
