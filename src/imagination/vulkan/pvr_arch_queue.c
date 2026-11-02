@@ -1257,8 +1257,8 @@ err_free_waits:
    return result;
 }
 
-static VkResult pvr_driver_queue_submit(struct vk_queue *queue,
-                                        struct vk_queue_submit *submit)
+static VkResult pvr_driver_queue_submit_jobs(struct vk_queue *queue,
+                                             struct vk_queue_submit *submit)
 {
    struct pvr_queue *driver_queue = container_of(queue, struct pvr_queue, vk);
    struct pvr_device *device = driver_queue->device;
@@ -1297,6 +1297,21 @@ static VkResult pvr_driver_queue_submit(struct vk_queue *queue,
       return result;
 
    return VK_SUCCESS;
+}
+
+/*
+ * A queue whose GPU context was lost (the kernel ends a hung job's context
+ * and refuses its jobs with EIO) stays lost, so that clients see
+ * VK_ERROR_DEVICE_LOST from here on instead of retrying
+ */
+static VkResult pvr_driver_queue_submit(struct vk_queue *queue,
+                                        struct vk_queue_submit *submit)
+{
+   VkResult result = pvr_driver_queue_submit_jobs(queue, submit);
+
+   if (result == VK_ERROR_DEVICE_LOST)
+      return vk_queue_set_lost(queue, "GPU context lost");
+   return result;
 }
 
 VkResult PVR_PER_ARCH(QueueBindSparse)(VkQueue _queue,

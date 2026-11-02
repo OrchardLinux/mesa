@@ -900,6 +900,9 @@ struct g9p_draw_programs {
     * render area.
     */
    uint32_t region[4];
+   /* the depth test (a depth attachment and the test enabled), its write and compare op */
+   bool depth_test, depth_write;
+   VkCompareOp depth_compare;
 };
 
 /*
@@ -1014,6 +1017,17 @@ PVR_PER_ARCH(g9p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer,
 
       memcpy(dp.vp, v, sizeof(v));
    }
+   /* the depth test: only with a depth attachment (D32_SFLOAT, the decoded one) */
+   {
+      const struct pvr_renderpass_hwsetup_render *hw = info->hw_render;
+      const bool has_depth = hw && hw->ds_attach_idx != VK_ATTACHMENT_UNUSED &&
+                             vk_format_has_depth(
+                                info->attachments[hw->ds_attach_idx]->vk.format);
+
+      dp.depth_test = has_depth && dyn->ds.depth.test_enable;
+      dp.depth_write = dp.depth_test && dyn->ds.depth.write_enable;
+      dp.depth_compare = dyn->ds.depth.compare_op;
+   }
    return emit_draw(cmd_buffer, state, &dp, draw, dyn->ia.primitive_topology);
 }
 
@@ -1072,14 +1086,26 @@ emit_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state
    /* 2: output selects: vertex size, rhw */
    PPP_BLOCK(0x00020000, state->vs_outputs << 24 | 0x00010000);
    /*
-    * 3: ISP control and front/back words (no depth, no culling yet); pass
-    * type in ISPA/BA bits 24-26: 1 translucent for shaders that read the
-    * tile (blending, `blend` capture), else 4 punch-through for discarding
-    * shaders (`discard` capture)
+    * 3: ISP control and front/back words (no culling yet); pass type in
+    * ISPA/BA bits 24-26: 1 translucent for shaders that read the tile
+    * (blending, `blend` capture), else 4 punch-through for discarding
+    * shaders (`discard` capture). The depth compare function is ISPA bits
+    * 17-19 in VkCompareOp's order and bit 21 disables the depth write; with
+    * a depth test the back words repeat the front ones and ISP_CTL bit 18
+    * is clear (`depth` capture: compare less and write, 03c00000 00120f00
+    * 0e000000 00120f00 0e000000). Without one: always, no write.
     */
    pass = state->uses_fbfetch ? 1u : state->uses_discard ? 4u : 0u;
-   PPP_BLOCK(0x1f, 0x03c40000 | (dp->scissor >= 0 ? BITFIELD_BIT(16) : 0),
-             0x003e0f00 | pass << 24, 0x0e000000, 0x00100f00 | pass << 24, 0);
+   if (dp->depth_test) {
+      const uint32_t a = 0x00100f00 | pass << 24 | (uint32_t)dp->depth_compare << 17 |
+                         (dp->depth_write ? 0 : BITFIELD_BIT(21));
+
+      PPP_BLOCK(0x1f, 0x03c00000 | (dp->scissor >= 0 ? BITFIELD_BIT(16) : 0), a, 0x0e000000, a,
+                0x0e000000);
+   } else {
+      PPP_BLOCK(0x1f, 0x03c40000 | (dp->scissor >= 0 ? BITFIELD_BIT(16) : 0),
+                0x003e0f00 | pass << 24, 0x0e000000, 0x00100f00 | pass << 24, 0);
+   }
    /*
     * 4: region clip (32-pixel tiles, inclusive; mode OUTSIDE drops what lies
     * outside) and the viewport (a0 m0 a1 m1 a2 m2). The clip is the draw's
@@ -1580,6 +1606,32 @@ PVR_PER_ARCH(g9p_geom_stream)(const struct pvr_device *device,
    return s.len;
 }
 
+/*
+ * ZLSCTL of a render with a D32_SFLOAT depth attachment: Rogue's fields
+ * (enables, F32Z format) and the extent in tiles; 0 without one. The
+ * hardware keeps the stored depth in its own (compressed) layout, which
+ * its loads read back: a uniform 64x64 clear stores 96 of 4096 words.
+ */
+static uint64_t
+g9p_zlsctl(const struct pvr_render_job *job)
+{
+   uint64_t v = 0;
+
+   if (!job->has_depth_attachment)
+      return 0;
+   if (job->ds.load.d)
+      v |= BITFIELD64_BIT(15) | BITFIELD64_BIT(1); /* zloaden, forcezload */
+   if (job->ds.store.d)
+      v |= BITFIELD64_BIT(19) | BITFIELD64_BIT(2); /* zstoreen, forcezstore */
+   /*
+    * Not twiddled: Rogue's storetwiddled (bit 17, set by iPadOS) hangs the
+    * A10's fragment job here; loads and stores agree on the linear layout
+    */
+   v |= (uint64_t)(DIV_ROUND_UP(job->ds.physical_extent.width, 32) - 1) << 3;
+   v |= (uint64_t)(DIV_ROUND_UP(job->ds.physical_extent.height, 32) - 1) << 27;
+   return v;
+}
+
 uint32_t
 PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
                               const struct pvr_render_job *job, uint8_t *buf, uint32_t size)
@@ -1588,10 +1640,26 @@ PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
    struct g9p_stream s = { .buf = buf, .len = 8, .size = size };
    const float t15 = tanf(15.0f * M_PI / 180.0f), t60 = tanf(60.0f * M_PI / 180.0f);
 
-   /* ISP scissor table base, then the dbias/oclqry/zls bases */
+   /*
+    * ISP scissor table base, then the dbias and occlusion query bases,
+    * ZLSCTL and the depth and stencil load/store bases (the kernel puts the
+    * depth base into both 0xf50 and 0xf60). ZLSCTL as Rogue's (`depth`
+    * capture: 0x000a2004, store twiddled and load twiddled, Z store and its
+    * force bit, format F32Z) with the extent in 32-pixel tiles minus one,
+    * which iPadOS's userspace passes as pixels (0x001f803f for 64x64).
+    */
    put64(&s, job->scissor_table_addr.addr);
-   for (unsigned i = 1; i < 6; i++)
-      put64(&s, 0);
+   put64(&s, 0);
+   put64(&s, 0);
+   put64(&s, g9p_zlsctl(job));
+   put64(&s, job->has_depth_attachment ? job->ds.addr.addr : 0);
+   /*
+    * The stencil base: none yet (stencil formats are not decoded). The
+    * kernel's Apple record takes the depth base for 0xf50/0xf58 (Z load and
+    * store) and this one for 0xf60/0xf68; a stencil base set here breaks
+    * the depth load even with stencil off in ZLSCTL.
+    */
+   put64(&s, 0);
    for (unsigned i = 0; i < 8 * 3; i++)
       put64(&s, 0); /* PBE words: in the image state instead */
    put64(&s, 0);
@@ -1600,7 +1668,8 @@ PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
    for (unsigned i = 0; i < 8; i++)
       put32(&s, 0); /* USC clear registers */
    put32(&s, 0);
-   put32(&s, 0x3f800000); /* ISP_BGOBJDEPTH */
+   put32(&s, job->has_depth_attachment ? fui(job->ds_clear_value.depth)
+                                        : 0x3f800000); /* ISP_BGOBJDEPTH: the depth clear */
    put32(&s, 0x300);      /* ISP_BGOBJVALS */
    put32(&s, 0);
    /*
@@ -1650,7 +1719,14 @@ PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
    }
    put32(&s, 0x1f); /* 0x6d0 */
    put32(&s, 0x408);
-   put32(&s, 4);
+   /*
+    * 0xfd8: ISP_ZLS_PIXELS, the depth buffer's size (width - 1, height - 1
+    * << 15, `depth` capture 0x001f803f for 64x64; the store writes nothing
+    * without it); iOS 10's 4 without depth
+    */
+   put32(&s, job->has_depth_attachment
+                ? (job->ds.physical_extent.width - 1) | (job->ds.physical_extent.height - 1) << 15
+                : 4);
    put32(&s, 0xf9);
    /* line rasterization (iOS 10): tan 15° / size, tan 60° / size, 16 x width */
    put32(&s, fui(t15 / w));

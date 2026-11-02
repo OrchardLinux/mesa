@@ -152,8 +152,11 @@ pvr_munmap(void *const addr, const size_t len, bool reserve)
       _ret = drmIoctl(fd, request, arg);                  \
       if (_ret) {                                         \
          _ret = errno;                                    \
+         /* EIO: the GPU context is lost (a job hung) */  \
          _result = vk_errorf(NULL,                        \
-                             error,                       \
+                             _ret == EIO                  \
+                                ? VK_ERROR_DEVICE_LOST    \
+                                : error,                  \
                              fmt " (errno %d: %s)",       \
                              ##args,                      \
                              _ret,                        \

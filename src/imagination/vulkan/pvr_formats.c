@@ -350,6 +350,17 @@ pvr_get_image_format_features2(struct pvr_physical_device *pdevice,
                  VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_2D_BIT_IMG |
                  VK_FORMAT_FEATURE_2_BLIT_SRC_BIT);
    }
+   /*
+    * Depth/stencil: D32_SFLOAT as an attachment only (`depth` capture; the
+    * hardware stores it compressed, which is not decoded for sampling).
+    * The other depth and stencil formats are not decoded: rendering with
+    * one crashed the GFX firmware (X8_D24, glmark2).
+    */
+   if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g9p) &&
+       vk_format_is_depth_or_stencil(vk_format)) {
+      flags &= vk_format == VK_FORMAT_D32_SFLOAT ? VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT
+                                                 : 0;
+   }
 
    return flags;
 }
