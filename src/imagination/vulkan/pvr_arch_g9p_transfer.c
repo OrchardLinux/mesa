@@ -11,6 +11,10 @@
  * dimensions have bits (the A10 notes' RENDER.md "Textures with our
  * encodings"). Copies convert formats through util_format when they differ
  * and scale with nearest sampling; MSAA resolves and YUV are not handled.
+ *
+ * The same copies serve VK_EXT_host_image_copy: an upload goes straight from
+ * the application's memory into the image, without a staging buffer and a
+ * second copy (Zink's glTexSubImage, a compositor's window contents).
  */
 
 #include <stdlib.h>
@@ -25,7 +29,9 @@
 
 #include "pvr_cmd_buffer.h"
 #include "pvr_device.h"
+#include "pvr_entrypoints.h"
 #include "pvr_g9p.h"
+#include "pvr_image.h"
 #include "pvr_job_transfer.h"
 #include "pvr_winsys.h"
 
@@ -256,4 +262,152 @@ PVR_PER_ARCH(g9p_transfer_submit)(struct pvr_device *device,
    list_for_each_entry (struct pvr_transfer_cmd, cmd, sub_cmd->transfer_cmds, link)
       run(device, cmd);
    return vk_sync_signal(&device->vk, signal_sync, 0);
+}
+
+/* --- VK_EXT_host_image_copy -------------------------------------------- */
+
+/* Layer @layer of the subresource @sub of @image, at its mip level's size */
+static bool
+host_image_surface(struct pvr_device *device, const struct pvr_image *image,
+                   const VkImageSubresourceLayers *sub, uint32_t layer, struct surface *out)
+{
+   const VkImageSubresource s = { sub->aspectMask, sub->mipLevel, sub->baseArrayLayer + layer };
+   VkSubresourceLayout info;
+
+   if (image->memlayout == PVR_MEMLAYOUT_3DTWIDDLED)
+      return false;
+   pvr_get_image_subresource_layout(image, &s, &info);
+   out->base = PVR_PER_ARCH(g9p_cpu_addr)(device, image->dev_addr.addr + info.offset);
+   out->format = vk_format_to_pipe_format(image->vk.format);
+   out->bpp = vk_format_get_blocksize(image->vk.format);
+   out->stride = info.rowPitch / out->bpp;
+   out->width = MAX2(image->vk.extent.width >> sub->mipLevel, 1);
+   out->height = MAX2(image->vk.extent.height >> sub->mipLevel, 1);
+   out->twiddled = image->memlayout == PVR_MEMLAYOUT_TWIDDLED;
+   return out->base != NULL;
+}
+
+/* Host memory holding @extent texels of @image's format at @row_length/@image_height */
+static void
+host_memory_surface(const struct pvr_image *image, const void *ptr, uint32_t row_length,
+                    uint32_t image_height, const VkExtent3D *extent, struct surface *out)
+{
+   out->base = (uint8_t *)ptr;
+   out->format = vk_format_to_pipe_format(image->vk.format);
+   out->bpp = vk_format_get_blocksize(image->vk.format);
+   out->stride = row_length ? row_length : extent->width;
+   out->width = out->stride;
+   out->height = image_height ? image_height : extent->height;
+   out->twiddled = false;
+}
+
+static VkResult
+host_copy(struct pvr_device *device, const struct pvr_image *image, bool to_image,
+          VkHostImageCopyFlags flags, const void *ptr, uint32_t row_length,
+          uint32_t image_height, const VkImageSubresourceLayers *sub, const VkOffset3D *offset,
+          const VkExtent3D *extent)
+{
+   const uint32_t layers = vk_image_subresource_layer_count(&image->vk, sub);
+
+   for (uint32_t l = 0; l < layers; l++) {
+      struct surface img, mem;
+
+      if (!host_image_surface(device, image, sub, l, &img))
+         return vk_error(device, VK_ERROR_MEMORY_MAP_FAILED);
+      if (flags & VK_HOST_IMAGE_COPY_MEMCPY_BIT) {
+         /* the subresource as it is laid out, back to back per layer */
+         const size_t size = (size_t)img.stride * (img.twiddled ? util_next_power_of_two(img.height)
+                                                                : img.height) * img.bpp;
+         uint8_t *host = (uint8_t *)ptr + l * size;
+
+         if (to_image)
+            memcpy(img.base, host, size);
+         else
+            memcpy(host, img.base, size);
+         continue;
+      }
+      host_memory_surface(image, ptr, row_length, image_height, extent, &mem);
+      mem.base += (size_t)l * mem.stride * mem.height * mem.bpp;
+
+      const VkRect2D at_image = { { offset->x, offset->y }, { extent->width, extent->height } };
+      const VkRect2D at_memory = { { 0, 0 }, { extent->width, extent->height } };
+      const struct pvr_rect_mapping m = { .src_rect = to_image ? at_memory : at_image,
+                                          .dst_rect = to_image ? at_image : at_memory };
+
+      copy(&m, to_image ? &mem : &img, to_image ? &img : &mem);
+   }
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+PVR_PER_ARCH(CopyMemoryToImage)(VkDevice _device, const VkCopyMemoryToImageInfo *info)
+{
+   VK_FROM_HANDLE(pvr_device, device, _device);
+   VK_FROM_HANDLE(pvr_image, image, info->dstImage);
+
+   for (uint32_t i = 0; i < info->regionCount; i++) {
+      const VkMemoryToImageCopy *r = &info->pRegions[i];
+      VkResult result = host_copy(device, image, true, info->flags, r->pHostPointer,
+                                  r->memoryRowLength, r->memoryImageHeight, &r->imageSubresource,
+                                  &r->imageOffset, &r->imageExtent);
+
+      if (result != VK_SUCCESS)
+         return result;
+   }
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+PVR_PER_ARCH(CopyImageToMemory)(VkDevice _device, const VkCopyImageToMemoryInfo *info)
+{
+   VK_FROM_HANDLE(pvr_device, device, _device);
+   VK_FROM_HANDLE(pvr_image, image, info->srcImage);
+
+   for (uint32_t i = 0; i < info->regionCount; i++) {
+      const VkImageToMemoryCopy *r = &info->pRegions[i];
+      VkResult result = host_copy(device, image, false, info->flags, r->pHostPointer,
+                                  r->memoryRowLength, r->memoryImageHeight, &r->imageSubresource,
+                                  &r->imageOffset, &r->imageExtent);
+
+      if (result != VK_SUCCESS)
+         return result;
+   }
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+PVR_PER_ARCH(CopyImageToImage)(VkDevice _device, const VkCopyImageToImageInfo *info)
+{
+   VK_FROM_HANDLE(pvr_device, device, _device);
+   VK_FROM_HANDLE(pvr_image, src_image, info->srcImage);
+   VK_FROM_HANDLE(pvr_image, dst_image, info->dstImage);
+
+   for (uint32_t i = 0; i < info->regionCount; i++) {
+      const VkImageCopy2 *r = &info->pRegions[i];
+      const uint32_t layers = vk_image_subresource_layer_count(&src_image->vk, &r->srcSubresource);
+
+      for (uint32_t l = 0; l < layers; l++) {
+         struct surface src, dst;
+
+         if (!host_image_surface(device, src_image, &r->srcSubresource, l, &src) ||
+             !host_image_surface(device, dst_image, &r->dstSubresource, l, &dst))
+            return vk_error(device, VK_ERROR_MEMORY_MAP_FAILED);
+
+         const struct pvr_rect_mapping m = {
+            .src_rect = { { r->srcOffset.x, r->srcOffset.y }, { r->extent.width, r->extent.height } },
+            .dst_rect = { { r->dstOffset.x, r->dstOffset.y }, { r->extent.width, r->extent.height } },
+         };
+
+         copy(&m, &src, &dst);
+      }
+   }
+   return VK_SUCCESS;
+}
+
+/* Layouts change nothing in G9P memory */
+VKAPI_ATTR VkResult VKAPI_CALL
+PVR_PER_ARCH(TransitionImageLayout)(VkDevice device, uint32_t transitionCount,
+                                    const VkHostImageLayoutTransitionInfo *pTransitions)
+{
+   return VK_SUCCESS;
 }

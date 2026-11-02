@@ -1272,6 +1272,34 @@ VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
       goto err_pvr_winsys_destroy;
    }
 
+   /*
+    * G9P: host image copies through the driver's CPU copies (all its memory
+    * is CPU-visible; pvr_arch_g9p_transfer.c)
+    */
+   if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g9p)) {
+      static const VkImageLayout g9p_host_copy_layouts[] = {
+         VK_IMAGE_LAYOUT_GENERAL,
+         VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+         VK_IMAGE_LAYOUT_PREINITIALIZED,
+         VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL,
+         VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL,
+         VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+      };
+
+      supported_extensions.EXT_host_image_copy = true;
+      supported_features.hostImageCopy = true;
+      supported_properties.copySrcLayoutCount = ARRAY_SIZE(g9p_host_copy_layouts);
+      supported_properties.pCopySrcLayouts = (VkImageLayout *)g9p_host_copy_layouts;
+      supported_properties.copyDstLayoutCount = ARRAY_SIZE(g9p_host_copy_layouts);
+      supported_properties.pCopyDstLayouts = (VkImageLayout *)g9p_host_copy_layouts;
+      /* names the image layouts (pvr_image.c); change it when they change */
+      memcpy(supported_properties.optimalTilingLayoutUUID, "G9P layout 1\0\0\0\0", VK_UUID_SIZE);
+      supported_properties.identicalMemoryTypeRequirements = true;
+   }
+
    vk_physical_device_dispatch_table_from_entrypoints(
       &dispatch_table,
       &pvr_physical_device_entrypoints,

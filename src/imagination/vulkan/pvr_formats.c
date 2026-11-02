@@ -361,6 +361,10 @@ pvr_get_image_format_features2(struct pvr_physical_device *pdevice,
       flags &= vk_format == VK_FORMAT_D32_SFLOAT ? VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT
                                                  : 0;
    }
+   /* G9P: colour images the driver copies can be copied from the host too */
+   if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g9p) && vk_format_is_color(vk_format) &&
+       (flags & VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT))
+      flags |= VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT;
 
    return flags;
 }
@@ -600,6 +604,8 @@ vk_image_usage_to_format_features(VkImageUsageFlagBits usage_flag)
    case VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT:
       return VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT |
              VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT;
+   case VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT:
+      return VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT;
    default:
       return 0;
    }
@@ -684,6 +690,12 @@ pvr_get_image_format_properties(struct pvr_physical_device *pdevice,
    if (info->type == VK_IMAGE_TYPE_3D) {
       const VkImageUsageFlags transfer_usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                                                VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+
+      /* Host copies (G9P) handle 2D layouts only */
+      if (usage & VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT) {
+         result = vk_error(pdevice, VK_ERROR_FORMAT_NOT_SUPPORTED);
+         goto err_unsupported_format;
+      }
 
       /* We don't support 3D depth/stencil images. */
       if (tiling_features2 & VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT) {
@@ -866,6 +878,13 @@ VkResult pvr_GetPhysicalDeviceImageFormatProperties2(
       case VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_IMAGE_FORMAT_PROPERTIES: {
          VkSamplerYcbcrConversionImageFormatProperties *ycbcr_props = ext;
          ycbcr_props->combinedImageSamplerDescriptorCount = 1;
+         break;
+      }
+      case VK_STRUCTURE_TYPE_HOST_IMAGE_COPY_DEVICE_PERFORMANCE_QUERY: {
+         /* host copies do not change the layout the GPU uses */
+         VkHostImageCopyDevicePerformanceQuery *hic = ext;
+         hic->optimalDeviceAccess = true;
+         hic->identicalMemoryLayout = true;
          break;
       }
       default:
