@@ -1049,6 +1049,23 @@ PVR_PER_ARCH(g9p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer,
  * A draw's words in the control stream: VDM state (the vertex kick), the
  * vertex shader's common-store DMA, the PPP state blocks and INDEX_LIST
  */
+/*
+ * VDM_STATE5's MAX_INSTANCES (bits 25-29, 0 = 32): how many instances one
+ * vertex task may hold. With too many for the shader's registers the task
+ * never finishes and the geometry job hangs, sooner with more instances
+ * (pvr-tri, 1000 instances x 300 renders, 3 runs each: 8 registers x 32 and
+ * 14 x 4/8/16 pass, 14 x 32 hangs by render 17; iPadOS's 8-register shaders
+ * keep 0). Kept at 256 register-instances, a power of two.
+ */
+static uint32_t
+vs_max_instances(unsigned regs)
+{
+   const unsigned allocated = 2 * DIV_ROUND_UP(MAX2(regs, 8), 2);
+   const unsigned n = 1u << util_logbase2(MAX2(256 / allocated, 2));
+
+   return n >= 32 ? 0 : n;
+}
+
 static VkResult
 emit_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state *state,
           const struct g9p_draw_programs *dp, const struct pvr_g9p_draw *draw,
@@ -1163,7 +1180,8 @@ emit_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state
    pvr_csb_set_relocation_mark(csb);
    {
       const uint32_t w[4] = { 0x44002f80, state->vs_kick.code_offset, state->vs_outputs,
-                              DIV_ROUND_UP(MAX2(state->vs_regs, 8), 2) << 10 | 2 << 6 | 1 };
+                              vs_max_instances(state->vs_regs) << 25 |
+                                 DIV_ROUND_UP(MAX2(state->vs_regs, 8), 2) << 10 | 2 << 6 | 1 };
 
       emit_words(csb, w, 4);
    }
