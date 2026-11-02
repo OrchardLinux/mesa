@@ -737,7 +737,7 @@ emit_alu(struct g9p_ctx *ctx, nir_alu_instr *alu)
    case nir_op_umin: case nir_op_umax:
    case nir_op_fneg: case nir_op_fabs: case nir_op_inot: case nir_op_ineg:
    case nir_op_fsin: case nir_op_fcos: case nir_op_fsign: case nir_op_b2f32:
-   case nir_op_slt: case nir_op_sge: case nir_op_seq: case nir_op_sne:
+   case nir_op_b2i32: case nir_op_slt: case nir_op_sge: case nir_op_seq: case nir_op_sne:
    case nir_op_flrp: {
       bool ok;
 
@@ -868,9 +868,10 @@ emit_alu_op(struct g9p_ctx *ctx, nir_alu_instr *alu, const int *r, int dst)
       g9p_pop_levels(ctx->c, ctx->st, 1);
       return true;
    }
-   case nir_op_b2f32: {
+   case nir_op_b2f32:
+   case nir_op_b2i32: {
       /* booleans are 0 / ~0 */
-      int one = const_reg(ctx, fui(1.0f));
+      int one = const_reg(ctx, alu->op == nir_op_b2f32 ? fui(1.0f) : 1);
 
       if (one < 0)
          return false;

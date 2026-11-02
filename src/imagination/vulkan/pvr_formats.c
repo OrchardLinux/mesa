@@ -28,6 +28,7 @@
 #include <vulkan/vulkan.h>
 
 #include "drm-uapi/drm_fourcc.h"
+#include "g9p_formats.h"
 #include "hwdef/rogue_hw_utils.h"
 
 #include "pvr_common.h"
@@ -335,6 +336,19 @@ pvr_get_image_format_features2(struct pvr_physical_device *pdevice,
    if (flags & VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT) {
       flags |= VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |
                VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
+   }
+
+   /*
+    * Apple G9P: textures only in the colour formats its image state is
+    * decoded for, so that Zink and others pick one of those (Qt's 8-bit
+    * glyph caches land in RGBA8)
+    */
+   if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g9p) && vk_format_is_color(vk_format) &&
+       !g9p_image_format(vk_format)) {
+      flags &= ~(VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
+                 VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+                 VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_2D_BIT_IMG |
+                 VK_FORMAT_FEATURE_2_BLIT_SRC_BIT);
    }
 
    return flags;

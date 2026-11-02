@@ -30,6 +30,7 @@
 
 #include "g9p_cdm.h"
 #include "g9p_compile.h"
+#include "g9p_formats.h"
 #include "g9p_isa.h"
 
 #include "pvr_bo.h"
@@ -1276,28 +1277,6 @@ PVR_PER_ARCH(g9p_clear_attachments)(struct pvr_cmd_buffer *cmd_buffer, uint32_t 
 /* --- Image and sampler states ---------------------------------------------- */
 
 /*
- * Bytes 1-2 of an image state's dword 0 by format (RENDER.md "Render target
- * captures"; the RGBA8 texture of "Varyings and textures with our
- * encodings"); 0 if not decoded yet
- */
-static uint32_t
-image_format_bits(VkFormat format)
-{
-   switch (format) {
-   case VK_FORMAT_B8G8R8A8_UNORM:
-   case VK_FORMAT_B8G8R8A8_SRGB:
-      return 0x0505;
-   case VK_FORMAT_R8G8B8A8_UNORM:
-   case VK_FORMAT_R8G8B8A8_SRGB:
-      return 0x4405;
-   case VK_FORMAT_R16G16B16A16_SFLOAT:
-      return 0x4446;
-   default:
-      return 0;
-   }
-}
-
-/*
  * The texture state of an image view's base level and layer (dwords 0-3;
  * the draw's DMA zeroes 4-7): the image state layout of render targets
  */
@@ -1307,7 +1286,7 @@ PVR_PER_ARCH(g9p_pack_image_view)(const struct pvr_image_view *iview, uint64_t w
    const struct pvr_image *image = pvr_image_view_get_image(iview);
    const struct pvr_image_plane *plane = pvr_single_plane_const(image);
    const VkComponentMapping *sw = &iview->vk.swizzle;
-   uint32_t fmt = image_format_bits(iview->vk.format);
+   uint32_t fmt = g9p_image_format(iview->vk.format);
    const bool linear = image->memlayout == PVR_MEMLAYOUT_LINEAR;
    const uint64_t addr = image->dev_addr.addr + plane->offset +
                          plane->mip_levels[iview->vk.base_mip_level].offset +
@@ -1385,13 +1364,12 @@ PVR_PER_ARCH(g9p_pack_sampler)(const VkSamplerCreateInfo *info)
  * instead of 0xa, the row pitch in 64-byte units minus one at bit 111, and
  * dword 5 0xc0000000, as iPadOS writes them.
  */
-static uint32_t image_format_bits(VkFormat format);
 
 static void
 pack_image_state(uint32_t *w, uint64_t addr, uint32_t width, uint32_t height,
                  bool linear, uint32_t pitch, VkFormat format)
 {
-   const uint32_t fmt = image_format_bits(format);
+   const uint32_t fmt = g9p_image_format(format);
 
    memset(w, 0, 8 * 4);
    w[0] = 0x03000000u | (fmt ? fmt : 0x0505) << 8 | (linear ? 0x02 : 0x0a) | (width - 1) << 27;
@@ -1430,7 +1408,7 @@ PVR_PER_ARCH(g9p_job_init)(struct pvr_cmd_buffer *cmd_buffer,
                             plane->mip_levels[iview->vk.base_mip_level].offset +
                             iview->vk.base_array_layer * plane->layer_size;
 
-      if (!image_format_bits(iview->vk.format))
+      if (!g9p_image_format(iview->vk.format))
          mesa_logw_once("G9P: render target format %s stored as BGRA8",
                         vk_Format_to_str(iview->vk.format));
       const bool linear = image_obj->memlayout == PVR_MEMLAYOUT_LINEAR;
