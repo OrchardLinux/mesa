@@ -230,7 +230,8 @@ static unsigned get_pbe_stride_align(const struct pvr_device_info *dev_info);
 
 static VkResult pvr_pick_modifier(const VkImageCreateInfo *pCreateInfo,
                                   unsigned pbe_stride_align,
-                                  uint64_t *modifier)
+                                  uint64_t *modifier,
+                                  VkDeviceSize *offset)
 {
    const VkImageDrmFormatModifierListCreateInfoEXT *mod_list =
          vk_find_struct_const(pCreateInfo->pNext,
@@ -251,12 +252,16 @@ static VkResult pvr_pick_modifier(const VkImageCreateInfo *pCreateInfo,
 
    if (explicit_mod) {
       const uint32_t bpp = vk_format_get_blocksize(pCreateInfo->format);
-      assert(explicit_mod->drmFormatModifier == DRM_FORMAT_MOD_LINEAR &&
-             explicit_mod->drmFormatModifierPlaneCount == 1);
+
+      if (explicit_mod->drmFormatModifier != DRM_FORMAT_MOD_LINEAR ||
+          explicit_mod->drmFormatModifierPlaneCount != 1)
+         return VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT;
       *modifier = explicit_mod->drmFormatModifier;
 
-      if (explicit_mod->pPlaneLayouts[0].offset != 0)
-         return VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT;
+      /* A plane that starts inside the memory, such as a client's buffer
+       * in a shared-memory pool: pvr_BindImageMemory2() maps from it.
+       */
+      *offset = explicit_mod->pPlaneLayouts[0].offset;
 
       if (explicit_mod->pPlaneLayouts[0].rowPitch %
           (bpp * pbe_stride_align) != 0) {
@@ -291,7 +296,11 @@ VkResult pvr_CreateImage(VkDevice _device,
    if (!image)
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
 
-   pvr_image_init(device, pCreateInfo, image);
+   VkResult result = pvr_image_init(device, pCreateInfo, image);
+   if (result != VK_SUCCESS) {
+      vk_image_destroy(&device->vk, pAllocator, &image->vk);
+      return vk_error(device, result);
+   }
 
    *pImage = pvr_image_to_handle(image);
 
@@ -312,9 +321,9 @@ void pvr_DestroyImage(VkDevice _device,
    vk_image_destroy(&device->vk, pAllocator, &image->vk);
 }
 
-void pvr_image_init(struct pvr_device *device,
-                    const VkImageCreateInfo *pCreateInfo,
-                    struct pvr_image *image)
+VkResult pvr_image_init(struct pvr_device *device,
+                        const VkImageCreateInfo *pCreateInfo,
+                        struct pvr_image *image)
 {
    unsigned pbe_stride_align = get_pbe_stride_align(&device->pdevice->dev_info);
 
@@ -324,9 +333,10 @@ void pvr_image_init(struct pvr_device *device,
    if (pCreateInfo->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) {
       VkResult res = pvr_pick_modifier(pCreateInfo,
                                        pbe_stride_align,
-                                       &image->vk.drm_format_mod);
+                                       &image->vk.drm_format_mod,
+                                       &image->import_offset);
       if (res != VK_SUCCESS)
-         assert(res == VK_SUCCESS);
+         return res;
 
       assert(image->vk.drm_format_mod == DRM_FORMAT_MOD_LINEAR);
    }
@@ -334,6 +344,8 @@ void pvr_image_init(struct pvr_device *device,
    pvr_image_init_memlayout(device, image);
    pvr_image_init_physical_extent(image, pCreateInfo, pbe_stride_align);
    pvr_image_setup_mip_levels(image);
+
+   return VK_SUCCESS;
 }
 
 void pvr_image_fini(struct pvr_device *device, struct pvr_image *image)
@@ -406,10 +418,13 @@ VkResult pvr_BindImageMemory2(VkDevice _device,
       result = pvr_bind_memory(device,
                                mem,
                                offset,
-                               image->total_size,
+                               image->import_offset + image->total_size,
                                image->alignment,
                                &image->vma,
                                &image->dev_addr);
+      if (result == VK_SUCCESS)
+         image->dev_addr =
+            PVR_DEV_ADDR_OFFSET(image->dev_addr, image->import_offset);
       if (result != VK_SUCCESS) {
          while (i--) {
             VK_FROM_HANDLE(pvr_image, image, pBindInfos[i].image);
@@ -463,7 +478,7 @@ void pvr_GetDeviceImageSubresourceLayout(
    struct pvr_image image = { 0 };
 
    vk_image_init(&device->vk, &image.vk, pInfo->pCreateInfo);
-   pvr_image_init(device, pInfo->pCreateInfo, &image);
+   (void)pvr_image_init(device, pInfo->pCreateInfo, &image);
 
    pvr_GetImageSubresourceLayout2(_device,
                                   pvr_image_to_handle(&image),

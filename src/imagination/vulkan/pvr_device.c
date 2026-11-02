@@ -1069,7 +1069,7 @@ void pvr_GetDeviceImageMemoryRequirements(
    struct pvr_image image = { 0 };
 
    vk_image_init(&device->vk, &image.vk, pInfo->pCreateInfo);
-   pvr_image_init(device, pInfo->pCreateInfo, &image);
+   (void)pvr_image_init(device, pInfo->pCreateInfo, &image);
 
    VkImageMemoryRequirementsInfo2 image_info = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
@@ -1124,7 +1124,7 @@ void pvr_GetImageMemoryRequirements2(VkDevice _device,
     */
    pMemoryRequirements->memoryRequirements.alignment = image->alignment;
    pMemoryRequirements->memoryRequirements.size =
-      align64(image->total_size, image->alignment);
+      align64(image->import_offset + image->total_size, image->alignment);
    pMemoryRequirements->memoryRequirements.memoryTypeBits = memory_types;
 
    vk_foreach_struct (sType, ext, pMemoryRequirements->pNext) {

@@ -64,6 +64,11 @@ struct pvr_image {
    VkDeviceSize alignment;
    VkDeviceSize total_size;
 
+   /* Imported with an explicit DRM format modifier layout: where the image
+    * starts in the memory it is bound to, past the bind offset.
+    */
+   VkDeviceSize import_offset;
+
    uint8_t plane_count;
    struct pvr_image_plane planes[PVR_MAX_PLANE_COUNT];
 };
@@ -169,9 +174,9 @@ void pvr_get_image_subresource_layout(const struct pvr_image *image,
                                       const VkImageSubresource *subresource,
                                       VkSubresourceLayout *layout);
 
-void pvr_image_init(struct pvr_device *device,
-                    const VkImageCreateInfo *pCreateInfo,
-                    struct pvr_image *image);
+VkResult pvr_image_init(struct pvr_device *device,
+                        const VkImageCreateInfo *pCreateInfo,
+                        struct pvr_image *image);
 void pvr_image_fini(struct pvr_device *device, struct pvr_image *image);
 
 #endif /* PVR_IMAGE_H */
