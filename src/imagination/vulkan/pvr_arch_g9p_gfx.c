@@ -489,8 +489,16 @@ PVR_PER_ARCH(g9p_graphics_pipeline_compile)(struct pvr_device *device,
                                loc, vk_Format_to_str(a->format));
             goto out;
          }
+         const struct vk_vertex_binding_state *b = &vk_state->vi->bindings[a->binding];
+
+         if (b->divisor != 1) {
+            result = g9p_error(device, "G9P: vertex binding %u: divisor %u not supported yet",
+                               a->binding, b->divisor);
+            goto out;
+         }
          attribs[loc] = (struct g9p_vertex_attrib){
             .present = true,
+            .per_instance = b->input_rate == VK_VERTEX_INPUT_RATE_INSTANCE,
             .binding = a->binding,
             .offset = a->offset,
             .format = vk_format_to_pipe_format(a->format),
@@ -558,12 +566,18 @@ PVR_PER_ARCH(g9p_graphics_pipeline_compile)(struct pvr_device *device,
       state->buffers[i].binding = vs.buffers[i].binding;
    }
 
-   /* Vertex kick: the vertex index into r0, DOUTU (CC as iPadOS's) */
+   /*
+    * Vertex kick: temps q0 holds the vertex index (low half) and the
+    * instance index (high half); one DOUTW each into r0 and r1 (Rogue
+    * control: AO destination at bit 13, BSIZE 0 lower / 1 upper; the
+    * `instanced` capture), then DOUTU (CC as iPadOS's)
+    */
    {
       const uint32_t data[4] = { usc_offset(device, state->vs_bo), usc_temps(vs.num_regs),
-                                 0x80000000u, 0 };
-      const uint32_t code[3] = {
+                                 0, 0x80000000u | 1u << 13 | 1u };
+      const uint32_t code[4] = {
          g9p_pds_dout(G9P_DOUTW, 0, G9P_PDS_TEMPS, 2, 0),
+         g9p_pds_dout(G9P_DOUTW, 0, G9P_PDS_TEMPS, 3, 0),
          g9p_pds_dout(G9P_DOUTU, 0, G9P_PDS_DATA, 0, G9P_PDS_END | G9P_PDS_CC),
          g9p_pds_halt(),
       };

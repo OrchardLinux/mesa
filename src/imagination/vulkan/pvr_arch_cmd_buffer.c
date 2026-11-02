@@ -9240,7 +9240,10 @@ void PVR_PER_ARCH(CmdDraw)(VkCommandBuffer commandBuffer,
          .offset = firstVertex,
       };
 
-      result = pvr_flush_push_descriptors(cmd_buffer, &state->gfx_desc_state);
+      /* the shaders' base instance is 0 (g9p_compile.c) */
+      result = firstInstance ? vk_errorf(cmd_buffer, VK_ERROR_FEATURE_NOT_PRESENT,
+                                         "G9P: firstInstance not supported yet")
+                             : pvr_flush_push_descriptors(cmd_buffer, &state->gfx_desc_state);
       if (result == VK_SUCCESS)
          result = pvr_arch_g9p_cmd_draw(cmd_buffer, &draw);
       if (result != VK_SUCCESS)
@@ -9306,7 +9309,10 @@ void PVR_PER_ARCH(CmdDrawIndexed)(VkCommandBuffer commandBuffer,
          .offset = vertexOffset,
       };
 
-      result = pvr_flush_push_descriptors(cmd_buffer, &state->gfx_desc_state);
+      /* the shaders' base instance is 0 (g9p_compile.c) */
+      result = firstInstance ? vk_errorf(cmd_buffer, VK_ERROR_FEATURE_NOT_PRESENT,
+                                         "G9P: firstInstance not supported yet")
+                             : pvr_flush_push_descriptors(cmd_buffer, &state->gfx_desc_state);
       if (result == VK_SUCCESS)
          result = pvr_arch_g9p_cmd_draw(cmd_buffer, &draw);
       if (result != VK_SUCCESS)

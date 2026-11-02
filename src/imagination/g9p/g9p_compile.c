@@ -1066,7 +1066,8 @@ pin(struct g9p_ctx *ctx, int r)
 
 /*
  * Vertex attribute component: base address of its vertex buffer (common
- * store) + vertex index (r0) x stride + offset + 4 x component.
+ * store) + vertex index (r0, or the instance index r1 for per-instance
+ * bindings) x stride + offset + 4 x component.
  */
 static bool
 emit_attrib_load(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
@@ -1098,7 +1099,7 @@ emit_attrib_load(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
    if (zero < 0 || rs < 0 || t < 0)
       return false;
    g9p_addr(ctx->c, rs, 2 * stride_slot, zero, 0, false);
-   g9p_alu2(ctx->c, G9P_IMUL, t, 0, rs, false);
+   g9p_alu2(ctx->c, G9P_IMUL, t, a->per_instance ? 1 : 0, rs, false);
    ctx->busy &= ~BITFIELD64_RANGE(rs, 2);
    if (offset) {
       int ro = const_reg(ctx, offset);
@@ -1487,8 +1488,12 @@ emit_intrinsic(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
       /* r0 at entry (the vertex kick's DOUTW), pinned in vertex shaders */
       ctx->reg[key(&intr->def, 0)] = 0;
       return true;
-   case nir_intrinsic_load_instance_id: {
-      /* not passed in yet: single-instance draws */
+   case nir_intrinsic_load_instance_id:
+      /* r1 at entry (the vertex kick's second DOUTW), pinned likewise */
+      ctx->reg[key(&intr->def, 0)] = 1;
+      return true;
+   case nir_intrinsic_load_base_instance: {
+      /* firstInstance is not passed in: draws with one are refused */
       int r = alloc_reg(ctx);
 
       if (r < 0)
@@ -1905,12 +1910,11 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
       ctx->colour[i] = -1;
 
    /*
-    * Vertex shaders: r0 is the vertex index throughout (attribute loads).
-    * Fragment shaders: r0-r1 take the colour output's halves at the end.
+    * Vertex shaders: r0 is the vertex index and r1 the instance index
+    * throughout (attribute loads). Fragment shaders: r0-r1 take the colour
+    * output's halves at the end.
     */
-   if (ctx->stage == MESA_SHADER_VERTEX)
-      ctx->busy = ctx->pinned = BITFIELD64_BIT(0);
-   else if (ctx->stage == MESA_SHADER_FRAGMENT)
+   if (ctx->stage == MESA_SHADER_VERTEX || ctx->stage == MESA_SHADER_FRAGMENT)
       ctx->busy = ctx->pinned = BITFIELD64_RANGE(0, 2);
 
    /* compute: r0 holds the local index from the start when it is used */

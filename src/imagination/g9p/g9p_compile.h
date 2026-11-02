@@ -72,6 +72,7 @@
  */
 struct g9p_vertex_attrib {
    bool present;
+   bool per_instance; /* indexed by the instance (r1), not the vertex (r0) */
    unsigned binding, offset;
    enum pipe_format format;
 };
