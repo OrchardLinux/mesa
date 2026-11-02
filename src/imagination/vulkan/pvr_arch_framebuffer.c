@@ -138,12 +138,19 @@ pvr_arch_render_state_setup(struct pvr_device *device,
       goto err_free_render_targets;
    }
 
-   assert(rstate->scratch_buffer_size);
-   result = pvr_spm_scratch_buffer_get_buffer(device,
-                                              rstate->scratch_buffer_size,
-                                              &rstate->scratch_buffer);
-   if (result != VK_SUCCESS)
-      goto err_finish_render_targets;
+   /* G9P has no SPM (see below): nothing ever spills to the scratch buffer,
+    * which is the size of the framebuffer (12 MB at 1536x2048).
+    */
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p)) {
+      rstate->scratch_buffer = NULL;
+   } else {
+      assert(rstate->scratch_buffer_size);
+      result = pvr_spm_scratch_buffer_get_buffer(device,
+                                                 rstate->scratch_buffer_size,
+                                                 &rstate->scratch_buffer);
+      if (result != VK_SUCCESS)
+         goto err_finish_render_targets;
+   }
 
    result = pvr_arch_ppp_state_create(device,
                                       rstate->width,

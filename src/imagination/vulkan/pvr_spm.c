@@ -137,6 +137,9 @@ void pvr_spm_scratch_buffer_release(struct pvr_device *device,
    struct pvr_spm_scratch_buffer_store *store =
       &device->spm_scratch_buffer_store;
 
+   if (!buffer)
+      return;
+
    simple_mtx_lock(&store->mtx);
 
    pvr_spm_scratch_buffer_release_locked(device, buffer);
