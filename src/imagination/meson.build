@@ -25,6 +25,9 @@ if with_imagination_vk or with_tools.contains('imagination')
   subdir('ds')
   subdir('pdsc')
   subdir('g9p')
+  if with_imagination_g5p
+    subdir('g5p')
+  endif
 endif
 
 if with_imagination_vk
