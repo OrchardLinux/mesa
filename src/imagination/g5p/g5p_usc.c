@@ -462,6 +462,21 @@ unsigned g5p_usc_special(uint8_t *out, bool end)
    return 2;
 }
 
+/* End of a task that writes no output: 5e 01 00 a0. The TA's end-of-stream
+ * program (GET_RENDER_INFO's TA program slot, W+0x88) is a branch to the next
+ * 64-byte block, 0xc000 padding, and this word: Apple's A9 job layout has it
+ * there, and Henrik Klee's G9P builds the same program for the same register
+ * on the A10 (pvr_arch_g9p_gfx.c, "Register 0x470's program"). */
+unsigned g5p_usc_task_end(uint8_t *out)
+{
+   out[0] = 0x5e;
+   out[1] = 0x01;
+   out[2] = 0x00;
+   out[3] = 0xa0;
+   g5p_usc_error = NULL;
+   return 4;
+}
+
 unsigned g5p_usc_branch(uint8_t *out, int delta, bool conditional)
 {
    CHECK(!(delta % 2) && delta >= -32768 && delta <= 65534, "branch must be even, in [-32768,65534]");
