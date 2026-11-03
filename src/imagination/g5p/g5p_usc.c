@@ -1703,12 +1703,19 @@ unsigned g5p_usc_stack(uint8_t *out, enum g5p_stack_op op, unsigned st, bool imm
    return put_words(out, w, 4);
 }
 
+/* The offset's low half is in word 1 (bit 8, the next-word flag's position, in
+ * bit 0; offsets are even). Word 2 holds bits 16..31 except bit 24: bit 8 of
+ * the last word is the next-word flag, clear, so bit 24 must equal bit 25 and
+ * the offset is within 16 MiB either way. Apple's A9 compiler, jumps of +0x1a05a
+ * and +0x10c94 over long bodies (tools/mesa-a9-codesize-re f_if1536, f_loop512):
+ * word 2 is offset >> 16 with bit 16 in bit 0. The port had bit 24 there, the
+ * same bits whenever bits 16 and 24 agree (every offset within 64 KiB). */
 unsigned g5p_usc_jump(uint8_t *out, bool any, int offset)
 {
-   CHECK(!(offset & 1) && offset > -0x10000 && offset < 0x10000, "jump offset must be even and within 64 KiB");
+   CHECK(!(offset & 1) && offset >= -0x1000000 && offset < 0x1000000, "jump offset must be even and within 16 MiB");
    const uint32_t off = offset;
    const uint16_t w[] = {any ? 0x0101 : 0x0900, (off & 0xfefe) | 0x0100 | ((off >> 8) & 1),
-                         ((off >> 16) & 0xfefe) | ((off >> 24) & 1)};
+                         (off >> 16) & 0xfeff};
    return put_words(out, w, 3);
 }
 
