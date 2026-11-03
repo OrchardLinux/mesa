@@ -88,6 +88,7 @@ unsigned g5p_usc_move(uint8_t *out, unsigned dst_half, unsigned src_half, unsign
 unsigned g5p_usc_immediate(uint8_t *out, unsigned dst_half, uint32_t value, unsigned bank,
                            int long_form);
 unsigned g5p_usc_special(uint8_t *out, bool end);
+unsigned g5p_usc_task_end(uint8_t *out);
 unsigned g5p_usc_branch(uint8_t *out, int delta, bool conditional);
 unsigned g5p_usc_iterator(uint8_t *out, unsigned dst_half, unsigned slot, unsigned count,
                           bool narrow, bool saturate);
