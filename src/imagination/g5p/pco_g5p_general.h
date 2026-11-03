@@ -13,6 +13,9 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+/* Runaway bound on one program (the backend has no size limit of its own; the
+ * ICD's job arena is what bounds a draw's programs, see pco_g5p_general.c). */
+#define PCO_G5P_PROGRAM_MAX (1u << 20)
 #define PCO_G5P_MAX_UPLOADS 12
 #define PCO_G5P_MAX_ATTRIBS 16
 #define PCO_G5P_COMMON_DWORDS 64
