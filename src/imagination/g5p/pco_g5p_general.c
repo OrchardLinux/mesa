@@ -45,10 +45,15 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Apple's A9 fragment programs pass 4 KiB (tools/mesa-a9-hypr-re: f_live40
- * 4152 bytes, f_u1024all 15516); code is placed per job in the 128 KiB user
- * arena with no size field of its own. */
-#define CODE_MAX 16384
+/* No program size limit of the backend's own. Apple's A9 compiler emits
+ * straight-line fragment programs far past 16 KiB (tools/mesa-a9-codesize-re:
+ * 17546 to 1258052 bytes, one end, no jump), USC code is addressed by a 32-bit
+ * offset from usc_base (code_window 4 GiB, render-uapi.md), and no program state
+ * word holds a size. What bounds a program is where it is placed: the ICD puts a
+ * draw's programs in one job's user arena and refuses a pipeline that cannot
+ * fit there (g5p_pipeline.c). PCO_G5P_PROGRAM_MAX only stops runaway growth. The
+ * buffer starts at CODE_INITIAL and doubles. */
+#define CODE_INITIAL 16384
 #define NUM_DWORDS 32
 #define F32_ONE 0x3f800000u
 #define LAST_END (INT_MAX - 1) /* read by the output block */
@@ -181,7 +186,8 @@ struct gctx {
    unsigned blend;     /* pco_g5p_program.blend_mode */
    struct g5p_blend_info binfo; /* BLEND_GENERAL */
    struct pco_g5p_program *p;
-   uint8_t code[CODE_MAX];
+   uint8_t *code;      /* CODE_INITIAL and doubling; kept by codegen_reset() */
+   unsigned code_cap;
    unsigned size;
    jmp_buf fail;
    struct val *vals;
@@ -275,8 +281,18 @@ static void put(struct gctx *c, const uint8_t *raw, unsigned n, const char *what
 {
    if (!n)
       refuse(c, "%s: encoder rejects the fields (%s)", what, g5p_usc_error ? g5p_usc_error : "?");
-   if (c->size + n > CODE_MAX)
-      refuse(c, "program exceeds %u bytes", CODE_MAX);
+   if (c->size + n > c->code_cap) {
+      if (c->size + n > PCO_G5P_PROGRAM_MAX)
+         refuse(c, "program exceeds %u bytes", PCO_G5P_PROGRAM_MAX);
+      unsigned cap = c->code_cap ? c->code_cap : CODE_INITIAL;
+      while (cap < c->size + n)
+         cap *= 2;
+      uint8_t *code = realloc(c->code, cap);
+      if (!code)
+         refuse(c, "out of memory");
+      c->code = code;
+      c->code_cap = cap;
+   }
    memcpy(c->code + c->size, raw, n);
    c->size += n;
    c->nput++;
@@ -5033,6 +5049,8 @@ static void codegen_reset(struct gctx *c)
    free(c->rh_half);
    struct gctx keep = *c;
    memset(c, 0, offsetof(struct gctx, fail));
+   c->code = keep.code;
+   c->code_cap = keep.code_cap;
    c->lastput = keep.lastput;
    memcpy(c->klast, keep.klast, sizeof(c->klast));
    c->remat = keep.remat;
@@ -5225,6 +5243,7 @@ done:
    free(c->rh_half);
    free(c->lastput);
    free(c->home);
+   free(c->code);
    free(c);
    return ok;
 }
