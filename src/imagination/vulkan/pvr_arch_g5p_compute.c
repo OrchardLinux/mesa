@@ -9,6 +9,7 @@
 #include "g9p_cdm.h"
 #include "g9p_compile.h"
 #include "g5p_cdm.h"
+#include "g5p_usc.h"
 #include "pvr_bo.h"
 #include "pvr_cmd_buffer.h"
 #include "pvr_csb.h"
@@ -226,28 +227,64 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
 }
 
 
-/* A normal generated USC end task and PDS fence, using the existing A9 TA
- * empty-task generator. A9 retirement with this tail is a hardware gate;
- * the legacy c401/barrier byte arrays are deliberately not imported. */
+/* A9's fenced task needs the single-word C4/01 control operation before
+ * the ordinary branch-to-END sequence (compute.md §9.2). The instruction's
+ * fence-ack role is inferred; its exact broader semantics remain unknown.
+ * Encode that instruction and the existing branch/pad/end forms; no captured
+ * program image is imported. CDM tasks end with the generic END word,
+ * not the VDM-specific UVSW end-task instruction used by ta_kick. */
+static VkResult
+upload_cdm_task(struct pvr_cmd_buffer *cmd, bool fenced, struct pvr_pds_upload *out)
+{
+   uint8_t usc[128] = {0};
+   const uint16_t control = (0xc4u << 8) | 1u;
+   unsigned at = 0;
+   if (fenced) {
+      memcpy(usc, &control, sizeof(control));
+      at = sizeof(control);
+   }
+   at += g5p_usc_branch(usc + at, 64 - at, false);
+   while (at < 64)
+      at += g5p_usc_special(usc + at, false);
+   at += g5p_usc_special(usc + at, true);
+   struct pvr_suballoc_bo *bo;
+   VkResult r = pvr_gpu_upload_usc(cmd->device, usc, ALIGN_POT(at, 64), 64, &bo);
+   if (r != VK_SUCCESS) return r;
+   list_add(&bo->link, &cmd->bo_list);
+   uint32_t data[4] = {usc_offset(cmd->device, bo), 0x10, 0, 0};
+   /* Same unconditional DOUTU.END/HALT as the original ta_kick; only the
+    * USC target changes, so probe2 does not also vary the IF1 launch. */
+   uint32_t code[2] = {
+      g9p_pds_dout(G9P_DOUTU, 0, G9P_PDS_DATA, 0, G9P_PDS_END),
+      g9p_pds_halt(),
+   };
+   if (getenv("PVR_G5P_WS_LOG"))
+      fprintf(stderr, "G5P-COMPUTE end_task control=%u usc=%#x bytes=%u branch_to=64 end=8000\n", fenced, data[0], at);
+   return pvr_arch_cmd_buffer_upload_pds(cmd, data, 4, 16, code, 2, 32, 64, out);
+}
+
 VkResult
 PVR_PER_ARCH(g5p_compute_end_pass)(struct pvr_cmd_buffer *cmd,
                                   struct pvr_sub_cmd_compute *sub)
 {
    uint32_t data[4] = {0}, code[4];
-   struct pvr_pds_upload fence;
-   const struct pvr_pds_upload *kick = &cmd->device->g5p->programs.ta_kick;
+   struct pvr_pds_upload fence, fenced, kick;
+   VkResult task_result = upload_cdm_task(cmd, false, &kick);
+   if (task_result == VK_SUCCESS)
+      task_result = upload_cdm_task(cmd, true, &fenced);
+   if (task_result != VK_SUCCESS) return task_result;
    g9p_pds_fence_program(code);
    VkResult r = pvr_arch_cmd_buffer_upload_pds(cmd, data, 4, 16, code, 4, 16, 16, &fence);
    if (r != VK_SUCCESS) return r;
    struct g5p_cdm_record rec;
    pvr_csb_set_relocation_mark(&sub->control_stream);
-   rec = g5p_cdm_task(G9P_CDM_ANY_CLUSTER, kick->data_offset, G9P_CDM_K1_DMA, kick->code_offset);
+   rec = g5p_cdm_task(G9P_CDM_ANY_CLUSTER, kick.data_offset, G9P_CDM_K1_DMA, kick.code_offset);
    emit_record(&sub->control_stream, &rec);
    rec = g5p_cdm_task(G9P_CDM_FENCE_BLOCK | G9P_CDM_ANY_CLUSTER | G9P_CDM_FENCE,
                      fence.data_offset, G9P_CDM_K1_FENCE, fence.code_offset);
    emit_record(&sub->control_stream, &rec);
-   rec = g5p_cdm_task(G9P_CDM_ANY_CLUSTER | G9P_CDM_FENCE, kick->data_offset,
-                     G9P_CDM_K1_FENCE, kick->code_offset);
+   rec = g5p_cdm_task(G9P_CDM_ANY_CLUSTER | G9P_CDM_FENCE, fenced.data_offset,
+                     G9P_CDM_K1_FENCE, fenced.code_offset);
    emit_record(&sub->control_stream, &rec);
    rec = g5p_cdm_task(G9P_CDM_FENCE_BLOCK | G9P_CDM_ANY_CLUSTER | G9P_CDM_FENCE,
                      fence.data_offset, G9P_CDM_K1_FENCE, fence.code_offset);
