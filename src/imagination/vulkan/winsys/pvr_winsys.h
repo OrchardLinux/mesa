@@ -480,4 +480,7 @@ VkResult pvr_winsys_create(const char *render_path,
                            const VkAllocationCallbacks *alloc,
                            struct pvr_winsys **ws_out);
 
+/* Apple A9 (G5P): its hooks in the shared files */
+#include "pvr_g5p_hooks.h"
+
 #endif /* PVR_WINSYS_H */

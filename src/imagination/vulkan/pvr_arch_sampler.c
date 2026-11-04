@@ -236,7 +236,7 @@ VkResult PVR_PER_ARCH(CreateSampler)(VkDevice _device,
       sampler->descriptor.words[0] = pvr_arch_g9p_pack_sampler(pCreateInfo);
       sampler->descriptor.words[1] = 0;
    }
-
+   PVR_G5P_HOOK(sampler, device, pCreateInfo, sampler)
    *pSampler = pvr_sampler_to_handle(sampler);
 
    return VK_SUCCESS;

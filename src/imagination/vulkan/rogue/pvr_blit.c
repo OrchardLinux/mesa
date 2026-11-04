@@ -223,7 +223,7 @@ static void pvr_setup_transfer_surface(struct pvr_device *device,
    surface->vk_format = format;
    surface->mem_layout = image->memlayout;
    surface->sample_count = image->vk.samples;
-
+   PVR_G5P_HOOK(transfer_slice, image, surface, &info, fdepth)
    if (image->memlayout == PVR_MEMLAYOUT_3DTWIDDLED)
       surface->z_position = fdepth;
    else
@@ -2532,7 +2532,7 @@ void pvr_rogue_CmdClearAttachments(VkCommandBuffer commandBuffer,
          pvr_cmd_buffer_set_error_unwarned(cmd_buffer, result);
       return;
    }
-
+   PVR_G5P_HOOK(clear_attachments, cmd_buffer, attachmentCount, pAttachments, rectCount, pRects)
    /* TODO: There are some optimizations that can be made here:
     *  - For a full screen clear, update the clear values for the corresponding
     *    attachment index.

@@ -140,6 +140,41 @@ if with_imagination_srv
   pvr_flags += '-DPVR_SUPPORT_SERVICES_DRIVER'
 endif
 
+# Apple A9 (G5P): its paths of the driver and the G5P backend, opt-in only
+if with_imagination_g5p
+  common_per_arch_files += files(
+    'pvr_arch_g5p.c',
+    'pvr_arch_g5p_blend.c',
+    'pvr_arch_g5p_gfx.c',
+    'pvr_arch_g5p_tex.c',
+    'pvr_arch_g5p_layout.c',
+    'pvr_arch_g5p_ds.c',
+    'pvr_arch_g5p_msaa.c',
+    'pvr_arch_g5p_mrt.c',
+    'pvr_arch_g5p_vertex.c',
+    'pvr_arch_g5p_upload.c',
+    'pvr_arch_g5p_xfb.c',
+    'pvr_arch_g5p_perf.c',
+    'pvr_arch_g5p_vdm.c',
+  )
+  pvr_files += files(
+    'pvr_g5p_formats.c',
+    'pvr_g5p_image.c',
+    'pvr_g5p_nir.c',
+    'pvr_g5p_xfb_query.c',
+    'pvr_g5p_ds.c',
+    'pvr_g5p_msaa.c',
+    'pvr_g5p_vertex_nir.c',
+    'winsys/apple_g5p/g5p_drm_transport.c',
+    'winsys/apple_g5p/pvr_g5p_winsys.c',
+    'winsys/apple_g5p/g5p_ws_perf.c',
+  )
+  pvr_includes += inc_powervr_g5p
+  # pvr_arch_g5p.c builds its PDS programs with pdsc (the A9 ICD's way)
+  pvr_includes += inc_powervr_pdsc
+  pvr_deps += idep_powervr_g5p
+endif
+
 rogue_files = files(
   'rogue/pvr_blit.c',
   'rogue/pvr_clear.c',

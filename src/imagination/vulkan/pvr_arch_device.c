@@ -35,7 +35,7 @@
 #include "pvr_g9p.h"
 #include "pvr_utrace.h"
 #include "util/os_misc.h"
-
+#include "pvr_g5p_publish_hooks.h"
 #define PVR_GLOBAL_FREE_LIST_INITIAL_SIZE (2U * 1024U * 1024U)
 #define PVR_GLOBAL_FREE_LIST_MAX_SIZE (256U * 1024U * 1024U)
 #define PVR_GLOBAL_FREE_LIST_GROW_SIZE (1U * 1024U * 1024U)
@@ -908,7 +908,7 @@ VkResult PVR_PER_ARCH(create_device)(struct pvr_physical_device *pdevice,
          goto err_pvr_free_compute_empty;
       }
    }
-
+   PVR_G5P_HOOK(pub_pvr_arch_device_914)
    result = pvr_device_init_view_index_init_programs(device);
    if (result != VK_SUCCESS)
       goto err_pvr_finish_g9p;
@@ -1006,7 +1006,7 @@ err_pvr_finish_g9p:
       pvr_arch_g9p_gfx_device_finish(device);
       pvr_arch_g9p_device_finish(device);
    }
-
+   PVR_G5P_HOOK(pub_pvr_arch_device_1019)
 err_pvr_free_compute_empty:
    pvr_bo_suballoc_free(device->pds_compute_empty_program.pvr_bo);
 
@@ -1085,8 +1085,8 @@ void PVR_PER_ARCH(destroy_device)(struct pvr_device *device,
       pvr_arch_g9p_gfx_device_finish(device);
       pvr_arch_g9p_device_finish(device);
    }
+   PVR_G5P_HOOK(pub_pvr_arch_device_1102)
    pvr_bo_suballoc_free(device->pds_compute_empty_program.pvr_bo);
-
    for (uint32_t u = 0; u < PVR_MAX_MULTIVIEW; ++u)
       pvr_bo_suballoc_free(device->view_index_init_programs[u].pvr_bo);
 

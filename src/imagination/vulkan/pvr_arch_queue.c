@@ -64,7 +64,7 @@
 #include "vk_sync.h"
 #include "vk_sync_dummy.h"
 #include "vk_util.h"
-
+#include "pvr_g5p_publish_hooks.h"
 static inline enum pvr_winsys_ctx_priority
 pvr_winsys_from_vk_queue_priority(const VkQueueGlobalPriority priority)
 {
@@ -545,7 +545,7 @@ static VkResult pvr_process_graphics_cmd(struct pvr_device *device,
                                          struct pvr_sub_cmd_gfx *sub_cmd)
 {
    const pvr_dev_addr_t ds_addr = sub_cmd->job.ds.addr;
-
+   PVR_G5P_HOOK(xfb_before_job, device, cmd_buffer, sub_cmd)
    u_foreach_bit (view_idx, sub_cmd->view_mask) {
       VkResult result;
 
@@ -559,7 +559,7 @@ static VkResult pvr_process_graphics_cmd(struct pvr_device *device,
       if (result != VK_SUCCESS)
          return result;
    }
-
+   PVR_G5P_HOOK(xfb_after_job, device, queue, cmd_buffer, sub_cmd)
    return VK_SUCCESS;
 }
 
@@ -615,7 +615,7 @@ static VkResult pvr_process_transfer_cmds(struct pvr_device *device,
                            &sync);
    if (result != VK_SUCCESS)
       return result;
-
+   PVR_G5P_HOOK(pub_pvr_arch_queue_619)
    /* G9P: no GPU transfer path yet; done by the CPU */
    if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p))
       result = pvr_arch_g9p_transfer_submit(
@@ -1084,7 +1084,7 @@ static VkResult pvr_process_cmd_buffer(struct pvr_device *device,
 
       p_atomic_inc(&device->global_cmd_buffer_submit_count);
    }
-
+   PVR_G5P_HOOK(xfb_end_cmd_buffer, device, cmd_buffer)
    return VK_SUCCESS;
 }
 

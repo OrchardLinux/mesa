@@ -553,6 +553,12 @@ struct pvr_cmd_buffer_state {
 
    uint32_t pds_fragment_descriptor_data_offset;
    uint32_t pds_compute_descriptor_data_offset;
+#if defined(PVR_APPLE_G5P)
+
+   /* G5P transform feedback (pvr_arch_g5p_xfb.c): bindings and events, NULL
+    * until the command buffer uses any */
+   struct pvr_g5p_xfb_cmd *g5p_xfb;
+#endif
 };
 
 /* Do not change this. This is the format used for the depth_bias_array

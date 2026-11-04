@@ -27,7 +27,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
-
+#include "pvr_g5p_ds_hooks.h"
 #include "drm-uapi/drm_fourcc.h"
 #include "pvr_buffer.h"
 #include "pvr_device.h"
@@ -45,7 +45,7 @@
 #include "vk_object.h"
 #include "vk_util.h"
 #include "wsi_common.h"
-
+#include "pvr_g5p_publish_hooks.h"
 static void pvr_image_init_memlayout(const struct pvr_device *device,
                                      struct pvr_image *image)
 {
@@ -326,7 +326,7 @@ VkResult pvr_image_init(struct pvr_device *device,
                         struct pvr_image *image)
 {
    unsigned pbe_stride_align = get_pbe_stride_align(&device->pdevice->dev_info);
-
+   PVR_G5P_HOOK(stride_align, device, pCreateInfo, pbe_stride_align)
    image->plane_count = vk_format_get_plane_count(image->vk.format);
    image->alignment = device->pdevice->ws->page_size;
 
@@ -344,7 +344,7 @@ VkResult pvr_image_init(struct pvr_device *device,
    pvr_image_init_memlayout(device, image);
    pvr_image_init_physical_extent(image, pCreateInfo, pbe_stride_align);
    pvr_image_setup_mip_levels(image);
-
+   PVR_G5P_HOOK(pub_pvr_image_347)
    return VK_SUCCESS;
 }
 
@@ -455,6 +455,7 @@ void pvr_get_image_subresource_layout(const struct pvr_image *image,
    layout->depthPitch = mip_level->pitch * mip_level->height_pitch;
    layout->arrayPitch = plane->layer_size;
    layout->size = mip_level->size;
+   PVR_G5P_HOOK(slice_pitch, image, layout)
 }
 
 void pvr_GetImageSubresourceLayout2(VkDevice device,

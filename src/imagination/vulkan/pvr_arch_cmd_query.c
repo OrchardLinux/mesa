@@ -22,7 +22,7 @@ void PVR_PER_ARCH(CmdResetQueryPool)(VkCommandBuffer commandBuffer,
    VkResult result;
 
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
-
+   PVR_G5P_HOOK(xfb_query_reset, cmd_buffer, queryPool, firstQuery, queryCount)
    if (queryCount == 0)
       return;
 
@@ -84,7 +84,7 @@ void PVR_PER_ARCH(CmdCopyQueryPoolResults)(VkCommandBuffer commandBuffer,
    VkResult result;
 
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
-
+   PVR_G5P_HOOK(xfb_query_copy, cmd_buffer, queryPool, firstQuery, queryCount, dstBuffer, dstOffset, stride, flags)
    if (queryCount == 0)
       return;
 
@@ -229,7 +229,7 @@ void PVR_PER_ARCH(CmdBeginQueryIndexedEXT)(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(pvr_query_pool, pool, queryPool);
 
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
-
+   PVR_G5P_HOOK(xfb_query_begin, cmd_buffer, pool, query, index)
    switch (pool->query_type) {
    case VK_QUERY_TYPE_OCCLUSION:
       pvr_occlusion_query_begin(cmd_buffer, pool, query);
@@ -254,7 +254,7 @@ void PVR_PER_ARCH(CmdEndQueryIndexedEXT)(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(pvr_query_pool, pool, queryPool);
 
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
-
+   PVR_G5P_HOOK(xfb_query_end, cmd_buffer, pool, query)
    switch (pool->query_type) {
    case VK_QUERY_TYPE_OCCLUSION:
       pvr_occlusion_query_end(cmd_buffer);

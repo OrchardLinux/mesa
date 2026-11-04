@@ -217,6 +217,11 @@ struct pvr_graphics_pipeline {
 
    const char *vs_nir_str;
    const char *fs_nir_str;
+#ifdef PVR_APPLE_G5P
+
+   /* G5P (pvr_arch_g5p_gfx.c, pvr_g5p.h): the programs of its draws */
+   struct pvr_g5p_pipeline *g5p;
+#endif
 };
 
 struct pvr_private_compute_pipeline {

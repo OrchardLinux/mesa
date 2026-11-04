@@ -30,7 +30,7 @@
 #include "drm-uapi/drm_fourcc.h"
 #include "g9p_formats.h"
 #include "hwdef/rogue_hw_utils.h"
-
+#include "pvr_g5p_ds_hooks.h"
 #include "pvr_common.h"
 #include "pvr_csb.h"
 #include "pvr_device.h"
@@ -54,7 +54,7 @@
 #include "vk_format.h"
 #include "vk_log.h"
 #include "vk_util.h"
-
+#include "pvr_g5p_publish_hooks.h"
 uint32_t pvr_get_pbe_accum_format_size_in_bytes(VkFormat vk_format)
 {
    enum pvr_pbe_accum_format pbe_accum_format;
@@ -345,7 +345,7 @@ pvr_get_image_format_features2(struct pvr_physical_device *pdevice,
       flags |= VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |
                VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
    }
-
+   PVR_G5P_HOOK(color_format_features, pdevice, vk_format, vk_tiling, flags)
    /*
     * Apple G9P: textures only in the colour formats its image state is
     * decoded for, so that Zink and others pick one of those (Qt's 8-bit
@@ -373,7 +373,7 @@ pvr_get_image_format_features2(struct pvr_physical_device *pdevice,
    if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g9p) && vk_format_is_color(vk_format) &&
        (flags & VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT))
       flags |= VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT;
-
+   PVR_G5P_HOOK(ds_format_features, pdevice, vk_format, flags)
    return flags;
 }
 
@@ -417,9 +417,9 @@ pvr_get_buffer_format_features2(struct pvr_physical_device *pdevice,
    VkFormatFeatureFlags2 flags = 0;
 
    const struct pvr_format *pvr_format = pvr_get_format(pdevice, vk_format);
+   PVR_G5P_HOOK(pub_pvr_formats_437)
    if (!pvr_format)
       return 0;
-
    assert(pvr_format->bind != 0);
 
    if (!vk_format_is_color(vk_format))
@@ -429,7 +429,7 @@ pvr_get_buffer_format_features2(struct pvr_physical_device *pdevice,
 
    if (pvr_format->bind & PVR_BIND_VERTEX_BUFFER)
       flags |= VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT;
-
+   PVR_G5P_HOOK(pub_pvr_formats_454)
    if (vk_format_is_scaled(vk_format))
       return flags;
 
@@ -485,7 +485,7 @@ pvr_get_buffer_format_features2(struct pvr_physical_device *pdevice,
    default:
       break;
    }
-
+   PVR_G5P_HOOK(pub_pvr_formats_519)
    if (flags & VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_BIT) {
       flags |= VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |
                VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
@@ -671,7 +671,7 @@ pvr_get_image_format_properties(struct pvr_physical_device *pdevice,
       result = vk_error(pdevice, VK_ERROR_FORMAT_NOT_SUPPORTED);
       goto err_unsupported_format;
    }
-
+   PVR_G5P_HOOK(image_format, pdevice, info, tiling, result)
    /* If VK_IMAGE_CREATE_EXTENDED_USAGE_BIT is set, the driver can't decide if a
     * specific format isn't supported based on the usage.
     */
@@ -809,7 +809,7 @@ pvr_get_image_format_properties(struct pvr_physical_device *pdevice,
 
       pImageFormatProperties->maxMipLevels = util_logbase2(max_size) + 1U;
    }
-
+   PVR_G5P_HOOK(msaa_image_samples, pdevice, info, tiling, pImageFormatProperties)
    /* Return 2GB (minimum required from spec).
     *
     * From the Vulkan spec:
