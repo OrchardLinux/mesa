@@ -33,16 +33,16 @@
 
 /* pvr_formats.c, pvr_get_image_format_features2(): depth/stencil formats
  * are the four the A9's ZLS stores (pvr_g5p_ds_format(): D16, D32F, S8,
- * D32F_S8), as attachments only. D24S8, X8_D24 and D16_S8 get no features,
- * so Zink renders GL's DEPTH24_STENCIL8 with D32F_S8 as on our ICD. No
- * sampling until the texture state packs a ZLS plane
- * (pvr_g5p_ds_texture_plane()), and no transfers: the planes are in the
- * ZLS's Morton order over a square of 32-pixel tiles, not a layout the
- * CPU copies know.
+ * D32F_S8), as attachments, and D32F and D32F_S8 sampled with depth
+ * comparison as well (pvr_g5p_ds_format_features(): the texture state reads
+ * a ZLS plane in place). D24S8, X8_D24 and D16_S8 get no features, so Zink
+ * renders GL's DEPTH24_STENCIL8 with D32F_S8 as on our ICD. No linear
+ * filtering and no transfers: the planes are in the ZLS's Morton order over
+ * a square of 32-pixel tiles, not a layout the CPU copies know.
  */
 #define PVR_G5P_HOOK_ds_format_features(pdevice, vk_format, flags)                          \
    if (PVR_HAS_FEATURE(&(pdevice)->dev_info, apple_g5p) && vk_format_is_depth_or_stencil(vk_format)) \
-      (flags) &= pvr_g5p_ds_format(vk_format) ? VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT : 0;
+      (flags) &= pvr_g5p_ds_format_features(vk_format);
 
 /* pvr_physical_device.c, pvr_physical_device_init(): the sample counts of
  * the A9 path (pvr_g5p_msaa_limits()) in place of upstream's 1 | 4 everywhere */

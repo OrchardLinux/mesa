@@ -306,3 +306,15 @@ pvr_g5p_ds_texture_plane(VkFormat format, VkImageAspectFlags aspect, uint32_t wi
       return "a sampled depth/stencil view with both aspects";
    }
 }
+
+VkFormatFeatureFlags2
+pvr_g5p_ds_format_features(VkFormat format)
+{
+   const struct pvr_g5p_ds_format *f = pvr_g5p_ds_format(format);
+
+   if (!f)
+      return 0;
+   return VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT |
+          (f->sampled ? VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT
+                      : 0);
+}

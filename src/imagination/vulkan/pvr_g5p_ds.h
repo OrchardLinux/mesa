@@ -114,11 +114,19 @@ void pvr_g5p_ds_isp(const struct pvr_g5p_isp_state *s, uint32_t w[5]);
 
 /* A sampled plane of a depth/stencil image, read in place by the texture
  * unit: the plane's VA and the colour format whose texture key reads it
- * (depth: R32_SFLOAT, swizzle RRR1, captured; stencil: R8_UINT, inferred).
+ * (depth: R32_SFLOAT, captured; stencil: R8_UINT, inferred).
  * Returns NULL, or why the plane cannot be sampled. */
 const char *pvr_g5p_ds_texture_plane(VkFormat format, VkImageAspectFlags aspect, uint32_t width,
                                      uint32_t height, uint64_t va, uint64_t *plane_va,
                                      VkFormat *texture_format);
+
+/* The format features of a depth/stencil format on the A9 path: none for a
+ * format the ZLS does not store; a depth/stencil attachment otherwise, and
+ * sampled with depth comparison when its planes have a texture key
+ * (pvr_g5p_ds_texture_plane()). No linear filtering (the A9 filters no
+ * 32-bit float texture, and ES 3.0 asks none of DEPTH_COMPONENT32F), and no
+ * transfers (the planes are in the ZLS's Morton order). */
+VkFormatFeatureFlags2 pvr_g5p_ds_format_features(VkFormat format);
 
 /* pvr_image_init(): a depth/stencil image of a ZLS format takes the ZLS
  * planes' size (pvr_g5p_ds_layout()), at least; other images are left as
@@ -126,7 +134,13 @@ const char *pvr_g5p_ds_texture_plane(VkFormat format, VkImageAspectFlags aspect,
 struct pvr_image;
 void pvr_g5p_ds_image_layout(struct pvr_image *image);
 
-#ifdef PVR_PER_ARCH
+#endif /* PVR_G5P_DS_H */
+
+/* The per-arch functions, guarded on their own: a header included early
+ * (through the hook headers) before PVR_PER_ARCH is defined still gives
+ * them to a later per-arch file. */
+#if defined(PVR_PER_ARCH) && !defined(PVR_G5P_DS_ARCH_H)
+#define PVR_G5P_DS_ARCH_H
 
 struct pvr_cmd_buffer;
 struct pvr_render_job;
@@ -153,6 +167,13 @@ VkImageAspectFlags PVR_PER_ARCH(g5p_ds_aspects)(const struct pvr_cmd_buffer *cmd
 VkResult PVR_PER_ARCH(g5p_ds_bias)(struct pvr_cmd_buffer *cmd_buffer, const struct vk_dynamic_graphics_state *dyn,
                                    uint32_t *index);
 
+/* lane b's image-view packing: the texture state of a depth or stencil view,
+ * its ZLS plane read in place (q0..q2 as pvr_g5p_tex_twiddled()), or why it
+ * has none */
+struct pvr_image_view;
+const char *PVR_PER_ARCH(g5p_ds_view_state)(const struct pvr_image_view *iview, uint64_t q[3]);
+
+#   define pvr_arch_g5p_ds_view_state PVR_PER_ARCH(g5p_ds_view_state)
 #   define pvr_arch_g5p_ds_admit PVR_PER_ARCH(g5p_ds_admit)
 #   define pvr_arch_g5p_ds_pass PVR_PER_ARCH(g5p_ds_pass)
 #   define pvr_arch_g5p_ds_isp PVR_PER_ARCH(g5p_ds_isp)
@@ -160,5 +181,3 @@ VkResult PVR_PER_ARCH(g5p_ds_bias)(struct pvr_cmd_buffer *cmd_buffer, const stru
 #   define pvr_arch_g5p_ds_bias PVR_PER_ARCH(g5p_ds_bias)
 
 #endif /* PVR_PER_ARCH */
-
-#endif /* PVR_G5P_DS_H */

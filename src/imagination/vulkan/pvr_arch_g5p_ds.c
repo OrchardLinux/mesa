@@ -22,6 +22,7 @@
 #include "pvr_cmd_buffer.h"
 #include "pvr_csb.h"
 #include "pvr_g5p_ds.h"
+#include "pvr_g5p_tex_encode.h"
 #include "pvr_hw_pass.h"
 #include "pvr_image.h"
 #include "pvr_job_render.h"
@@ -187,4 +188,48 @@ PVR_PER_ARCH(g5p_ds_bias)(struct pvr_cmd_buffer *cmd_buffer, const struct vk_dyn
    *slot = bias;
    *index = n;
    return VK_SUCCESS;
+}
+
+/* The texture keys of a ZLS plane: depth reads as R32_SFLOAT (format code
+ * 0x221, the captured shadow-sampling scene's), stencil as R8_UINT (code
+ * 0x100, inferred); both with Vulkan's depth/stencil selectors (D or S, 0, 0,
+ * 1). The view's swizzle composes over them. */
+#define G5P_DS_TEX_KEY_DEPTH \
+   PVR_G5P_TEX_KEY(0x221, 0, PVR_G5P_TEX_SEL_ZERO, PVR_G5P_TEX_SEL_ZERO, PVR_G5P_TEX_SEL_ONE)
+#define G5P_DS_TEX_KEY_STENCIL \
+   PVR_G5P_TEX_KEY(0x100, 0, PVR_G5P_TEX_SEL_ZERO, PVR_G5P_TEX_SEL_ZERO, PVR_G5P_TEX_SEL_ONE)
+
+const char *
+PVR_PER_ARCH(g5p_ds_view_state)(const struct pvr_image_view *iview, uint64_t q[3])
+{
+   const struct pvr_image *image = pvr_image_view_get_image(iview);
+   const struct pvr_image_plane *plane = pvr_single_plane_const(image);
+   uint64_t va;
+   VkFormat tf;
+
+   if (image->vk.mip_levels != 1 || image->vk.array_layers != 1 || iview->vk.base_mip_level)
+      return "a sampled depth/stencil image with mips or layers (the ZLS stores one surface)";
+   if (image->vk.samples != VK_SAMPLE_COUNT_1_BIT)
+      return "a sampled multisample depth/stencil image";
+   if (iview->vk.view_type != VK_IMAGE_VIEW_TYPE_2D && iview->vk.view_type != VK_IMAGE_VIEW_TYPE_2D_ARRAY)
+      return "a depth/stencil view that is not 2D";
+   const char *why = pvr_g5p_ds_texture_plane(image->vk.format, iview->vk.aspects, image->vk.extent.width,
+                                              image->vk.extent.height, image->dev_addr.addr + plane->offset, &va,
+                                              &tf);
+   if (why)
+      return why;
+   if (va % 64)
+      return "a ZLS plane off a 64-byte base";
+   const struct pvr_g5p_tex_twiddled_view v = {
+      .key = pvr_g5p_tex_swizzle_key(tf == VK_FORMAT_R32_SFLOAT ? G5P_DS_TEX_KEY_DEPTH : G5P_DS_TEX_KEY_STENCIL,
+                                     &iview->vk.swizzle),
+      .layout = iview->vk.view_type == VK_IMAGE_VIEW_TYPE_2D ? PVR_G5P_TEX_LAYOUT_2D : PVR_G5P_TEX_LAYOUT_2D_ARRAY,
+      .width = image->vk.extent.width,
+      .height = image->vk.extent.height,
+      .depth = 1,
+      .level_count = 1,
+      .va = va,
+   };
+   pvr_g5p_tex_twiddled(q, &v);
+   return NULL;
 }
