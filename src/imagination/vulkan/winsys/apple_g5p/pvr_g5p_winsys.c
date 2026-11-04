@@ -7,7 +7,7 @@
  * pins at most 256 MiB per VM in BOs of at most 64 MiB. So this winsys keeps
  * an arena: a range of GPU VA at the kernel's code base (pds_base ==
  * usc_base), reserved up front for PVR_G5P_ARENA_MIB and committed in
- * READ|WRITE|EXEC chunks as it fills (8 MiB first, then doubling), each
+ * READ|WRITE|EXEC chunks as it fills (2 MiB minimum, demand sized), each
  * CPU-mapped at its place in one reservation. Pinned memory is what a process
  * uses, not the maximum (g5p_ws_arena_grow()). Every BO is a slice of it, taken at buffer_create:
  * its CPU and GPU addresses are fixed from then on. Because the whole arena
@@ -61,9 +61,9 @@
 
 #define G5P_WS_PAGE 16384ull
 #define G5P_WS_CHUNK (64ull << 20)         /* the kernel's largest BO */
-#define G5P_WS_MAX_CHUNKS 8                /* the arena grows in up to 8 BOs; 256 MiB, the kernel's per-VM cap */
+#define G5P_WS_MAX_CHUNKS 64                /* at least 2 MiB per chunk; 128 MiB default, 256 MiB kernel cap */
 #define G5P_WS_ARENA_DEFAULT (128ull << 20) /* the most the arena grows to; PVR_G5P_ARENA_MIB overrides */
-#define G5P_WS_ARENA_FIRST (8ull << 20)    /* what device creation commits; PVR_G5P_ARENA_FIRST_MIB overrides */
+#define G5P_WS_ARENA_FIRST (2ull << 20)    /* initial demand floor; PVR_G5P_ARENA_FIRST_MIB overrides */
 #define G5P_WS_DEDICATED_SIZE (1ull << 30) /* VA window for display BOs and imports */
 /* Render programs are 32-bit USC/PDS offsets from the code base, so no code window is larger. The kernel's
  * (GET_RENDER_INFO.code_window) bounds the arena; GET_EXEC_INFO.window_size (0x34000) is the older compute path's
@@ -104,6 +104,9 @@ struct g5p_ws {
    uint64_t *arena_used;    /* one bit per page of [arena_va, +arena_size): handed out before (memset on reuse) */
    struct g5p_drm_bo chunks[G5P_WS_MAX_CHUNKS];
    unsigned chunk_count;
+   int64_t chunk_idle_ns[G5P_WS_MAX_CHUNKS];
+   uint32_t chunk_live[G5P_WS_MAX_CHUNKS]; /* slices referencing each chunk; lock held */
+   uint64_t arena_reclaimed;
    struct util_vma_heap slices;
 
    /* own kernel BOs: display buffers and imports; every live one is listed in own_bos, because a job names
@@ -125,6 +128,7 @@ struct g5p_ws_bo {
    uint64_t va; /* GPU address of the slice or of the own BO */
    uint8_t *cpu;
    uint64_t alloc_size;
+   unsigned chunk; /* stable until this slice is destroyed */
    bool own; /* an own kernel BO (display buffer or import) */
    struct g5p_drm_bo kbo;
    struct list_head link; /* in g5p_ws::own_bos, while own */
@@ -326,19 +330,21 @@ static void g5p_ws_wait_jobs(struct g5p_ws *ws, int64_t deadline);
    } while (0)
 /* ---- the arena: committed on demand ---- */
 
-/* One more chunk, at least `need` bytes (lock held). Chunks double: the first is PVR_G5P_ARENA_FIRST_MIB, each next
- * one the size committed so far, at most a kernel BO (64 MiB) and what is left of PVR_G5P_ARENA_MIB. A fresh kernel
+/* One more chunk, at least `need` bytes (lock held), at most a kernel BO (64 MiB)
+ * and what is left of PVR_G5P_ARENA_MIB. A fresh kernel
  * BO reads as zero, so its pages are not memset (arena_used). The bind is a VM edit: the kernel refuses it (EBUSY)
  * while the context has queued jobs and no job has retired on its binding yet; then it is retried for up to 2 s. */
-static int g5p_ws_arena_grow(struct g5p_ws *ws, uint64_t need)
+static int g5p_ws_arena_grow(struct g5p_ws *ws, uint64_t need, uint64_t alignment)
 {
    if (ws->chunk_count == G5P_WS_MAX_CHUNKS || ws->arena_committed >= ws->arena_max)
       return -ENOSPC;
-   uint64_t bytes = ws->chunk_count ? MAX2(ws->arena_committed, need) : need;
+   /* Bounded demand, not geometric commitment: a transient large allocation must not
+    * double every later chunk. The VA, not extra physical memory, provides alignment. */
+   uint64_t bytes = MAX2(need, 2ull << 20);
    bytes = MIN3(align64(bytes, G5P_WS_PAGE), G5P_WS_CHUNK, ws->arena_max - ws->arena_committed);
-   if (bytes < need || ws->arena_next + bytes > ws->arena_size)
+   const uint64_t off = align64(ws->arena_va + ws->arena_next, alignment) - ws->arena_va;
+   if (bytes < need || off > ws->arena_size || bytes > ws->arena_size - off)
       return -ENOSPC;
-   const uint64_t off = ws->arena_next;
    struct g5p_drm_bo *k = &ws->chunks[ws->chunk_count];
    const int64_t deadline = os_time_get_nano() + 2000000000ll;
    int r;
@@ -369,9 +375,9 @@ static int g5p_ws_arena_grow(struct g5p_ws *ws, uint64_t need)
 /* lock held: requested slice bytes versus physically committed chunk bytes, never a device-pinned estimate */
 static void g5p_ws_arena_stats(struct g5p_ws *ws, const char *why)
 {
-   fprintf(stderr, "apple_g5p winsys: arena stats pid=%ld why=%s committed_kib=%" PRIu64 " live_kib=%" PRIu64
-           " peak_kib=%" PRIu64 " allocs=%" PRIu64 " reused_pages=%" PRIu64 " chunks=%u max_kib=%" PRIu64 "\n",
-           (long)getpid(), why, ws->arena_committed >> 10, ws->arena_live >> 10, ws->arena_peak >> 10,
+   fprintf(stderr, "apple_g5p winsys: arena stats pid=%ld fd=%d why=%s committed_kib=%" PRIu64 " live_kib=%" PRIu64
+           " peak_kib=%" PRIu64 " reclaimed_kib=%" PRIu64 " allocs=%" PRIu64 " reused_pages=%" PRIu64 " chunks=%u max_kib=%" PRIu64 "\n",
+           (long)getpid(), ws->drm.fd, why, ws->arena_committed >> 10, ws->arena_live >> 10, ws->arena_peak >> 10, ws->arena_reclaimed >> 10,
            ws->arena_allocs, ws->arena_reused, ws->chunk_count, ws->arena_max >> 10);
 }
 
@@ -396,6 +402,41 @@ static void g5p_ws_arena_take(struct g5p_ws *ws, uint64_t va, uint64_t size)
       g5p_ws_arena_stats(ws, "alloc");
 }
 
+
+/* Final BO references are gone. Never move a live slice or release the first chunk.
+ * Two seconds empty avoids allocating/unmapping a transient chunk every frame.
+ * VM_UNMAP itself proves the VM idle; EBUSY leaves the chunk intact for a later
+ * free/allocation. A failed unmap is never reported as reclaimed memory. Lock held.
+ * Only the tail is removed, so all remaining chunk indexes and CPU mappings stay fixed. */
+static void g5p_ws_arena_trim(struct g5p_ws *ws)
+{
+   while (ws->chunk_count > 1) {
+      const unsigned i = ws->chunk_count - 1;
+      struct g5p_drm_bo *k = &ws->chunks[i];
+      if (ws->chunk_live[i] || os_time_get_nano() - ws->chunk_idle_ns[i] < G5P_WS_BUSY_NS)
+         break;
+      const uint64_t va = k->va, size = k->size;
+      if (g5p_drm_bo_destroy(&ws->drm, k))
+         break;
+      /* All of this chunk's slice range is free. Remove it before reusing its VA. */
+      bool removed = util_vma_heap_alloc_addr(&ws->slices, va, size);
+      assert(removed);
+      (void)removed;
+      void *reserved = mmap(ws->arena_cpu + va - ws->arena_va, size, PROT_NONE,
+                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE, -1, 0);
+      if (reserved == MAP_FAILED)
+         fprintf(stderr, "apple_g5p winsys: empty chunk CPU reservation: %s\n", strerror(errno));
+      for (uint64_t page = (va - ws->arena_va) / G5P_WS_PAGE;
+           page < (va + size - ws->arena_va) / G5P_WS_PAGE; page++)
+         ws->arena_used[page / 64] &= ~(1ull << (page % 64));
+      ws->arena_committed -= size;
+      ws->arena_reclaimed += size;
+      ws->arena_next = va - ws->arena_va;
+      p_atomic_set(&ws->chunk_count, i);
+      if (ws->arena_log)
+         g5p_ws_arena_stats(ws, "trim");
+   }
+}
 
 static struct g5p_ws_bo *g5p_ws_bo_new(struct g5p_ws *ws, uint64_t size)
 {
@@ -455,11 +496,20 @@ static VkResult g5p_ws_buffer_create(struct pvr_winsys *ws_, uint64_t size, uint
    } else {
       const uint64_t alloc = align64(size, G5P_WS_PAGE), align = MAX2(alignment, G5P_WS_PAGE);
       simple_mtx_lock(&ws->lock);
+      g5p_ws_arena_trim(ws);
       uint64_t va = util_vma_heap_alloc(&ws->slices, alloc, align);
-      if (!va && g5p_ws_arena_grow(ws, alloc + align) == 0)
+      if (!va && g5p_ws_arena_grow(ws, alloc, align) == 0)
          va = util_vma_heap_alloc(&ws->slices, alloc, align);
-      if (va)
+      if (va) {
+         for (unsigned i = 0; i < ws->chunk_count; i++)
+            if (va >= ws->chunks[i].va && va + alloc <= ws->chunks[i].va + ws->chunks[i].size) {
+               b->chunk = i;
+               ws->chunk_live[i]++;
+               ws->chunk_idle_ns[i] = 0;
+               break;
+            }
          g5p_ws_arena_take(ws, va, alloc);
+      }
       simple_mtx_unlock(&ws->lock);
       if (!va) {
          r = g5p_ws_fail( VK_ERROR_OUT_OF_DEVICE_MEMORY,
@@ -572,6 +622,10 @@ static void g5p_ws_buffer_destroy(struct pvr_winsys_bo *bo)
    } else {
       util_vma_heap_free(&ws->slices, b->va, b->alloc_size);
       ws->arena_live -= b->alloc_size;
+      assert(ws->chunk_live[b->chunk]);
+      if (!--ws->chunk_live[b->chunk])
+         ws->chunk_idle_ns[b->chunk] = os_time_get_nano();
+      g5p_ws_arena_trim(ws);
    }
    simple_mtx_unlock(&ws->lock);
    vk_free(ws->base.alloc, b);
@@ -687,6 +741,8 @@ struct g5p_ws_render_ctx {
     * kernel creates a render target only on an idle context, so a new size
     * waits on it (g5p_ws_rt_create_idle()) */
    uint32_t last;
+   struct g5p_ws_rt *idle_rt; /* one completed dataset, same context and geometry only */
+   uint64_t rt_creates, rt_reuses;
    struct list_head link; /* in g5p_ws::render_ctxs */
 };
 
@@ -744,9 +800,32 @@ static void g5p_ws_rt_dataset_destroy(struct pvr_winsys_rt_dataset *d)
 {
    struct g5p_ws_rt *rt = container_of(d, struct g5p_ws_rt, base);
    struct g5p_ws *ws = to_ws(d->ws);
-   if (rt->handle)
-      g5p_ws_rt_destroy_idle(ws, rt);
-   vk_free(d->ws->alloc, rt);
+   /* Kernel g5p_rt_create stores context + dimensions/sample geometry, no image
+    * or framebuffer attachment. Keep one idle dataset per context for reuse.
+    * Never share a live dataset across contexts, or keep an unbounded size cache. */
+   struct g5p_ws_rt *old = NULL;
+   bool cached = false;
+   const char *cache = getenv("PVR_G5P_RT_CACHE");
+   simple_mtx_lock(&ws->lock);
+   if (rt->handle && (!cache || strcmp(cache, "0")))
+      list_for_each_entry (struct g5p_ws_render_ctx, c, &ws->render_ctxs, link) {
+         if (c->context == rt->context) {
+            old = c->idle_rt;
+            c->idle_rt = rt;
+            cached = true;
+            break;
+         }
+      }
+   simple_mtx_unlock(&ws->lock);
+   if (old) {
+      g5p_ws_rt_destroy_idle(ws, old);
+      vk_free(d->ws->alloc, old);
+   }
+   if (!cached) {
+      if (rt->handle)
+         g5p_ws_rt_destroy_idle(ws, rt);
+      vk_free(d->ws->alloc, rt);
+   }
 }
 
 static VkResult g5p_ws_render_ctx_create(struct pvr_winsys *ws, struct pvr_winsys_render_ctx_create_info *info,
@@ -771,6 +850,13 @@ static void g5p_ws_render_ctx_destroy(struct pvr_winsys_render_ctx *ctx)
    simple_mtx_lock(&to_ws(ctx->ws)->lock);
    list_del(&c->link);
    simple_mtx_unlock(&to_ws(ctx->ws)->lock);
+   if (c->idle_rt) {
+      g5p_ws_rt_destroy_idle(to_ws(ctx->ws), c->idle_rt);
+      vk_free(ctx->ws->alloc, c->idle_rt);
+   }
+   if (to_ws(ctx->ws)->arena_log)
+      fprintf(stderr, "apple_g5p winsys: rt stats pid=%ld context=%u creates=%" PRIu64 " reuses=%" PRIu64 "\n",
+              (long)getpid(), c->context, c->rt_creates, c->rt_reuses);
    if (c->context)
       g5p_drm_render_context_destroy(&to_ws(ctx->ws)->drm, c->context);
    if (c->last)
@@ -877,6 +963,27 @@ static VkResult g5p_ws_render_submit(const struct pvr_winsys_render_ctx *ctx,
       simple_mtx_lock(&ws->lock);
       rt->handle = 0;
    }
+   if (!rt->handle && c->idle_rt) {
+      struct g5p_ws_rt *idle = c->idle_rt;
+      c->idle_rt = NULL;
+      if (idle->width == rt->width && idle->height == rt->height &&
+          idle->samples == rt->samples && idle->layers == rt->layers) {
+         rt->handle = idle->handle;
+         rt->context = idle->context;
+         c->rt_reuses++;
+      } else {
+         /* Evict before creating another geometry: the kernel has a 32-target cap. */
+         simple_mtx_unlock(&ws->lock);
+         r = g5p_ws_rt_destroy_idle(ws, idle);
+         simple_mtx_lock(&ws->lock);
+         if (r) {
+            c->idle_rt = idle;
+            simple_mtx_unlock(&ws->lock);
+            return g5p_ws_refuse(VK_ERROR_DEVICE_LOST, "cached target eviction: %s", strerror(-r));
+         }
+      }
+      vk_free(ws->base.alloc, idle);
+   }
    if (!rt->handle) {
       r = g5p_ws_rt_create_idle(ws, c, rt);
       if (r) {
@@ -885,6 +992,7 @@ static VkResult g5p_ws_render_submit(const struct pvr_winsys_render_ctx *ctx,
                               rt->height, strerror(-r));
       }
       rt->context = c->context;
+      c->rt_creates++;
    }
    simple_mtx_unlock(&ws->lock);
 
@@ -899,6 +1007,7 @@ static VkResult g5p_ws_render_submit(const struct pvr_winsys_render_ctx *ctx,
    struct g5p_ws_perf_job pj;
    g5p_ws_perf_job(&ws->perf, &pass, info->fragment.fw_stream + sizeof(pass),
                    info->fragment.fw_stream_len - sizeof(pass), &pj);
+   simple_mtx_lock(&ws->lock);
    for (unsigned i = 0; i < ws->chunk_count; i++) {
       uint64_t off, len;
       if (g5p_ws_perf_chunk(&ws->perf, ws->chunks[i].va, ws->chunks[i].size, &off, &len))
@@ -907,7 +1016,6 @@ static VkResult g5p_ws_render_submit(const struct pvr_winsys_render_ctx *ctx,
             .kind = DRM_G5P_RENDER_ACCESS_READ | DRM_G5P_RENDER_ACCESS_WRITE | DRM_G5P_RENDER_ACCESS_CACHE};
    }
    const unsigned nchunks = nres;
-   simple_mtx_lock(&ws->lock);
    if (ws->chunk_count + ws->own_count > ARRAY_SIZE(res)) {
       simple_mtx_unlock(&ws->lock);
       return g5p_ws_refuse(VK_ERROR_OUT_OF_DEVICE_MEMORY, "%u own BOs: more than a job's %u resources",
@@ -1121,8 +1229,8 @@ static VkResult g5p_ws_arena_init(struct g5p_ws *ws)
    uint64_t first = f ? strtoull(f, NULL, 10) << 20 : G5P_WS_ARENA_FIRST;
    first = MIN2(align64(MAX2(first, G5P_WS_PAGE), G5P_WS_PAGE), max);
    /* the VA: every chunk plus one page after each */
-   const uint64_t size = max + G5P_WS_MAX_CHUNKS * G5P_WS_PAGE;
-   if (max > G5P_WS_CHUNK * G5P_WS_MAX_CHUNKS || size > ws->render.code_window)
+   const uint64_t size = 2 * max + G5P_WS_MAX_CHUNKS * G5P_WS_PAGE;
+   if (max > (256ull << 20) || size > ws->render.code_window)
       return g5p_ws_fail(VK_ERROR_INITIALIZATION_FAILED, "arena of %" PRIu64 " MiB is too large",
                        max >> 20);
 
@@ -1141,7 +1249,7 @@ static VkResult g5p_ws_arena_init(struct g5p_ws *ws)
    /* the slices heap starts empty; every chunk adds its range */
    util_vma_heap_init(&ws->slices, ws->arena_va, size);
    util_vma_heap_alloc_addr(&ws->slices, ws->arena_va, size);
-   int r = g5p_ws_arena_grow(ws, first);
+   int r = g5p_ws_arena_grow(ws, first, G5P_WS_PAGE);
    if (r)
       return g5p_ws_fail(VK_ERROR_INITIALIZATION_FAILED, "the arena's first chunk at %#" PRIx64 ": %s",
                        ws->arena_va, strerror(-r));
