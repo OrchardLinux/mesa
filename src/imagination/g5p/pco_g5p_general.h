@@ -77,6 +77,12 @@ enum pco_g5p_evidence {
  * blend state, colour write mask and the draw-buffer format select a
  * compiled program; none of them is a hardware state word on this GPU.
  * Factors/ops use the VkBlendFactor/VkBlendOp numbering. */
+enum pco_g5p_color_output {
+   PCO_G5P_COLOR_F16 = 0,
+   PCO_G5P_COLOR_UINT32,
+   PCO_G5P_COLOR_SINT32,
+};
+
 struct pco_g5p_fs_key {
    bool blend;
    /* Real kill feedback for depth/stencil writes; merge conditions into one token. */
@@ -98,6 +104,8 @@ struct pco_g5p_fs_key {
    /* Colour attachments written by the program: 0 = 1. 1, 2 and 4 are the
     * homogeneous 8-bit RGBA sets with an Apple witness (g5p_mrt_out.h). */
    uint8_t color_targets;
+   /* Per-RT format key: RGBA32 integer attachment, never inferred from SSA. */
+   enum pco_g5p_color_output color_output;
 };
 #define PCO_G5P_FS_KEY_DEFAULT ((struct pco_g5p_fs_key){.write_mask = 0xf})
 

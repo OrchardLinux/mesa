@@ -28,6 +28,7 @@
  * v_depth, and Hyprland's passthru FS equals the iOS tex capture.
  */
 #include "pco_g5p_general.h"
+#include "../vulkan/pvr_g5p_dgl.h"
 #include "g5p_usc.h"
 #include "g5p_mrt_out.h"
 
@@ -1545,7 +1546,9 @@ static void liveness(struct gctx *c)
                refuse(c, "store_output to %s", gl_frag_result_name(loc));
             } else {
                unsigned slot = loc - FRAG_RESULT_DATA0, half = g5p_mrt_half(slot, comp + k);
-               struct ref r = resolve_float(c, in->src[0].ssa, k);
+               struct ref r = c->key->color_output != PCO_G5P_COLOR_F16
+                                 ? resolve_value(c, in->src[0].ssa, k)
+                                 : resolve_float(c, in->src[0].ssa, k);
                c->out[half] = r;
                c->out_written[half] = true;
                c->slot_written[slot] |= 1u << (comp + k);
@@ -4298,6 +4301,10 @@ static bool out_const(struct gctx *c, unsigned k, uint16_t *h)
 /* Output-plan decisions that need use counts. */
 static void plan_fs_output(struct gctx *c)
 {
+   if (c->key->color_output != PCO_G5P_COLOR_F16) {
+      c->mrt.words = c->mrt.emit_field = c->mrt.pixel_output_width = 4;
+      return; /* No narrow f16 loads, output ALU fusion, or f16 constants. */
+   }
    enum g5p_mrt_refusal mr = g5p_mrt_check_writes(&c->mrt, c->slot_written);
    if (mr != G5P_MRT_OK)
       refuse(c, "%s", g5p_mrt_refusal_str(mr));
@@ -4364,6 +4371,8 @@ static bool any_color(struct gctx *c)
 
 static void fs_prologue(struct gctx *c)
 {
+   if (c->key->color_output != PCO_G5P_COLOR_F16)
+      return;
    uint8_t raw[G5P_USC_MAX];
    if (c->narrow_tex || c->narrow_iter || !any_color(c))
       return;
@@ -4419,6 +4428,35 @@ static void fs_output(struct gctx *c)
    }
    fs_discards(c);
    c->now = LAST_END;
+   if (c->key->color_output != PCO_G5P_COLOR_F16) {
+      struct pvr_g5p_dgl_source sources[4] = {0};
+      for (unsigned k = 0; k < 4; k++) {
+         if (!(c->key->write_mask & (1u << k)) || !c->out_written[k]) {
+            sources[k].immediate = true; /* undefined component: choose zero */
+            continue;
+         }
+         struct ref r = c->out[k];
+         struct val *v = V(c, r.def, r.comp);
+         sources[k].immediate = is_const(c, r);
+         if (sources[k].immediate) {
+            sources[k].value = v->imm;
+         } else {
+            sources[k].value = reg_of(c, r, "raw integer output");
+            sources[k].group = vgrp(c, r);
+            /* A repeated component must survive earlier output moves. */
+            for (unsigned j = k + 1; j < 4; j++)
+               if (c->out_written[j] && c->out[j].def == r.def && c->out[j].comp == r.comp)
+                  sources[k].group = 0;
+         }
+      }
+      uint8_t code[6 * G5P_USC_MAX];
+      size_t size = pvr_g5p_dgl_output(code, sizeof(code), sources, c->key->write_mask);
+      if (!size)
+         refuse(c, "raw integer output source cannot be encoded");
+      put(c, code, size, "raw integer output and emitpix4");
+      free_scratch(c);
+      return;
+   }
    if (!any_color(c)) { /* colour write mask 0: Apple's f_mask_none is `00 80` */
       put(c, raw, g5p_usc_special(raw, true), "end");
       return;
@@ -5803,7 +5841,7 @@ bool pco_g5p_compile_general_link(nir_shader *nir, bool half_output, const uint8
       goto done;
    if (!c->vs && nir->info.stage != MESA_SHADER_FRAGMENT)
       refuse(c, "stage %u", nir->info.stage);
-   if (!c->vs && !half_output)
+   if (!c->vs && !half_output && c->key->color_output == PCO_G5P_COLOR_F16)
       refuse(c, "only packed-f16 colour output (8-bit UNORM targets) is implemented");
    if (!c->vs && c->key->depth_feedback && storage_with_depth(nir))
       refuse(c, "fragment depth export with memory side effects is not qualified");
@@ -5814,9 +5852,19 @@ bool pco_g5p_compile_general_link(nir_shader *nir, bool half_output, const uint8
          mr = g5p_mrt_check_key(&c->mrt, c->key->blend, c->key->write_mask);
       if (mr != G5P_MRT_OK)
          refuse(c, "%s", g5p_mrt_refusal_str(mr));
-      apply_fs_key(c, nir, c->key);
+      if (c->key->color_output != PCO_G5P_COLOR_F16) {
+         if (c->key->color_output != PCO_G5P_COLOR_UINT32 &&
+             c->key->color_output != PCO_G5P_COLOR_SINT32)
+            refuse(c, "unknown colour output format");
+         if (c->mrt.targets != 1 || c->key->blend)
+            refuse(c, "raw32 output needs one unblended target");
+      } else {
+         apply_fs_key(c, nir, c->key);
+      }
    }
    out->blend_mode = c->blend == BLEND_REPLACE ? 0 : c->blend;
+   if (!c->vs && c->key->color_output != PCO_G5P_COLOR_F16 && c->key->write_mask != 0xf)
+      out->blend_mode = BLEND_GENERAL; /* destination read requires TRANSLUCENT ISP */
    if (lower(nir))
       out->evidence |= PCO_G5P_EV_FLATTEN;
    fuse_ffma(c, nir);
