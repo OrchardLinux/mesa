@@ -326,7 +326,7 @@ VkResult pvr_image_init(struct pvr_device *device,
                         struct pvr_image *image)
 {
    unsigned pbe_stride_align = get_pbe_stride_align(&device->pdevice->dev_info);
-
+   PVR_G5P_HOOK(stride_align, device, pCreateInfo, pbe_stride_align)
    image->plane_count = vk_format_get_plane_count(image->vk.format);
    image->alignment = device->pdevice->ws->page_size;
 
