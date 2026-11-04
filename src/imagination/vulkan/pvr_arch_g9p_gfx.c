@@ -917,8 +917,8 @@ struct g9p_draw_programs {
    /* the depth test (a depth attachment and the test enabled), its write and compare op */
    bool depth_test, depth_write;
    VkCompareOp depth_compare;
+   PVR_G9P_ES3_HOOK(arch_g9p_gfx_919)
 };
-
 /*
  * A scissor table entry for the render (the scissor capture: {left << 16 |
  * right, top << 16 | bottom}, right and bottom exclusive), reusing the
@@ -1130,13 +1130,13 @@ emit_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state
    if (dp->depth_test) {
       const uint32_t a = 0x00100f00 | pass << 24 | (uint32_t)dp->depth_compare << 17 |
                          (dp->depth_write ? 0 : BITFIELD_BIT(21));
-
       PPP_BLOCK(0x1f, 0x03c00000 | (dp->scissor >= 0 ? BITFIELD_BIT(16) : 0), a, 0x0e000000, a,
                 0x0e000000);
    } else {
       PPP_BLOCK(0x1f, 0x03c40000 | (dp->scissor >= 0 ? BITFIELD_BIT(16) : 0),
                 0x003e0f00 | pass << 24, 0x0e000000, 0x00100f00 | pass << 24, 0);
    }
+   PVR_G9P_ES3_HOOK(arch_g9p_gfx_1139)
    /*
     * 4: region clip (32-pixel tiles, inclusive; mode OUTSIDE drops what lies
     * outside) and the viewport (a0 m0 a1 m1 a2 m2). The clip is the draw's
@@ -1683,6 +1683,9 @@ PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
    put64(&s, job->scissor_table_addr.addr);
    put64(&s, 0);
    put64(&s, 0);
+#ifdef PVR_G9P_ES3
+   const uint32_t es3_zlsctl_at = ALIGN_POT(s.len, 8);
+#endif
    put64(&s, g9p_zlsctl(job));
    put64(&s, job->has_depth_attachment ? job->ds.addr.addr : 0);
    /*
@@ -1700,6 +1703,9 @@ PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
    for (unsigned i = 0; i < 8; i++)
       put32(&s, 0); /* USC clear registers */
    put32(&s, 0);
+#ifdef PVR_G9P_ES3
+   const uint32_t es3_bgobj_at = s.len;
+#endif
    put32(&s, job->has_depth_attachment ? fui(job->ds_clear_value.depth)
                                         : 0x3f800000); /* ISP_BGOBJDEPTH: the depth clear */
    put32(&s, 0x300);      /* ISP_BGOBJVALS */
@@ -1778,6 +1784,7 @@ PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
    put32(&s, fui(t15 / w));
 #ifdef PVR_G9P_ES3
    es3_frag_stream_patch(job, buf, es3_info_at, es3_cluster1_at, es3_r4070_at);
+   es3_frag_stream_zls(job, buf, es3_zlsctl_at, es3_bgobj_at);
 #endif
    dump32("frag stream", 0, (const uint32_t *)buf, s.len / 4);
    return s.len;

@@ -364,19 +364,19 @@ pvr_get_image_format_features2(struct pvr_physical_device *pdevice,
     * The other depth and stencil formats are not decoded: rendering with
     * one crashed the GFX firmware (X8_D24, glmark2).
     */
+   PVR_G9P_ES3_HOOK(formats_366)
    if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g9p) &&
        vk_format_is_depth_or_stencil(vk_format)) {
       flags &= vk_format == VK_FORMAT_D32_SFLOAT ? VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT
                                                  : 0;
    }
+   PVR_G9P_ES3_HOOK(formats_371)
    /* G9P: colour images the driver copies can be copied from the host too */
    if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g9p) && vk_format_is_color(vk_format) &&
        (flags & VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT))
       flags |= VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT;
-
    return flags;
 }
-
 const uint8_t *pvr_get_format_swizzle(VkFormat vk_format)
 {
    const struct util_format_description *vf = vk_format_description(vk_format);

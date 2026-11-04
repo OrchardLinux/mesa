@@ -32,6 +32,13 @@ static VkResult es3_xfb_draw(struct pvr_cmd_buffer *cmd_buffer,
                              const struct pvr_g9p_graphics_state *state,
                              const struct pvr_g9p_draw *draw, VkPrimitiveTopology topology);
 static uint64_t es3_xfb_addr(const struct pvr_cmd_buffer *cmd_buffer, unsigned binding);
+static VkResult es3_ds_check(struct pvr_cmd_buffer *cmd_buffer,
+                             const struct pvr_renderpass_hwsetup_render *hw);
+static void es3_frag_stream_zls(const struct pvr_render_job *job, uint8_t *buf,
+                                uint32_t zlsctl_at, uint32_t bgobj_at);
+static void es3_draw_isp(const struct pvr_cmd_buffer *cmd_buffer,
+                         const struct pvr_g9p_graphics_state *state, bool scissor,
+                         uint32_t *ppp_block);
 
 /* pvr_arch_g9p_gfx.c, after main line 288: the option-on insertion. */
 #define PVR_G9P_ES3_HOOK_arch_g9p_gfx_288() \
@@ -66,6 +73,19 @@ static uint64_t es3_xfb_addr(const struct pvr_cmd_buffer *cmd_buffer, unsigned b
    result = es3_xfb_draw(cmd_buffer, state, draw, dyn->ia.primitive_topology); \
    if (result != VK_SUCCESS) \
    return result;
+/* pvr_arch_g9p_gfx.c, after main line 919: the option-on insertion. */
+#define PVR_G9P_ES3_HOOK_arch_g9p_gfx_919() \
+   /* -Dimagination-g9p-es3: ISP words of a draw that sets its own (es3_ds_clear()) */ \
+   bool es3_isp_set; \
+   uint32_t es3_isp[5];
+
+/* pvr_arch_g9p_gfx.c, after main line 1139: the option-on insertion. */
+#define PVR_G9P_ES3_HOOK_arch_g9p_gfx_1139() \
+   /* ISP words with a stencil aspect (pvr_arch_g9p_es3_gfx.h) */ \
+   if (dp->es3_isp_set) \
+   memcpy(&ppp[blocks[nb - 1][0] + 1], dp->es3_isp, sizeof(dp->es3_isp)); \
+   else \
+   es3_draw_isp(cmd_buffer, state, dp->scissor >= 0, &ppp[blocks[nb - 1][0]]);
 
 /* pvr_arch_g9p_gfx.c, after main line 1267: the option-on insertion. */
 #define PVR_G9P_ES3_HOOK_arch_g9p_gfx_1267() \
@@ -79,6 +99,9 @@ static uint64_t es3_xfb_addr(const struct pvr_cmd_buffer *cmd_buffer, unsigned b
 
 /* pvr_arch_g9p_gfx.c, after main line 1456: the option-on insertion. */
 #define PVR_G9P_ES3_HOOK_arch_g9p_gfx_1456() \
+   result = es3_ds_check(cmd_buffer, hw_render); \
+   if (result != VK_SUCCESS) \
+   return result; \
    { \
    bool handled; \
    result = es3_job_init(cmd_buffer, hw_render, job, &handled); \

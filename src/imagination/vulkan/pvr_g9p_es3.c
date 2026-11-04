@@ -62,3 +62,17 @@ pvr_g9p_es3_sample_counts(void)
 {
    return VK_SAMPLE_COUNT_1_BIT;
 }
+
+VkFormatFeatureFlags2
+pvr_g9p_es3_ds_features(VkFormat format)
+{
+   switch (format) {
+   case VK_FORMAT_D16_UNORM:
+   case VK_FORMAT_D32_SFLOAT:
+   case VK_FORMAT_S8_UINT:
+   case VK_FORMAT_D32_SFLOAT_S8_UINT:
+      return VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT;
+   default:
+      return 0;
+   }
+}

@@ -424,6 +424,9 @@ es3_frag_stream_patch(const struct pvr_render_job *job, uint8_t *buf, uint32_t i
    *(uint32_t *)(buf + r4070_at) = 0xfa;
 }
 
+static VkResult es3_ds_clear(struct pvr_cmd_buffer *cmd_buffer, const VkClearAttachment *att,
+                             uint32_t rect_count, const VkClearRect *rects);
+
 /*
  * vkCmdClearAttachments in a render with several colour targets: one draw
  * of the n-target clear program over the rectangles, every target's
@@ -458,6 +461,15 @@ es3_clear_attachments(struct pvr_cmd_buffer *cmd_buffer, uint32_t attachment_cou
    float *verts;
    VkResult result;
 
+   *handled = false;
+   /* depth and stencil first (a draw of their own), then the colour */
+   for (uint32_t i = 0; i < attachment_count; i++) {
+      if (attachments[i].aspectMask & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) {
+         result = es3_ds_clear(cmd_buffer, &attachments[i], rect_count, rects);
+         if (result != VK_SUCCESS)
+            return result;
+      }
+   }
    *handled = n > 1;
    if (n <= 1)
       return VK_SUCCESS;
@@ -689,4 +701,328 @@ PVR_PER_ARCH(g9p_es3_xfb_end)(struct pvr_cmd_buffer *cmd_buffer, uint32_t first,
       }
       *c = x->written[first + j];
    }
+/* --- Depth/stencil formats ------------------------------------------------- */
+
+/*
+ * D16, D32F, S8 and D32F_S8 attachments, as our A9 driver renders them
+ * (exact on A9 hardware; field values checked against Apple's A9 driver,
+ * depth-msaa.md), packed from Rogue's fields:
+ *  - ZLSCTL takes the plane format (D16 16BITINT, the others F32Z) and,
+ *    with a stencil aspect, the stencil load/store enables; the force bits
+ *    follow either aspect;
+ *  - stencil is a plane of its own, one byte per pixel, with its own load
+ *    and store base (the base's enable bit set: the plane holds no depth).
+ *    D32F_S8 keeps its depth plane first and the stencil plane in the
+ *    second half of the image's eight bytes per pixel. Upstream's Rogue
+ *    layout for D32F_S8 is F64Z, depth and stencil interleaved; which one
+ *    the A10 uses is not known, and this one is the A9's;
+ *  - the background depth is in the plane's format (D16: 1.0 is 0xffff);
+ *    ISP_BGOBJVALS takes the stencil clear;
+ *  - a stencil test sets ISPCTL bpres and two_sided and per-face ISPA/ISPB
+ *    words (Rogue's fields, VkStencilOp's numbering), as Apple's A9 driver
+ *    emits them (our recorder's isp_words_ds()).
+ * The A10 keeps its own choices where it has them: ZLS loads and stores
+ * linear (its fragment job hangs with storetwiddled), ZLS_PIXELS the
+ * physical extent. Its notes say a stencil base breaks the depth load "even
+ * with stencil off in ZLSCTL": here a stencil base is set only for a render
+ * whose attachment has a stencil aspect, with the stencil enables on.
+ * Never 24-bit depth: X8_D24 crashed the A10's GFX firmware (glmark2), and
+ * Zink renders GL's DEPTH24_STENCIL8 with D32F_S8.
+ * Not sampled: the A10 stores depth in a layout of its own (its notes:
+ * compressed), so depth textures stay unadvertised.
+ * Refused by name: sides under 32 pixels (the ZLS writes whole 32-pixel
+ * tiles past such an image), mip levels and layers other than the first.
+ */
+
+/* The stencil plane's offset in a D32F_S8 image: the second half */
+static uint64_t
+es3_stencil_offset(const struct pvr_image *img)
+{
+   const struct pvr_image_plane *plane = pvr_single_plane_const(img);
+
+   return img->vk.format == VK_FORMAT_D32_SFLOAT_S8_UINT
+             ? (uint64_t)plane->physical_extent.width * plane->physical_extent.height * 4
+             : 0;
+}
+
+static bool
+es3_ds_format(VkFormat f)
+{
+   return f == VK_FORMAT_D16_UNORM || f == VK_FORMAT_D32_SFLOAT || f == VK_FORMAT_S8_UINT ||
+          f == VK_FORMAT_D32_SFLOAT_S8_UINT;
+}
+
+/* The ZLS words of a render's depth/stencil attachment, or false to keep his */
+static bool
+es3_zls(const struct pvr_render_job *job, uint64_t *zlsctl, uint64_t *stencil_base,
+        uint32_t *bgobjdepth, uint32_t *bgobjvals)
+{
+   const struct pvr_image_view *iview = job->ds.iview;
+   const struct pvr_image *img;
+   const VkFormat f = iview ? iview->vk.format : VK_FORMAT_UNDEFINED;
+
+   if ((!job->has_depth_attachment && !job->has_stencil_attachment) || !iview ||
+       (f == VK_FORMAT_D32_SFLOAT && !job->has_stencil_attachment))
+      return false;
+   img = pvr_image_view_get_image(iview);
+   pvr_csb_pack (zlsctl, CR_ISP_ZLSCTL, z) {
+      z.zloadformat = z.zstoreformat = f == VK_FORMAT_D16_UNORM
+                                          ? ROGUE_CR_ZLS_FORMAT_TYPE_16BITINT
+                                          : ROGUE_CR_ZLS_FORMAT_TYPE_F32Z;
+      z.zloaden = job->has_depth_attachment && job->ds.load.d;
+      z.zstoreen = job->has_depth_attachment && job->ds.store.d;
+      z.sloaden = job->has_stencil_attachment && job->ds.load.s;
+      z.sstoreen = job->has_stencil_attachment && job->ds.store.s;
+      z.forcezload = z.zloaden || z.sloaden;
+      z.forcezstore = z.zstoreen || z.sstoreen;
+      z.zlsextent_x_z = DIV_ROUND_UP(job->ds.physical_extent.width, 32) - 1;
+      z.zlsextent_y_z = DIV_ROUND_UP(job->ds.physical_extent.height, 32) - 1;
+   }
+   *stencil_base = 0;
+   if (job->has_stencil_attachment) {
+      pvr_csb_pack (stencil_base, CR_ISP_STENCIL_LOAD_BASE, s) {
+         s.addr = PVR_DEV_ADDR_OFFSET(job->ds.addr, es3_stencil_offset(img));
+         s.enable = true;
+      }
+   }
+   *bgobjdepth = f == VK_FORMAT_D16_UNORM
+                    ? (uint32_t)lroundf(CLAMP(job->ds_clear_value.depth, 0.0f, 1.0f) * 65535.0f)
+                    : fui(job->has_depth_attachment ? job->ds_clear_value.depth : 1.0f);
+   pvr_csb_pack (bgobjvals, CR_ISP_BGOBJVALS, v) {
+      v.enablebgtag = true;
+      v.mask = true;
+      v.stencil = job->has_stencil_attachment ? job->ds_clear_value.stencil & 0xff : 0;
+   }
+   return true;
+}
+
+/*
+ * g9p_job_init() (before upstream fills job->ds): what these attachments
+ * cannot do
+ */
+static VkResult
+es3_ds_check(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_renderpass_hwsetup_render *hw)
+{
+   const struct pvr_render_pass_info *info = &cmd_buffer->state.render_pass_info;
+   const struct pvr_image_view *iview;
+   const struct pvr_image_plane *plane;
+
+   if (!hw || hw->ds_attach_idx == VK_ATTACHMENT_UNUSED)
+      return VK_SUCCESS;
+   iview = info->attachments[hw->ds_attach_idx];
+   plane = pvr_single_plane_const(pvr_image_view_get_image(iview));
+   if (!es3_ds_format(iview->vk.format))
+      return vk_errorf(cmd_buffer, VK_ERROR_FEATURE_NOT_PRESENT,
+                       "G9P: depth/stencil format %s", vk_Format_to_str(iview->vk.format));
+   if (plane->physical_extent.width < 32 || plane->physical_extent.height < 32 ||
+       iview->vk.base_mip_level || iview->vk.base_array_layer)
+      return vk_errorf(cmd_buffer, VK_ERROR_FEATURE_NOT_PRESENT,
+                       "G9P: a depth/stencil attachment of %ux%u (level %u, layer %u): "
+                       "32x32 or larger, level 0, layer 0 only",
+                       plane->physical_extent.width, plane->physical_extent.height,
+                       iview->vk.base_mip_level, iview->vk.base_array_layer);
+   return VK_SUCCESS;
+}
+
+/* The fragment stream's ZLS words (offsets of the words g9p_frag_stream() put) */
+static void
+es3_frag_stream_zls(const struct pvr_render_job *job, uint8_t *buf, uint32_t zlsctl_at,
+                    uint32_t bgobj_at)
+{
+   uint64_t zlsctl, stencil_base;
+   uint32_t bgobjdepth, bgobjvals;
+
+   if (!es3_zls(job, &zlsctl, &stencil_base, &bgobjdepth, &bgobjvals))
+      return;
+   /* ZLSCTL, then the depth base, then the stencil base */
+   *(uint64_t *)(buf + zlsctl_at) = zlsctl;
+   *(uint64_t *)(buf + zlsctl_at + 16) = stencil_base;
+   *(uint32_t *)(buf + bgobj_at) = bgobjdepth;
+   *(uint32_t *)(buf + bgobj_at + 4) = bgobjvals;
+}
+
+/*
+ * A draw's ISP words with a stencil aspect: ISPCTL and the front and back
+ * ISPA/ISPB (our A9 recorder's isp_words_ds(), Rogue's face setup in the
+ * form Apple's A9 driver emits it)
+ */
+static void
+es3_isp_words(const struct pvr_cmd_buffer *cmd_buffer, unsigned pass, bool scissor,
+              bool no_colour, uint32_t w[5])
+{
+   const struct vk_dynamic_graphics_state *dyn = &cmd_buffer->vk.dynamic_graphics_state;
+   const struct pvr_render_pass_info *info = &cmd_buffer->state.render_pass_info;
+   const struct pvr_renderpass_hwsetup_render *hw = info->hw_render;
+   const VkFormat f = info->attachments[hw->ds_attach_idx]->vk.format;
+   const VkImageAspectFlags aspects = (vk_format_has_depth(f) ? VK_IMAGE_ASPECT_DEPTH_BIT : 0) |
+                                      (vk_format_has_stencil(f) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
+   struct vk_depth_stencil_state ds = dyn->ds;
+   const struct vk_stencil_test_face_state *face[2] = { &ds.stencil.front, &ds.stencil.back };
+   uint32_t a[2], b[2], t;
+   bool stencil;
+
+   vk_optimize_depth_stencil_state(&ds, aspects, true);
+   stencil = ds.stencil.test_enable;
+   for (unsigned i = 0; i < 2; i++) {
+      pvr_csb_pack (&a[i], TA_STATE_ISPA, x) {
+         x.objtype = ROGUE_TA_OBJTYPE_TRIANGLE;
+         x.passtype = pass;
+         x.dwritedisable = !ds.depth.write_enable;
+         x.dfbztestenable = true;
+         /* VkCompareOp and ROGUE_TA_CMPMODE share their numbering */
+         x.dcmpmode = ds.depth.test_enable ? (uint32_t)ds.depth.compare_op
+                                           : ROGUE_TA_CMPMODE_ALWAYS;
+         x.pointlinewidth = 15;
+         x.sref = stencil ? face[i]->reference : 0;
+      }
+      pvr_csb_pack (&b[i], TA_STATE_ISPB, x) {
+         x.scmpmode = stencil ? (uint32_t)face[i]->op.compare : ROGUE_TA_CMPMODE_ALWAYS;
+         if (stencil) {
+            /* VkStencilOp and ROGUE_TA_ISPB_STENCILOP share their numbering */
+            x.sop1 = face[i]->op.fail;
+            x.sop2 = face[i]->op.depth_fail;
+            x.sop3 = face[i]->op.pass;
+            x.scmpmask = face[i]->compare_mask;
+            x.swmask = face[i]->write_mask;
+         }
+      }
+   }
+   if (a[0] != a[1] || b[0] != b[1]) {
+      if (dyn->rs.cull_mode & VK_CULL_MODE_BACK_BIT) {
+         a[1] = a[0], b[1] = b[0];
+      } else if (dyn->rs.cull_mode & VK_CULL_MODE_FRONT_BIT) {
+         a[0] = a[1], b[0] = b[1];
+      } else if (dyn->rs.front_face == VK_FRONT_FACE_COUNTER_CLOCKWISE) {
+         t = a[0], a[0] = a[1], a[1] = t;
+         t = b[0], b[0] = b[1], b[1] = t;
+      }
+   }
+   pvr_csb_pack (&w[0], TA_STATE_ISPCTL, c) {
+      c.upass = no_colour ? 0 : 15;
+      c.tagwritedisable = no_colour;
+      c.bpres = stencil;
+      c.two_sided = stencil;
+      c.scenable = scissor;
+   }
+   w[1] = a[0], w[2] = b[0], w[3] = a[1], w[4] = b[1];
+}
+
+/*
+ * A draw in a render whose attachment has a stencil aspect: its ISP words
+ * replace the depth-only ones of emit_draw()
+ */
+static void
+es3_draw_isp(const struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state *state,
+             bool scissor, uint32_t *ppp_block)
+{
+   const struct pvr_render_pass_info *info = &cmd_buffer->state.render_pass_info;
+   const struct pvr_renderpass_hwsetup_render *hw = info->hw_render;
+   const unsigned pass = state->uses_fbfetch ? 1u : state->uses_discard ? 4u : 0u;
+
+   if (!hw || hw->ds_attach_idx == VK_ATTACHMENT_UNUSED ||
+       !vk_format_has_stencil(info->attachments[hw->ds_attach_idx]->vk.format))
+      return;
+   es3_isp_words(cmd_buffer, pass, scissor, false, &ppp_block[1]);
+}
+
+/*
+ * vkCmdClearAttachments of depth and/or stencil: a draw of the rectangles
+ * with depth ALWAYS (written when cleared) and stencil REPLACE by the
+ * clear value (written when cleared), no colour written and no fragment
+ * shading (ISPCTL tag write off, as our A9 recorder's mask-none draws)
+ */
+static VkResult
+es3_ds_clear(struct pvr_cmd_buffer *cmd_buffer, const VkClearAttachment *att,
+             uint32_t rect_count, const VkClearRect *rects)
+{
+   const struct pvr_g9p_gfx_programs *p = &cmd_buffer->device->g9p.gfx;
+   const struct pvr_render_pass_info *info = &cmd_buffer->state.render_pass_info;
+   const struct pvr_renderpass_hwsetup_render *hw = info->hw_render;
+   const float w = info->render_area.offset.x + info->render_area.extent.width;
+   const float h = info->render_area.offset.y + info->render_area.extent.height;
+   const bool depth = att->aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT;
+   const bool stencil = att->aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT;
+   struct pvr_g9p_graphics_state state = {
+      .vs_kick = p->clear_vs_kick,
+      .fs_kick = p->clear_kick,
+      .vs_outputs = 4,
+      .vs_regs = 8,
+      .num_buffers = 1,
+   };
+   struct pvr_pds_upload dma;
+   struct g9p_draw_programs dp = {
+      .dma = &dma,
+      /* z = the clear depth: the clear vertex shader's z is 0 */
+      .vp = { w / 2, w / 2, h / 2, h / 2, att->clearValue.depthStencil.depth, 0 },
+      .scissor = -1,
+      .es3_isp_set = true,
+   };
+   struct pvr_suballoc_bo *verts_bo, *table_bo;
+   float *verts;
+   VkResult result;
+
+   if (!hw || hw->ds_attach_idx == VK_ATTACHMENT_UNUSED || !rect_count)
+      return VK_SUCCESS;
+   pvr_csb_pack (&dp.es3_isp[0], TA_STATE_ISPCTL, c) {
+      c.upass = 0;
+      c.tagwritedisable = true;
+      c.bpres = stencil;
+      c.two_sided = stencil;
+   }
+   pvr_csb_pack (&dp.es3_isp[1], TA_STATE_ISPA, x) {
+      x.objtype = ROGUE_TA_OBJTYPE_TRIANGLE;
+      x.passtype = ROGUE_TA_PASSTYPE_OPAQUE;
+      x.dwritedisable = !depth;
+      x.dfbztestenable = true;
+      x.dcmpmode = ROGUE_TA_CMPMODE_ALWAYS;
+      x.pointlinewidth = 15;
+      x.sref = att->clearValue.depthStencil.stencil & 0xff;
+   }
+   pvr_csb_pack (&dp.es3_isp[2], TA_STATE_ISPB, x) {
+      x.scmpmode = ROGUE_TA_CMPMODE_ALWAYS;
+      if (stencil) {
+         x.sop3 = ROGUE_TA_ISPB_STENCILOP_REPLACE;
+         x.scmpmask = 0xff;
+         x.swmask = 0xff;
+      }
+   }
+   dp.es3_isp[3] = dp.es3_isp[1];
+   dp.es3_isp[4] = dp.es3_isp[2];
+
+   result = pvr_arch_cmd_buffer_start_sub_cmd(cmd_buffer, PVR_SUB_CMD_TYPE_GRAPHICS);
+   if (result != VK_SUCCESS)
+      return result;
+   verts = malloc(rect_count * 12 * sizeof(float));
+   if (!verts)
+      return vk_error(cmd_buffer, VK_ERROR_OUT_OF_HOST_MEMORY);
+   for (uint32_t r = 0; r < rect_count; r++) {
+      const VkRect2D *rc = &rects[r].rect;
+      const float x0 = 2 * rc->offset.x / w - 1, y0 = 2 * rc->offset.y / h - 1;
+      const float x1 = 2 * (rc->offset.x + rc->extent.width) / w - 1;
+      const float y1 = 2 * (rc->offset.y + rc->extent.height) / h - 1;
+      const float v[12] = { x0, y0, x1, y0, x0, y1, x1, y0, x1, y1, x0, y1 };
+
+      memcpy(&verts[12 * r], v, sizeof(v));
+   }
+   result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, verts, rect_count * 12 * sizeof(float),
+                                               &verts_bo);
+   free(verts);
+   if (result != VK_SUCCESS)
+      return result;
+   result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, &verts_bo->dev_addr.addr, 8,
+                                               &table_bo);
+   if (result != VK_SUCCESS)
+      return result;
+   {
+      const uint32_t data[4] = { table_bo->dev_addr.addr, table_bo->dev_addr.addr >> 32,
+                                 doutd_ctrl(0, 2, true), 0 };
+
+      result = pvr_arch_cmd_buffer_upload_pds(cmd_buffer, data, ARRAY_SIZE(data), 16, NULL, 0,
+                                              0, 64, &dma);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+   return emit_draw(cmd_buffer, &state, &dp,
+                    &(const struct pvr_g9p_draw){ .count = 6 * rect_count, .instances = 1 },
+                    VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
 }
