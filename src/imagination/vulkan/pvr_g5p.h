@@ -78,6 +78,18 @@ struct pvr_g5p_job {
    bool enabled;
 };
 
+/* ---- shader compilation (pvr_g5p_nir.c) ---- */
+
+struct pco_g5p_fs_key;
+struct pco_g5p_program;
+struct pco_g5p_vs_link;
+
+/* SPIR-V of one stage -> the G5P backend's program (pvr_g5p_nir.c).
+ * false with out->refusal set. */
+bool pvr_g5p_compile_stage(const VkPipelineShaderStageCreateInfo *stage_info, bool half_output,
+                           const uint8_t *attrib_components, const struct pco_g5p_fs_key *key,
+                           const struct pco_g5p_vs_link *link, struct pco_g5p_program *out);
+
 #ifdef PVR_PER_ARCH
 
 VkResult PVR_PER_ARCH(g5p_device_init)(struct pvr_device *device);
