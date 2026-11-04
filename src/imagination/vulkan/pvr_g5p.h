@@ -113,20 +113,25 @@ struct vk_graphics_pipeline_state;
 
 /* The index a vertex fetch's DDMAD multiplies the stride by: the vertex
  * (t0), the instance (t1: per-instance rate, divisor 1; the base instance
- * is added to t1 first), or none (divisor 0: the first instance's element,
- * the draw folds it into the base and fetches with stride 0) */
+ * is added to t1 first), none (divisor 0: the first instance's element,
+ * the draw folds it into the base and fetches with stride 0), or the
+ * instance divided by `divisor` (> 1) in a temp pair, plus the base */
 enum pvr_g5p_fetch_rate {
    PVR_G5P_FETCH_VERTEX,
    PVR_G5P_FETCH_INSTANCE,
    PVR_G5P_FETCH_INSTANCE_DIVISOR0,
+   PVR_G5P_FETCH_INSTANCE_DIVISOR,
 };
+
+/* Distinct divisors > 1 a pipeline's fetch divides by (PDS temps t2..t7) */
+#define PVR_G5P_MAX_DIVISORS 3
 
 /* One vertex fetch: a DDMAD of `dwords` from binding `binding` at `offset`
  * into the unified store at dword `ao` (the A9 ICD's g5p_fetch), by `rate`
  * (enum pvr_g5p_fetch_rate) */
 struct pvr_g5p_fetch {
    uint8_t binding, dwords, ao, rate;
-   uint32_t offset;
+   uint32_t offset, divisor;
 };
 
 /* One common-store upload of the fragment program (the backend's

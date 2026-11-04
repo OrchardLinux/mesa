@@ -141,14 +141,38 @@ generic_location(const nir_intrinsic_instr *in)
    return loc >= 0 && loc < PCO_G5P_MAX_ATTRIBS ? loc : -1;
 }
 
-/* A binding's fetch index: per vertex, per instance (divisor 1), or the
- * first instance's element (divisor 0); other divisors are refused */
+/* A binding's fetch index: per vertex, per instance (divisor 1), the first
+ * instance's element (divisor 0), or the instance divided (divisor > 1) */
 static uint8_t
 fetch_rate(const struct vk_vertex_input_state *vi, unsigned binding)
 {
    if (vi->bindings[binding].input_rate == VK_VERTEX_INPUT_RATE_VERTEX)
       return PVR_G5P_FETCH_VERTEX;
-   return vi->bindings[binding].divisor ? PVR_G5P_FETCH_INSTANCE : PVR_G5P_FETCH_INSTANCE_DIVISOR0;
+   const uint32_t d = vi->bindings[binding].divisor;
+   return d == 1 ? PVR_G5P_FETCH_INSTANCE : d ? PVR_G5P_FETCH_INSTANCE_DIVISOR : PVR_G5P_FETCH_INSTANCE_DIVISOR0;
+}
+
+/* The fetches' divisors; at most PVR_G5P_MAX_DIVISORS distinct ones > 1 */
+static bool
+fetch_divisors(struct pvr_g5p_vertex_layout *l)
+{
+   uint32_t seen[PVR_G5P_MAX_DIVISORS];
+   unsigned n = 0;
+   for (unsigned f = 0; f < l->fetch_count; f++) {
+      struct pvr_g5p_fetch *fe = &l->fetch_list[f];
+      fe->divisor = l->vi->bindings[fe->binding].divisor;
+      if (fe->rate != PVR_G5P_FETCH_INSTANCE_DIVISOR)
+         continue;
+      unsigned k = 0;
+      while (k < n && seen[k] != fe->divisor)
+         k++;
+      if (k == n) {
+         if (n == PVR_G5P_MAX_DIVISORS)
+            return REFUSE(l, "more than %u distinct vertex attribute divisors", PVR_G5P_MAX_DIVISORS);
+         seen[n++] = fe->divisor;
+      }
+   }
+   return true;
 }
 
 /* The ICD's fetches: each binding whose attributes are consecutive whole
@@ -316,9 +340,6 @@ pvr_g5p_vertex_lower(nir_shader *vs, struct pvr_g5p_vertex_layout *l)
    bool converted = false;
    u_foreach_bit (loc, valid) {
       const struct vk_vertex_attribute_state *at = &vi->attributes[loc];
-      const struct vk_vertex_binding_state *bs = &vi->bindings[at->binding];
-      if (bs->input_rate != VK_VERTEX_INPUT_RATE_VERTEX && bs->divisor > 1)
-         return REFUSE(l, "vertex attribute %u: per-instance divisor %u (divisors 0 and 1 only)", loc, bs->divisor);
       struct pvr_g5p_vertex_format f;
       if (!pvr_g5p_vertex_format_info(at->format, &f))
          return REFUSE(l, "vertex attribute %u: format %d (32-bit float and integer, 8/16-bit normalized and scaled, "
@@ -347,11 +368,11 @@ pvr_g5p_vertex_lower(nir_shader *vs, struct pvr_g5p_vertex_layout *l)
    l->packed = converted || l->read >= BITFIELD_BIT(ICD_LOCATIONS);
    if (!l->packed) {
       icd_fetches(l, a, n);
-      return true;
+      return fetch_divisors(l);
    }
 
    unsigned base[PCO_G5P_MAX_ATTRIBS] = { 0 };
-   if (!packed_fetches(l, a, n, base))
+   if (!packed_fetches(l, a, n, base) || !fetch_divisors(l))
       return false;
    const struct rewrite rw = { l, base };
    nir_shader_intrinsics_pass(vs, rewrite_load, nir_metadata_control_flow, (void *)&rw);

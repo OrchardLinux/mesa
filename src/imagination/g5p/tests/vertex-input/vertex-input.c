@@ -39,6 +39,9 @@
  *   inst-rate     a per-instance colour and offset (divisor 1), 4 instances from firstInstance 1
  *   inst-divisor0 the offset per instance, the colour divisor 0 (every instance the first's), firstInstance 2
  *                 (VK_KHR/EXT_vertex_attribute_divisor's zero divisor; skipped without it)
+ *   inst-div3 inst-div-mixed
+ *                 8 instances, each 8 pixels right (offset divisor 1); the colour's red/green and blue/alpha
+ *                 from bindings of divisors 3 and 3 (firstInstance 0), 2 and 5 (firstInstance 3)
  *   restart-16 restart-32 restart-8
  *                 8 quads as one indexed triangle strip, cut by primitive restart (0xffff, 0xffffffff, 0xff)
  *
@@ -65,7 +68,7 @@
 #define MAX2(a, b) ((a) > (b) ? (a) : (b))
 #define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
 #define MAX_QUADS 8
-#define MAX_BINDINGS 3
+#define MAX_BINDINGS 4
 #define MAX_ATTRIBS 16
 #define MAX_FLOATS 1024
 
@@ -74,7 +77,7 @@ static const float CLEAR[4] = { 0.2f, 0.4f, 0.6f, 0.8f };
 enum shader {
    SH_COLOR, SH_INSTANCE, SH_VERTEX_INDEX, SH_ATTRIB16,
    SH_INT_IMIN, SH_INT_IMAX, SH_INT_UMIN, SH_INT_UMAX, SH_INT_ISUB, SH_INT_INEG,
-   SH_FMT, SH_FMT_INT, SH_INST_ATTR,
+   SH_FMT, SH_FMT_INT, SH_INST_ATTR, SH_INST_DIV,
 };
 
 struct rung {
@@ -121,6 +124,8 @@ static const struct rung rungs[] = {
    { "inst-first-indexed", "instances 1..3, indexed, vertex offset 4 (firstInstance 1)" },
    { "inst-rate", "per-instance colour and offset, divisor 1, firstInstance 1" },
    { "inst-divisor0", "per-instance offset, colour divisor 0, firstInstance 2" },
+   { "inst-div3", "8 instances, colour halves divisors 3 and 3" },
+   { "inst-div-mixed", "8 instances from firstInstance 3, colour halves divisors 2 and 5" },
    { "restart-16", "one 16-bit indexed strip of 8 quads, cut by 0xffff" },
    { "restart-32", "one 32-bit indexed strip of 8 quads, cut by 0xffffffff" },
    { "restart-8", "one 8-bit indexed strip of 8 quads, cut by 0xff" },
@@ -170,6 +175,7 @@ static VkDevice dev;
 static VkQueue queue;
 static uint32_t queue_family;
 static bool verify = true, has_uint8, has_divisor0;
+static uint32_t max_divisor = 1;
 static const char *cur = "setup";
 
 #define CHECK(x)                                                                                        \
@@ -768,6 +774,47 @@ build(const char *name, struct scene *s, const char **why)
       s->topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
       add_draw(s, 4, count, 0, 0);
       s->draw[0].first_instance = first;
+   } else if (!strcmp(name, "inst-div3") || !strcmp(name, "inst-div-mixed")) {
+      /* binding 0 the quad (x 1..7, y 10..54); binding 1 the offset, divisor 1: element k moves instance to
+       * column k - first; bindings 2 and 3 the colour's halves, divisors d2 and d3: instance i (0-based) reads
+       * element first + i / d */
+      const bool mixed = name[8] == '-';
+      const uint32_t first = mixed ? 3 : 0, n = 8, d2 = mixed ? 2 : 3, d3 = mixed ? 5 : 3;
+      if (!has_divisor0 || max_divisor < MAX2(d2, d3)) {
+         *why = "no vertex attribute divisor this large (maxVertexAttribDivisor)";
+         return false;
+      }
+      s->shader = SH_INST_DIV;
+      s->bindings = 4;
+      s->vib[0] = (VkVertexInputBindingDescription){ 0, 8, VK_VERTEX_INPUT_RATE_VERTEX };
+      s->vib[1] = (VkVertexInputBindingDescription){ 1, 8, VK_VERTEX_INPUT_RATE_INSTANCE };
+      s->vib[2] = (VkVertexInputBindingDescription){ 2, 8, VK_VERTEX_INPUT_RATE_INSTANCE };
+      s->vib[3] = (VkVertexInputBindingDescription){ 3, 8, VK_VERTEX_INPUT_RATE_INSTANCE };
+      s->divisor[s->ndivisors++] = (VkVertexInputBindingDivisorDescriptionKHR){ 2, d2 };
+      s->divisor[s->ndivisors++] = (VkVertexInputBindingDivisorDescriptionKHR){ 3, d3 };
+      s->attribs = 4;
+      s->via[0] = (VkVertexInputAttributeDescription){ 0, 0, VK_FORMAT_R32G32_SFLOAT, 0 };
+      s->via[1] = (VkVertexInputAttributeDescription){ 1, 2, VK_FORMAT_R32G32_SFLOAT, 0 };
+      s->via[2] = (VkVertexInputAttributeDescription){ 2, 1, VK_FORMAT_R32G32_SFLOAT, 0 };
+      s->via[3] = (VkVertexInputAttributeDescription){ 3, 3, VK_FORMAT_R32G32_SFLOAT, 0 };
+      const int px[4] = { 1, 7, 1, 7 }, py[4] = { 10, 10, 54, 54 };
+      for (unsigned k = 0; k < 4; k++)
+         put(s, 0, (const float[2]){ nx(px[k]), ny(py[k]) }, 2);
+      for (unsigned k = 0; k < first + n; k++) {
+         const float off[2] = { k >= first ? (float)(8 * (k - first)) / (W / 2) : 0.9f, 0 };
+         put(s, 1, off, 2);
+         put(s, 2, (const float[2]){ (float)(20 + 23 * k) / 255.0f, (float)(240 - 19 * k) / 255.0f }, 2);
+         put(s, 3, (const float[2]){ (float)(10 + 29 * k) / 255.0f, (float)(255 - 13 * k) / 255.0f }, 2);
+      }
+      for (unsigned i = 0; i < n; i++) {
+         const unsigned e2 = first + i / d2, e3 = first + i / d3;
+         const float c[4] = { (float)(20 + 23 * e2) / 255.0f, (float)(240 - 19 * e2) / 255.0f,
+                              (float)(10 + 29 * e3) / 255.0f, (float)(255 - 13 * e3) / 255.0f };
+         fill(s, 1 + 8 * i, 10, 7 + 8 * i, 54, c);
+      }
+      s->topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+      add_draw(s, 4, n, 0, 0);
+      s->draw[0].first_instance = first;
    } else if (!strncmp(name, "restart-", 8)) {
       /* quad q's 4 vertices (a strip of 2 triangles) at 4q, the strips joined by the cut index; without the cut
        * the strip would bridge the quads */
@@ -1088,6 +1135,7 @@ run(const struct rung *r)
    case SH_FMT: vs_code = spv_fmt_vert; vs_size = sizeof(spv_fmt_vert); break;
    case SH_FMT_INT: vs_code = spv_fmt_int_vert; vs_size = sizeof(spv_fmt_int_vert); break;
    case SH_INST_ATTR: vs_code = spv_inst_attr_vert; vs_size = sizeof(spv_inst_attr_vert); break;
+   case SH_INST_DIV: vs_code = spv_inst_div_vert; vs_size = sizeof(spv_inst_div_vert); break;
    default: vs_code = spv_color_vert; vs_size = sizeof(spv_color_vert); break;
    }
    VkShaderModuleCreateInfo smi = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = vs_size,
@@ -1312,6 +1360,13 @@ main(int argc, char **argv)
       vkGetPhysicalDeviceFeatures2(pd, &f2);
    }
    has_divisor0 = dext && divf.vertexAttributeInstanceRateZeroDivisor;
+   if (dext) {
+      VkPhysicalDeviceVertexAttributeDivisorPropertiesKHR divp = {
+         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES_KHR };
+      VkPhysicalDeviceProperties2 p2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &divp };
+      vkGetPhysicalDeviceProperties2(pd, &p2);
+      max_divisor = divp.maxVertexAttribDivisor;
+   }
    divf.vertexAttributeInstanceRateDivisor = divf.vertexAttributeInstanceRateZeroDivisor = has_divisor0;
    VkPhysicalDeviceIndexTypeUint8FeaturesEXT u8 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_EXT,
                                                     .indexTypeUint8 = VK_TRUE };
