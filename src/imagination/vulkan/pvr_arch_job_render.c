@@ -1382,6 +1382,13 @@ pvr_render_job_ws_fragment_state_init(struct pvr_render_ctx *ctx,
                                       struct vk_sync *wait,
                                       struct pvr_winsys_fragment_state *state)
 {
+#ifdef PVR_APPLE_G5P
+   if (job->g5p.enabled) {
+      /* G5P: the TYPED_V3 pass the apple_g5p winsys submits */
+      state->fw_stream_len = pvr_arch_g5p_frag_stream(ctx->device, job, state->fw_stream,
+                                                      sizeof(state->fw_stream));
+   } else
+#endif
    if (job->g9p.enabled) {
       state->fw_stream_len = pvr_arch_g9p_frag_stream(ctx->device, job, state->fw_stream,
                                                       sizeof(state->fw_stream));
@@ -1489,6 +1496,13 @@ static void pvr_render_job_ws_submit_info_init(
     * there. For now we'll always setup the pr.
     */
    /* G9P: no partial renders (the kernel's Apple path has none yet) */
+#ifdef PVR_APPLE_G5P
+   if (job->g5p.enabled) {
+      /* G5P: no partial renders yet */
+      submit_info->fragment_pr.fw_stream_len = 0;
+      submit_info->fragment_pr.wait = wait_frag;
+   } else
+#endif
    if (job->g9p.enabled) {
       submit_info->fragment_pr.fw_stream_len = 0;
       submit_info->fragment_pr.wait = wait_frag;

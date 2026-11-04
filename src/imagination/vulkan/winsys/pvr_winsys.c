@@ -94,7 +94,7 @@ VkResult pvr_winsys_create(const char *render_path,
                          "Failed to query kernel driver version for device.");
       goto err_close_display_fd;
    }
-
+   PVR_G5P_HOOK(winsys, version, render_fd, display_fd, alloc, ws_out, result)
    if (strcmp(version->name, PVR_DRM_DRIVER_NAME) == 0) {
       result = pvr_drm_winsys_create(render_fd, display_fd, alloc, ws_out);
 #if defined(PVR_SUPPORT_SERVICES_DRIVER)
