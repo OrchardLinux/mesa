@@ -70,4 +70,53 @@
    if (PVR_HAS_FEATURE(&(cmd_buffer)->device->pdevice->dev_info, apple_g5p)) { \
    } else
 
+/* pvr_arch_pipeline.c, pvr_graphics_pipeline_destroy(): a G5P pipeline's
+ * programs (pvr_arch_g5p_graphics_pipeline_compile()).
+ */
+#define PVR_G5P_HOOK_pipeline_destroy(device, allocator, gfx_pipeline) \
+   if (PVR_HAS_FEATURE(&(device)->pdevice->dev_info, apple_g5p)) {     \
+      pvr_arch_g5p_graphics_pipeline_destroy(device, gfx_pipeline);    \
+      pvr_pipeline_finish(device, &(gfx_pipeline)->base);              \
+      vk_free2(&(device)->vk.alloc, allocator, gfx_pipeline);          \
+      return;                                                          \
+   }
+
+/* pvr_arch_pipeline.c, pvr_graphics_pipeline_compile(): a G5P pipeline is
+ * compiled by the G5P backend from NIR (pvr_arch_g5p_gfx.c).
+ */
+#define PVR_G5P_HOOK_pipeline_compile(device, info, pipeline, state) \
+   if (PVR_HAS_FEATURE(&(device)->pdevice->dev_info, apple_g5p))     \
+      return pvr_arch_g5p_graphics_pipeline_compile(device,          \
+                                                    info,            \
+                                                    pipeline,        \
+                                                    state);
+
+/* pvr_arch_cmd_buffer.c, CmdDraw(): the draw's VDM/PPP words and programs
+ * (pvr_arch_g5p_cmd_draw()), from CmdDraw's own parameters (vertexCount,
+ * instanceCount, firstVertex, firstInstance); then to its label `end`.
+ */
+#define PVR_G5P_HOOK_draw(cmd_buffer, end)                                     \
+   if (PVR_HAS_FEATURE(&(cmd_buffer)->device->pdevice->dev_info, apple_g5p)) { \
+      const struct pvr_g5p_draw g5p_draw_ = {                                  \
+         .count = vertexCount,                                                 \
+         .instances = instanceCount,                                           \
+         .first = firstVertex,                                                 \
+         .first_instance = firstInstance,                                      \
+      };                                                                       \
+      VkResult g5p_result_ = pvr_arch_g5p_cmd_draw(cmd_buffer, &g5p_draw_);    \
+      if (g5p_result_ != VK_SUCCESS)                                           \
+         vk_command_buffer_set_error(&(cmd_buffer)->vk, g5p_result_);          \
+      goto end;                                                                \
+   }
+
+/* pvr_arch_cmd_buffer.c, CmdDrawIndexed(): refused by name for now
+ * (pvr_arch_g5p_cmd_draw_indexed()); then to its label `end`.
+ */
+#define PVR_G5P_HOOK_draw_indexed(cmd_buffer, end)                             \
+   if (PVR_HAS_FEATURE(&(cmd_buffer)->device->pdevice->dev_info, apple_g5p)) { \
+      vk_command_buffer_set_error(&(cmd_buffer)->vk,                           \
+                                  pvr_arch_g5p_cmd_draw_indexed(cmd_buffer));  \
+      goto end;                                                                \
+   }
+
 #endif /* PVR_G5P_HOOKS_H */
