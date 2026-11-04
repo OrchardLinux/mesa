@@ -122,6 +122,16 @@
    /* Apple A9 (G5P): our kernel's typed UAPI (winsys/apple_g5p) */ \
    is_pvr |= !strcmp(version->name, "apple_g5p");
 
+#define PVR_G5P_HOOK_pub_pvr_physical_device_1275() \
+   PVR_G5P_HOOK_msaa_limits(pdevice, &supported_properties) \
+   /* G5P: no transform feedback is built yet (G5P refuses every XFB pipeline), \
+    * so none is advertised: Zink derives its GL/ES version from what is real */ \
+   if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g5p)) { \
+      supported_extensions.EXT_transform_feedback = false; \
+      supported_features.transformFeedback = false; \
+      supported_features.geometryStreams = false; \
+   }
+
 #define PVR_G5P_HOOK_winsys(version, render_fd, display_fd, alloc, ws, result) \
    if (strcmp((version)->name, PVR_G5P_DRIVER_NAME) == 0) \
       result = pvr_g5p_winsys_create(render_fd, display_fd, alloc, ws); \
