@@ -1657,7 +1657,7 @@ static VkResult pvr_sub_cmd_gfx_job_init(const struct pvr_device_info *dev_info,
     * time.
     */
    job->view_state.view_index = 0;
-
+   PVR_G5P_HOOK(job_init, dev_info, cmd_buffer, sub_cmd, hw_render, job, result)
    if (PVR_HAS_FEATURE(dev_info, apple_g9p)) {
       result = pvr_arch_g9p_job_init(cmd_buffer, hw_render, job);
       if (result != VK_SUCCESS)
@@ -1728,7 +1728,7 @@ static VkResult pvr_sub_cmd_gfx_job_init(const struct pvr_device_info *dev_info,
              emit_state.pbe_reg_words,
              sizeof(job->pbe_reg_words));
    }
-
+   PVR_G5P_HOOK(job_bgnd, dev_info)
    if (PVR_HAS_FEATURE(dev_info, apple_g9p)) {
       /* the background object: pvr_arch_g9p_job_init() */
    } else if (sub_cmd->barrier_load) {
@@ -3534,7 +3534,7 @@ pvr_perform_start_of_render_attachment_clear(struct pvr_cmd_buffer *cmd_buffer,
    struct pvr_image_view *iview;
    VkFormat vk_format;
    uint32_t iview_idx;
-
+   PVR_G5P_HOOK(start_clear, cmd_buffer)
    /* G9P: clears are background objects (pvr_arch_g9p_job_init()) */
    if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g9p))
       return;
@@ -4232,6 +4232,7 @@ void PVR_PER_ARCH(CmdBeginRenderPass2)(
     */
    hw_subpass = pvr_arch_get_hw_subpass(pass, 0);
    /* G9P: clears are background objects (pvr_arch_g9p_job_init()) */
+   PVR_G5P_HOOK(load_op, cmd_buffer)
    if (hw_subpass->load_op &&
        !PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g9p)) {
       result = pvr_cs_write_load_op(cmd_buffer,
@@ -4241,7 +4242,6 @@ void PVR_PER_ARCH(CmdBeginRenderPass2)(
       if (result != VK_SUCCESS)
          return;
    }
-
    pvr_perform_start_of_render_clears(cmd_buffer, false);
    pvr_stash_depth_format(&cmd_buffer->state,
                           &cmd_buffer->state.current_sub_cmd->gfx);
@@ -9232,7 +9232,7 @@ void PVR_PER_ARCH(CmdDraw)(VkCommandBuffer commandBuffer,
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
 
    PVR_TRACE_BEGIN_DRAW(cmd_buffer, PVR_DRAW);
-
+   PVR_G5P_HOOK(draw, cmd_buffer, end_cmd_draw)
    if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g9p)) {
       const struct pvr_g9p_draw draw = {
          .count = vertexCount,
@@ -9296,7 +9296,7 @@ void PVR_PER_ARCH(CmdDrawIndexed)(VkCommandBuffer commandBuffer,
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
 
    PVR_TRACE_BEGIN_DRAW(cmd_buffer, PVR_DRAW_INDEXED);
-
+   PVR_G5P_HOOK(draw_indexed, cmd_buffer, end_cmd_draw_indexed)
    if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g9p)) {
       const unsigned size = state->index_buffer_binding.type == VK_INDEX_TYPE_UINT16 ? 2 : 4;
       const struct pvr_g9p_draw draw = {
@@ -10185,7 +10185,7 @@ void PVR_PER_ARCH(CmdNextSubpass2)(VkCommandBuffer commandBuffer,
 
    hw_subpass = &next_hw_render->subpasses[next_map->subpass];
    hw_subpass_load_op = hw_subpass->load_op;
-
+   PVR_G5P_HOOK(load_op, cmd_buffer)
    if (hw_subpass_load_op &&
        !PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g9p)) {
       result = pvr_cs_write_load_op(cmd_buffer,
