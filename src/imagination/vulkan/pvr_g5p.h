@@ -60,6 +60,11 @@ struct pvr_g5p_programs {
    /* the TA scratch the kernel's records point into, and the V2 tables of
     * a render that has none of its own (the template's sizes) */
    struct pvr_suballoc_bo *scratch, *scissor_pool, *dbias_pool;
+   /* 4x (pvr_g5p_msaa.c): the end of tile of a one-target multisample
+    * store (emitpix per sample), and the one-target clear's kick at sample
+    * rate (DOUTU src0[34:33] 2) */
+   struct pvr_suballoc_bo *eot_usc_ms;
+   struct pvr_pds_upload clear_kick_ms;
 };
 
 /* G5P's per-device state (pvr_device::g5p), allocated by g5p_device_init() */
@@ -76,6 +81,8 @@ struct pvr_g5p_job {
    uint32_t width, height;
    unsigned targets;            /* colour targets, 1, 2 or 4 */
    uint32_t dbias_count;        /* entries of upstream's depth-bias table, 0 without one */
+   uint32_t samples;            /* 1 or 4 (hw_render->sample_count) */
+   bool msaa_resolve;           /* 4x: the PBE resolves target 0 into a one-sample view */
    bool enabled;
 };
 
@@ -144,6 +151,8 @@ struct pvr_g5p_pipeline {
    unsigned fs_num_uploads, fs_common_dwords;
    struct pvr_g5p_upload fs_uploads[PVR_G5P_MAX_FS_UPLOADS];
    struct pvr_pds_upload fs_loader;
+   /* rasterization samples, 1 or 4: the fragment launch's sample rate and the draws' ISP user pass */
+   uint32_t samples;
 };
 
 /* A non-indexed draw (CmdDraw) */
@@ -151,9 +160,9 @@ struct pvr_g5p_draw {
    uint32_t count, instances, first, first_instance;
 };
 
-/* SPIR-V of one stage -> the G5P backend's program (pvr_g5p_nir.c).
- * false with out->refusal set. */
-bool pvr_g5p_compile_stage(const VkPipelineShaderStageCreateInfo *stage_info, bool half_output,
+/* SPIR-V of one stage -> the G5P backend's program (pvr_g5p_nir.c), for a
+ * pipeline of `samples` rasterization samples. false with out->refusal set. */
+bool pvr_g5p_compile_stage(const VkPipelineShaderStageCreateInfo *stage_info, bool half_output, uint32_t samples,
                            const uint8_t *attrib_components, const struct pco_g5p_fs_key *key,
                            const struct pco_g5p_vs_link *link, struct pco_g5p_program *out);
 

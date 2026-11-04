@@ -28,7 +28,7 @@
 
 #include "pco/pco.h"
 #include "pco_uscgen_programs.h"
-
+#include "pvr_g5p_ds_hooks.h"
 #include "pvr_device.h"
 #include "pvr_dump_info.h"
 #include "pvr_entrypoints.h"
@@ -1271,7 +1271,7 @@ VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
                          "Failed to collect physical device properties");
       goto err_pvr_winsys_destroy;
    }
-
+   PVR_G5P_HOOK(msaa_limits, pdevice, &supported_properties)
    /*
     * G9P: host image copies through the driver's CPU copies (all its memory
     * is CPU-visible; pvr_arch_g9p_transfer.c)

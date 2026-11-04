@@ -9,6 +9,7 @@
 #ifndef PVR_G5P_WINSYS_H
 #define PVR_G5P_WINSYS_H
 
+#include <stdbool.h>
 #include <vulkan/vulkan_core.h>
 
 #define PVR_G5P_DRIVER_NAME "apple_g5p"
@@ -18,5 +19,8 @@ struct pvr_winsys;
 VkResult pvr_g5p_winsys_create(int render_fd, int display_fd,
                                const VkAllocationCallbacks *alloc,
                                struct pvr_winsys **ws_out);
+
+/* The kernel takes 4-sample passes (TYPED_V3 and DRM_G5P_CAP_RENDER_MSAA) */
+bool pvr_g5p_winsys_msaa(struct pvr_winsys *ws);
 
 #endif /* PVR_G5P_WINSYS_H */
