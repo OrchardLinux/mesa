@@ -68,6 +68,34 @@
       align = cpp_ && 64 % cpp_ == 0 ? 64 / cpp_ : 64;                      \
    }
 
+/* A G5P 3D image is a 2D array of its slices (pvr_g5p_image_layout(); it
+ * keeps memlayout 3DTWIDDLED for upstream's view setup).
+ *
+ * pvr_image.c, pvr_get_image_subresource_layout(): a level's next slice is
+ * one layer pitch on, not one level slice on.
+ */
+#define PVR_G5P_IMAGE_IS_SLICED_3D(image)                                     \
+   (PVR_HAS_FEATURE(&container_of((image)->vk.base.device, struct pvr_device, \
+                                  vk)->pdevice->dev_info,                   \
+                    apple_g5p) &&                                           \
+    (image)->vk.image_type == VK_IMAGE_TYPE_3D &&                            \
+    (image)->memlayout == PVR_MEMLAYOUT_3DTWIDDLED)
+#define PVR_G5P_HOOK_slice_pitch(image, layout)                               \
+   if (PVR_G5P_IMAGE_IS_SLICED_3D(image))                                    \
+      (layout)->depthPitch = (layout)->arrayPitch;
+
+/* rogue/pvr_blit.c, pvr_setup_transfer_surface(): the transfer surface of
+ * such an image is the 2D-twiddled surface of its slice, so G9P's 2D copies
+ * take it, and the blit and image-to-buffer slice loops step it by the
+ * depthPitch above.
+ */
+#define PVR_G5P_HOOK_transfer_slice(image, surface, info, fdepth)             \
+   if (PVR_G5P_IMAGE_IS_SLICED_3D(image)) {                                  \
+      (surface)->dev_addr.addr += (info)->depthPitch * (uint32_t)(fdepth);   \
+      (surface)->mem_layout = PVR_MEMLAYOUT_TWIDDLED;                        \
+      (surface)->depth = 1;                                                  \
+   }
+
 /* pvr_device.c, pvr_MapMemory2(): the CPU transfer path G5P shares with G9P
  * (pvr_arch_g9p_cpu_addr()) maps a bound BO and leaves it mapped. That is the
  * driver's mapping, not the application's, so a vkMapMemory of that memory

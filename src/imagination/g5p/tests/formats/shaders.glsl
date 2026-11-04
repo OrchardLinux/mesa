@@ -63,6 +63,42 @@ void main()
    o = vec4((v >> SHIFT) & 0xff) / 255.0;
 }
 
+#elif defined(LAY2D_FRAG) || defined(LAYARR_FRAG) || defined(LAY3D_FRAG)
+// The layout rungs: an RGBA8 texture read at level LOD. 2D: over the whole
+// target. Arrays and 3D: the target is a 4x4 grid of cells, cell
+// c = x + 4 y reads layer c, or slice c of DEPTH at its centre; inside a cell
+// the coordinates run over the level
+#ifndef LOD
+#define LOD 0.0
+#endif
+#ifndef DEPTH
+#define DEPTH 1.0
+#endif
+#if defined(LAY2D_FRAG)
+layout(set = 0, binding = 0) uniform sampler2D t;
+#elif defined(LAYARR_FRAG)
+layout(set = 0, binding = 0) uniform sampler2DArray t;
+#else
+layout(set = 0, binding = 0) uniform sampler3D t;
+#endif
+layout(location = 0) in vec2 v_uv;
+layout(location = 0) out vec4 o;
+void main()
+{
+#if defined(LAY2D_FRAG)
+   o = textureLod(t, v_uv, LOD);
+#else
+   vec2 cell = floor(v_uv * 4.0);
+   vec2 st = fract(v_uv * 4.0);
+   float c = cell.x + 4.0 * cell.y;
+#if defined(LAYARR_FRAG)
+   o = textureLod(t, vec3(st, c), LOD);
+#else
+   o = textureLod(t, vec3(st, (c + 0.5) / DEPTH), LOD);
+#endif
+#endif
+}
+
 #elif defined(SOLID_FRAG)
 // A constant colour: COLOR, a vec4
 layout(location = 0) out vec4 o;

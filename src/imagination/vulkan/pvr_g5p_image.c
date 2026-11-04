@@ -6,16 +6,28 @@
  * Colour images (lane b; the A9 ICD's image_layout()/twiddled_layout()):
  * Apple's image state takes a linear layout for plain 2D only, so the A9
  * twiddles exactly the images that need it:
- *  - mip chains, cube-compatible images, sampled arrays and compressed
- *    formats are twiddled: Morton order with y in bit 0, levels back to back
+ *  - mip chains, cube-compatible images, sampled arrays, compressed
+ *    formats and 3D images are twiddled: Morton order with y in bit 0 over
+ *    each level's own extent padded to powers of two, levels back to back
  *    from the image base, each the power-of-two level-0 extent shifted
- *    (upstream's twiddled levels, unchanged), a layer the image's own levels
- *    rounded to 64 bytes, or to 16 KiB from 16 KiB up (Apple's
- *    getMipmapSize; the image state marks the 16 KiB case);
+ *    (upstream's twiddled levels, unchanged);
+ *  - a layer of an array or cube is, when the image has levels, the whole 2D
+ *    chain down to 1x1, rounded to 64 bytes, or to 16 KiB from 16 KiB up:
+ *    the A9 derives the layer pitch from the level-0 size, the has-levels bit
+ *    and the big-layer bit of the image state alone (device 2026-11-04,
+ *    formats l-arr-npot: a 12x10 3-level array reads layer 1 at 1408 =
+ *    the 5-level chain's 1364 rounded, not 1344; Apple's getMipmapSize);
+ *  - a 3D image is a 2D array of its slices (the same device run: 8x8x8
+ *    reads (4,0,0) at element 32 of slice 0, and level 1 at 64 elements, one
+ *    slice's 2D chain; Apple's getLevelOffset has no depth term and
+ *    agxsTwiddle3DAddressCommon steps slice z by the layer pitch): one
+ *    slice's 2D levels, slice z of every level z layer pitches on. It keeps
+ *    memlayout 3DTWIDDLED (upstream's view setup wants it); the transfers
+ *    take each slice as a 2D-twiddled surface one layer pitch on
+ *    (PVR_G5P_HOOK_slice_pitch, PVR_G5P_HOOK_transfer_slice);
  *  - every other optimal 2D colour image is linear, its rows a multiple of
  *    64 bytes (pvr_image_init()'s stride alignment on G5P). The G5P render
  *    path writes only linear colour targets, as the ICD's desktop did.
- * 3D (Rogue's 3DTWIDDLED bricks) keeps the layout the rest of the driver gives it.
  *
  * Depth/stencil and 4-sample images (lane c): the ZLS stores each
  * depth/stencil plane in its twiddled order over a power-of-two square of
@@ -43,12 +55,14 @@ pvr_g5p_image_layout(struct pvr_image *image, unsigned stride_align)
    struct pvr_image_plane *plane = &image->planes[0];
    const VkDeviceSize alignment = image->alignment;
 
-   if (image->plane_count != 1 || image->vk.image_type != VK_IMAGE_TYPE_2D ||
+   const bool is3d = image->vk.image_type == VK_IMAGE_TYPE_3D && image->memlayout == PVR_MEMLAYOUT_3DTWIDDLED;
+
+   if (image->plane_count != 1 || (image->vk.image_type != VK_IMAGE_TYPE_2D && !is3d) ||
        image->vk.samples != VK_SAMPLE_COUNT_1_BIT || vk_format_is_depth_or_stencil(image->vk.format) ||
-       image->memlayout != PVR_MEMLAYOUT_TWIDDLED)
+       (!is3d && image->memlayout != PVR_MEMLAYOUT_TWIDDLED))
       return;
 
-   const bool twiddled = image->vk.mip_levels > 1 ||
+   const bool twiddled = is3d || image->vk.mip_levels > 1 ||
                          (image->vk.create_flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) ||
                          (image->vk.array_layers > 1 && (image->vk.usage & VK_IMAGE_USAGE_SAMPLED_BIT)) ||
                          vk_format_is_compressed(image->vk.format);
@@ -68,15 +82,37 @@ pvr_g5p_image_layout(struct pvr_image *image, unsigned stride_align)
       if (image->vk.array_layers > 1)
          plane->layer_size = align64(plane->layer_size, alignment);
    } else {
-      VkDeviceSize size = 0;
+      const unsigned cpp = vk_format_get_blocksize(image->vk.format);
+      const unsigned bw = vk_format_get_blockwidth(image->vk.format), bh = vk_format_get_blockheight(image->vk.format);
+      const uint32_t pw = util_next_power_of_two(image->vk.extent.width);
+      const uint32_t ph = util_next_power_of_two(image->vk.extent.height);
+      /* the levels a layer holds: the whole chain when the image has levels */
+      const uint32_t chain = image->vk.mip_levels > 1 ? util_logbase2(MAX2(pw, ph)) + 1 : 1;
+      VkDeviceSize size = 0, own = 0;
 
-      for (uint32_t l = 0; l < image->vk.mip_levels; l++)
-         size += plane->mip_levels[l].size;
-      plane->layer_size = image->vk.array_layers > 1
+      for (uint32_t l = 0; l < MAX2(chain, image->vk.mip_levels); l++) {
+         const uint32_t ew = DIV_ROUND_UP(u_minify(pw, l), bw), eh = DIV_ROUND_UP(u_minify(ph, l), bh);
+         const VkDeviceSize level_size = (VkDeviceSize)cpp * ew * eh;
+
+         if (is3d && l < image->vk.mip_levels) {
+            /* a 3D image's levels are one slice's: upstream's 3DTWIDDLED levels hold every slice */
+            struct pvr_mip_level *level = &plane->mip_levels[l];
+
+            level->pitch = cpp * ew;
+            level->height_pitch = eh;
+            level->size = level_size;
+            level->offset = own;
+         }
+         if (l < chain)
+            size += level_size;
+         if (l < image->vk.mip_levels)
+            own += level_size;
+      }
+      plane->layer_size = image->vk.array_layers > 1 || is3d
                              ? align64(size, size >= PVR_G5P_IMAGE_BIG_LAYER ? PVR_G5P_IMAGE_BIG_LAYER : 64)
-                             : size;
+                             : own;
    }
-   plane->size = plane->layer_size * image->vk.array_layers;
+   plane->size = plane->layer_size * (is3d ? image->vk.extent.depth : image->vk.array_layers);
    plane->offset = 0;
    image->total_size = plane->size;
 }

@@ -78,8 +78,10 @@ pvr_g5p_image_format_check(const VkPhysicalDeviceImageFormatInfo2 *info, VkImage
       why = "no A9 format key";
    else if (info->type == VK_IMAGE_TYPE_1D)
       why = "1D images (the A9 texture state takes 2D, arrays, 3D and cubes; 1D is not built)";
-   else if (info->type == VK_IMAGE_TYPE_3D)
-      why = "3D images (the A9's 3D layout, pvr_g5p_layout.c, is not built)";
+   else if (info->type == VK_IMAGE_TYPE_3D && vk_format_is_compressed(info->format))
+      why = "3D block-compressed images (the A9's 3D order is built for texels only)";
+   else if (info->type == VK_IMAGE_TYPE_3D && tiling != VK_IMAGE_TILING_OPTIMAL)
+      why = "linear 3D images (Apple samples 3D twiddled only)";
    if (!why)
       return VK_SUCCESS;
    mesa_logd("G5P: no %s image of %s, tiling %s, usage %#x, flags %#x: %s", vk_ImageType_to_str(info->type),

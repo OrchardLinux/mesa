@@ -65,6 +65,9 @@ g5p_view_state(const struct pvr_image_view *iview, uint64_t q[3])
       return NULL;
    }
 
+   if (image->vk.image_type == VK_IMAGE_TYPE_3D && iview->vk.view_type != VK_IMAGE_VIEW_TYPE_3D)
+      return "2D view of a 3D image (a slice of the A9's 3D bricks is no 2D texture)";
+
    struct pvr_g5p_tex_twiddled_view v = {
       .key = key,
       .width = image->vk.extent.width,
