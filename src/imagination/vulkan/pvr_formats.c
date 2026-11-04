@@ -30,7 +30,7 @@
 #include "drm-uapi/drm_fourcc.h"
 #include "g9p_formats.h"
 #include "hwdef/rogue_hw_utils.h"
-
+#include "pvr_g5p_ds_hooks.h"
 #include "pvr_common.h"
 #include "pvr_csb.h"
 #include "pvr_device.h"
@@ -373,7 +373,7 @@ pvr_get_image_format_features2(struct pvr_physical_device *pdevice,
    if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g9p) && vk_format_is_color(vk_format) &&
        (flags & VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT))
       flags |= VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT;
-
+   PVR_G5P_HOOK(ds_format_features, pdevice, vk_format, flags)
    return flags;
 }
 
