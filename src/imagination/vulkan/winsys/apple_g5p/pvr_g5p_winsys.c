@@ -751,6 +751,10 @@ struct g5p_ws_rt {
    struct pvr_winsys_rt_dataset base;
    uint32_t width, height, samples, layers;
    uint32_t handle, context; /* 0: not created */
+   struct g5p_ws_rt *shared; /* dataset reference to a context-owned geometry key */
+   unsigned users; /* pool key only: number of live datasets, plus a teardown hold */
+   bool in_pool;
+   struct list_head pool_link;
 };
 
 /* A render context: the kernel's DRM_G5P_CONTEXT_RENDER, created at the first
@@ -762,7 +766,7 @@ struct g5p_ws_render_ctx {
     * kernel creates a render target only on an idle context, so a new size
     * waits on it (g5p_ws_rt_create_idle()) */
    uint32_t last;
-   struct g5p_ws_rt *idle_rt; /* one completed dataset, same context and geometry only */
+   struct list_head targets; /* kernel datasets, keyed by dimensions/samples/layers */
    uint64_t rt_creates, rt_reuses;
    struct list_head link; /* in g5p_ws::render_ctxs */
 };
@@ -817,29 +821,93 @@ static int g5p_ws_rt_destroy_idle(struct g5p_ws *ws, struct g5p_ws_rt *rt)
    return r;
 }
 
-/* Lock held on entry and return; only a completed/idle dataset may be reused. */
-static int g5p_ws_rt_reuse_idle(struct g5p_ws *ws, struct g5p_ws_render_ctx *c, struct g5p_ws_rt *rt)
+/* A key owns geometry scratch only, never attachment pixels (kernel g5p_rt_create
+ * and g5p_ru_rt_fill). Jobs on one context are serialized by the kernel render
+ * worker; the same key already serves successive renders of a single framebuffer.
+ * Share it across identical live framebuffer datasets too. Never across contexts. */
+static int g5p_ws_rt_create_idle(struct g5p_ws *, struct g5p_ws_render_ctx *, struct g5p_ws_rt *);
+
+/* ws lock held. A context teardown may orphan a key before its last dataset dies. */
+static void g5p_ws_rt_drop(struct g5p_ws *ws, struct g5p_ws_rt *rt)
 {
-   if (!rt->handle && c->idle_rt) {
-      struct g5p_ws_rt *idle = c->idle_rt;
-      c->idle_rt = NULL;
-      if (idle->width == rt->width && idle->height == rt->height &&
-          idle->samples == rt->samples && idle->layers == rt->layers) {
-         rt->handle = idle->handle;
-         rt->context = idle->context;
-         c->rt_reuses++;
-      } else {
-         /* Evict before creating another geometry: the kernel has a 32-target cap. */
-         simple_mtx_unlock(&ws->lock);
-         int r = g5p_ws_rt_destroy_idle(ws, idle);
-         simple_mtx_lock(&ws->lock);
-         if (r) {
-            c->idle_rt = idle;
-            return r;
-         }
-      }
-      vk_free(ws->base.alloc, idle);
+   struct g5p_ws_rt *key = rt->shared;
+   if (key) {
+      assert(key->users);
+      if (!--key->users && !key->in_pool)
+         vk_free(ws->base.alloc, key);
    }
+   rt->shared = NULL;
+   rt->handle = rt->context = 0;
+}
+
+/* Lock held on entry and return. Queue submits for this context are externally
+ * serialized. Dataset destruction only drops users under the same ws lock. */
+static int g5p_ws_rt_acquire(struct g5p_ws *ws, struct g5p_ws_render_ctx *c, struct g5p_ws_rt *rt)
+{
+   if (rt->shared) {
+      if (rt->shared->context == c->context && rt->shared->handle)
+         return 0;
+      g5p_ws_rt_drop(ws, rt);
+   } else if (rt->handle) {
+      if (rt->context == c->context)
+         return 0;
+      simple_mtx_unlock(&ws->lock);
+      int r = g5p_ws_rt_destroy_idle(ws, rt);
+      simple_mtx_lock(&ws->lock);
+      if (r)
+         return r;
+      rt->handle = 0;
+   }
+   const char *cache = getenv("PVR_G5P_RT_CACHE");
+   if (cache && !strcmp(cache, "0")) {
+      int r = g5p_ws_rt_create_idle(ws, c, rt);
+      if (!r) { rt->context = c->context; c->rt_creates++; }
+      return r;
+   }
+   list_for_each_entry (struct g5p_ws_rt, key, &c->targets, pool_link)
+      if (key->width == rt->width && key->height == rt->height &&
+          key->samples == rt->samples && key->layers == rt->layers) {
+         key->users++;
+         rt->shared = key;
+         rt->handle = key->handle;
+         rt->context = key->context;
+         c->rt_reuses++;
+         return 0;
+      }
+   /* A miss discards unused geometries before growing the pool. Resizing a
+    * window never fills the kernel cap with dead sizes. Failed destroys stay
+    * tracked; no key with a live dataset is evicted. */
+   list_for_each_entry_safe (struct g5p_ws_rt, key, &c->targets, pool_link) {
+      if (key->users)
+         continue;
+      list_del(&key->pool_link);
+      key->in_pool = false;
+      simple_mtx_unlock(&ws->lock);
+      int r = g5p_ws_rt_destroy_idle(ws, key);
+      simple_mtx_lock(&ws->lock);
+      if (r) {
+         key->in_pool = true;
+         list_addtail(&key->pool_link, &c->targets);
+         return r;
+      }
+      vk_free(ws->base.alloc, key);
+   }
+   struct g5p_ws_rt *key = vk_zalloc(ws->base.alloc, sizeof(*key), 8, VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
+   if (!key)
+      return -ENOMEM;
+   key->base.ws = &ws->base;
+   key->width = rt->width; key->height = rt->height;
+   key->samples = rt->samples; key->layers = rt->layers;
+   int r = g5p_ws_rt_create_idle(ws, c, key);
+   if (r) { vk_free(ws->base.alloc, key); return r; }
+   key->context = c->context;
+   key->users = 1;
+   key->in_pool = true;
+   list_addtail(&key->pool_link, &c->targets);
+   rt->shared = key;
+   rt->handle = key->handle;
+   rt->context = key->context;
+   c->rt_creates++;
    return 0;
 }
 
@@ -847,32 +915,16 @@ static void g5p_ws_rt_dataset_destroy(struct pvr_winsys_rt_dataset *d)
 {
    struct g5p_ws_rt *rt = container_of(d, struct g5p_ws_rt, base);
    struct g5p_ws *ws = to_ws(d->ws);
-   /* Kernel g5p_rt_create stores context + dimensions/sample geometry, no image
-    * or framebuffer attachment. Keep one idle dataset per context for reuse.
-    * Never share a live dataset across contexts, or keep an unbounded size cache. */
-   struct g5p_ws_rt *old = NULL;
-   bool cached = false;
-   const char *cache = getenv("PVR_G5P_RT_CACHE");
    simple_mtx_lock(&ws->lock);
-   if (rt->handle && (!cache || strcmp(cache, "0")))
-      list_for_each_entry (struct g5p_ws_render_ctx, c, &ws->render_ctxs, link) {
-         if (c->context == rt->context) {
-            old = c->idle_rt;
-            c->idle_rt = rt;
-            cached = true;
-            break;
-         }
-      }
-   simple_mtx_unlock(&ws->lock);
-   if (old) {
-      g5p_ws_rt_destroy_idle(ws, old);
-      vk_free(d->ws->alloc, old);
-   }
-   if (!cached) {
+   if (rt->shared) {
+      g5p_ws_rt_drop(ws, rt);
+      simple_mtx_unlock(&ws->lock);
+   } else {
+      simple_mtx_unlock(&ws->lock);
       if (rt->handle)
          g5p_ws_rt_destroy_idle(ws, rt);
-      vk_free(d->ws->alloc, rt);
    }
+   vk_free(d->ws->alloc, rt);
 }
 
 static VkResult g5p_ws_render_ctx_create(struct pvr_winsys *ws, struct pvr_winsys_render_ctx_create_info *info,
@@ -884,6 +936,7 @@ static VkResult g5p_ws_render_ctx_create(struct pvr_winsys *ws, struct pvr_winsy
    if (!c)
       return vk_error(NULL, VK_ERROR_OUT_OF_HOST_MEMORY);
    c->base.ws = ws;
+   list_inithead(&c->targets);
    simple_mtx_lock(&to_ws(ws)->lock);
    list_addtail(&c->link, &to_ws(ws)->render_ctxs);
    simple_mtx_unlock(&to_ws(ws)->lock);
@@ -897,10 +950,23 @@ static void g5p_ws_render_ctx_destroy(struct pvr_winsys_render_ctx *ctx)
    simple_mtx_lock(&to_ws(ctx->ws)->lock);
    list_del(&c->link);
    simple_mtx_unlock(&to_ws(ctx->ws)->lock);
-   if (c->idle_rt) {
-      g5p_ws_rt_destroy_idle(to_ws(ctx->ws), c->idle_rt);
-      vk_free(ctx->ws->alloc, c->idle_rt);
+   if (c->last)
+      drmSyncobjWait(ctx->ws->render_fd, &c->last, 1, os_time_get_nano() + G5P_WS_BUSY_NS,
+                     DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL);
+   struct g5p_ws *ws = to_ws(ctx->ws);
+   simple_mtx_lock(&ws->lock);
+   list_for_each_entry_safe (struct g5p_ws_rt, key, &c->targets, pool_link) {
+      list_del(&key->pool_link);
+      key->in_pool = false;
+      key->users++; /* protect the key across a concurrent dataset drop while unlocked */
+      simple_mtx_unlock(&ws->lock);
+      g5p_ws_rt_destroy_idle(ws, key);
+      simple_mtx_lock(&ws->lock);
+      key->handle = key->context = 0;
+      if (!--key->users)
+         vk_free(ws->base.alloc, key);
    }
+   simple_mtx_unlock(&ws->lock);
    if (to_ws(ctx->ws)->arena_log)
       fprintf(stderr, "apple_g5p winsys: rt stats pid=%ld context=%u creates=%" PRIu64 " reuses=%" PRIu64 "\n",
               (long)getpid(), c->context, c->rt_creates, c->rt_reuses);
@@ -1001,30 +1067,12 @@ static VkResult g5p_ws_render_submit(const struct pvr_winsys_render_ctx *ctx,
       simple_mtx_unlock(&ws->lock);
       return g5p_ws_refuse(VK_ERROR_INITIALIZATION_FAILED, "CREATE_CONTEXT (render): %s", strerror(-r));
    }
-   if (rt->handle && rt->context != c->context) {
-      simple_mtx_unlock(&ws->lock);
-      r = g5p_ws_rt_destroy_idle(ws, rt);
-      if (r)
-         return g5p_ws_refuse(VK_ERROR_DEVICE_LOST,
-                              "DESTROY_RENDER_TARGET %u before context reassignment: %s", rt->handle, strerror(-r));
-      simple_mtx_lock(&ws->lock);
-      rt->handle = 0;
-   }
-   r = g5p_ws_rt_reuse_idle(ws, c, rt);
+   r = g5p_ws_rt_acquire(ws, c, rt);
    if (r) {
       simple_mtx_unlock(&ws->lock);
-      return g5p_ws_refuse(VK_ERROR_DEVICE_LOST, "cached target eviction: %s", strerror(-r));
+      return g5p_ws_refuse(VK_ERROR_OUT_OF_DEVICE_MEMORY, "CREATE_RENDER_TARGET %ux%u: %s", rt->width, rt->height, strerror(-r));
    }
-   if (!rt->handle) {
-      r = g5p_ws_rt_create_idle(ws, c, rt);
-      if (r) {
-         simple_mtx_unlock(&ws->lock);
-         return g5p_ws_refuse(VK_ERROR_OUT_OF_DEVICE_MEMORY, "CREATE_RENDER_TARGET %ux%u: %s", rt->width,
-                              rt->height, strerror(-r));
-      }
-      rt->context = c->context;
-      c->rt_creates++;
-   }
+   const uint32_t rt_handle = rt->handle;
    simple_mtx_unlock(&ws->lock);
 
    /* the arena's chunks, then every own BO (display buffers, imports): the job may write a swapchain image or
@@ -1076,7 +1124,7 @@ static VkResult g5p_ws_render_submit(const struct pvr_winsys_render_ctx *ctx,
 
    if (getenv("PVR_G5P_WS_LOG"))
       fprintf(stderr, "apple_g5p render: %ux%u rt %u ctx %u vdm %#" PRIx64 "+%u ta %#" PRIx64 " bgnd %08x %08x %08x %08x "
-              "eot %08x %08x %08x, %u syncs, %u resources\n", rt->width, rt->height, rt->handle, c->context,
+              "eot %08x %08x %08x, %u syncs, %u resources\n", rt->width, rt->height, rt_handle, c->context,
               (uint64_t)pass.base.vdm_va, pass.base.vdm_size, (uint64_t)pass.ta_program_va, pass.base.background[0],
               pass.base.background[1], pass.base.background[4], pass.base.background[6], pass.base.eot[0],
               pass.base.eot[1], pass.base.eot[2], n, nres);
@@ -1110,7 +1158,7 @@ static VkResult g5p_ws_render_submit(const struct pvr_winsys_render_ctx *ctx,
    }
    uint64_t job_id = 0;
    const uint64_t t0 = g5p_ws_perf_now();
-   r = g5p_drm_submit_render_typed(&ws->drm, c->context, rt->handle, &pass, res, nres, syncs, n,
+   r = g5p_drm_submit_render_typed(&ws->drm, c->context, rt_handle, &pass, res, nres, syncs, n,
                                    &job_id);
    g5p_ws_perf_account(&ws->perf, res, nres, nchunks, t0);
    if (ws->arena_log) {
