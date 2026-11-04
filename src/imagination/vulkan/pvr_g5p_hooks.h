@@ -80,6 +80,18 @@
       }                                                                    \
    }
 
+/* Public Vulkan layout is relative to the bound memory. Internal transfer
+ * layout stays relative to image->dev_addr, which already includes import_offset.
+ */
+#define PVR_G5P_HOOK_shm_layout_public(image, subresource, layout)          \
+   if (PVR_HAS_FEATURE(&container_of((image)->vk.base.device, struct pvr_device, \
+                                     vk)->pdevice->dev_info, apple_g5p)) { \
+      pvr_get_image_subresource_layout(image, &(subresource)->imageSubresource, \
+                                       &(layout)->subresourceLayout);     \
+      (layout)->subresourceLayout.offset += (image)->import_offset;        \
+      return;                                                            \
+   }
+
 /* A G5P 3D image is a 2D array of its slices (pvr_g5p_image_layout(); it
  * keeps memlayout 3DTWIDDLED for upstream's view setup).
  *
@@ -93,9 +105,6 @@
     (image)->vk.image_type == VK_IMAGE_TYPE_3D &&                            \
     (image)->memlayout == PVR_MEMLAYOUT_3DTWIDDLED)
 #define PVR_G5P_HOOK_slice_pitch(image, layout)                               \
-   if (PVR_HAS_FEATURE(&container_of((image)->vk.base.device, struct pvr_device, \
-                                     vk)->pdevice->dev_info, apple_g5p))     \
-      (layout)->offset += (image)->import_offset;                           \
    if (PVR_G5P_IMAGE_IS_SLICED_3D(image))                                    \
       (layout)->depthPitch = (layout)->arrayPitch;
 

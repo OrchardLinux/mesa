@@ -547,7 +547,7 @@ void pvr_GetImageSubresourceLayout2(VkDevice device,
                                     VkSubresourceLayout2 *pLayout)
 {
    VK_FROM_HANDLE(pvr_image, image, _image);
-
+   PVR_G5P_HOOK(shm_layout_public, image, pSubresource, pLayout)
    pvr_get_image_subresource_layout(image,
                                     &pSubresource->imageSubresource,
                                     &pLayout->subresourceLayout);
