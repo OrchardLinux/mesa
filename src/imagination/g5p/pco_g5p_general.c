@@ -98,7 +98,8 @@ enum { BLEND_NONE, BLEND_PREMULT, BLEND_STRAIGHT_OVER, BLEND_REPLACE, BLEND_GENE
  * settings without a measured epilogue. Premultiplied, straight-over and
  * replace keep their paths. By default only the settings of the device
  * blend ladder (linux-a9 blend-ladder.c, release7 2026-11-02: 45 rungs,
- * every pixel within 1 LSB) take it; the rest stay refused by name.
+ * every pixel within 1 LSB) and of the bench ladder's three blend rungs
+ * take it; the rest stay refused by name.
  * PVR_G5P_BLEND_GENERAL=1: every setting the generator builds;
  * PVR_G5P_BLEND_GENERAL=0: none. */
 bool pco_g5p_blend_general(void)
@@ -130,6 +131,9 @@ static const uint8_t blend_proven[][6] = {
    {10, 3, 0, 10, 3, 0}, {6, 7, 0, 6, 7, 0}, {10, 3, 0, 1, 7, 0},
    /* mixed settings outside Apple's 45 */
    {4, 7, 1, 4, 7, 1}, {12, 9, 2, 12, 9, 2}, {11, 2, 0, 13, 6, 0}, {14, 1, 0, 1, 1, 0}, {8, 4, 0, 8, 8, 0},
+   /* linux-a9 bench-ladder (release8-pmprevshm, 2026-11-03, max error 1): blend_sa_one (glmark2 pulsar, terrain),
+    * blend_sa_omsa_z1 (glmark2 desktop), blend_sa_omsa_10 (vkmark desktop) */
+   {6, 1, 0, 6, 1, 0}, {6, 7, 0, 0, 1, 0}, {6, 7, 0, 1, 0, 0},
 };
 
 /* A channel's setting matches; min/max ignore the factors (Vulkan, and the generator). */
