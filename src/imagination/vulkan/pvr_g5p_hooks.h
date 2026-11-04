@@ -163,4 +163,31 @@
 /* pvr_arch_cmd_buffer.c, pvr_cmd_buffer_free_resources() */
 #define PVR_G5P_HOOK_xfb_free(cmd_buffer) pvr_arch_g5p_xfb_free(cmd_buffer);
 
+/* rogue/pvr_blit.c, vkCmdClearAttachments(): Rogue's clear programs and
+ * words do not run on the A9 (G9P's hung its geometry job); G5P's own
+ * (pvr_arch_g5p_gfx.c).
+ */
+#define PVR_G5P_HOOK_clear_attachments(cmd_buffer, count, attachments, rect_count, rects)               \
+   if (PVR_HAS_FEATURE(&(cmd_buffer)->device->pdevice->dev_info, apple_g5p)) {                        \
+      VkResult r_ = pvr_arch_g5p_clear_attachments(cmd_buffer, count, attachments, rect_count, rects); \
+      if (r_ != VK_SUCCESS)                                                                           \
+         pvr_cmd_buffer_set_error_unwarned(cmd_buffer, r_);                                           \
+      return;                                                                                         \
+   }
+
 #endif /* PVR_G5P_HOOKS_H */
+
+/* The per-arch functions of the hooks, guarded on their own (as
+ * pvr_g5p_ds.h): a file that includes this header before PVR_PER_ARCH is
+ * defined still gets them from a later include. */
+#if defined(PVR_APPLE_G5P) && defined(PVR_PER_ARCH) && !defined(PVR_G5P_HOOKS_ARCH_H)
+#define PVR_G5P_HOOKS_ARCH_H
+
+struct pvr_cmd_buffer;
+
+VkResult PVR_PER_ARCH(g5p_clear_attachments)(struct pvr_cmd_buffer *cmd_buffer, uint32_t attachment_count,
+                                             const VkClearAttachment *attachments, uint32_t rect_count,
+                                             const VkClearRect *rects);
+#   define pvr_arch_g5p_clear_attachments PVR_PER_ARCH(g5p_clear_attachments)
+
+#endif /* PVR_G5P_HOOKS_ARCH_H */

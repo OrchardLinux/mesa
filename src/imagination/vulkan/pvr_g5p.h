@@ -95,6 +95,7 @@ struct pvr_g5p_job {
    uint32_t width, height;
    unsigned targets;            /* colour targets, 1, 2 or 4 */
    uint32_t dbias_count;        /* entries of upstream's depth-bias table, 0 without one */
+   uint32_t scissor_count;      /* entries of upstream's scissor table, 0 without one */
    uint32_t samples;            /* 1 or 4 (hw_render->sample_count) */
    bool msaa_resolve;           /* 4x: the PBE resolves target 0 into a one-sample view */
    bool enabled;
