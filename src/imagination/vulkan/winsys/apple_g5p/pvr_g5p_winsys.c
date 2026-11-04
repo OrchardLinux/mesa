@@ -275,6 +275,9 @@ static void g5p_ws_vma_unmap(struct pvr_winsys_vma *vma)
       g5p_ws_buffer_destroy(bo); /* drops the bind's reference */
 }
 
+#define g5p_ws_refuse(result, ...)                                                                                 \
+   (fprintf(stderr, "apple_g5p render: " __VA_ARGS__), fprintf(stderr, "\n"), vk_errorf(NULL, result, __VA_ARGS__))
+
 /* ---- buffers ---- */
 
 static struct g5p_ws_bo *g5p_ws_bo_new(struct g5p_ws *ws, uint64_t size)
@@ -434,7 +437,7 @@ static VkResult g5p_ws_buffer_map(struct pvr_winsys_bo *bo, void *addr)
    uint64_t in_bo = 0;
    if (b->own) {
       if (b->kbo.shared && b->base.is_imported)
-         return vk_errorf(NULL, VK_ERROR_MEMORY_MAP_FAILED, "apple_g5p: placed map of an imported dma-buf");
+         return g5p_ws_refuse(VK_ERROR_MEMORY_MAP_FAILED, "placed map of an imported dma-buf");
       k = &b->kbo;
    } else {
       for (unsigned i = 0; i < ws->chunk_count && !k; i++)
@@ -445,10 +448,10 @@ static VkResult g5p_ws_buffer_map(struct pvr_winsys_bo *bo, void *addr)
    }
    uint64_t off;
    if (!k || g5p_drm_bo_mmap_offset(&ws->drm, k, &off))
-      return vk_errorf(NULL, VK_ERROR_MEMORY_MAP_FAILED, "apple_g5p: placed map: no mmap offset");
+      return g5p_ws_refuse(VK_ERROR_MEMORY_MAP_FAILED, "placed map at %p of %" PRIu64 " bytes: no mmap offset (own %d)", addr, b->alloc_size, b->own);
    void *m = mmap(addr, b->alloc_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, ws->drm.fd, off + in_bo);
    if (m == MAP_FAILED)
-      return vk_errorf(NULL, VK_ERROR_MEMORY_MAP_FAILED, "apple_g5p: placed map: %s", strerror(errno));
+      return g5p_ws_refuse(VK_ERROR_MEMORY_MAP_FAILED, "placed map at %p of %" PRIu64 " bytes (own %d): %s", addr, b->alloc_size, b->own, strerror(errno));
    bo->map = m;
    b->placed = true;
    return VK_SUCCESS;
@@ -585,8 +588,6 @@ static void g5p_ws_dump_doutd(const struct g5p_ws *ws, const char *what, uint32_
 }
 
 /* A submit refusal, on stderr too (vk_errorf() is silent in release builds) */
-#define g5p_ws_refuse(result, ...)                                                                                 \
-   (fprintf(stderr, "apple_g5p render: " __VA_ARGS__), fprintf(stderr, "\n"), vk_errorf(NULL, result, __VA_ARGS__))
 
 /* One G5P render: the fragment stream holds the TYPED_V3 pass
  * (pvr_arch_g5p_frag_stream); the job reads and writes inside the arena, every
