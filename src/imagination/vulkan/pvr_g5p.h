@@ -75,6 +75,7 @@ struct pvr_g5p_job {
    uint32_t vdm_bytes;          /* through STREAM_TERMINATE */
    uint32_t width, height;
    unsigned targets;            /* colour targets, 1, 2 or 4 */
+   uint32_t dbias_count;        /* entries of upstream's depth-bias table, 0 without one */
    bool enabled;
 };
 

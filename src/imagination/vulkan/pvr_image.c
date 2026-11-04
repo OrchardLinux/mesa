@@ -27,7 +27,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
-
+#include "pvr_g5p_ds_hooks.h"
 #include "drm-uapi/drm_fourcc.h"
 #include "pvr_buffer.h"
 #include "pvr_device.h"
@@ -344,7 +344,7 @@ VkResult pvr_image_init(struct pvr_device *device,
    pvr_image_init_memlayout(device, image);
    pvr_image_init_physical_extent(image, pCreateInfo, pbe_stride_align);
    pvr_image_setup_mip_levels(image);
-
+   PVR_G5P_HOOK(ds_image, device, image)
    return VK_SUCCESS;
 }
 
