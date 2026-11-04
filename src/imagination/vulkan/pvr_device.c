@@ -449,7 +449,7 @@ VkResult pvr_MapMemory2(VkDevice _device,
 
    assert(size > 0);
    assert(offset + size <= mem->bo->size);
-
+   PVR_G5P_HOOK(map_again, device, mem, addr, offset, ppData)
    /* From the Vulkan 1.2.194 spec:
     *
     *    "memory must not be currently host mapped"
