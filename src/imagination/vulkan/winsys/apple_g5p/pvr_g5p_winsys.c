@@ -535,6 +535,18 @@ static void g5p_ws_dump(const struct g5p_ws *ws, const char *what, uint32_t off,
    fprintf(stderr, "\n");
 }
 
+/* What a DOUTD data block (source address, control) moves: its bsize dwords
+ * (control bits 0..11) at the source, when the source is in the arena */
+static void g5p_ws_dump_doutd(const struct g5p_ws *ws, const char *what, uint32_t data_off)
+{
+   if (data_off + 12 > ws->arena_size)
+      return;
+   const uint32_t *d = (const uint32_t *)(ws->arena_cpu + data_off);
+   const uint64_t src = (uint64_t)d[1] << 32 | d[0];
+   if (src >= ws->arena_va && src - ws->arena_va < ws->arena_size)
+      g5p_ws_dump(ws, what, (uint32_t)(src - ws->arena_va), d[2] & 0xfff);
+}
+
 /* A submit refusal, on stderr too (vk_errorf() is silent in release builds) */
 #define g5p_ws_refuse(result, ...)                                                                                 \
    (fprintf(stderr, "apple_g5p render: " __VA_ARGS__), fprintf(stderr, "\n"), vk_errorf(NULL, result, __VA_ARGS__))
@@ -641,6 +653,9 @@ static VkResult g5p_ws_render_submit(const struct pvr_winsys_render_ctx *ctx,
       g5p_ws_dump(ws, "bgnd dma data", bg_uni, 4);
       g5p_ws_dump(ws, "eot data", pass.base.eot[0], 8);
       g5p_ws_dump(ws, "eot code", pass.base.eot[1], 3);
+      /* what the two DOUTDs move: the clear colours and the PBE block (the MRT comparison reads these) */
+      g5p_ws_dump_doutd(ws, "bgnd dma src", bg_uni);
+      g5p_ws_dump_doutd(ws, "eot dma src", pass.base.eot[0]);
       g5p_ws_dump(ws, "ta kick data", (uint32_t)ta, 4);
       g5p_ws_dump(ws, "ta kick code", (uint32_t)ta + 0x20, 2);
       g5p_ws_dump(ws, "ta usc", ta_doutu & ~0xfu, 17);

@@ -40,6 +40,7 @@
 #include "pvr_g5p_ds.h"
 #include "pvr_g5p_msaa.h"
 #include "pvr_g5p_tex_encode.h"
+#include "pvr_g5p_mrt.h"
 #include "pvr_hw_pass.h"
 #include "pvr_image.h"
 #include "pvr_job_render.h"
@@ -528,6 +529,10 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
    case 4: v = 2; break;
    default: return G5P_REFUSE(cmd_buffer, "%u colour targets (1, 2 or 4 are built)", n);
    }
+   /* several targets: Apple's pass shape (pvr_g5p_mrt.h) */
+   VkResult mrt = pvr_arch_g5p_mrt_pass_check(cmd_buffer, hw_render);
+   if (mrt != VK_SUCCESS)
+      return mrt;
    /* a depth/stencil attachment: what the ZLS builds (pvr_arch_g5p_ds.c) */
    VkResult admit = pvr_arch_g5p_ds_admit(cmd_buffer, hw_render);
    if (admit != VK_SUCCESS)
