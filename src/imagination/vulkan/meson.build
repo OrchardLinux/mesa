@@ -142,10 +142,17 @@ endif
 
 # Apple A9 (G5P): its paths of the driver and the G5P backend, opt-in only
 if with_imagination_g5p
+  common_per_arch_files += files(
+    'pvr_arch_g5p.c',
+  )
   pvr_files += files(
     'winsys/apple_g5p/g5p_drm_transport.c',
     'winsys/apple_g5p/pvr_g5p_winsys.c',
   )
+  pvr_includes += inc_powervr_g5p
+  # pvr_arch_g5p.c builds its PDS programs with pdsc (the A9 ICD's way)
+  pvr_includes += inc_powervr_pdsc
+  pvr_deps += idep_powervr_g5p
 endif
 
 rogue_files = files(
