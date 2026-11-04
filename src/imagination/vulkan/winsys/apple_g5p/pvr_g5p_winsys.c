@@ -107,6 +107,7 @@ struct g5p_ws {
    int64_t chunk_idle_ns[G5P_WS_MAX_CHUNKS];
    uint32_t chunk_live[G5P_WS_MAX_CHUNKS]; /* slices referencing each chunk; lock held */
    uint64_t arena_reclaimed;
+   uint64_t arena_submits;
    struct util_vma_heap slices;
 
    /* own kernel BOs: display buffers and imports; every live one is listed in own_bos, because a job names
@@ -365,9 +366,9 @@ static int g5p_ws_arena_grow(struct g5p_ws *ws, uint64_t need, uint64_t alignmen
    ws->arena_committed += bytes;
    ws->arena_next = off + bytes + G5P_WS_PAGE; /* one unbound page: no slice spans two chunks */
    p_atomic_set(&ws->chunk_count, ws->chunk_count + 1);
-   if (getenv("PVR_G5P_WS_LOG") || getenv("PVR_G5P_PERF_LOG"))
-      fprintf(stderr, "apple_g5p winsys: arena chunk %u of %" PRIu64 " KiB at +%#" PRIx64 ": %" PRIu64
-              " KiB committed of at most %" PRIu64 " KiB\n", ws->chunk_count, bytes >> 10, off,
+   if (ws->arena_log || getenv("PVR_G5P_WS_LOG") || getenv("PVR_G5P_PERF_LOG"))
+      fprintf(stderr, "apple_g5p winsys: arena chunk pid=%ld fd=%d handle=%u chunk=%u of %" PRIu64 " KiB at +%#" PRIx64 ": %" PRIu64
+              " KiB committed of at most %" PRIu64 " KiB\n", (long)getpid(), ws->drm.fd, k->handle, ws->chunk_count, bytes >> 10, off,
               ws->arena_committed >> 10, ws->arena_max >> 10);
    return 0;
 }
@@ -796,6 +797,32 @@ static int g5p_ws_rt_destroy_idle(struct g5p_ws *ws, struct g5p_ws_rt *rt)
    return r;
 }
 
+/* Lock held on entry and return; only a completed/idle dataset may be reused. */
+static int g5p_ws_rt_reuse_idle(struct g5p_ws *ws, struct g5p_ws_render_ctx *c, struct g5p_ws_rt *rt)
+{
+   if (!rt->handle && c->idle_rt) {
+      struct g5p_ws_rt *idle = c->idle_rt;
+      c->idle_rt = NULL;
+      if (idle->width == rt->width && idle->height == rt->height &&
+          idle->samples == rt->samples && idle->layers == rt->layers) {
+         rt->handle = idle->handle;
+         rt->context = idle->context;
+         c->rt_reuses++;
+      } else {
+         /* Evict before creating another geometry: the kernel has a 32-target cap. */
+         simple_mtx_unlock(&ws->lock);
+         int r = g5p_ws_rt_destroy_idle(ws, idle);
+         simple_mtx_lock(&ws->lock);
+         if (r) {
+            c->idle_rt = idle;
+            return r;
+         }
+      }
+      vk_free(ws->base.alloc, idle);
+   }
+   return 0;
+}
+
 static void g5p_ws_rt_dataset_destroy(struct pvr_winsys_rt_dataset *d)
 {
    struct g5p_ws_rt *rt = container_of(d, struct g5p_ws_rt, base);
@@ -963,26 +990,10 @@ static VkResult g5p_ws_render_submit(const struct pvr_winsys_render_ctx *ctx,
       simple_mtx_lock(&ws->lock);
       rt->handle = 0;
    }
-   if (!rt->handle && c->idle_rt) {
-      struct g5p_ws_rt *idle = c->idle_rt;
-      c->idle_rt = NULL;
-      if (idle->width == rt->width && idle->height == rt->height &&
-          idle->samples == rt->samples && idle->layers == rt->layers) {
-         rt->handle = idle->handle;
-         rt->context = idle->context;
-         c->rt_reuses++;
-      } else {
-         /* Evict before creating another geometry: the kernel has a 32-target cap. */
-         simple_mtx_unlock(&ws->lock);
-         r = g5p_ws_rt_destroy_idle(ws, idle);
-         simple_mtx_lock(&ws->lock);
-         if (r) {
-            c->idle_rt = idle;
-            simple_mtx_unlock(&ws->lock);
-            return g5p_ws_refuse(VK_ERROR_DEVICE_LOST, "cached target eviction: %s", strerror(-r));
-         }
-      }
-      vk_free(ws->base.alloc, idle);
+   r = g5p_ws_rt_reuse_idle(ws, c, rt);
+   if (r) {
+      simple_mtx_unlock(&ws->lock);
+      return g5p_ws_refuse(VK_ERROR_DEVICE_LOST, "cached target eviction: %s", strerror(-r));
    }
    if (!rt->handle) {
       r = g5p_ws_rt_create_idle(ws, c, rt);
@@ -1082,6 +1093,15 @@ static VkResult g5p_ws_render_submit(const struct pvr_winsys_render_ctx *ctx,
    r = g5p_drm_submit_render_typed(&ws->drm, c->context, rt->handle, &pass, res, nres, syncs, n,
                                    &job_id);
    g5p_ws_perf_account(&ws->perf, res, nres, nchunks, t0);
+   if (ws->arena_log) {
+      simple_mtx_lock(&ws->lock);
+      if (++ws->arena_submits % 120 == 0) {
+         g5p_ws_arena_stats(ws, "submit");
+         fprintf(stderr, "apple_g5p winsys: rt stats pid=%ld context=%u creates=%" PRIu64 " reuses=%" PRIu64 "\n",
+                 (long)getpid(), c->context, c->rt_creates, c->rt_reuses);
+      }
+      simple_mtx_unlock(&ws->lock);
+   }
    if (r)
       return g5p_ws_refuse(r == -ENOMEM ? VK_ERROR_OUT_OF_DEVICE_MEMORY : VK_ERROR_DEVICE_LOST,
                            "SUBMIT_RENDER_TYPED: %s (the kernel's reason is in dmesg)", strerror(-r));

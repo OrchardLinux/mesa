@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -383,6 +384,10 @@ int g5p_drm_render_target_create(struct g5p_drm *ws, uint32_t context, uint32_t 
                                              .samples = samples, .layers = layers};
    int r = call(ws->fd, DRM_IOCTL_G5P_CREATE_RENDER_TARGET, &rt);
    if (!r) *handle = rt.handle;
+   if (!r && getenv("PVR_G5P_ARENA_LOG"))
+      fprintf(stderr, "apple_g5p winsys: rt allocation pid=%ld context=%u handle=%u width=%u height=%u samples=%u main_kib=%llu secondary_kib=%llu\n",
+              (long)getpid(), context, rt.handle, width, height, samples,
+              (unsigned long long)(rt.main_bytes >> 10), (unsigned long long)(rt.secondary_bytes >> 10));
    return r;
 }
 
