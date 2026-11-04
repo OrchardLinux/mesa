@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 CC      ?= cc
 GLSLANG ?= glslangValidator
-CFLAGS  ?= -std=gnu11 -O1 -g -Wall -Wextra -Wno-missing-field-initializers
+CFLAGS  ?= -std=gnu11 -O1 -Wall -Wextra -Wno-missing-field-initializers
 VK_LIBS ?= -lvulkan -lm
 GLES_LIBS ?= -lEGL -lGLESv2 -lm
 B := build
