@@ -333,9 +333,4 @@ pvr_stage_mask_dst(VkPipelineStageFlags2 stage_mask)
    return pvr_stage_mask(stage_mask);
 }
 
-#ifdef PVR_APPLE_G5P
-/* Apple A9 (G5P): pvr_graphics_pipeline::g5p and its pipeline hooks */
-#   include "pvr_g5p.h"
-#endif
-
 #endif /* PVR_PIPELINE_H */

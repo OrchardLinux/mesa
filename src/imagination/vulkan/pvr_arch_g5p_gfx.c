@@ -11,9 +11,11 @@
  * -Dimagination-g5p-experimental=true.
  *
  * Rung A of step 7 (docs: orchard-mesa-pr-plan.md "Step 7 design"): one
- * linear colour target without blending, no depth/stencil, no descriptors
- * or push constants, one vertex buffer, non-indexed single-instance draws,
- * the scissor at the whole attachment. Everything else is refused by name.
+ * linear colour target, no depth/stencil, one vertex buffer, non-indexed
+ * single-instance draws, the scissor at the whole attachment; blending as
+ * the G5P backend compiles it (pvr_g5p_blend.h); the fragment program's
+ * texture, sampler, image-size and blend-constant uploads (no push
+ * constants or buffers yet). Everything else is refused by name.
  */
 
 #include <inttypes.h>
@@ -36,11 +38,15 @@
 #include "pdsc_ops.h"
 #include "pvr_bo.h"
 #include "pvr_buffer.h"
+#include "pvr_descriptor_set.h"
 #include "pvr_cmd_buffer.h"
 #include "pvr_csb.h"
 #include "pvr_device.h"
 #include "pvr_framebuffer.h"
 #include "pvr_g5p.h"
+#include "pvr_g5p_blend.h"
+#include "pvr_g5p_tex.h"
+#include "pvr_g5p_tex_encode.h"
 #include "pvr_pass.h"
 #include "pvr_pipeline.h"
 
@@ -128,6 +134,40 @@ ddmad_src3(unsigned dwords, unsigned ao, bool last)
    const uint64_t v = pdsc_ddmad_src3_pack(p, &s);
    ralloc_free(p);
    return v;
+}
+
+/* DOUTD control: `dwords` from the source address into common-store dword
+ * `common` */
+static uint32_t
+doutd_control(unsigned common, unsigned dwords, bool last)
+{
+   pdsc_init();
+   pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-doutd");
+   struct pdsc_doutd_src1 s = { .last_issue = last, .store_dest = PDSC_STORE_DEST_COMMON, .ao = common,
+                                .bsize = dwords };
+   const uint32_t v = pdsc_doutd_src1_pack(p, &s);
+   ralloc_free(p);
+   return v;
+}
+
+/*
+ * The fragment program's uniform/texture loader (the ICD's loader_program(),
+ * iOS tex capture): DOUTD c(2i):c(2i+1) -> common store with the control word
+ * in c(2n+2i), the last one ends, then HALT. Its data, per draw, is behind
+ * the UNIFORMDATABASE pointer.
+ */
+static unsigned
+loader_program(uint32_t *dest, unsigned n)
+{
+   pdsc_init();
+   pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-fs-loader");
+   for (unsigned i = 0; i < n; i++)
+      pdsc_dout(p, pdsc_ref_const64(2 * i), pdsc_ref_const32(2 * n + 2 * i), pdsc_ref_null(),
+                .dstdout = PDSC_DSTDOUT_D, .end = i == n - 1);
+   pdsc_halt(p);
+   const unsigned dwords = pds_pack(p, dest);
+   ralloc_free(p);
+   return dwords;
 }
 
 /*
@@ -398,20 +438,12 @@ g5p_check_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo *c
       return G5P_REFUSE(device, "colour attachment format %s", vk_Format_to_str(cf));
    if (ds)
       return G5P_REFUSE(device, "a depth/stencil attachment (rung A has none)");
+   /* blending and the write mask compile into the fragment program
+    * (pvr_g5p_blend.h) */
    *key = PCO_G5P_FS_KEY_DEFAULT;
-   if (s->cb) {
-      if (s->cb->logic_op_enable || s->cb->attachment_count != 1 ||
-          BITSET_TEST(s->dynamic, MESA_VK_DYNAMIC_CB_BLEND_ENABLES) ||
-          BITSET_TEST(s->dynamic, MESA_VK_DYNAMIC_CB_BLEND_EQUATIONS) ||
-          BITSET_TEST(s->dynamic, MESA_VK_DYNAMIC_CB_WRITE_MASKS) ||
-          BITSET_TEST(s->dynamic, MESA_VK_DYNAMIC_CB_COLOR_WRITE_ENABLES))
-         return G5P_REFUSE(device, "logic op or dynamic blend state");
-      const struct vk_color_blend_attachment_state *a = &s->cb->attachments[0];
-      if (a->blend_enable)
-         return G5P_REFUSE(device, "blending (rung A draws without)");
-      if (a->write_mask != 0xf || !(s->cb->color_write_enables & 1))
-         return G5P_REFUSE(device, "colour write mask %#x (rung A writes all channels)", a->write_mask);
-   }
+   const char *why = pvr_arch_g5p_blend_fs_key(s, colors, key);
+   if (why)
+      return G5P_REFUSE(device, "colour blend state: %s", why);
    return VK_SUCCESS;
 }
 
@@ -425,6 +457,7 @@ g5p_pipeline_free(struct pvr_device *device, struct pvr_g5p_pipeline *g)
    pvr_bo_suballoc_free(g->fetch.pvr_bo);
    pvr_bo_suballoc_free(g->fs_launch.pvr_bo);
    pvr_bo_suballoc_free(g->varying.pvr_bo);
+   pvr_bo_suballoc_free(g->fs_loader.pvr_bo);
    pvr_bo_suballoc_free(g->static_vary);
    pvr_bo_suballoc_free(g->static_frag);
    vk_free(&device->vk.alloc, g);
@@ -483,11 +516,29 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
       if (!vs->vout_dword[fs->vary[i].location])
          return G5P_REFUSE(device, "the fragment program reads VAR%u, which the vertex program does not write",
                            fs->vary[i].location);
-   if (vs->num_uploads || fs->num_uploads)
-      return G5P_REFUSE(device, "common-store uploads (descriptors or push constants: %u vertex, %u fragment; "
-                        "rung A has none)", vs->num_uploads, fs->num_uploads);
-   if (fs->blend_mode)
-      return G5P_REFUSE(device, "a fragment program that reads the tile (blend mode %u)", fs->blend_mode);
+   if (vs->num_uploads)
+      return G5P_REFUSE(device, "%u vertex-stage common-store uploads (not built)", vs->num_uploads);
+   static_assert(PCO_G5P_MAX_UPLOADS <= PVR_G5P_MAX_FS_UPLOADS, "G5P upload list");
+   for (unsigned i = 0; i < fs->num_uploads; i++) {
+      const struct pco_g5p_upload *u = &fs->uploads[i];
+      switch (u->kind) {
+      case PCO_G5P_UPLOAD_IMAGE:
+      case PCO_G5P_UPLOAD_SAMPLER:
+      case PCO_G5P_UPLOAD_IMAGE_SIZE:
+      case PCO_G5P_UPLOAD_BLEND_CONSTANTS:
+         break;
+      default:
+         return G5P_REFUSE(device, "fragment upload kind %u (push constants and buffers are not built)", u->kind);
+      }
+      if (u->dwords > 8 || u->set > UINT8_MAX || u->binding > UINT8_MAX || u->offset > UINT16_MAX)
+         return G5P_REFUSE(device, "fragment upload %u: set %u binding %u offset %u, %u dwords", i, u->set,
+                           u->binding, u->offset, u->dwords);
+      g->fs_uploads[i] = (struct pvr_g5p_upload){ .kind = u->kind, .set = u->set, .binding = u->binding,
+                                                  .dwords = u->dwords, .offset = u->offset,
+                                                  .common = u->common };
+   }
+   g->fs_num_uploads = fs->num_uploads;
+   g->fs_common_dwords = fs->common_dwords;
    if (vs->xfb_buffers)
       return G5P_REFUSE(device, "transform feedback");
 
@@ -502,6 +553,8 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
    g->vs_id_mask = vs->id_mask;
    memcpy(g->vs_id_reg, vs->id_reg, sizeof(g->vs_id_reg));
    g->fs_discard = (fs->evidence & PCO_G5P_EV_DISCARD) != 0;
+   g->fs_blend_mode = fs->blend_mode;
+   g->fs_write_mask = key.write_mask;
    for (unsigned i = 0; i < fs->num_varyings; i++)
       g->fs_flat |= fs->vary[i].interp == PCO_G5P_INTERP_FLAT;
 
@@ -567,6 +620,14 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
                           g->varying.code_offset - g->varying.data_offset, 4 * varying_data_dwords);
    }
 
+   /* PDS: the uniform/texture loader (the device HALT without uploads) */
+   if (g->fs_num_uploads) {
+      n = loader_program(code, g->fs_num_uploads);
+      result = pvr_gpu_upload_pds(device, NULL, 0, 0, code, n, 16, 64, &g->fs_loader);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+
    /* the static PPP blocks: the varying format (output dwords per
     * interpolation, in the vertex program's grouped order) */
    {
@@ -603,12 +664,14 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
       pvr_csb_pack (&w[1], TA_STATE_PDS_SHADERBASE, sb) {
          sb.addr = PVR_DEV_ADDR(g->fs_launch.data_offset);
       }
-      /* no uniforms: the uniform/texture program is the device HALT */
+      /* the uniform/texture loader, or the device HALT without uploads */
       pvr_csb_pack (&w[2], TA_STATE_PDS_TEXUNICODEBASE, tb) {
-         tb.addr = PVR_DEV_ADDR(dp->halt.code_offset);
+         tb.addr = PVR_DEV_ADDR(g->fs_num_uploads ? g->fs_loader.code_offset : dp->halt.code_offset);
       }
       pvr_csb_pack (&w[3], TA_STATE_PDS_SIZEINFO1, s1) {
-         s1.pds_uniformsize = 1;
+         s1.pds_uniformsize = g->fs_num_uploads ? DIV_ROUND_UP(4 * g->fs_num_uploads,
+                                                               ROGUE_TA_STATE_PDS_SIZEINFO1_PDS_UNIFORMSIZE_UNIT_SIZE)
+                                                : 1;
          if (fs->num_varyings) {
             s1.pds_varyingsize = DIV_ROUND_UP(varying_data_dwords, 4);
             /* coefficient sets: W, then four per varying (4 dwords each) */
@@ -619,6 +682,9 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
        * (Apple's discard capture; Henrik's G9P; Rogue's pvr) */
       pvr_csb_pack (&w[4], TA_STATE_PDS_SIZEINFO2, s2) {
          s2.pds_tri_merge_disable = g->fs_discard;
+         if (g->fs_num_uploads)
+            s2.usc_sharedsize = DIV_ROUND_UP(g->fs_common_dwords,
+                                             ROGUE_TA_STATE_PDS_SIZEINFO2_USC_SHAREDSIZE_UNIT_SIZE);
       }
       pvr_csb_pack (&w[5], TA_STATE_PDS_VARYINGBASE, vb) {
          vb.addr = PVR_DEV_ADDR(fs->num_varyings ? g->varying.data_offset : dp->halt.code_offset);
@@ -727,6 +793,98 @@ emit_ppp(struct pvr_csb *csb, const char *what, uint64_t addr, const uint32_t *b
    g5p_dump("draw", what, addr, block, words);
 }
 
+/*
+ * The fragment program's uploads of one draw (the ICD's loader_data()): the
+ * words of each in one buffer, from the bound descriptor or the dynamic
+ * state; the loader data, their addresses then the DOUTD controls; and the
+ * PPP block that points at it (UNIFORMDATABASE). State the A9 has no words
+ * for (zero in the descriptor, pvr_g5p_tex.h) is refused by name.
+ */
+static VkResult
+fs_uploads(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_pipeline *g, uint32_t block[2],
+           uint64_t *block_va)
+{
+   const struct pvr_descriptor_state *ds = &cmd_buffer->state.gfx_desc_state;
+   const struct vk_dynamic_graphics_state *dyn = &cmd_buffer->vk.dynamic_graphics_state;
+   const unsigned n = g->fs_num_uploads;
+   uint32_t words[PVR_G5P_MAX_FS_UPLOADS][8] = { { 0 } }, data[4 * PVR_G5P_MAX_FS_UPLOADS];
+   struct pvr_suballoc_bo *bo;
+   struct pvr_pds_upload up;
+   VkResult result;
+
+   for (unsigned i = 0; i < n; i++) {
+      const struct pvr_g5p_upload *u = &g->fs_uploads[i];
+      uint32_t *out = words[i];
+
+      if (u->kind == PCO_G5P_UPLOAD_BLEND_CONSTANTS) {
+         float bc[4];
+         if (u->dwords != 4)
+            return G5P_REFUSE(cmd_buffer, "blend constants of %u dwords", u->dwords);
+         pvr_g5p_blend_constants(dyn->cb.blend_constants, bc);
+         memcpy(out, bc, sizeof(bc));
+         continue;
+      }
+      const struct pvr_descriptor_set *set = u->set < PVR_MAX_DESCRIPTOR_SETS ? ds->sets[u->set] : NULL;
+      if (!set || u->binding >= set->layout->binding_count)
+         return G5P_REFUSE(cmd_buffer, "fragment upload: set %u binding %u is not bound", u->set, u->binding);
+      const struct pvr_descriptor_set_layout_binding *lb = &set->layout->bindings[u->binding];
+      const uint32_t *desc = (const uint32_t *)((const uint8_t *)set->mapping + lb->offset);
+      switch (u->kind) {
+      case PCO_G5P_UPLOAD_IMAGE:
+         if (!pvr_g5p_tex_state_valid(desc))
+            return G5P_REFUSE(cmd_buffer, "set %u binding %u: a view without A9 texture state", u->set,
+                              u->binding);
+         memcpy(out, desc, 4 * u->dwords);
+         break;
+      case PCO_G5P_UPLOAD_SAMPLER:
+         /* a combined descriptor's sampler is at +32 (the upload's offset),
+          * a standalone sampler's at +0 */
+         if (lb->type != VK_DESCRIPTOR_TYPE_SAMPLER)
+            desc += u->offset / 4;
+         if (!pvr_g5p_sampler_valid(desc))
+            return G5P_REFUSE(cmd_buffer, "set %u binding %u: a sampler without A9 words", u->set, u->binding);
+         memcpy(out, desc, 4 * u->dwords);
+         break;
+      case PCO_G5P_UPLOAD_IMAGE_SIZE:
+         if (u->dwords != 4 || !pvr_g5p_tex_size(desc, u->offset, out))
+            return G5P_REFUSE(cmd_buffer, "set %u binding %u: an image size without A9 texture state", u->set,
+                              u->binding);
+         break;
+      default:
+         return G5P_REFUSE(cmd_buffer, "fragment upload kind %u", u->kind);
+      }
+   }
+   result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, words, sizeof(words[0]) * n, &bo);
+   if (result != VK_SUCCESS)
+      return result;
+   for (unsigned i = 0; i < n; i++) {
+      const struct pvr_g5p_upload *u = &g->fs_uploads[i];
+      const uint64_t src = bo->dev_addr.addr + sizeof(words[0]) * i;
+
+      data[2 * i] = (uint32_t)src;
+      data[2 * i + 1] = (uint32_t)(src >> 32);
+      data[2 * n + 2 * i] = doutd_control(u->common, u->dwords, i == n - 1);
+      data[2 * n + 2 * i + 1] = 0;
+   }
+   result = pvr_arch_cmd_buffer_upload_pds(cmd_buffer, data, 4 * n, 16, NULL, 0, 0, 16, &up);
+   if (result != VK_SUCCESS)
+      return result;
+   pvr_csb_pack (&block[0], TA_STATE_HEADER, h) {
+      h.pres_pds_state_ptr3 = true;
+   }
+   pvr_csb_pack (&block[1], TA_STATE_PDS_UNIFORMDATABASE, ub) {
+      ub.addr = PVR_DEV_ADDR(up.data_offset);
+   }
+   result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, block, 8, &bo);
+   if (result != VK_SUCCESS)
+      return result;
+   *block_va = bo->dev_addr.addr;
+   for (unsigned i = 0; i < n; i++)
+      g5p_dump("draw", "fs upload words", bo->dev_addr.addr, words[i], g->fs_uploads[i].dwords);
+   g5p_dump("draw", "uniform data", up.data_offset, data, 4 * n);
+   return VK_SUCCESS;
+}
+
 VkResult
 PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_draw *draw)
 {
@@ -833,10 +991,12 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
    }
    PPP_BLOCK(w, 2);
    /* 6. ISP: the colour-only form (no depth/stencil attachment); Apple's
-    * pass rule: a discarding program runs FAST_PUNCH_THROUGH, else OPAQUE */
+    * pass rule (pvr_g5p_blend.h): a program that reads the tile runs
+    * TRANSLUCENT, a discarding one punch-through, else OPAQUE */
    {
-      const enum ROGUE_TA_PASSTYPE pass =
-         g->fs_discard ? ROGUE_TA_PASSTYPE_FAST_PUNCH_THROUGH : ROGUE_TA_PASSTYPE_OPAQUE;
+      struct pvr_g5p_blend_isp isp;
+      pvr_arch_g5p_blend_isp(g->fs_blend_mode, g->fs_discard, g->fs_write_mask, false, &isp);
+      const enum ROGUE_TA_PASSTYPE pass = isp.pass_type;
       uint32_t lw = util_unsigned_fixed(dyn->rs.line.width, 4);
       lw = MIN2(lw ? lw - 1 : 0, 255);
       pvr_csb_pack (&w[0], TA_STATE_HEADER, h) {
@@ -847,8 +1007,9 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
          h.pres_ispctl_bb = true;
       }
       pvr_csb_pack (&w[1], TA_STATE_ISPCTL, ctl) {
-         ctl.upass = 15;
+         ctl.upass = isp.upass;
          ctl.bpres = true;
+         ctl.tagwritedisable = isp.tag_write_disable;
       }
       pvr_csb_pack (&w[2], TA_STATE_ISPA, fa) {
          fa.objtype = lines ? ROGUE_TA_OBJTYPE_LINE : ROGUE_TA_OBJTYPE_TRIANGLE;
@@ -947,6 +1108,15 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
       return result;
    const uint64_t ppp_va = ppp_bo->dev_addr.addr;
 
+   /* the fragment program's uploads: their data and PPP block */
+   uint32_t uniform_block[2];
+   uint64_t uniform_va = 0;
+   if (g->fs_num_uploads) {
+      result = fs_uploads(cmd_buffer, g, uniform_block, &uniform_va);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+
    /* the draw's words move whole into the next block when the stream fills
     * up mid-draw (pvr_csb's relocation mark) */
    struct pvr_csb *csb = &cs->current_sub_cmd->gfx.control_stream;
@@ -999,8 +1169,15 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
    g5p_dump("draw", "fs launch data", g->fs_launch.data_offset, pvr_bo_suballoc_get_map_addr(g->fs_launch.pvr_bo), 4);
    g5p_dump("draw", "fs launch code", g->fs_launch.code_offset,
             (const uint32_t *)pvr_bo_suballoc_get_map_addr(g->fs_launch.pvr_bo) + 8, g->fs_launch.code_size);
-   g5p_dump("draw", "uniform code", dp->halt.code_offset,
-            (const uint32_t *)pvr_bo_suballoc_get_map_addr(dp->halt.pvr_bo) + 4, 1);
+   if (g->fs_num_uploads) {
+      /* then, as in the ICD's draws, the per-draw loader data pointer */
+      emit_ppp(csb, "ppp uniform data", uniform_va, uniform_block, 2);
+      g5p_dump("draw", "uniform code", g->fs_loader.code_offset,
+               (const uint32_t *)pvr_bo_suballoc_get_map_addr(g->fs_loader.pvr_bo), g->fs_loader.code_size);
+   } else {
+      g5p_dump("draw", "uniform code", dp->halt.code_offset,
+               (const uint32_t *)pvr_bo_suballoc_get_map_addr(dp->halt.pvr_bo) + 4, 1);
+   }
    if (g->varying.pvr_bo) {
       const uint32_t *m = pvr_bo_suballoc_get_map_addr(g->varying.pvr_bo);
       g5p_dump("draw", "varying data", g->varying.data_offset, m, g->varying.data_size);
