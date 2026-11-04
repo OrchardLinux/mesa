@@ -357,6 +357,26 @@ static VkResult g5p_ws_buffer_create(struct pvr_winsys *ws_, uint64_t size, uint
 static VkResult g5p_ws_buffer_create_from_fd(struct pvr_winsys *ws_, int fd, struct pvr_winsys_bo **bo_out)
 {
    struct g5p_ws *ws = to_ws(ws_);
+   /* A dma-buf this winsys exported (a GBM buffer allocated through Zink, imported back by EGL, as labwc's first
+    * frame does): the kernel gives the same GEM handle back (drm_prime_lookup_buf_handle), so it is the same
+    * buffer. Return that BO, one more reference: a second BO would bind the object at a second VA and name the
+    * handle twice in a job, which the kernel refuses (g5p_render_resolve, duplicate handle: EINVAL). */
+   uint32_t handle;
+   if (!drmPrimeFDToHandle(ws->drm.fd, fd, &handle)) {
+      struct g5p_ws_bo *found = NULL;
+      simple_mtx_lock(&ws->lock);
+      list_for_each_entry (struct g5p_ws_bo, o, &ws->own_bos, link)
+         if (o->kbo.handle == handle) {
+            found = o;
+            p_atomic_inc(&o->refs);
+            break;
+         }
+      simple_mtx_unlock(&ws->lock);
+      if (found) {
+         *bo_out = &found->base;
+         return VK_SUCCESS;
+      }
+   }
    const off_t end = lseek(fd, 0, SEEK_END);
    if (end <= 0)
       return vk_error(NULL, VK_ERROR_INVALID_EXTERNAL_HANDLE);
