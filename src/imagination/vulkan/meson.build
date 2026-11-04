@@ -150,6 +150,7 @@ if with_imagination_g5p
     'pvr_arch_g5p_ds.c',
     'pvr_arch_g5p_msaa.c',
     'pvr_arch_g5p_mrt.c',
+    'pvr_arch_g5p_upload.c',
   )
   pvr_files += files(
     'pvr_g5p_image.c',
