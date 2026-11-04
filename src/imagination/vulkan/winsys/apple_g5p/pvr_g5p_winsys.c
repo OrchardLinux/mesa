@@ -36,6 +36,7 @@
 #include <unistd.h>
 
 #include "hwdef/rogue_hw_utils.h"
+#include "util/list.h"
 #include "util/macros.h"
 #include "util/simple_mtx.h"
 #include "util/u_atomic.h"
@@ -82,8 +83,11 @@ struct g5p_ws {
    unsigned chunk_count;
    struct util_vma_heap slices;
 
-   /* own kernel BOs: display buffers and imports */
+   /* own kernel BOs: display buffers and imports; every live one is listed in own_bos, because a job names
+    * them all as its resources (a swapchain image or an imported buffer the job may write or read) */
    struct util_vma_heap dedicated;
+   struct list_head own_bos;
+   unsigned own_count;
    bool vma_heaps_ready; /* slices and dedicated are initialized */
 
    struct pvr_winsys_heap general_heap, pds_heap, usc_heap, vis_test_heap, transfer_frag_heap;
@@ -96,8 +100,17 @@ struct g5p_ws_bo {
    uint64_t alloc_size;
    bool own; /* an own kernel BO (display buffer or import) */
    struct g5p_drm_bo kbo;
+   struct list_head link; /* in g5p_ws::own_bos, while own */
    int refs;
 };
+
+static void g5p_ws_own_list(struct g5p_ws *ws, struct g5p_ws_bo *b)
+{
+   simple_mtx_lock(&ws->lock);
+   list_addtail(&b->link, &ws->own_bos);
+   ws->own_count++;
+   simple_mtx_unlock(&ws->lock);
+}
 
 struct g5p_ws_vma {
    struct pvr_winsys_vma base;
@@ -286,6 +299,7 @@ static VkResult g5p_ws_own_create(struct g5p_ws *ws, uint64_t size, struct g5p_w
    b->va = va;
    b->cpu = b->kbo.map;
    b->alloc_size = alloc;
+   g5p_ws_own_list(ws, b);
    return VK_SUCCESS;
 }
 
@@ -356,6 +370,7 @@ static VkResult g5p_ws_buffer_create_from_fd(struct pvr_winsys *ws_, int fd, str
    b->cpu = b->kbo.map;
    b->alloc_size = alloc;
    b->base.is_imported = true;
+   g5p_ws_own_list(ws, b);
    *bo_out = &b->base;
    return VK_SUCCESS;
 }
@@ -369,6 +384,8 @@ static void g5p_ws_buffer_destroy(struct pvr_winsys_bo *bo)
    simple_mtx_lock(&ws->lock);
    if (b->own) {
       const uint64_t va = b->va;
+      list_del(&b->link);
+      ws->own_count--;
       if (g5p_drm_bo_destroy(&ws->drm, &b->kbo))
          mesa_logw("apple_g5p: own BO at %#" PRIx64 " not released (context busy); its VA stays reserved", va);
       else
@@ -557,11 +574,28 @@ static VkResult g5p_ws_render_submit(const struct pvr_winsys_render_ctx *ctx,
    }
    simple_mtx_unlock(&ws->lock);
 
-   struct drm_g5p_render_resource res[G5P_WS_MAX_CHUNKS];
+   /* the arena's chunks, then every own BO (display buffers, imports): the job may write a swapchain image or
+    * read an imported buffer. A shared one (imported or exported dma-buf) is IMPLICIT|CACHE: the kernel fences
+    * it in its dma_resv, which is what a compositor waits on, and does its cache maintenance. Every own BO is
+    * named, not just the job's own: correct, at the cost of fencing buffers the job doesn't touch. */
+   struct drm_g5p_render_resource res[DRM_G5P_RENDER_MAX_RESOURCES];
+   unsigned nres = 0;
    for (unsigned i = 0; i < ws->chunk_count; i++)
-      res[i] = (struct drm_g5p_render_resource){
+      res[nres++] = (struct drm_g5p_render_resource){
          .handle = ws->chunks[i].handle, .va = ws->chunks[i].va, .size = ws->chunks[i].size,
          .kind = DRM_G5P_RENDER_ACCESS_READ | DRM_G5P_RENDER_ACCESS_WRITE | DRM_G5P_RENDER_ACCESS_CACHE};
+   simple_mtx_lock(&ws->lock);
+   if (ws->chunk_count + ws->own_count > ARRAY_SIZE(res)) {
+      simple_mtx_unlock(&ws->lock);
+      return g5p_ws_refuse(VK_ERROR_OUT_OF_DEVICE_MEMORY, "%u own BOs: more than a job's %u resources",
+                           ws->own_count, (unsigned)ARRAY_SIZE(res) - ws->chunk_count);
+   }
+   list_for_each_entry (struct g5p_ws_bo, b, &ws->own_bos, link)
+      res[nres++] = (struct drm_g5p_render_resource){
+         .handle = b->kbo.handle, .va = b->va, .size = b->kbo.size,
+         .kind = DRM_G5P_RENDER_ACCESS_READ | DRM_G5P_RENDER_ACCESS_WRITE | DRM_G5P_RENDER_ACCESS_CACHE |
+                 (b->kbo.shared ? DRM_G5P_RENDER_ACCESS_IMPLICIT : 0)};
+   simple_mtx_unlock(&ws->lock);
 
    /* waits (the two stages' waits), then the signal: the kernel takes one per job, so the fragment stage's is
     * signalled and the geometry stage's gets the same fence afterwards (a G5P job is one TA + 3D pass) */
@@ -578,10 +612,10 @@ static VkResult g5p_ws_render_submit(const struct pvr_winsys_render_ctx *ctx,
 
    if (getenv("PVR_G5P_WS_LOG"))
       fprintf(stderr, "apple_g5p render: %ux%u rt %u ctx %u vdm %#" PRIx64 "+%u ta %#" PRIx64 " bgnd %08x %08x %08x %08x "
-              "eot %08x %08x %08x, %u syncs\n", rt->width, rt->height, rt->handle, c->context,
+              "eot %08x %08x %08x, %u syncs, %u resources\n", rt->width, rt->height, rt->handle, c->context,
               (uint64_t)pass.base.vdm_va, pass.base.vdm_size, (uint64_t)pass.ta_program_va, pass.base.background[0],
               pass.base.background[1], pass.base.background[4], pass.base.background[6], pass.base.eot[0],
-              pass.base.eot[1], pass.base.eot[2], n);
+              pass.base.eot[1], pass.base.eot[2], n, nres);
    if (getenv("PVR_G5P_WS_LOG")) {
       /* the words the pass points at, through the arena's CPU mapping (the step-6 comparison reads these) */
       const uint32_t bg0 = pass.base.background[0], bg_tex = pass.base.background[1], bg_uni = pass.base.background[4];
@@ -608,7 +642,7 @@ static VkResult g5p_ws_render_submit(const struct pvr_winsys_render_ctx *ctx,
       }
    }
    uint64_t job_id = 0;
-   r = g5p_drm_submit_render_typed(&ws->drm, c->context, rt->handle, &pass, res, ws->chunk_count, syncs, n,
+   r = g5p_drm_submit_render_typed(&ws->drm, c->context, rt->handle, &pass, res, nres, syncs, n,
                                    &job_id);
    if (r)
       return g5p_ws_refuse(r == -ENOMEM ? VK_ERROR_OUT_OF_DEVICE_MEMORY : VK_ERROR_DEVICE_LOST,
@@ -788,6 +822,7 @@ VkResult pvr_g5p_winsys_create(int render_fd, int display_fd, const VkAllocation
    if (!ws)
       return vk_error(NULL, VK_ERROR_OUT_OF_HOST_MEMORY);
    simple_mtx_init(&ws->lock, mtx_plain);
+   list_inithead(&ws->own_bos);
    ws->base.ops = &g5p_ws_ops;
    ws->base.alloc = alloc;
    ws->base.render_fd = render_fd;
