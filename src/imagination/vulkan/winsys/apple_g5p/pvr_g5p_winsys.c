@@ -38,6 +38,7 @@
 #include "hwdef/rogue_hw_utils.h"
 #include "util/list.h"
 #include "util/macros.h"
+#include "util/os_time.h"
 #include "util/simple_mtx.h"
 #include "util/u_atomic.h"
 #include "util/u_math.h"
@@ -537,6 +538,10 @@ struct g5p_ws_rt {
 struct g5p_ws_render_ctx {
    struct pvr_winsys_render_ctx base;
    uint32_t context; /* 0: not created */
+   /* a syncobj holding the fence of the context's last job (0: none yet): the
+    * kernel creates a render target only on an idle context, so a new size
+    * waits on it (g5p_ws_rt_create_idle()) */
+   uint32_t last;
 };
 
 static VkResult g5p_ws_rt_dataset_create(struct pvr_winsys *ws, const struct pvr_winsys_rt_dataset_create_info *info,
@@ -583,7 +588,43 @@ static void g5p_ws_render_ctx_destroy(struct pvr_winsys_render_ctx *ctx)
    struct g5p_ws_render_ctx *c = container_of(ctx, struct g5p_ws_render_ctx, base);
    if (c->context)
       g5p_drm_render_context_destroy(&to_ws(ctx->ws)->drm, c->context);
+   if (c->last)
+      drmSyncobjDestroy(ctx->ws->render_fd, c->last);
    vk_free(ctx->ws->alloc, c);
+}
+
+/* CREATE_RENDER_TARGET on the context, with the ws lock held. The kernel
+ * edits a render context's VM for a new target only while no job of it is
+ * queued (g5p_render_vm_idle(): EBUSY otherwise, "G5P VM_BIND
+ * busy=render-idle" in dmesg). A compositor's new framebuffer size comes while
+ * its previous frame is in flight, so on EBUSY this waits for the context's
+ * last job (c->last) with the lock dropped, and tries again: 2 s at most,
+ * the kernel's own job timeout. Other errors, and an EBUSY that outlasts the
+ * wait (a recovery, a bad context), are returned as they are. */
+static int g5p_ws_rt_create_idle(struct g5p_ws *ws, struct g5p_ws_render_ctx *c, struct g5p_ws_rt *rt)
+{
+   const int64_t deadline = os_time_get_nano() + 2000000000ll;
+   unsigned waits = 0;
+   int r;
+
+   while ((r = g5p_drm_render_target_create(&ws->drm, c->context, rt->width, rt->height, MAX2(rt->samples, 1),
+                                            MAX2(rt->layers, 1), &rt->handle)) == -EBUSY &&
+          os_time_get_nano() < deadline) {
+      const uint32_t last = c->last;
+      simple_mtx_unlock(&ws->lock);
+      if (last)
+         drmSyncobjWait(ws->base.render_fd, (uint32_t *)&last, 1, deadline, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL);
+      else
+         os_time_sleep(1000);
+      /* the kernel drops its queued count before it signals: a short pause after the fence */
+      if (++waits > 1)
+         os_time_sleep(1000);
+      simple_mtx_lock(&ws->lock);
+   }
+   if (waits && getenv("PVR_G5P_WS_LOG"))
+      fprintf(stderr, "apple_g5p render: CREATE_RENDER_TARGET %ux%u waited for the context to idle (%u waits): %s\n",
+              rt->width, rt->height, waits, r ? strerror(-r) : "created");
+   return r;
 }
 
 /* PVR_G5P_WS_LOG: n dwords at a base-relative offset of the arena */
@@ -647,8 +688,7 @@ static VkResult g5p_ws_render_submit(const struct pvr_winsys_render_ctx *ctx,
       rt->handle = 0;
    }
    if (!rt->handle) {
-      r = g5p_drm_render_target_create(&ws->drm, c->context, rt->width, rt->height, MAX2(rt->samples, 1),
-                                       MAX2(rt->layers, 1), &rt->handle);
+      r = g5p_ws_rt_create_idle(ws, c, rt);
       if (r) {
          simple_mtx_unlock(&ws->lock);
          return g5p_ws_refuse(VK_ERROR_OUT_OF_DEVICE_MEMORY, "CREATE_RENDER_TARGET %ux%u: %s", rt->width,
@@ -739,6 +779,12 @@ static VkResult g5p_ws_render_submit(const struct pvr_winsys_render_ctx *ctx,
        drmSyncobjTransfer(ws->base.render_fd, vk_sync_as_drm_syncobj(geom)->syncobj, 0,
                           vk_sync_as_drm_syncobj(frag)->syncobj, 0, 0))
       return g5p_ws_refuse(VK_ERROR_DEVICE_LOST, "the geometry signal (SYNCOBJ_TRANSFER): %s", strerror(errno));
+   /* the job's fence into the context's last-job syncobj, for the next new render target. A job without a
+    * signal leaves the old one; g5p_ws_rt_create_idle() then also retries on a timer. */
+   simple_mtx_lock(&ws->lock);
+   if (signal && (c->last || !drmSyncobjCreate(ws->base.render_fd, 0, &c->last)))
+      drmSyncobjTransfer(ws->base.render_fd, c->last, 0, vk_sync_as_drm_syncobj(signal)->syncobj, 0, 0);
+   simple_mtx_unlock(&ws->lock);
    return VK_SUCCESS;
 }
 
