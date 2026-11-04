@@ -25,7 +25,7 @@ Run names are retained so a missing result is not replaced with an inference.
 | Vertex input | `vtxin-71fa6eb573e`, `device-run-13`: **45/45** | Fetch byte/norm conversion, firstInstance, divisor 0/1/>1, restart sentinels, point-size output ordering | recipe and API-only `tests/vertex-input`; no untested vertex-format/divisor caps added |
 | Formats slice 1 + ETC2/EAC | `formats-aaabb7a16da/device-run`: **118/118**, then **39/39 probes**, every rung 4096 pixels exact | G9P texture/PBE format interpretation; integer sampler result bits; compressed block order and mip padding | exact slice-1 test source in `tests/formats`; no G5P descriptor table or cap promotions copied |
 | 4x MSAA | `dsms-1aff46dae07/device-run-ms`: **8/8**, one/resolve/depth alongside depth controls; old standalone implementation has additional cases | Kernel render-target dataset/sample positions before userspace PBE/EOT sample-rate state | partial G9P implementation retained; test its supported subset first, not full sample-mask/a2c support |
-| CPU transfer then vkMapMemory | G5P fix `0eed6eda1c3` (publication `327241fcbd1`), encountered after CPU texture uploads | Copy to previously unmapped memory, then map/read exact bytes; buffer and image | normal-map fix adapted, `tests/memory` regression added; no new A10 run |
+| CPU transfer then vkMapMemory | G5P fix `0eed6eda1c3` (publication `327241fcbd1`), encountered after CPU texture uploads | Copy to previously unmapped memory, then map/read exact bytes; buffer and image | implementation excluded: no dedicated A9 device PASS for this map regression was located; keep the recipe below |
 | Duplicate GEM import | G5P `c8b91b29e97`, fixes the compositor's first-frame duplicate-handle refusal | Export a BO and re-import it; same DRM file must acquire the existing BO, not a second wrapper/binding | already implemented in G9P's DRM winsys; no duplicate patch added |
 
 The map fix and duplicate-import fix are traced to concrete code changes and
@@ -168,9 +168,11 @@ cap promotions.
 `pvr_arch_g9p_cpu_addr()` in the existing G9P CPU transfer path leaves BOs mapped.
 The application's first normal vkMapMemory must reuse that mapping. Calling
 pvr_drm_winsys_buffer_map again would assert because that winsys requires an
-unmapped BO. The new option-gated normal-map hook returns the mapped base plus
-the requested offset; placed-address behavior is unchanged. Run both cases of
-`tests/memory/build/map-after-transfer` on A10.
+unmapped BO. A normal-map adaptation would return the mapped base plus the requested offset;
+a placed-address request needs separate treatment. That implementation and its
+new regression are deliberately not included: the publication rule requires a
+dedicated A9 device PASS, which was not located for this map regression. The
+source fix and recipe are retained as pointers, not a passed feature.
 
 Duplicate-GEM-handle import is already handled by
 `winsys/powervr/pvr_drm_bo.c:pvr_drm_winsys_buffer_create_from_fd`: the dmabuf lock
@@ -180,9 +182,13 @@ by G5P commit c8b91b29e97; G9P should retain its existing implementation. Verify
 export/re-import identity and balanced references, including concurrent imports,
 but do not add a second deduplication table.
 
-## Deliberately not enabled
+## Not included (and why)
 
-Depth sampling, XFB queries and the newer A9 vertex/format capabilities above
+The map-after-CPU-transfer fix has no dedicated A9 device PASS located for its
+new regression; its local candidate is not part of this series. Duplicate-GEM
+deduplication is already in upstream main and requires no extra patch.
+
+Depth sampling, XFB queries and the newer A9 vertex/format driver capabilities above
 remain G9P follow-through work. D24S8 stays disabled: the A10 X8_D24 path had
 crashed the firmware in the original notes. D32F_S8 is the tested substitute on
 A9, not an A10 proof. MSAA is partial: the existing one/resolve/depth/store/
