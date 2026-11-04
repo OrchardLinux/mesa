@@ -54,7 +54,7 @@
 #include "vk_format.h"
 #include "vk_log.h"
 #include "vk_util.h"
-
+#include "pvr_g5p_publish_hooks.h"
 uint32_t pvr_get_pbe_accum_format_size_in_bytes(VkFormat vk_format)
 {
    enum pvr_pbe_accum_format pbe_accum_format;
@@ -455,7 +455,7 @@ pvr_get_buffer_format_features2(struct pvr_physical_device *pdevice,
 
    if (pvr_format->bind & PVR_BIND_VERTEX_BUFFER)
       flags |= VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT;
-
+   PVR_G5P_HOOK(pub_pvr_formats_432)
    if (vk_format_is_scaled(vk_format))
       /*
     * G9P: no texel buffers yet. Mesa's PBO path samples one when it is offered, and

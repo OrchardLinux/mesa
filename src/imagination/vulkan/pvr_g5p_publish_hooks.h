@@ -145,6 +145,14 @@
       simple_mtx_unlock(&device->g9p_vmas.lock); \
    }
 
+#define PVR_G5P_HOOK_pub_pvr_formats_432() \
+   /* G5P fetches 32-bit float vertex attributes only so far: advertise no \
+    * other vertex format, so that Zink converts the rest itself */ \
+   if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g5p) && vk_format != VK_FORMAT_R32_SFLOAT && \
+       vk_format != VK_FORMAT_R32G32_SFLOAT && vk_format != VK_FORMAT_R32G32B32_SFLOAT && \
+       vk_format != VK_FORMAT_R32G32B32A32_SFLOAT) \
+      flags &= ~VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT;
+
 #define PVR_G5P_HOOK_pub_pvr_image_347() \
    /* G5P: the A9's colour layouts (pvr_g5p_image.c) */ \
    if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p)) \
