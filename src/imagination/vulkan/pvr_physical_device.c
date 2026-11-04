@@ -36,7 +36,7 @@
 #include "pvr_macros.h"
 #include "pvr_winsys.h"
 #include "pvr_wsi.h"
-
+#include "pvr_g5p_publish_hooks.h"
 #define VK_VENDOR_ID_IMAGINATION 0x1010
 
 void pvr_physical_device_dump_info(const struct pvr_physical_device *pdevice,
@@ -1271,7 +1271,7 @@ VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
                          "Failed to collect physical device properties");
       goto err_pvr_winsys_destroy;
    }
-   PVR_G5P_HOOK(msaa_limits, pdevice, &supported_properties)
+   PVR_G5P_HOOK(pub_pvr_physical_device_1275)
    /*
     * G9P: host image copies through the driver's CPU copies (all its memory
     * is CPU-visible; pvr_arch_g9p_transfer.c)
