@@ -384,6 +384,9 @@ PVR_PER_ARCH(g5p_device_init)(struct pvr_device *device)
    simple_mtx_init(&device->g9p_vmas.lock, mtx_plain);
    util_dynarray_init(&device->g9p_vmas.vmas, NULL);
 
+   /* vkCmdClearAttachments' clear quad: its pipelines are made at first use (pvr_arch_g5p_gfx.c) */
+   simple_mtx_init(&device->g5p->clear_lock, mtx_plain);
+
    VkResult result = g5p_upload_programs(device, &device->g5p->programs);
    if (result != VK_SUCCESS)
       PVR_PER_ARCH(g5p_device_finish)(device);
@@ -395,6 +398,14 @@ PVR_PER_ARCH(g5p_device_finish)(struct pvr_device *device)
 {
    if (!device->g5p)
       return;
+
+   /* the clear quad's pipelines and their layout */
+   const VkDevice vk_dev = pvr_device_to_handle(device);
+   for (unsigned i = 0; i < device->g5p->clear_count; i++)
+      device->vk.dispatch_table.DestroyPipeline(vk_dev, device->g5p->clear[i].pipeline, NULL);
+   if (device->g5p->clear_layout)
+      device->vk.dispatch_table.DestroyPipelineLayout(vk_dev, device->g5p->clear_layout, NULL);
+   simple_mtx_destroy(&device->g5p->clear_lock);
 
    g5p_free_programs(&device->g5p->programs);
    util_dynarray_fini(&device->g9p_vmas.vmas);
