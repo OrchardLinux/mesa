@@ -36,6 +36,7 @@
 #include "pvr_csb.h"
 #include "pvr_device.h"
 #include "pvr_g5p.h"
+#include "pvr_g5p_ds.h"
 #include "pvr_hw_pass.h"
 #include "pvr_image.h"
 #include "pvr_job_render.h"
@@ -330,10 +331,17 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
    case 4: v = 2; break;
    default: return G5P_REFUSE(cmd_buffer, "%u colour targets (1, 2 or 4 are built)", n);
    }
-   if (hw_render->ds_attach_idx != VK_ATTACHMENT_UNUSED)
-      return G5P_REFUSE(cmd_buffer, "a depth/stencil attachment (ZLS words are step 7)");
+   /* a depth/stencil attachment: what the ZLS builds (pvr_arch_g5p_ds.c) */
+   VkResult admit = pvr_arch_g5p_ds_admit(cmd_buffer, hw_render);
+   if (admit != VK_SUCCESS)
+      return admit;
    if (hw_render->sample_count > 1)
-      return G5P_REFUSE(cmd_buffer, "%u samples", hw_render->sample_count);
+      return G5P_REFUSE(cmd_buffer, "%u samples (4x: the pass's MSAA fields are not wired yet)",
+                        hw_render->sample_count);
+   /* the render's depth-bias table (upstream's, uploaded before this hook):
+    * the kernel takes its entries from ISP_DBIAS_BASE */
+   if (sub_cmd->depth_bias_bo)
+      g->dbias_count = sub_cmd->depth_bias_bo->size / sizeof(struct pvr_depth_bias_state);
 
    /* the control stream: one block, through STREAM_TERMINATE */
    struct pvr_csb *csb = &sub_cmd->control_stream;
@@ -481,8 +489,19 @@ PVR_PER_ARCH(g5p_frag_stream)(const struct pvr_device *device, const struct pvr_
    e->scissor_count = MIN2(G5P_SCISSOR_POOL_BYTES / 8, DRM_G5P_RENDER_MAX_TABLE_ENTRIES);
    e->dbias_va = p->dbias_pool->dev_addr.addr;
    e->dbias_count = MIN2(G5P_DBIAS_POOL_BYTES / 12, DRM_G5P_RENDER_MAX_TABLE_ENTRIES);
-   e->bgobj_depth = 0x3f800000; /* 1.0f: no depth attachment */
-   e->bgobj_vals = 0x300;
+   /* the depth/stencil attachment's ZLS words and background object
+    * (pvr_arch_g5p_ds.c; without one, depth 1.0f and tag | mask) */
+   struct pvr_g5p_zls_words zls;
+   pvr_arch_g5p_ds_pass(job, &zls);
+   memcpy(e->zls, zls.zls, sizeof(e->zls));
+   e->zls_address_mask = zls.address_mask;
+   e->bgobj_depth = zls.bgobj_depth;
+   e->bgobj_vals = zls.bgobj_vals;
+   /* the draws' depth-bias entries: upstream's per-render table */
+   if (g->dbias_count && job->depth_bias_table_addr.addr) {
+      e->dbias_va = job->depth_bias_table_addr.addr;
+      e->dbias_count = MIN2(g->dbias_count, DRM_G5P_RENDER_MAX_TABLE_ENTRIES);
+   }
    e->pixel_output_width = g5p_mrt_pixel_width(g->targets);
 
    pass.ta_program_va = device->heaps.pds_heap->base_addr.addr + p->ta_kick.data_offset;

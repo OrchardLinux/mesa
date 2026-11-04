@@ -47,6 +47,7 @@
 #include "pvr_g5p_blend.h"
 #include "pvr_g5p_tex.h"
 #include "pvr_g5p_tex_encode.h"
+#include "pvr_g5p_ds.h"
 #include "pvr_pass.h"
 #include "pvr_pipeline.h"
 
@@ -436,8 +437,9 @@ g5p_check_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo *c
       return G5P_REFUSE(device, "%u colour attachments (rung A: 1)", colors);
    if (cf != VK_FORMAT_B8G8R8A8_UNORM && cf != VK_FORMAT_R8G8B8A8_UNORM)
       return G5P_REFUSE(device, "colour attachment format %s", vk_Format_to_str(cf));
-   if (ds)
-      return G5P_REFUSE(device, "a depth/stencil attachment (rung A has none)");
+   /* a depth/stencil attachment: the ZLS formats (pvr_g5p_ds.c), no depth bounds */
+   if (ds && s->ds && s->ds->depth.bounds_test.enable)
+      return G5P_REFUSE(device, "a depth bounds test");
    /* blending and the write mask compile into the fragment program
     * (pvr_g5p_blend.h) */
    *key = PCO_G5P_FS_KEY_DEFAULT;
@@ -940,6 +942,19 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
    /* flat varyings take vertex 0; a fan's first vertex is the hardware's vertex 1 */
    if (dyn->ia.primitive_topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN && g->fs_flat)
       return G5P_REFUSE(cmd_buffer, "flat varyings with a triangle fan");
+   /* a depth/stencil attachment: its tests and bias (pvr_arch_g5p_ds.c) */
+   const VkImageAspectFlags ds_aspects = pvr_arch_g5p_ds_aspects(cmd_buffer);
+   const bool dbias = ds_aspects && dyn->rs.depth_bias.enable;
+   uint32_t dbias_index = 0;
+   if (ds_aspects && g->fs_discard && (dyn->ds.depth.test_enable || dyn->ds.stencil.test_enable))
+      return G5P_REFUSE(cmd_buffer, "a discarding program under a depth/stencil test (no capture of the pass)");
+   if ((ds_aspects & VK_IMAGE_ASPECT_DEPTH_BIT) && dyn->ds.depth.bounds_test.enable)
+      return G5P_REFUSE(cmd_buffer, "a depth bounds test");
+   if (dbias) {
+      result = pvr_arch_g5p_ds_bias(cmd_buffer, dyn, &dbias_index);
+      if (result != VK_SUCCESS)
+         return result;
+   }
 
    /* 3. the vertex fetch data: bases, controls, strides, the DOUTU word */
    uint32_t fdata[4 * 2 * PVR_G5P_MAX_FETCH + 4] = { 0 };
@@ -1030,6 +1045,9 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
          ba.pointlinewidth = lw;
       }
       w[5] = 0;
+      /* with a depth/stencil attachment: its tests, Apple's face form */
+      if (ds_aspects)
+         pvr_arch_g5p_ds_isp(dyn, ds_aspects, 1, lines, pass, false, dbias, false, &w[1]);
       PPP_BLOCK(w, 6);
    }
    /* 7. region clip (32-pixel tiles) and the viewport */
@@ -1073,13 +1091,13 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
       }
       PPP_BLOCK(w, 3);
    }
-   /* 9. depth bias and scissor indices: none */
+   /* 9. depth bias and scissor indices: the draw's depth-bias entry, no scissor table */
    {
       pvr_csb_pack (&w[0], TA_STATE_HEADER, h) {
          h.pres_ispctl_dbsc = true;
       }
       pvr_csb_pack (&w[1], TA_STATE_ISPDBSC, dbsc) {
-         dbsc.dbindex = 0;
+         dbsc.dbindex = dbias_index;
          dbsc.scindex = 0;
       }
       PPP_BLOCK(w, 2);
