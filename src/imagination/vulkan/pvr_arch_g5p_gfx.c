@@ -48,6 +48,7 @@
 #include "pvr_g5p_mrt.h"
 #include "pvr_g5p_tex.h"
 #include "pvr_g5p_tex_encode.h"
+#include "pvr_g5p_upload.h"
 #include "pvr_g5p_ds.h"
 #include "pvr_g5p_msaa.h"
 #include "pvr_pass.h"
@@ -490,6 +491,7 @@ g5p_pipeline_free(struct pvr_device *device, struct pvr_g5p_pipeline *g)
    pvr_bo_suballoc_free(g->fs_launch.pvr_bo);
    pvr_bo_suballoc_free(g->varying.pvr_bo);
    pvr_bo_suballoc_free(g->fs_loader.pvr_bo);
+   pvr_arch_g5p_vs_uploads_destroy(device, g->vs_uploads);
    pvr_bo_suballoc_free(g->static_vary);
    pvr_bo_suballoc_free(g->static_frag);
    vk_free(&device->vk.alloc, g);
@@ -549,8 +551,10 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
       if (!vs->vout_dword[fs->vary[i].location])
          return G5P_REFUSE(device, "the fragment program reads VAR%u, which the vertex program does not write",
                            fs->vary[i].location);
-   if (vs->num_uploads)
-      return G5P_REFUSE(device, "%u vertex-stage common-store uploads (not built)", vs->num_uploads);
+   /* the vertex program's common-store uploads and their loader (pvr_g5p_upload.h) */
+   VkResult up_result = pvr_arch_g5p_vs_uploads_create(device, vs, &g->vs_uploads);
+   if (up_result != VK_SUCCESS)
+      return up_result;
    static_assert(PCO_G5P_MAX_UPLOADS <= PVR_G5P_MAX_FS_UPLOADS, "G5P upload list");
    for (unsigned i = 0; i < fs->num_uploads; i++) {
       const struct pco_g5p_upload *u = &fs->uploads[i];
@@ -1178,6 +1182,14 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
          return result;
    }
 
+   /* the vertex program's uploads: their sources, loader data and PDS_STATE words */
+   struct pvr_g5p_vs_upload_draw vs_up = { 0 };
+   if (g->vs_uploads) {
+      result = pvr_arch_g5p_vs_uploads_draw(cmd_buffer, g->vs_uploads, &vs_up);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+
    /* the draw's words move whole into the next block when the stream fills
     * up mid-draw (pvr_csb's relocation mark) */
    struct pvr_csb *csb = &cs->current_sub_cmd->gfx.control_stream;
@@ -1212,6 +1224,10 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
 
       /* 2. the varying format */
       emit_ppp(csb, "ppp varying", g->static_vary->dev_addr.addr, g->static_vary_words, 4);
+
+      /* 2b. the vertex program's common store: its loader (pvr_g5p_upload.h) */
+      if (g->vs_uploads)
+         emit_words(csb, "vdm pds state", vs_up.pds_state, 3);
 
       /* 3. the fetch data */
       pvr_csb_pack (&w[0], VDMCTRL_VDM_STATE0, v0) {
