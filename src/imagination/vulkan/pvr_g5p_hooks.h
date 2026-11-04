@@ -29,6 +29,7 @@
 #   include "pvr_g5p_tex.h"
 #   include "pvr_g5p_xfb.h"
 #   include "pvr_g5p_memory.h"
+#   include "pvr_g5p_spm.h"
 #endif
 
 /* pvr_arch_image.c, pvr_CreateImageView(): the sampled state of a view is
@@ -111,6 +112,17 @@
          *(data) = (uint8_t *)(mem)->bo->map + (offset);                  \
       return r_;                                                          \
    }
+
+/* pvr_arch_framebuffer.c: experimental omission of unreachable generic SPM
+ * allocations only. Keep zeroed per-render states for unconditional cleanup.
+ * The existing G9P and generic branches remain unchanged.
+ */
+#define PVR_G5P_HOOK_spm_scratch(device, rstate)                         \
+   if (PVR_HAS_FEATURE(&(device)->pdevice->dev_info, apple_g5p) &&        \
+       pvr_g5p_spm_skip()) { (rstate)->scratch_buffer = NULL; } else
+#define PVR_G5P_HOOK_spm_render(device)                                 \
+   if (!PVR_HAS_FEATURE(&(device)->pdevice->dev_info, apple_g5p) ||       \
+       !pvr_g5p_spm_skip())
 
 /* Application memory only: internal programs and control streams keep GPU type. */
 #define PVR_G5P_HOOK_memory_bo_type(device, info, type)                     \

@@ -91,6 +91,7 @@ struct g5p_ws_perf {
    /* PVR_G5P_PERF_LOG: totals since the last summary line */
    uint64_t jobs, pre_bytes, post_bytes, own_listed, own_written, submit_ns, writes_known, drawless, drawless_noclear,
       reads_known, own_omitted;
+   uint64_t arena_pre_bytes, arena_post_bytes; /* own = total minus arena */
    bool last_known;    /* the last job's writes were known (the per-job line) */
    bool last_reads;    /* the last job's reads were known */
    unsigned last_omitted; /* own BOs the last job did not list */
@@ -118,6 +119,9 @@ bool g5p_ws_perf_chunk(const struct g5p_ws_perf *p, uint64_t va, uint64_t size, 
 /* the access kind of an own BO [va, va + size) in this job; 0: the job doesn't touch it, don't list it */
 uint32_t g5p_ws_perf_own_kind(struct g5p_ws_perf *p, const struct g5p_ws_perf_job *j, uint64_t va, uint64_t size,
                               bool shared);
+/* Level3 only: bounded diagnostic run, one receipt per listed resource. */
+void g5p_ws_perf_resource(const struct g5p_ws_perf *p, const struct drm_g5p_render_resource *res,
+                           const char *category);
 uint64_t g5p_ws_perf_now(void);
 /* after the submit ioctl that started at t0 (g5p_ws_perf_now()) */
 void g5p_ws_perf_account(struct g5p_ws_perf *p, const struct drm_g5p_render_resource *res, unsigned n,

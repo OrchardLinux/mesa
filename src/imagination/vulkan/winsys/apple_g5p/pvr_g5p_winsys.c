@@ -1094,6 +1094,8 @@ static VkResult g5p_ws_render_submit(const struct pvr_winsys_render_ctx *ctx,
             .handle = ws->chunks[i].handle, .offset = off, .va = ws->chunks[i].va + off, .size = len,
             .kind = DRM_G5P_RENDER_ACCESS_READ | DRM_G5P_RENDER_ACCESS_WRITE | DRM_G5P_RENDER_ACCESS_CACHE};
    }
+   for (unsigned i = 0; i < nres; i++)
+      g5p_ws_perf_resource(&ws->perf, &res[i], "arena");
    const unsigned nchunks = nres;
    if (ws->chunk_count + ws->own_count > ARRAY_SIZE(res)) {
       simple_mtx_unlock(&ws->lock);
@@ -1103,9 +1105,13 @@ static VkResult g5p_ws_render_submit(const struct pvr_winsys_render_ctx *ctx,
    list_for_each_entry (struct g5p_ws_bo, b, &ws->own_bos, link) {
       /* 0: the job neither writes nor reads it (g5p_ws_perf.h): not listed, no maintenance, no fence */
       const uint32_t kind = g5p_ws_perf_own_kind(&ws->perf, &pj, b->va, b->kbo.size, b->kbo.shared);
-      if (kind)
+      if (kind) {
          res[nres++] = (struct drm_g5p_render_resource){
             .handle = b->kbo.handle, .va = b->va, .size = b->kbo.size, .kind = kind};
+         g5p_ws_perf_resource(&ws->perf, &res[nres - 1], b->data_only
+                                ? (b->dedicated_image ? "image-data" : "data")
+                                : (b->kbo.shared ? "shared" : "display"));
+      }
    }
    simple_mtx_unlock(&ws->lock);
 

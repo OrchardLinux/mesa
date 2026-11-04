@@ -142,21 +142,34 @@ g5p_ws_perf_now(void)
 }
 
 void
+g5p_ws_perf_resource(const struct g5p_ws_perf *p, const struct drm_g5p_render_resource *r,
+                       const char *category)
+{
+   if (p->log < 3)
+      return;
+   fprintf(stderr, "G5P perf resource job=%" PRIu64 " class=%s handle=%u offset=%" PRIu64
+           " bytes=%" PRIu64 " access=%#x\n", p->jobs + 1, category, r->handle,
+           (uint64_t)r->offset, (uint64_t)r->size, r->kind);
+}
+
+void
 g5p_ws_perf_account(struct g5p_ws_perf *p, const struct drm_g5p_render_resource *res, unsigned n, unsigned chunks,
                     uint64_t t0)
 {
    if (!p->log)
       return;
    const uint64_t ns = g5p_ws_perf_now() - t0;
-   uint64_t pre = 0, post = 0;
+   uint64_t pre = 0, post = 0, arena_pre = 0, arena_post = 0;
    unsigned own_w = 0;
 
    for (unsigned i = 0; i < n; i++) {
       if (!(res[i].kind & DRM_G5P_RENDER_ACCESS_CACHE))
          continue;
       pre += res[i].size;
+      if (i < chunks) arena_pre += res[i].size;
       if (res[i].kind & DRM_G5P_RENDER_ACCESS_WRITE) {
          post += res[i].size;
+         if (i < chunks) arena_post += res[i].size;
          own_w += i >= chunks;
       }
    }
@@ -167,6 +180,8 @@ g5p_ws_perf_account(struct g5p_ws_perf *p, const struct drm_g5p_render_resource 
               n, chunks, n - chunks, own_w, p->last_omitted, p->last_known, p->last_reads, p->last_vdm, pre, post, p->arena_lo - p->arena_va, ns / 1000);
 
    /* the summary: totals over the last G5P_PERF_SUMMARY_JOBS jobs (approximate under concurrent submits) */
+   p_atomic_add(&p->arena_pre_bytes, arena_pre);
+   p_atomic_add(&p->arena_post_bytes, arena_post);
    p_atomic_add(&p->pre_bytes, pre);
    p_atomic_add(&p->post_bytes, post);
    p_atomic_add(&p->own_listed, n - chunks);
@@ -186,15 +201,18 @@ g5p_ws_perf_account(struct g5p_ws_perf *p, const struct drm_g5p_render_resource 
    if (jobs % G5P_PERF_SUMMARY_JOBS)
       return;
    const uint64_t pb = p_atomic_xchg(&p->pre_bytes, 0), qb = p_atomic_xchg(&p->post_bytes, 0);
+   const uint64_t ap = p_atomic_xchg(&p->arena_pre_bytes, 0), aq = p_atomic_xchg(&p->arena_post_bytes, 0);
    const uint64_t ol = p_atomic_xchg(&p->own_listed, 0), ow = p_atomic_xchg(&p->own_written, 0);
    const uint64_t sn = p_atomic_xchg(&p->submit_ns, 0), wk = p_atomic_xchg(&p->writes_known, 0),
                   dl = p_atomic_xchg(&p->drawless, 0), dn = p_atomic_xchg(&p->drawless_noclear, 0),
                   rk = p_atomic_xchg(&p->reads_known, 0), om = p_atomic_xchg(&p->own_omitted, 0);
    fprintf(stderr,
            "G5P perf summary jobs=%" PRIu64 " res=%s per_job: pre_kib=%" PRIu64 " post_kib=%" PRIu64
-           " own=%.1f own_written=%.1f omitted=%.1f writes_known=%" PRIu64 "/%u reads_known=%" PRIu64 " drawless=%" PRIu64 " (no clear %" PRIu64 ") submit_us=%" PRIu64 " arena_used_kib=%" PRIu64 "\n",
+           " own=%.1f own_written=%.1f omitted=%.1f writes_known=%" PRIu64 "/%u reads_known=%" PRIu64 " drawless=%" PRIu64 " (no clear %" PRIu64 ") submit_us=%" PRIu64 " arena_used_kib=%" PRIu64 " arena_pre_kib=%" PRIu64 " arena_post_kib=%" PRIu64
+           " own_pre_kib=%" PRIu64 " own_post_kib=%" PRIu64 "\n",
            jobs, p->on ? "narrow" : "whole", pb / 1024 / G5P_PERF_SUMMARY_JOBS, qb / 1024 / G5P_PERF_SUMMARY_JOBS,
            (double)ol / G5P_PERF_SUMMARY_JOBS, (double)ow / G5P_PERF_SUMMARY_JOBS, (double)om / G5P_PERF_SUMMARY_JOBS, wk,
            G5P_PERF_SUMMARY_JOBS, rk, dl, dn,
-           sn / 1000 / G5P_PERF_SUMMARY_JOBS, (p->arena_end - p->arena_lo) / 1024);
+           sn / 1000 / G5P_PERF_SUMMARY_JOBS, (p->arena_end - p->arena_lo) / 1024, ap / 1024 / G5P_PERF_SUMMARY_JOBS, aq / 1024 / G5P_PERF_SUMMARY_JOBS,
+           (pb - ap) / 1024 / G5P_PERF_SUMMARY_JOBS, (qb - aq) / 1024 / G5P_PERF_SUMMARY_JOBS);
 }
