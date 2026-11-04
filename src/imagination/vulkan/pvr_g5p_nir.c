@@ -528,12 +528,12 @@ pvr_g5p_compile_stage(const VkPipelineShaderStageCreateInfo *stage_info, bool ha
 /*
  * The background program of a render whose colour attachment is loaded
  * (loadOp LOAD): the attachment, bound as a combined image/sampler at set 0
- * binding 0, sampled at the fragment's own pixel centre,
- *   color = texture(prev, gl_FragCoord.xy / vec2(textureSize(prev, 0))),
+ * binding 0, read at the fragment's own pixel,
+ *   color = texelFetch(prev, ivec2(gl_FragCoord.xy), 0),
  * built with nir_builder (Mesa's way for a driver's own shaders), then the
- * same preparation and backend as every graphics stage. Its uploads are
- * the image state, the sampler and the size block at that binding
- * (out->uploads).
+ * same preparation and backend as every graphics stage, with the
+ * last-read source groups of every fragment program. Its uploads are the
+ * image state and the sampler at that binding (out->uploads).
  */
 bool
 pvr_g5p_compile_load(struct pco_g5p_program *out)
@@ -551,14 +551,10 @@ pvr_g5p_compile_load(struct pco_g5p_program *out)
    prev->data.binding = 0;
    nir_variable *color = nir_variable_create(b.shader, nir_var_shader_out, glsl_vec4_type(), "color");
    color->data.location = FRAG_RESULT_DATA0;
-   /* texture() at the pixel's centre, not texelFetch(): the backend's read op returns one channel in the wrong lane
-    * on the A9 (the LOAD probe, 2026-11-04), while its sample op is proven (lane b's tex-blend, 13/13). The
-    * centre (x + 0.5) / size lands on the texel itself, so the nearest sample is the texel, exact. */
-   nir_deref_instr *tex_deref = nir_build_deref_var(&b, prev);
-   nir_def *size = nir_i2f32(&b, nir_txs(&b, .texture_deref = tex_deref, .lod = nir_imm_int(&b, 0),
-                                          .dim = GLSL_SAMPLER_DIM_2D, .dest_type = nir_type_int32));
-   nir_def *uv = nir_fdiv(&b, nir_trim_vector(&b, nir_load_frag_coord(&b), 2), size);
-   nir_def *texel = nir_tex(&b, uv, .texture_deref = tex_deref, .sampler_deref = tex_deref,
+   /* texelFetch (Mesa's form of a load): with the last-read group bits it reads every channel (the LOAD probe's
+    * one-channel result was the default group rule, not the read op) */
+   nir_def *xy = nir_f2i32(&b, nir_trim_vector(&b, nir_load_frag_coord(&b), 2));
+   nir_def *texel = nir_txf(&b, xy, .texture_deref = nir_build_deref_var(&b, prev), .lod = nir_imm_int(&b, 0),
                             .dim = GLSL_SAMPLER_DIM_2D, .dest_type = nir_type_float32);
    nir_store_var(&b, color, texel, 0xf);
 
