@@ -99,6 +99,12 @@ void main()
 #endif
 }
 
+#elif defined(SOLID_U32_FRAG)
+layout(location = 0) out uvec4 o;
+void main() { o = uvec4(0x80000001u, 0x7fffffffu, 0x12345678u, 0xffffffffu); }
+#elif defined(SOLID_I32_FRAG)
+layout(location = 0) out ivec4 o;
+void main() { o = ivec4(-2147483647, 2147483647, 305419896, -1); }
 #elif defined(SOLID_FRAG)
 // A constant colour: COLOR, a vec4
 layout(location = 0) out vec4 o;

@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT
  * Generated-by: LLM
  * A9 integer colour output: no floating-point conversion of source bits.
- * Same physical output register class as G9P's PCO PIXOUT, and the
+ * Same physical output register class as PCO PIXOUT, and the
  * existing pco_g5p.c constant FS with half_output=false (o0..o3, emitpix 4).
  * Register encodings are the existing G5P field encoders, not program arrays.
  * This component deliberately does not change format/feature advertisement.

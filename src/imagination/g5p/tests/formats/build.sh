@@ -29,6 +29,7 @@ for s in quad.vert:vert:QUAD_VERT \
          lay3d-2-2.frag:frag:LAY3D_FRAG+DEPTH=2.0+LOD=2.0 lay3d-3-0.frag:frag:LAY3D_FRAG+DEPTH=3.0+LOD=0.0 \
          lay3d-4-1.frag:frag:LAY3D_FRAG+DEPTH=4.0+LOD=1.0 lay3d-8-0.frag:frag:LAY3D_FRAG+DEPTH=8.0+LOD=0.0 \
          lay3d-16-0.frag:frag:LAY3D_FRAG+DEPTH=16.0+LOD=0.0 \
+         solid-u32.frag:frag:SOLID_U32_FRAG solid-i32.frag:frag:SOLID_I32_FRAG \
          'solid.frag:frag:SOLID_FRAG+COLOR=vec4(0.9375,0.1875,0.125,0.25)' \
          'solid-b.frag:frag:SOLID_FRAG+COLOR=vec4(0.9375,0.1875,0.75,0.25)'; do
     name=${s%%:*} rest=${s#*:}

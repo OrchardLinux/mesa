@@ -663,8 +663,8 @@ add(const struct fmt *f, enum kind k, unsigned shift)
 
 /* The render candidates: the formats a fragment program's four f16 outputs
  * and a PBE could write (8-bit RGBA, sRGB, 10_10_10_2, R/RG 8, half float,
- * 11_11_10 float). Integer targets need integer outputs: no rung here, so a
- * device advertising them fails --coverage. */
+ * 11_11_10 float). RGBA32 integer targets have separate typed raw-output
+ * rungs, added in the integer branch of build_rungs(). */
 static bool
 render_candidate(const struct fmt *f)
 {
@@ -691,6 +691,8 @@ build_rungs(void)
             add(f, K_SAMPLE, s);
          if (f->vk == VK_FORMAT_R32_UINT || f->vk == VK_FORMAT_R8G8B8A8_UINT)
             add(f, K_FETCH, 0);
+         if (f->vk == VK_FORMAT_R32G32B32A32_UINT || f->vk == VK_FORMAT_R32G32B32A32_SINT)
+            add(f, K_RENDER, 0);
          continue;
       }
       add(f, K_SAMPLE, 0);
@@ -1596,6 +1598,7 @@ run_render(const struct rung *r)
 {
    const struct fmt *f = r->f;
    const bool blend = r->kind == K_BLEND;
+   const bool raw32 = f->vk == VK_FORMAT_R32G32B32A32_UINT || f->vk == VK_FORMAT_R32G32B32A32_SINT;
    const double *dst = blend ? CLEAR_B : CLEAR, *src = blend ? SRC_B : SRC;
    struct img target;
    struct buf vb, rb;
@@ -1603,7 +1606,13 @@ run_render(const struct rung *r)
 
    /* the expected texels: the clear on the right, the colour (or the blend) on the left */
    uint8_t left[16] = { 0 }, right[16] = { 0 };
-   for (unsigned c = 0; c < 4; c++) {
+   const uint32_t raw_src[4] = { 0x80000001u, 0x7fffffffu, 0x12345678u, 0xffffffffu };
+   const uint32_t raw_dst[4] = { 0, 17, 0x10001u, 0x76543210u };
+   if (raw32) {
+      memcpy(left, raw_src, sizeof(left));
+      memcpy(right, raw_dst, sizeof(right));
+   }
+   for (unsigned c = 0; !raw32 && c < 4; c++) {
       const struct ch *ch = &f->c[c];
       const double sa = src[3];
       const double lv = !blend ? src[c] : c == 3 ? src[3] + dst[3] * (1 - sa) : src[c] * sa + dst[c] * (1 - sa);
@@ -1634,14 +1643,19 @@ run_render(const struct rung *r)
    CHECK(vkCreatePipelineLayout(dev, &lci, NULL, &layout));
    /* the colour is compiled into solid.frag / solid-b.frag (SRC, SRC_B: build.sh) */
    VkPipeline pipe;
-   if (make_pipeline(rp, layout, blend ? spv_solid_b_frag : spv_solid_frag,
-                     blend ? sizeof(spv_solid_b_frag) : sizeof(spv_solid_frag), blend, &pipe))
+   const uint32_t *fs = raw32 ? (f->vk == VK_FORMAT_R32G32B32A32_UINT ? spv_solid_u32_frag : spv_solid_i32_frag)
+                             : (blend ? spv_solid_b_frag : spv_solid_frag);
+   const size_t fs_size = raw32 ? (f->vk == VK_FORMAT_R32G32B32A32_UINT ? sizeof(spv_solid_u32_frag) : sizeof(spv_solid_i32_frag))
+                               : (blend ? sizeof(spv_solid_b_frag) : sizeof(spv_solid_frag));
+   if (make_pipeline(rp, layout, fs, fs_size, blend, &pipe))
       return 1;
    if (quad(&vb, 0, 0, 0, 0, 0))
       return 1;
    if (begin(&cmd))
       return 1;
-   const VkClearValue cv = { .color.float32 = { (float)dst[0], (float)dst[1], (float)dst[2], (float)dst[3] } };
+   VkClearValue cv = { .color.float32 = { (float)dst[0], (float)dst[1], (float)dst[2], (float)dst[3] } };
+   if (raw32)
+      memcpy(cv.color.uint32, raw_dst, sizeof(raw_dst));
    const VkRenderPassBeginInfo rbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = rp,
                                        .framebuffer = fb, .renderArea = { { 0, 0 }, { W, H } }, .clearValueCount = 1,
                                        .pClearValues = &cv };
