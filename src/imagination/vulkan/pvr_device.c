@@ -72,7 +72,7 @@
 #include "vk_physical_device_properties.h"
 #include "vk_sampler.h"
 #include "vk_util.h"
-
+#include "pvr_g5p_publish_hooks.h"
 /** Gets the amount of memory to allocate per-core for a tile buffer. */
 static uint32_t
 pvr_get_tile_buffer_size_per_core(const struct pvr_device *device)
@@ -246,7 +246,7 @@ VkResult pvr_AllocateMemory(VkDevice _device,
          break;
       }
    }
-
+   PVR_G5P_HOOK(pub_pvr_device_245)
    if (fd_info && fd_info->handleType) {
       assert(
          fd_info->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT ||

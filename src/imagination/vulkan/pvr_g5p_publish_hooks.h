@@ -110,6 +110,14 @@
       return pvr_arch_g5p_graphics_pipeline_compile(device, pCreateInfo, gfx_pipeline, \
                                                     state);
 
+#define PVR_G5P_HOOK_pub_pvr_device_245() \
+   /* G5P: memory that may become a dma-buf (exportable, or a WSI image) is a \
+    * kernel BO of its own; the winsys's arena slices cannot be exported. */ \
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p) && \
+       (vk_find_struct_const(pAllocateInfo->pNext, EXPORT_MEMORY_ALLOCATE_INFO) || \
+        vk_find_struct_const(pAllocateInfo->pNext, WSI_MEMORY_ALLOCATE_INFO_MESA))) \
+      type = PVR_WINSYS_BO_TYPE_DISPLAY;
+
 #define PVR_G5P_HOOK_pub_pvr_instance_117() \
    /* Apple A9 (G5P): our kernel's typed UAPI (winsys/apple_g5p) */ \
    is_pvr |= !strcmp(version->name, "apple_g5p");
