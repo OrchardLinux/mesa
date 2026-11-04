@@ -42,6 +42,8 @@
  *   inst-div3 inst-div-mixed
  *                 8 instances, each 8 pixels right (offset divisor 1); the colour's red/green and blue/alpha
  *                 from bindings of divisors 3 and 3 (firstInstance 0), 2 and 5 (firstInstance 3)
+ *   points        8 points of gl_PointSize 6, centred on pixel corners (6x6 pixels each), with a colour varying
+ *   points-default  8 points of a program that writes no gl_PointSize: 1 pixel each
  *   restart-16 restart-32 restart-8
  *                 8 quads as one indexed triangle strip, cut by primitive restart (0xffff, 0xffffffff, 0xff)
  *
@@ -77,7 +79,7 @@ static const float CLEAR[4] = { 0.2f, 0.4f, 0.6f, 0.8f };
 enum shader {
    SH_COLOR, SH_INSTANCE, SH_VERTEX_INDEX, SH_ATTRIB16,
    SH_INT_IMIN, SH_INT_IMAX, SH_INT_UMIN, SH_INT_UMAX, SH_INT_ISUB, SH_INT_INEG,
-   SH_FMT, SH_FMT_INT, SH_INST_ATTR, SH_INST_DIV,
+   SH_FMT, SH_FMT_INT, SH_INST_ATTR, SH_INST_DIV, SH_POINT,
 };
 
 struct rung {
@@ -126,6 +128,8 @@ static const struct rung rungs[] = {
    { "inst-divisor0", "per-instance offset, colour divisor 0, firstInstance 2" },
    { "inst-div3", "8 instances, colour halves divisors 3 and 3" },
    { "inst-div-mixed", "8 instances from firstInstance 3, colour halves divisors 2 and 5" },
+   { "points", "8 points of size 6 with a colour varying" },
+   { "points-default", "8 points without gl_PointSize (size 1)" },
    { "restart-16", "one 16-bit indexed strip of 8 quads, cut by 0xffff" },
    { "restart-32", "one 32-bit indexed strip of 8 quads, cut by 0xffffffff" },
    { "restart-8", "one 8-bit indexed strip of 8 quads, cut by 0xff" },
@@ -815,6 +819,26 @@ build(const char *name, struct scene *s, const char **why)
       s->topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
       add_draw(s, 4, n, 0, 0);
       s->draw[0].first_instance = first;
+   } else if (!strcmp(name, "points") || !strcmp(name, "points-default")) {
+      /* points: size 6 centred on the pixel corner (16 q % 4 + 8, 32 (q / 4) + 16), so pixels cx - 3..cx + 2;
+       * points-default: size 1 at that pixel's centre */
+      const bool sized = name[6] != '-';
+      s->shader = sized ? SH_POINT : SH_COLOR;
+      s->topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+      color_input(s);
+      for (unsigned q = 0; q < 8; q++) {
+         float c[4];
+         quad_color(q, c);
+         const int cx = 16 * (q % 4) + 8, cy = 32 * (q / 4) + 16;
+         const float px = sized ? nx(cx) : (float)(cx + 0.5) / (W / 2) - 1.0f;
+         const float py = sized ? ny(cy) : (float)(cy + 0.5) / (H / 2) - 1.0f;
+         put(s, 0, (const float[6]){ px, py, c[0], c[1], c[2], c[3] }, 6);
+         if (sized)
+            fill(s, cx - 3, cy - 3, cx + 3, cy + 3, c);
+         else
+            fill(s, cx, cy, cx + 1, cy + 1, c);
+      }
+      add_draw(s, 8, 1, 0, 0);
    } else if (!strncmp(name, "restart-", 8)) {
       /* quad q's 4 vertices (a strip of 2 triangles) at 4q, the strips joined by the cut index; without the cut
        * the strip would bridge the quads */
@@ -1136,6 +1160,7 @@ run(const struct rung *r)
    case SH_FMT_INT: vs_code = spv_fmt_int_vert; vs_size = sizeof(spv_fmt_int_vert); break;
    case SH_INST_ATTR: vs_code = spv_inst_attr_vert; vs_size = sizeof(spv_inst_attr_vert); break;
    case SH_INST_DIV: vs_code = spv_inst_div_vert; vs_size = sizeof(spv_inst_div_vert); break;
+   case SH_POINT: vs_code = spv_point_vert; vs_size = sizeof(spv_point_vert); break;
    default: vs_code = spv_color_vert; vs_size = sizeof(spv_color_vert); break;
    }
    VkShaderModuleCreateInfo smi = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = vs_size,

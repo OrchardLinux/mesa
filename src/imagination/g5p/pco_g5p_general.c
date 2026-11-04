@@ -217,6 +217,7 @@ struct gctx {
    struct { unsigned slot; struct ref r; int at; } vout[72]; /* at: eager emission point, -1 = the end */
    unsigned nvout;
    const struct pco_g5p_vs_link *link;
+   unsigned psize_dword; /* a point pipeline's point size: the last output dword */
    bool eager_vout; /* VS temps retry: each output written as soon as its value is final */
    nir_intrinsic_instr *vend_store; /* eager: the output component written by the final vend */
    unsigned vend_comp;
@@ -1109,6 +1110,8 @@ static int vs_base(struct gctx *c, unsigned loc)
 {
    if (loc == VARYING_SLOT_POS)
       return 0;
+   if (loc == VARYING_SLOT_PSIZ && c->link && c->link->point_size)
+      return c->psize_dword;
    if (loc < VARYING_SLOT_VAR0 || loc > VARYING_SLOT_VAR31)
       return -2;
    unsigned d = c->p->vout_dword[loc - VARYING_SLOT_VAR0];
@@ -1137,18 +1140,19 @@ static void plan_vs_layout(struct gctx *c)
    }
    memset(c->p->vout_dword, 0, sizeof(c->p->vout_dword));
    memset(c->p->vout_interp, 0, sizeof(c->p->vout_interp));
+   const unsigned first = 4;
    if (!c->link || !c->link->valid) {
       unsigned top = 0;
       u_foreach_bit(n, written) {
-         c->p->vout_dword[n] = 4 + 4 * n;
+         c->p->vout_dword[n] = first + 4 * n;
          c->p->vout_interp[n] = PCO_G5P_INTERP_SMOOTH;
          top = n + 1;
       }
       c->p->varyings = top;
-      c->p->outputs = 4 + 4 * top;
+      c->p->outputs = first + 4 * top;
    } else {
       static const uint8_t order[] = {PCO_G5P_INTERP_SMOOTH, PCO_G5P_INTERP_FLAT, PCO_G5P_INTERP_NOPERSPECTIVE};
-      unsigned next = 4, kept = 0;
+      unsigned next = first, kept = 0;
       for (unsigned m = 0; m < ARRAY_SIZE(order); m++)
          u_foreach_bit(n, written) {
             if (c->link->interp[n] != order[m])
@@ -1161,6 +1165,13 @@ static void plan_vs_layout(struct gctx *c)
       c->p->varyings = kept;
       c->p->outputs = next;
    }
+   /* a point pipeline: the point size is the last output dword (the TA reads
+    * it there and leaves it out of the varyings; Apple's g3b-points has only
+    * the position before it, and a varying in front of it is the device's
+    * reading: with the size after the position, the TA took the colour's
+    * alpha for the size) */
+   if (c->link && c->link->point_size)
+      c->psize_dword = c->p->outputs++;
    if (c->p->outputs > 255)
       refuse(c, "%u output dwords", c->p->outputs);
    if (!c->eager_vout)

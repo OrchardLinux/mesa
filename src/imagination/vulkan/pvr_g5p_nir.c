@@ -306,6 +306,11 @@ g5p_nir_prepare(nir_shader *nir)
    nir_lower_returns(nir);
    nir_inline_functions(nir);
    nir_remove_non_entrypoints(nir);
+   /* gl_PerVertex: one variable per member, each at its builtin's slot, as
+    * the Vulkan runtime does (vk_nir.c); without it a member keeps its index
+    * as its location (glslang's gl_PointSize became slot 1, COL0) */
+   nir_split_var_copies(nir);
+   nir_split_per_member_structs(nir);
    nir_lower_vars_to_ssa(nir);
    nir_opt_deref(nir);
    nir_lower_system_values(nir);
@@ -376,9 +381,10 @@ lower_sample_mask_1x(nir_builder *b, nir_intrinsic_instr *in, void *data)
    return true;
 }
 
-/* gl_PointSize has no effect on any draw G5P runs (no point topologies,
- * polygon mode FILL only): its store is dropped unless transform feedback
- * captures it. */
+/* gl_PointSize has no effect outside point pipelines (polygon mode FILL
+ * only): its store is dropped unless transform feedback captures it. A
+ * point pipeline keeps it (the TA reads it after the position), and gets
+ * 1.0 when the program writes none (maintenance5's default). */
 static bool
 drop_point_size(nir_builder *b, nir_intrinsic_instr *in, void *data)
 {
@@ -386,6 +392,16 @@ drop_point_size(nir_builder *b, nir_intrinsic_instr *in, void *data)
       return false;
    nir_instr_remove(&in->instr);
    return true;
+}
+
+/* The program stores gl_PointSize (its intrinsics: outputs_written is not
+ * kept up to date by the passes before) */
+static bool
+find_point_size(nir_builder *b, nir_intrinsic_instr *in, void *data)
+{
+   if (in->intrinsic == nir_intrinsic_store_output && nir_intrinsic_io_semantics(in).location == VARYING_SLOT_PSIZ)
+      *(bool *)data = true;
+   return false;
 }
 
 static bool
@@ -401,15 +417,27 @@ xfb_captures(const nir_shader *nir, gl_varying_slot slot)
 
 /* The graphics lowerings of a prepared stage (the ICD's graphics_nir()) */
 static nir_shader *
-graphics_lower(nir_shader *nir, unsigned color_targets, bool *sample_mask)
+graphics_lower(nir_shader *nir, unsigned color_targets, bool *sample_mask, bool point_size)
 {
    const mesa_shader_stage stage = nir ? nir->info.stage : MESA_SHADER_NONE;
 
-   if (nir && stage == MESA_SHADER_VERTEX && !xfb_captures(nir, VARYING_SLOT_PSIZ) &&
+   if (nir && stage == MESA_SHADER_VERTEX && !point_size && !xfb_captures(nir, VARYING_SLOT_PSIZ) &&
        nir_shader_intrinsics_pass(nir, drop_point_size, nir_metadata_control_flow, NULL)) {
       nir->info.outputs_written &= ~BITFIELD64_BIT(VARYING_SLOT_PSIZ);
       nir_opt_dce(nir);
       nir_index_ssa_defs(nir_shader_get_entrypoint(nir));
+   }
+   bool writes_psize = false;
+   if (nir && stage == MESA_SHADER_VERTEX && point_size)
+      nir_shader_intrinsics_pass(nir, find_point_size, nir_metadata_all, &writes_psize);
+   if (nir && stage == MESA_SHADER_VERTEX && point_size && !writes_psize) {
+      nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+      nir_builder b = nir_builder_at(nir_after_impl(impl));
+      nir_store_output(&b, nir_imm_float(&b, 1.0f), nir_imm_int(&b, 0), .base = 0, .component = 0,
+                       .write_mask = 1, .src_type = nir_type_float32,
+                       .io_semantics = (nir_io_semantics){ .location = VARYING_SLOT_PSIZ, .num_slots = 1 });
+      nir->info.outputs_written |= BITFIELD64_BIT(VARYING_SLOT_PSIZ);
+      nir_index_ssa_defs(impl);
    }
    if (nir && stage == MESA_SHADER_FRAGMENT &&
        nir_shader_intrinsics_pass(nir, drop_unattached_output, nir_metadata_control_flow, &color_targets)) {
@@ -430,9 +458,9 @@ graphics_lower(nir_shader *nir, unsigned color_targets, bool *sample_mask)
 
 static nir_shader *
 graphics_nir(const uint32_t *spv, size_t words, mesa_shader_stage stage, const char *entry, unsigned color_targets,
-             bool *sample_mask)
+             bool *sample_mask, bool point_size)
 {
-   return graphics_lower(g5p_nir(spv, words, stage, entry), color_targets, sample_mask);
+   return graphics_lower(g5p_nir(spv, words, stage, entry), color_targets, sample_mask, point_size);
 }
 
 /* Vertex system values: the hardware index the PDS writes is the draw's
@@ -575,9 +603,10 @@ compile_stage(const VkPipelineShaderStageCreateInfo *stage_info, bool half_outpu
    const char *entry = stage_info->pName ? stage_info->pName : "main";
    const unsigned color_targets = key && key->color_targets ? key->color_targets : 1;
    bool sample_mask = false;
+   const bool point_size = stage == MESA_SHADER_VERTEX && link && link->point_size;
    nir_shader *nir = internal ? graphics_lower(g5p_nir_prepare(nir_shader_clone(NULL, internal)), color_targets,
-                                               &sample_mask)
-                              : graphics_nir(spv, bytes / 4, stage, entry, color_targets, &sample_mask);
+                                               &sample_mask, point_size)
+                              : graphics_nir(spv, bytes / 4, stage, entry, color_targets, &sample_mask, point_size);
    bool ok = false;
    if (!nir) {
       snprintf(out->refusal, sizeof(out->refusal), "SPIR-V -> NIR failed");
@@ -664,7 +693,7 @@ pvr_g5p_compile_load(struct pco_g5p_program *out)
    nir_store_var(&b, color, texel, 0xf);
 
    bool sample_mask = false; /* the load program reads no sample mask */
-   nir_shader *nir = graphics_lower(g5p_nir_prepare(b.shader), 1, &sample_mask);
+   nir_shader *nir = graphics_lower(g5p_nir_prepare(b.shader), 1, &sample_mask, false);
    /* Apple's source groups, as every pipeline's fragment program (g5p_check_state()): 1 only on a register's last
     * read. The default, 1 on every read, returns a wrong value on a re-read: the LOAD probe's texelFetch wrote only
     * output component 0 (B G R A = 0 0 R 0). */

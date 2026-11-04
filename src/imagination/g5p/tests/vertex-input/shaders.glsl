@@ -122,6 +122,13 @@ layout(location = 3) in vec2 ba;
 layout(location = 0) out vec4 v_color;
 void main() { gl_Position = vec4(position + offset, 0.0, 1.0); v_color = vec4(rg, ba); }
 
+#elif defined(POINT_VERT)
+// the points rung: a position, a colour and gl_PointSize 6
+layout(location = 0) in vec2 position;
+layout(location = 1) in vec4 color;
+layout(location = 0) out vec4 v_color;
+void main() { gl_Position = vec4(position, 0.0, 1.0); gl_PointSize = 6.0; v_color = color; }
+
 #elif defined(COLOR_FRAG)
 layout(location = 0) in vec4 v_color;
 layout(location = 0) out vec4 color;

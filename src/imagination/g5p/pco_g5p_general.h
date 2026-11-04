@@ -141,6 +141,9 @@ struct pco_g5p_varying {
 struct pco_g5p_vs_link {
    bool valid;
    uint8_t interp[PCO_G5P_VARYING_SLOTS];
+   /* a point pipeline: gl_PointSize is the last output dword, after the
+    * varyings (TA_OUTPUT_SEL psprite_size_pres; Apple's g3b-points) */
+   bool point_size;
 };
 
 /* Per-draw transform feedback block (PCO_G5P_UPLOAD_XFB): the VA each

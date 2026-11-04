@@ -546,6 +546,10 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
    if (!pvr_g5p_compile_stage(fs_info, true, g->samples, NULL, &key, NULL, fs))
       return G5P_REFUSE(device, "fragment shader: %s", fs->refusal);
    struct pco_g5p_vs_link link = { .valid = true };
+   /* points (Apple's g3b-points): the point size after the position; the
+    * topology class is fixed per pipeline even when the topology is dynamic */
+   link.point_size = s->ia && s->ia->primitive_topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+   g->vs_point_size = link.point_size;
    for (unsigned i = 0; i < fs->num_varyings; i++)
       link.interp[fs->vary[i].location] = fs->vary[i].interp;
    /* the transform feedback variant (pvr_g5p_xfb.h): the capturing vertex program */
@@ -1062,6 +1066,10 @@ g5p_topology(VkPrimitiveTopology t, uint32_t *hw, uint32_t *split, bool *lines)
 {
    *lines = false;
    switch (t) {
+   case VK_PRIMITIVE_TOPOLOGY_POINT_LIST: /* split 512: Apple's g3b-points */
+      *hw = ROGUE_VDMCTRL_PRIMITIVE_TOPOLOGY_POINT_LIST;
+      *split = 512;
+      return true;
    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST:
       *hw = ROGUE_VDMCTRL_PRIMITIVE_TOPOLOGY_TRI_LIST;
       *split = 170;
@@ -1424,6 +1432,8 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
    pvr_csb_pack (&w[1], TA_OUTPUT_SEL, os) {
       os.vtxsize = g->vs_outputs;
       os.rhw_pres = true;
+      /* points: the size follows the position (g3b-points) */
+      os.psprite_size_pres = g->vs_point_size;
    }
    PPP_BLOCK(w, 2);
    /* 6. ISP: the colour-only form (no depth/stencil attachment); Apple's
@@ -1433,6 +1443,10 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
       struct pvr_g5p_blend_isp isp;
       pvr_arch_g5p_blend_isp(g->fs_blend_mode, g->fs_discard, g->fs_write_mask, discard, &isp);
       const enum ROGUE_TA_PASSTYPE pass = isp.pass_type;
+      /* points rasterize as sprites (g3b-points: SPRITE_01UV, front and back) */
+      const enum ROGUE_TA_OBJTYPE objtype = g->vs_point_size ? ROGUE_TA_OBJTYPE_SPRITE_01UV
+                                            : lines         ? ROGUE_TA_OBJTYPE_LINE
+                                                            : ROGUE_TA_OBJTYPE_TRIANGLE;
       uint32_t lw = util_unsigned_fixed(dyn->rs.line.width, 4);
       lw = MIN2(lw ? lw - 1 : 0, 255);
       pvr_csb_pack (&w[0], TA_STATE_HEADER, h) {
@@ -1451,7 +1465,7 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
          ctl.tagwritedisable = isp.tag_write_disable;
       }
       pvr_csb_pack (&w[2], TA_STATE_ISPA, fa) {
-         fa.objtype = lines ? ROGUE_TA_OBJTYPE_LINE : ROGUE_TA_OBJTYPE_TRIANGLE;
+         fa.objtype = objtype;
          fa.passtype = pass;
          fa.dwritedisable = true;
          fa.dfbztestenable = true;
@@ -1463,15 +1477,25 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
       }
       /* the captured back words: single-sided ISPCTL ignores them */
       pvr_csb_pack (&w[4], TA_STATE_ISPA, ba) {
-         ba.objtype = lines ? ROGUE_TA_OBJTYPE_LINE : ROGUE_TA_OBJTYPE_TRIANGLE;
+         ba.objtype = objtype;
          ba.passtype = pass;
          ba.dfbztestenable = true;
          ba.pointlinewidth = lw;
       }
-      w[5] = 0;
+      /* points: the back B word is the front's (g3b-points) */
+      w[5] = g->vs_point_size ? w[3] : 0;
       /* with a depth/stencil attachment: its tests, Apple's face form */
       if (ds_aspects)
          pvr_arch_g5p_ds_isp(dyn, ds_aspects, g->samples, lines, pass, scissor, dbias, false, &w[1]);
+      /* ... with the sprite object type of a point pipeline */
+      if (ds_aspects && g->vs_point_size) {
+         for (unsigned k = 2; k <= 4; k += 2) {
+            struct ROGUE_TA_STATE_ISPA a;
+            ROGUE_TA_STATE_ISPA_unpack(&w[k], &a);
+            a.objtype = objtype;
+            ROGUE_TA_STATE_ISPA_pack(&w[k], &a);
+         }
+      }
       PPP_BLOCK(w, 6);
    }
    /* 7. region clip (32-pixel tiles) and the viewport */
