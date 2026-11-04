@@ -158,6 +158,10 @@ struct pvr_g5p_pipeline {
     * and colour write mask, for the ISP pass type (pvr_g5p_blend.h) */
    unsigned fs_blend_mode;
    uint8_t fs_write_mask;
+   /* the fragment program's colour targets (pco_g5p_fs_key::color_targets:
+    * 0 for one, else 2 or 4), checked against the pass per draw
+    * (pvr_g5p_mrt.h) */
+   unsigned color_targets;
    /* the fragment program's uploads (descriptor state, image sizes, blend
     * constants) and their loader, DOUTD per upload from the per-draw data
     * behind UNIFORMDATABASE (no uploads: the device HALT) */

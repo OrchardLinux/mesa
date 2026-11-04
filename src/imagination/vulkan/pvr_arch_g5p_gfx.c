@@ -45,6 +45,7 @@
 #include "pvr_framebuffer.h"
 #include "pvr_g5p.h"
 #include "pvr_g5p_blend.h"
+#include "pvr_g5p_mrt.h"
 #include "pvr_g5p_tex.h"
 #include "pvr_g5p_tex_encode.h"
 #include "pvr_g5p_ds.h"
@@ -396,6 +397,7 @@ g5p_check_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo *c
     * runtime only their aspects), or the dynamic rendering state */
    unsigned colors;
    VkFormat cf;
+   VkFormat cfs[PVR_G5P_MRT_MAX_COLORS] = { VK_FORMAT_UNDEFINED };
    bool ds;
    if (create_info->renderPass) {
       VK_FROM_HANDLE(pvr_render_pass, pass, create_info->renderPass);
@@ -405,6 +407,8 @@ g5p_check_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo *c
       for (unsigned i = 0; i < sub->color_count; i++) {
          if (sub->color_attachments[i] == VK_ATTACHMENT_UNUSED)
             continue;
+         if (colors < PVR_G5P_MRT_MAX_COLORS)
+            cfs[colors] = pass->attachments[sub->color_attachments[i]].vk_format;
          if (!colors++)
             cf = pass->attachments[sub->color_attachments[i]].vk_format;
       }
@@ -412,6 +416,8 @@ g5p_check_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo *c
    } else if (s->rp) {
       colors = s->rp->color_attachment_count;
       cf = colors ? s->rp->color_attachment_formats[0] : VK_FORMAT_UNDEFINED;
+      for (unsigned i = 0; i < MIN2(colors, PVR_G5P_MRT_MAX_COLORS); i++)
+         cfs[i] = s->rp->color_attachment_formats[i];
       ds = s->rp->depth_attachment_format != VK_FORMAT_UNDEFINED ||
            s->rp->stencil_attachment_format != VK_FORMAT_UNDEFINED;
    } else {
@@ -440,8 +446,16 @@ g5p_check_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo *c
    /* pvr_* gives a render pass without multiview the view mask 1 */
    if (s->mv && util_bitcount(s->mv->view_mask) > 1)
       return G5P_REFUSE(device, "multiview (view mask %#x)", s->mv->view_mask);
-   if (colors != 1)
+   /* several colour targets: 2 or 4 in one format (pvr_g5p_mrt.h) */
+   if (colors > 1) {
+      if (colors > PVR_G5P_MRT_MAX_COLORS)
+         return G5P_REFUSE(device, "%u colour attachments (at most %u)", colors, PVR_G5P_MRT_MAX_COLORS);
+      VkResult mrt = pvr_arch_g5p_mrt_pipeline_check(device, colors, cfs);
+      if (mrt != VK_SUCCESS)
+         return mrt;
+   } else if (colors != 1) {
       return G5P_REFUSE(device, "%u colour attachments (rung A: 1)", colors);
+   }
    if (cf != VK_FORMAT_B8G8R8A8_UNORM && cf != VK_FORMAT_R8G8B8A8_UNORM)
       return G5P_REFUSE(device, "colour attachment format %s", vk_Format_to_str(cf));
    /* a depth/stencil attachment: the ZLS formats (pvr_g5p_ds.c), no depth bounds */
@@ -565,6 +579,7 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
    g->fs_discard = (fs->evidence & PCO_G5P_EV_DISCARD) != 0;
    g->fs_blend_mode = fs->blend_mode;
    g->fs_write_mask = key.write_mask;
+   g->color_targets = key.color_targets;
    for (unsigned i = 0; i < fs->num_varyings; i++)
       g->fs_flat |= fs->vary[i].interp == PCO_G5P_INTERP_FLAT;
 
@@ -933,6 +948,10 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
    if (info->hw_render && MAX2(info->hw_render->sample_count, 1) != g->samples)
       return G5P_REFUSE(cmd_buffer, "a %u-sample pipeline in a %u-sample pass", g->samples,
                         info->hw_render->sample_count);
+   /* one emitpix writes every target: the program's count is the pass's */
+   VkResult mrt = pvr_arch_g5p_mrt_draw_check(cmd_buffer, g->color_targets);
+   if (mrt != VK_SUCCESS)
+      return mrt;
 
    VkResult result = pvr_arch_cmd_buffer_start_sub_cmd(cmd_buffer, PVR_SUB_CMD_TYPE_GRAPHICS);
    if (result != VK_SUCCESS)
