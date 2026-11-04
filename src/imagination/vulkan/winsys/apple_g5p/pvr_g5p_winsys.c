@@ -54,6 +54,7 @@
 #include "pvr_winsys_helper.h"
 
 #include "g5p_drm_transport.h"
+#include "g5p_ws_perf.h"
 #include "pvr_g5p_winsys.h"
 
 #define G5P_WS_PAGE 16384ull
@@ -104,6 +105,7 @@ struct g5p_ws {
    struct list_head render_ctxs;
 
    struct pvr_winsys_heap general_heap, pds_heap, usc_heap, vis_test_heap, transfer_frag_heap;
+   struct g5p_ws_perf perf; /* the jobs' resource lists (g5p_ws_perf.h) */
 };
 
 struct g5p_ws_bo {
@@ -377,6 +379,7 @@ static VkResult g5p_ws_buffer_create(struct pvr_winsys *ws_, uint64_t size, uint
                          ws->arena_size);
       } else {
          b->va = va;
+         g5p_ws_perf_slice(&ws->perf, va);
          b->cpu = ws->arena_cpu + (va - ws->arena_va);
          b->alloc_size = alloc;
          /* a fresh slice reads as zero, as a fresh kernel BO would */
@@ -743,7 +746,7 @@ static VkResult g5p_ws_render_submit(const struct pvr_winsys_render_ctx *ctx,
    struct drm_g5p_render_pass_v3 pass;
    int r;
 
-   if (info->fragment.fw_stream_len != sizeof(pass) || info->geometry.fw_stream_len)
+   if (info->fragment.fw_stream_len < sizeof(pass) || info->geometry.fw_stream_len)
       return g5p_ws_refuse(VK_ERROR_FEATURE_NOT_PRESENT,
                            "a job without a G5P pass (fragment stream %u bytes, geometry %u): not a G5P render",
                            info->fragment.fw_stream_len, info->geometry.fw_stream_len);
@@ -781,10 +784,19 @@ static VkResult g5p_ws_render_submit(const struct pvr_winsys_render_ctx *ctx,
     * named, not just the job's own: correct, at the cost of fencing buffers the job doesn't touch. */
    struct drm_g5p_render_resource res[DRM_G5P_RENDER_MAX_RESOURCES];
    unsigned nres = 0;
-   for (unsigned i = 0; i < ws->chunk_count; i++)
-      res[nres++] = (struct drm_g5p_render_resource){
-         .handle = ws->chunks[i].handle, .va = ws->chunks[i].va, .size = ws->chunks[i].size,
-         .kind = DRM_G5P_RENDER_ACCESS_READ | DRM_G5P_RENDER_ACCESS_WRITE | DRM_G5P_RENDER_ACCESS_CACHE};
+   /* the speed lane's narrowing (g5p_ws_perf.h): each chunk from the arena's lowest slice, and each own BO
+    * WRITE only when the job writes it */
+   struct g5p_ws_perf_job pj;
+   g5p_ws_perf_job(&ws->perf, &pass, info->fragment.fw_stream + sizeof(pass),
+                   info->fragment.fw_stream_len - sizeof(pass), &pj);
+   for (unsigned i = 0; i < ws->chunk_count; i++) {
+      uint64_t off, len;
+      if (g5p_ws_perf_chunk(&ws->perf, ws->chunks[i].va, ws->chunks[i].size, &off, &len))
+         res[nres++] = (struct drm_g5p_render_resource){
+            .handle = ws->chunks[i].handle, .offset = off, .va = ws->chunks[i].va + off, .size = len,
+            .kind = DRM_G5P_RENDER_ACCESS_READ | DRM_G5P_RENDER_ACCESS_WRITE | DRM_G5P_RENDER_ACCESS_CACHE};
+   }
+   const unsigned nchunks = nres;
    simple_mtx_lock(&ws->lock);
    if (ws->chunk_count + ws->own_count > ARRAY_SIZE(res)) {
       simple_mtx_unlock(&ws->lock);
@@ -794,8 +806,7 @@ static VkResult g5p_ws_render_submit(const struct pvr_winsys_render_ctx *ctx,
    list_for_each_entry (struct g5p_ws_bo, b, &ws->own_bos, link)
       res[nres++] = (struct drm_g5p_render_resource){
          .handle = b->kbo.handle, .va = b->va, .size = b->kbo.size,
-         .kind = DRM_G5P_RENDER_ACCESS_READ | DRM_G5P_RENDER_ACCESS_WRITE | DRM_G5P_RENDER_ACCESS_CACHE |
-                 (b->kbo.shared ? DRM_G5P_RENDER_ACCESS_IMPLICIT : 0)};
+         .kind = g5p_ws_perf_own_kind(&ws->perf, &pj, b->va, b->kbo.size, b->kbo.shared)};
    simple_mtx_unlock(&ws->lock);
 
    /* waits (the two stages' waits), then the signal: the kernel takes one per job, so the fragment stage's is
@@ -846,8 +857,10 @@ static VkResult g5p_ws_render_submit(const struct pvr_winsys_render_ctx *ctx,
       }
    }
    uint64_t job_id = 0;
+   const uint64_t t0 = g5p_ws_perf_now();
    r = g5p_drm_submit_render_typed(&ws->drm, c->context, rt->handle, &pass, res, nres, syncs, n,
                                    &job_id);
+   g5p_ws_perf_account(&ws->perf, res, nres, nchunks, t0);
    if (r)
       return g5p_ws_refuse(r == -ENOMEM ? VK_ERROR_OUT_OF_DEVICE_MEMORY : VK_ERROR_DEVICE_LOST,
                            "SUBMIT_RENDER_TYPED: %s (the kernel's reason is in dmesg)", strerror(-r));
@@ -1010,6 +1023,7 @@ static VkResult g5p_ws_arena_init(struct g5p_ws *ws)
       ws->chunk_count++;
    }
    util_vma_heap_init(&ws->slices, ws->arena_va, size);
+   g5p_ws_perf_init(&ws->perf, ws->arena_va, size);
    /* above the code window: display BOs and imports are never programs */
    util_vma_heap_init(&ws->dedicated, ws->arena_va + ws->render.code_window, G5P_WS_DEDICATED_SIZE);
    ws->vma_heaps_ready = true;
