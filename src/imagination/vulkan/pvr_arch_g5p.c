@@ -43,6 +43,7 @@
 #include "pvr_g5p_tex_encode.h"
 #include "pvr_g5p_mrt.h"
 #include "pvr_g5p_perf.h"
+#include "pvr_g5p_vdm.h"
 #include "pvr_hw_pass.h"
 #include "pvr_image.h"
 #include "pvr_job_render.h"
@@ -567,12 +568,10 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
    if (sub_cmd->scissor_bo)
       g->scissor_count = sub_cmd->scissor_bo->size / sizeof(struct pvr_scissor_words);
 
-   /* the control stream: one block, through STREAM_TERMINATE */
-   struct pvr_csb *csb = &sub_cmd->control_stream;
-   if (!list_is_singular(&csb->pvr_bo_list))
-      return G5P_REFUSE(cmd_buffer, "a control stream of %u blocks (one is built)", list_length(&csb->pvr_bo_list));
-   g->vdm_va = pvr_csb_get_start_address(csb).addr;
-   g->vdm_bytes = (uint32_t)((uint8_t *)csb->next - (uint8_t *)csb->start);
+   /* the control stream: one range through STREAM_TERMINATE, also from several linked blocks (pvr_g5p_vdm.h) */
+   VkResult vdm = pvr_arch_g5p_vdm_stream(cmd_buffer, &sub_cmd->control_stream, &g->vdm_va, &g->vdm_bytes);
+   if (vdm != VK_SUCCESS)
+      return vdm;
 
    /* targets: PBE words and clear colours */
    uint64_t pbe[4][3];
