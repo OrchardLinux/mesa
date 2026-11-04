@@ -22,40 +22,17 @@
 #include "pvr_common.h"
 #include "pvr_g5p_tex.h" /* pvr_macros.h: PVR_PER_ARCH, before pvr_g5p_ds.h */
 #include "pvr_g5p_ds.h"
+#include "pvr_g5p_formats.h"
 #include "pvr_g5p_tex_encode.h"
 #include "pvr_image.h"
 
-/*
- * Format keys of the rendered and textured rungs: format code and channel
- * selectors, our decode of the iOS descriptor tables (pass/pass-rgba,
- * fmt-rgb10a2, fmt-srgb8 captures; ds-isa-state.md §2.1). The code is a bit
- * layout: 0x28 8_8_8_8, 0x26 10_10_10_2. sRGB is q1 bit 45 on the same
- * key. The A8B8G8R8 packed formats are the R8G8B8A8 bytes on a
- * little-endian GPU. Lane (f)'s table (every format) replaces this one.
- */
-#define TEX_FMT_BGRA8 0x28, 2, 1, 0, 3
-#define TEX_FMT_RGBA8 0x28, 0, 1, 2, 3
-#define TEX_FMT_RGB10A2 0x26, 0, 1, 2, 3
-#define TEX_KEY(...) PVR_G5P_TEX_KEY(__VA_ARGS__)
-
-static const struct pvr_g5p_tex_format g5p_tex_formats[] = {
-   { VK_FORMAT_B8G8R8A8_UNORM, TEX_KEY(TEX_FMT_BGRA8), false },
-   { VK_FORMAT_B8G8R8A8_SRGB, TEX_KEY(TEX_FMT_BGRA8), true },
-   { VK_FORMAT_R8G8B8A8_UNORM, TEX_KEY(TEX_FMT_RGBA8), false },
-   { VK_FORMAT_R8G8B8A8_SRGB, TEX_KEY(TEX_FMT_RGBA8), true },
-   { VK_FORMAT_A8B8G8R8_UNORM_PACK32, TEX_KEY(TEX_FMT_RGBA8), false },
-   { VK_FORMAT_A8B8G8R8_SRGB_PACK32, TEX_KEY(TEX_FMT_RGBA8), true },
-   { VK_FORMAT_A2B10G10R10_UNORM_PACK32, TEX_KEY(TEX_FMT_RGB10A2), false },
-};
-
+/* A view format's texture key and sRGB bit: the A9 format table's
+ * (pvr_g5p_formats.h, lane f) */
 static const struct pvr_g5p_tex_format *
-g5p_tex_format(VkFormat format)
+g5p_tex_format(VkFormat format, struct pvr_g5p_tex_format *out)
 {
-   for (unsigned i = 0; i < ARRAY_SIZE(g5p_tex_formats); i++) {
-      if (g5p_tex_formats[i].format == format)
-         return &g5p_tex_formats[i];
-   }
-   return NULL;
+   out->format = format;
+   return pvr_g5p_format_tex(format, &out->key, &out->srgb) ? out : NULL;
 }
 
 /* The three qwords of a view, or the reason it has none */
@@ -64,7 +41,8 @@ g5p_view_state(const struct pvr_image_view *iview, uint64_t q[3])
 {
    const struct pvr_image *image = pvr_image_view_get_image(iview);
    const struct pvr_image_plane *plane = pvr_single_plane_const(image);
-   const struct pvr_g5p_tex_format *f = g5p_tex_format(iview->vk.format);
+   struct pvr_g5p_tex_format tf;
+   const struct pvr_g5p_tex_format *f = g5p_tex_format(iview->vk.format, &tf);
 
    if (vk_format_is_depth_or_stencil(iview->vk.format))
       return pvr_arch_g5p_ds_view_state(iview, q); /* its ZLS plane in place (pvr_arch_g5p_ds.c) */

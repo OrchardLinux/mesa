@@ -47,6 +47,7 @@
 #include "pvr_framebuffer.h"
 #include "pvr_g5p.h"
 #include "pvr_g5p_blend.h"
+#include "pvr_g5p_formats.h"
 #include "pvr_g5p_mrt.h"
 #include "pvr_g5p_tex.h"
 #include "pvr_g5p_tex_encode.h"
@@ -460,7 +461,10 @@ g5p_check_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo *c
    } else if (colors != 1) {
       return G5P_REFUSE(device, "%u colour attachments (rung A: 1)", colors);
    }
-   if (cf != VK_FORMAT_B8G8R8A8_UNORM && cf != VK_FORMAT_R8G8B8A8_UNORM)
+   /* the formats the two-word program renders: the A9 format table's (pvr_g5p_formats.h) */
+   uint32_t cf_key;
+   bool cf_srgb;
+   if (!pvr_g5p_format_pbe(cf, &cf_key, &cf_srgb))
       return G5P_REFUSE(device, "colour attachment format %s", vk_Format_to_str(cf));
    /* a depth/stencil attachment: the ZLS formats (pvr_g5p_ds.c), no depth bounds */
    if (ds && s->ds && s->ds->depth.bounds_test.enable)

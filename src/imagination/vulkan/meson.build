@@ -147,6 +147,7 @@ if with_imagination_g5p
     'pvr_arch_g5p_blend.c',
     'pvr_arch_g5p_gfx.c',
     'pvr_arch_g5p_tex.c',
+    'pvr_arch_g5p_layout.c',
     'pvr_arch_g5p_ds.c',
     'pvr_arch_g5p_msaa.c',
     'pvr_arch_g5p_mrt.c',
@@ -155,6 +156,7 @@ if with_imagination_g5p
     'pvr_arch_g5p_xfb.c',
   )
   pvr_files += files(
+    'pvr_g5p_formats.c',
     'pvr_g5p_image.c',
     'pvr_g5p_nir.c',
     'pvr_g5p_xfb_query.c',

@@ -22,8 +22,10 @@
 #   define PVR_G5P_HOOK(name, ...)
 #endif
 
-/* Textures and samplers (pvr_g5p_tex.h). */
+/* Textures and samplers (pvr_g5p_tex.h), colour formats (pvr_g5p_formats.h). */
 #if defined(PVR_APPLE_G5P)
+#   include "pvr_g5p_formats.h"
+#   include "pvr_g5p_layout.h"
 #   include "pvr_g5p_tex.h"
 #   include "pvr_g5p_xfb.h"
 #endif
@@ -174,6 +176,23 @@
          pvr_cmd_buffer_set_error_unwarned(cmd_buffer, r_);                                           \
       return;                                                                                         \
    }
+
+/* pvr_formats.c, pvr_get_image_format_features2(): a colour format's
+ * features are the A9's (pvr_g5p_color_format_features(): its format table,
+ * not Rogue's), before the G9P and depth/stencil gates.
+ */
+#define PVR_G5P_HOOK_color_format_features(pdevice, vk_format, tiling, flags) \
+   if (PVR_HAS_FEATURE(&(pdevice)->dev_info, apple_g5p) &&                 \
+       !vk_format_is_depth_or_stencil(vk_format))                          \
+      (flags) = pvr_g5p_color_format_features((vk_format), (tiling), (flags));
+
+/* pvr_formats.c, pvr_get_image_format_properties(): the image types the A9
+ * has of a colour format (pvr_g5p_image_format_check()), after the features
+ */
+#define PVR_G5P_HOOK_image_format(pdevice, info, tiling, result)                   \
+   if (PVR_HAS_FEATURE(&(pdevice)->dev_info, apple_g5p) &&                        \
+       ((result) = pvr_g5p_image_format_check((info), (tiling))) != VK_SUCCESS) \
+      goto err_unsupported_format;
 
 #endif /* PVR_G5P_HOOKS_H */
 
