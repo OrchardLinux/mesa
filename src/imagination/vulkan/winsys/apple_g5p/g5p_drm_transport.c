@@ -253,6 +253,15 @@ fail:
    (void)g5p_drm_bo_destroy(ws, bo);
    return r;
 }
+int g5p_drm_bo_mmap_offset(struct g5p_drm *ws, const struct g5p_drm_bo *bo, uint64_t *offset)
+{
+   struct drm_g5p_bo_mmap_offset off = {.handle = bo->handle};
+   int r = call(ws->fd, DRM_IOCTL_G5P_BO_MMAP_OFFSET, &off);
+   if (r) return r;
+   if (off.offset > INT64_MAX) return -ERANGE;
+   *offset = off.offset;
+   return 0;
+}
 int g5p_drm_bo_export(struct g5p_drm *ws, struct g5p_drm_bo *bo, int *fd)
 {
    struct drm_prime_handle prime = {.handle = bo->handle, .flags = DRM_CLOEXEC | DRM_RDWR};

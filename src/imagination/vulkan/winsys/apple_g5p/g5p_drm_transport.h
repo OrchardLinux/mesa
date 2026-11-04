@@ -51,6 +51,8 @@ int g5p_drm_bo_destroy(struct g5p_drm *, struct g5p_drm_bo *);
  * CPU mapping through the dma-buf itself; export returns a new dma-buf fd. */
 int g5p_drm_bo_import(struct g5p_drm *, struct g5p_drm_bo *, int fd, uint64_t va, uint64_t *size);
 int g5p_drm_bo_export(struct g5p_drm *, struct g5p_drm_bo *, int *fd);
+/* The BO's mmap offset on the DRM fd (BO_MMAP_OFFSET), for a second mapping of it */
+int g5p_drm_bo_mmap_offset(struct g5p_drm *, const struct g5p_drm_bo *, uint64_t *offset);
 int g5p_drm_bo_sync(struct g5p_drm *, const struct g5p_drm_bo *, uint32_t);
 int g5p_drm_bo_sync_range(struct g5p_drm *, const struct g5p_drm_bo *, uint32_t op, uint64_t va_lo, uint64_t va_hi);
 int g5p_drm_wait(struct g5p_drm *, int64_t timeout_ns);

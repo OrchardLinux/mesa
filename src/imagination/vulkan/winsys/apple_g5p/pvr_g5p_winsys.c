@@ -101,6 +101,7 @@ struct g5p_ws_bo {
    bool own; /* an own kernel BO (display buffer or import) */
    struct g5p_drm_bo kbo;
    struct list_head link; /* in g5p_ws::own_bos, while own */
+   bool placed; /* bo->map is a placed mapping (VK_EXT_map_memory_placed), not cpu */
    int refs;
 };
 
@@ -416,18 +417,54 @@ static VkResult g5p_ws_buffer_get_fd(struct pvr_winsys_bo *bo, int *const fd_out
    return r ? vk_errorf(NULL, VK_ERROR_OUT_OF_DEVICE_MEMORY, "apple_g5p: export: %s", strerror(-r)) : VK_SUCCESS;
 }
 
+/* A placed mapping (VK_EXT_map_memory_placed, which Zink uses): the BO's pages mapped again at addr, MAP_FIXED over
+ * the application's reservation. A slice is its arena chunk at the slice's offset; an own BO is itself. Both views
+ * are MAP_SHARED of one GEM object, so they stay coherent with each other. Imports are mapped through their dma-buf
+ * fd, which the winsys doesn't keep: placed maps of imports are refused. */
 static VkResult g5p_ws_buffer_map(struct pvr_winsys_bo *bo, void *addr)
 {
    struct g5p_ws_bo *b = to_bo(bo);
-   if (addr && addr != (void *)b->cpu) /* placed mappings: the slice's CPU address is fixed */
-      return vk_error(NULL, VK_ERROR_MEMORY_MAP_FAILED);
-   bo->map = b->cpu;
+   struct g5p_ws *ws = to_ws(bo->ws);
+   if (!addr || addr == (void *)b->cpu) {
+      bo->map = b->cpu;
+      b->placed = false;
+      return VK_SUCCESS;
+   }
+   const struct g5p_drm_bo *k = NULL;
+   uint64_t in_bo = 0;
+   if (b->own) {
+      if (b->kbo.shared && b->base.is_imported)
+         return vk_errorf(NULL, VK_ERROR_MEMORY_MAP_FAILED, "apple_g5p: placed map of an imported dma-buf");
+      k = &b->kbo;
+   } else {
+      for (unsigned i = 0; i < ws->chunk_count && !k; i++)
+         if (b->va >= ws->chunks[i].va && b->va + b->alloc_size <= ws->chunks[i].va + ws->chunks[i].size) {
+            k = &ws->chunks[i];
+            in_bo = b->va - ws->chunks[i].va;
+         }
+   }
+   uint64_t off;
+   if (!k || g5p_drm_bo_mmap_offset(&ws->drm, k, &off))
+      return vk_errorf(NULL, VK_ERROR_MEMORY_MAP_FAILED, "apple_g5p: placed map: no mmap offset");
+   void *m = mmap(addr, b->alloc_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, ws->drm.fd, off + in_bo);
+   if (m == MAP_FAILED)
+      return vk_errorf(NULL, VK_ERROR_MEMORY_MAP_FAILED, "apple_g5p: placed map: %s", strerror(errno));
+   bo->map = m;
+   b->placed = true;
    return VK_SUCCESS;
 }
 
 static VkResult g5p_ws_buffer_unmap(struct pvr_winsys_bo *bo, bool reserve)
 {
-   (void)reserve;
+   struct g5p_ws_bo *b = to_bo(bo);
+   if (b->placed) {
+      /* reserve (VK_MEMORY_UNMAP_RESERVE_BIT_EXT): keep the range as an inaccessible reservation */
+      if (reserve)
+         mmap(bo->map, b->alloc_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE, -1, 0);
+      else
+         munmap(bo->map, b->alloc_size);
+      b->placed = false;
+   }
    bo->map = NULL;
    return VK_SUCCESS;
 }
