@@ -108,6 +108,8 @@ struct g5p_ws {
    uint32_t chunk_live[G5P_WS_MAX_CHUNKS]; /* slices referencing each chunk; lock held */
    uint64_t arena_reclaimed;
    uint64_t arena_submits;
+   uint64_t data_live, data_peak;
+   unsigned data_count;
    struct util_vma_heap slices;
 
    /* own kernel BOs: display buffers and imports; every live one is listed in own_bos, because a job names
@@ -130,6 +132,7 @@ struct g5p_ws_bo {
    uint8_t *cpu;
    uint64_t alloc_size;
    unsigned chunk; /* stable until this slice is destroyed */
+   bool data_only; /* large application VkDeviceMemory, not code/control streams */
    bool own; /* an own kernel BO (display buffer or import) */
    struct g5p_drm_bo kbo;
    struct list_head link; /* in g5p_ws::own_bos, while own */
@@ -142,6 +145,14 @@ static void g5p_ws_own_list(struct g5p_ws *ws, struct g5p_ws_bo *b)
    simple_mtx_lock(&ws->lock);
    list_addtail(&b->link, &ws->own_bos);
    ws->own_count++;
+   if (b->data_only) {
+      ws->data_live += b->alloc_size;
+      ws->data_peak = MAX2(ws->data_peak, ws->data_live);
+      ws->data_count++;
+      if (ws->arena_log)
+         fprintf(stderr, "apple_g5p winsys: data allocation pid=%ld fd=%d handle=%u size_kib=%" PRIu64 " live_kib=%" PRIu64 " bos=%u\n",
+                 (long)getpid(), ws->drm.fd, b->kbo.handle, b->alloc_size >> 10, ws->data_live >> 10, ws->data_count);
+   }
    simple_mtx_unlock(&ws->lock);
 }
 
@@ -377,8 +388,8 @@ static int g5p_ws_arena_grow(struct g5p_ws *ws, uint64_t need, uint64_t alignmen
 static void g5p_ws_arena_stats(struct g5p_ws *ws, const char *why)
 {
    fprintf(stderr, "apple_g5p winsys: arena stats pid=%ld fd=%d why=%s committed_kib=%" PRIu64 " live_kib=%" PRIu64
-           " peak_kib=%" PRIu64 " reclaimed_kib=%" PRIu64 " allocs=%" PRIu64 " reused_pages=%" PRIu64 " chunks=%u max_kib=%" PRIu64 "\n",
-           (long)getpid(), ws->drm.fd, why, ws->arena_committed >> 10, ws->arena_live >> 10, ws->arena_peak >> 10, ws->arena_reclaimed >> 10,
+           " peak_kib=%" PRIu64 " data_live_kib=%" PRIu64 " data_peak_kib=%" PRIu64 " data_bos=%u reclaimed_kib=%" PRIu64 " allocs=%" PRIu64 " reused_pages=%" PRIu64 " chunks=%u max_kib=%" PRIu64 "\n",
+           (long)getpid(), ws->drm.fd, why, ws->arena_committed >> 10, ws->arena_live >> 10, ws->arena_peak >> 10, ws->data_live >> 10, ws->data_peak >> 10, ws->data_count, ws->arena_reclaimed >> 10,
            ws->arena_allocs, ws->arena_reused, ws->chunk_count, ws->arena_max >> 10);
 }
 
@@ -452,11 +463,11 @@ static struct g5p_ws_bo *g5p_ws_bo_new(struct g5p_ws *ws, uint64_t size)
 
 /* An own kernel BO in the dedicated window (a VM edit: the kernel refuses it
  * while a job of the context is queued or running). */
-static VkResult g5p_ws_own_create(struct g5p_ws *ws, uint64_t size, struct g5p_ws_bo *b)
+static VkResult g5p_ws_own_create(struct g5p_ws *ws, uint64_t size, uint64_t alignment, bool data, struct g5p_ws_bo *b)
 {
    const uint64_t alloc = align64(size, G5P_WS_PAGE);
    simple_mtx_lock(&ws->lock);
-   uint64_t va = util_vma_heap_alloc(&ws->dedicated, alloc, G5P_WS_PAGE);
+   uint64_t va = util_vma_heap_alloc(&ws->dedicated, alloc, MAX2(alignment, G5P_WS_PAGE));
    simple_mtx_unlock(&ws->lock);
    if (!va)
       return g5p_ws_fail(VK_ERROR_OUT_OF_DEVICE_MEMORY, "own BO of %" PRIu64 " bytes: the %" PRIu64
@@ -479,6 +490,7 @@ static VkResult g5p_ws_own_create(struct g5p_ws *ws, uint64_t size, struct g5p_w
    b->va = va;
    b->cpu = b->kbo.map;
    b->alloc_size = alloc;
+   b->data_only = data;
    g5p_ws_own_list(ws, b);
    return VK_SUCCESS;
 }
@@ -492,8 +504,8 @@ static VkResult g5p_ws_buffer_create(struct pvr_winsys *ws_, uint64_t size, uint
       return vk_error(NULL, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    VkResult r = VK_SUCCESS;
-   if (type == PVR_WINSYS_BO_TYPE_DISPLAY) {
-      r = g5p_ws_own_create(ws, size, b);
+   if (type == PVR_WINSYS_BO_TYPE_DISPLAY || type == PVR_G5P_BO_TYPE_DATA) {
+      r = g5p_ws_own_create(ws, size, alignment, type == PVR_G5P_BO_TYPE_DATA, b);
    } else {
       const uint64_t alloc = align64(size, G5P_WS_PAGE), align = MAX2(alignment, G5P_WS_PAGE);
       simple_mtx_lock(&ws->lock);
@@ -618,8 +630,13 @@ static void g5p_ws_buffer_destroy(struct pvr_winsys_bo *bo)
       if (r)
          fprintf(stderr, "apple_g5p winsys: own BO at %#" PRIx64 " of %" PRIu64 " bytes not released (%s, %u waits): "
                  "its VA stays reserved\n", va, b->alloc_size, strerror(-r), waits);
-      else
+      else {
          util_vma_heap_free(&ws->dedicated, va, b->alloc_size);
+         if (b->data_only) {
+            ws->data_live -= b->alloc_size;
+            ws->data_count--;
+         }
+      }
    } else {
       util_vma_heap_free(&ws->slices, b->va, b->alloc_size);
       ws->arena_live -= b->alloc_size;

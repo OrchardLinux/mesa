@@ -296,7 +296,7 @@ VkResult pvr_AllocateMemory(VkDevice _device,
        * entire allocation can be mapped.
        */
       const uint64_t alignment = device->heaps.general_heap->page_size;
-
+      PVR_G5P_HOOK(memory_bo_type, device, pAllocateInfo, type)
       /* FIXME: Need to determine the flags based on
        * device->pdevice->memory.memoryTypes[pAllocateInfo->memoryTypeIndex].propertyFlags.
        *
@@ -1170,4 +1170,5 @@ void pvr_GetImageMemoryRequirements2(VkDevice _device,
          break;
       }
    }
+   PVR_G5P_HOOK(memory_dedicated, device, pMemoryRequirements)
 }

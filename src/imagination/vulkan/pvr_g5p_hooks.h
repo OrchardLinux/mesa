@@ -28,6 +28,7 @@
 #   include "pvr_g5p_layout.h"
 #   include "pvr_g5p_tex.h"
 #   include "pvr_g5p_xfb.h"
+#   include "pvr_g5p_memory.h"
 #endif
 
 /* pvr_arch_image.c, pvr_CreateImageView(): the sampled state of a view is
@@ -110,6 +111,17 @@
          *(data) = (uint8_t *)(mem)->bo->map + (offset);                  \
       return r_;                                                          \
    }
+
+/* Application memory only: internal programs and control streams keep GPU type. */
+#define PVR_G5P_HOOK_memory_bo_type(device, info, type)                     \
+   if (PVR_HAS_FEATURE(&(device)->pdevice->dev_info, apple_g5p) &&           \
+       (type) == PVR_WINSYS_BO_TYPE_GPU &&                                  \
+       pvr_g5p_memory_is_large((info)->allocationSize))                     \
+      (type) = PVR_G5P_BO_TYPE_DATA;
+
+#define PVR_G5P_HOOK_memory_dedicated(device, requirements)                 \
+   if (PVR_HAS_FEATURE(&(device)->pdevice->dev_info, apple_g5p))             \
+      pvr_g5p_memory_dedicated(requirements);
 
 /* pvr_arch_xfb.c, vkCmdBind/Begin/EndTransformFeedbackEXT(): G5P records
  * its own events (pvr_g5p_xfb.h); Rogue's stream-out programs and End's
