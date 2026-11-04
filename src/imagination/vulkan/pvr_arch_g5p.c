@@ -540,7 +540,8 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
    const unsigned n = hw_render->eot_surface_count;
    unsigned v;
 
-   memset(g, 0, sizeof(*g));
+   /* everything but the reads the pass's draws collected (pvr_g5p_perf.h) */
+   memset(g, 0, offsetof(struct pvr_g5p_job, reads));
    switch (n) {
    case 1: v = 0; break;
    case 2: v = 1; break;
@@ -708,7 +709,7 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
    g->eot[1] = p->eot.code_offset;
    g->eot[2] = g5p_mrt_eot_info(n);
    /* what the render writes, for the winsys's resource list (pvr_g5p_perf.h) */
-   pvr_arch_g5p_perf_job(cmd_buffer, hw_render, &g->perf);
+   pvr_arch_g5p_perf_job(cmd_buffer, hw_render, &g->reads, &g->perf);
    g->enabled = true;
    return VK_SUCCESS;
 }

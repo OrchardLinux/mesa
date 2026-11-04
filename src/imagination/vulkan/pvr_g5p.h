@@ -23,7 +23,7 @@
 #include "pvr_macros.h"
 #include "util/simple_mtx.h"
 #include "pvr_g5p_xfb_core.h"
-#include "winsys/apple_g5p/g5p_ws_perf.h"
+#include "pvr_g5p_perf.h"
 
 struct pvr_cmd_buffer;
 struct pvr_device;
@@ -112,6 +112,8 @@ struct pvr_g5p_job {
    bool msaa_resolve;           /* 4x: the PBE resolves target 0 into a one-sample view */
    bool enabled;
    struct g5p_perf_tail perf;   /* what the job writes, for the winsys (pvr_g5p_perf.h) */
+   /* last: what the pass's draws read outside the arena (pvr_arch_g5p_perf_draw()); job init keeps it */
+   struct pvr_g5p_perf_reads reads;
 };
 
 /* ---- graphics (pvr_arch_g5p_gfx.c, pvr_g5p_nir.c) ---- */

@@ -803,10 +803,13 @@ static VkResult g5p_ws_render_submit(const struct pvr_winsys_render_ctx *ctx,
       return g5p_ws_refuse(VK_ERROR_OUT_OF_DEVICE_MEMORY, "%u own BOs: more than a job's %u resources",
                            ws->own_count, (unsigned)ARRAY_SIZE(res) - ws->chunk_count);
    }
-   list_for_each_entry (struct g5p_ws_bo, b, &ws->own_bos, link)
-      res[nres++] = (struct drm_g5p_render_resource){
-         .handle = b->kbo.handle, .va = b->va, .size = b->kbo.size,
-         .kind = g5p_ws_perf_own_kind(&ws->perf, &pj, b->va, b->kbo.size, b->kbo.shared)};
+   list_for_each_entry (struct g5p_ws_bo, b, &ws->own_bos, link) {
+      /* 0: the job neither writes nor reads it (g5p_ws_perf.h): not listed, no maintenance, no fence */
+      const uint32_t kind = g5p_ws_perf_own_kind(&ws->perf, &pj, b->va, b->kbo.size, b->kbo.shared);
+      if (kind)
+         res[nres++] = (struct drm_g5p_render_resource){
+            .handle = b->kbo.handle, .va = b->va, .size = b->kbo.size, .kind = kind};
+   }
    simple_mtx_unlock(&ws->lock);
 
    /* waits (the two stages' waits), then the signal: the kernel takes one per job, so the fragment stage's is
@@ -1023,7 +1026,7 @@ static VkResult g5p_ws_arena_init(struct g5p_ws *ws)
       ws->chunk_count++;
    }
    util_vma_heap_init(&ws->slices, ws->arena_va, size);
-   g5p_ws_perf_init(&ws->perf, ws->arena_va, size);
+   g5p_ws_perf_init(&ws->perf, ws->arena_va, size, ws->arena_cpu);
    /* above the code window: display BOs and imports are never programs */
    util_vma_heap_init(&ws->dedicated, ws->arena_va + ws->render.code_window, G5P_WS_DEDICATED_SIZE);
    ws->vma_heaps_ready = true;
