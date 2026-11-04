@@ -21,6 +21,14 @@ for s in quad.vert:vert:QUAD_VERT \
          usamp-0.frag:frag:USAMP_FRAG usamp-8.frag:frag:USAMP_FRAG+SHIFT=8 usamp-16.frag:frag:USAMP_FRAG+SHIFT=16 \
          usamp-24.frag:frag:USAMP_FRAG+SHIFT=24 isamp-0.frag:frag:ISAMP_FRAG isamp-8.frag:frag:ISAMP_FRAG+SHIFT=8 \
          isamp-16.frag:frag:ISAMP_FRAG+SHIFT=16 isamp-24.frag:frag:ISAMP_FRAG+SHIFT=24 ufetch.frag:frag:UFETCH_FRAG \
+         lay2d-0.frag:frag:LAY2D_FRAG+LOD=0.0 lay2d-1.frag:frag:LAY2D_FRAG+LOD=1.0 \
+         lay2d-2.frag:frag:LAY2D_FRAG+LOD=2.0 lay2d-3.frag:frag:LAY2D_FRAG+LOD=3.0 \
+         layarr-0.frag:frag:LAYARR_FRAG+LOD=0.0 layarr-1.frag:frag:LAYARR_FRAG+LOD=1.0 \
+         layarr-2.frag:frag:LAYARR_FRAG+LOD=2.0 \
+         lay3d-1-1.frag:frag:LAY3D_FRAG+DEPTH=1.0+LOD=1.0 lay3d-2-0.frag:frag:LAY3D_FRAG+DEPTH=2.0+LOD=0.0 \
+         lay3d-2-2.frag:frag:LAY3D_FRAG+DEPTH=2.0+LOD=2.0 lay3d-3-0.frag:frag:LAY3D_FRAG+DEPTH=3.0+LOD=0.0 \
+         lay3d-4-1.frag:frag:LAY3D_FRAG+DEPTH=4.0+LOD=1.0 lay3d-8-0.frag:frag:LAY3D_FRAG+DEPTH=8.0+LOD=0.0 \
+         lay3d-16-0.frag:frag:LAY3D_FRAG+DEPTH=16.0+LOD=0.0 \
          'solid.frag:frag:SOLID_FRAG+COLOR=vec4(0.9375,0.1875,0.125,0.25)' \
          'solid-b.frag:frag:SOLID_FRAG+COLOR=vec4(0.9375,0.1875,0.75,0.25)'; do
     name=${s%%:*} rest=${s#*:}

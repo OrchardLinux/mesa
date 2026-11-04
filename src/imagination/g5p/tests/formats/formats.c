@@ -504,27 +504,40 @@ struct img {
    VkImage image;
    VkDeviceMemory mem;
    VkImageView view;
+   VkDeviceSize size;
 };
 
+/* An image and a view of all of it: 2D, a 2D array of d layers, or 3D of depth d */
 static int
-make_image(struct img *im, VkFormat format, unsigned w, unsigned h, unsigned levels, VkImageUsageFlags usage)
+make_image_ex(struct img *im, VkFormat format, VkImageViewType vt, unsigned w, unsigned h, unsigned d,
+              unsigned levels, VkImageUsageFlags usage)
 {
-   const VkImageCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
-                                   .format = format, .extent = { w, h, 1 }, .mipLevels = levels, .arrayLayers = 1,
+   const bool is3d = vt == VK_IMAGE_VIEW_TYPE_3D;
+   const unsigned layers = vt == VK_IMAGE_VIEW_TYPE_2D_ARRAY ? d : 1;
+   const VkImageCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+                                   .imageType = is3d ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D, .format = format,
+                                   .extent = { w, h, is3d ? d : 1 }, .mipLevels = levels, .arrayLayers = layers,
                                    .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
                                    .usage = usage, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
    VkMemoryRequirements req;
 
    CHECK(vkCreateImage(dev, &ici, NULL, &im->image));
    vkGetImageMemoryRequirements(dev, im->image, &req);
+   im->size = req.size;
    if (host_memory(&req, &im->mem))
       return 1;
    CHECK(vkBindImageMemory(dev, im->image, im->mem, 0));
    const VkImageViewCreateInfo vci = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = im->image,
-                                       .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = format,
-                                       .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, levels, 0, 1 } };
+                                       .viewType = vt, .format = format,
+                                       .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, levels, 0, layers } };
    CHECK(vkCreateImageView(dev, &vci, NULL, &im->view));
    return 0;
+}
+
+static int
+make_image(struct img *im, VkFormat format, unsigned w, unsigned h, unsigned levels, VkImageUsageFlags usage)
+{
+   return make_image_ex(im, format, VK_IMAGE_VIEW_TYPE_2D, w, h, 1, levels, usage);
 }
 
 static void
@@ -543,7 +556,8 @@ barrier(VkCommandBuffer cmd, VkImage image, unsigned levels, VkImageLayout from,
                                       .dstAccessMask = dst, .oldLayout = from, .newLayout = to,
                                       .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                                       .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = image,
-                                      .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, levels, 0, 1 } };
+                                      .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, levels, 0,
+                                                            VK_REMAINING_ARRAY_LAYERS } };
    vkCmdPipelineBarrier(cmd, ss, ds, 0, 0, NULL, 0, NULL, 1, &imb);
 }
 
@@ -579,14 +593,46 @@ submit(VkCommandBuffer cmd)
 
 /* ---- rungs ---- */
 
-enum kind { K_SAMPLE, K_FILTER, K_MIP, K_FETCH, K_RENDER, K_BLEND, K_BLIT };
-static const char kind_prefix[] = { 's', 'f', 'm', 'x', 'r', 'b', 'k' };
+enum kind { K_SAMPLE, K_FILTER, K_MIP, K_FETCH, K_RENDER, K_BLEND, K_BLIT, K_LAYOUT };
+static const char kind_prefix[] = { 's', 'f', 'm', 'x', 'r', 'b', 'k', 'l' };
+
+struct layout_case {
+   const char *name;
+   VkImageViewType vt;
+   unsigned w, h, d; /* d: the layers of an array, the depth of a 3D image */
+   unsigned levels, level;
+   const uint32_t *fs;
+   size_t fs_size;
+};
+
+#define LAY(n, vt, w, h, d, levels, level, fs) { n, VK_IMAGE_VIEW_TYPE_##vt, w, h, d, levels, level, spv_##fs##_frag, \
+                                                  sizeof(spv_##fs##_frag) }
+static const struct layout_case layouts[] = {
+   LAY("l-npot-0", 2D, 12, 10, 1, 4, 0, lay2d_0),
+   LAY("l-npot-1", 2D, 12, 10, 1, 4, 1, lay2d_1),
+   LAY("l-npot-2", 2D, 12, 10, 1, 4, 2, lay2d_2),
+   LAY("l-npot-3", 2D, 12, 10, 1, 4, 3, lay2d_3),
+   LAY("l-wide-1", 2D, 16, 4, 1, 3, 1, lay2d_1),
+   LAY("l-tall-2", 2D, 4, 16, 1, 3, 2, lay2d_2),
+   LAY("l-arr-mip-1", 2D_ARRAY, 8, 8, 2, 4, 1, layarr_1),
+   LAY("l-arr-npot-0", 2D_ARRAY, 12, 10, 3, 3, 0, layarr_0),
+   LAY("l-arr-npot-2", 2D_ARRAY, 12, 10, 3, 3, 2, layarr_2),
+   LAY("l-3d-4x4x2", 3D, 4, 4, 2, 1, 0, lay3d_2_0),
+   LAY("l-3d-8", 3D, 8, 8, 8, 1, 0, lay3d_8_0),
+   LAY("l-3d-npot", 3D, 6, 5, 3, 1, 0, lay3d_3_0),
+   LAY("l-3d-mip-1", 3D, 8, 8, 8, 4, 1, lay3d_4_1),
+   LAY("l-3d-mip-2", 3D, 8, 8, 8, 4, 2, lay3d_2_2),
+   LAY("l-3d-npot-1", 3D, 6, 5, 3, 2, 1, lay3d_1_1),
+   LAY("l-3d-big", 3D, 16, 16, 16, 1, 0, lay3d_16_0),
+};
+#undef LAY
 
 struct rung {
    char name[64];
    const struct fmt *f;
    enum kind kind;
    unsigned shift; /* integers: the byte of the channels read */
+   const struct layout_case *lay; /* K_LAYOUT */
 };
 
 static struct rung rungs[512];
@@ -596,7 +642,7 @@ static VkFormatFeatureFlags
 feature_of(enum kind k)
 {
    switch (k) {
-   case K_SAMPLE: case K_MIP: case K_FETCH: return VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+   case K_SAMPLE: case K_MIP: case K_FETCH: case K_LAYOUT: return VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
    case K_FILTER: return VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
    case K_RENDER: return VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
    case K_BLIT: return VK_FORMAT_FEATURE_BLIT_SRC_BIT;
@@ -661,6 +707,16 @@ build_rungs(void)
          add(f, K_RENDER, 0);
          add(f, K_BLEND, 0);
       }
+   }
+   const struct fmt *rgba8 = NULL;
+   for (unsigned i = 0; i < ARRAY_LEN(fmts); i++) {
+      if (fmts[i].vk == VK_FORMAT_R8G8B8A8_UNORM)
+         rgba8 = &fmts[i];
+   }
+   for (unsigned i = 0; i < ARRAY_LEN(layouts); i++) {
+      struct rung *r = &rungs[nrungs++];
+      r->f = rgba8, r->kind = K_LAYOUT, r->shift = 0, r->lay = &layouts[i];
+      snprintf(r->name, sizeof(r->name), "%s", layouts[i].name);
    }
 }
 
@@ -1179,6 +1235,95 @@ level_bytes(const struct fmt *f, unsigned w, unsigned h)
    return f->codec ? (size_t)((w + 3) / 4) * ((h + 3) / 4) * f->cpp : (size_t)w * h * f->cpp;
 }
 
+/* Draw the 64x64 quad sampling view with fs into a BGRA8 target and read it back into rb: nearest, uv 0..1
+ * over the target, or linear at half-texel offsets (the quad below) */
+static int
+draw_sampled(VkImageView view, bool linear, float max_lod, const uint32_t *fs, size_t fs_size, struct buf *rb)
+{
+   struct img target;
+   struct buf vb;
+   VkCommandBuffer cmd;
+
+   const VkSamplerCreateInfo sci = { .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+                                     .magFilter = linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
+                                     .minFilter = linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
+                                     .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+                                     .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                                     .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                                     .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                                     .maxLod = max_lod };
+   VkSampler sampler;
+   CHECK(vkCreateSampler(dev, &sci, NULL, &sampler));
+   const VkDescriptorSetLayoutBinding b = { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                            .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT };
+   const VkDescriptorSetLayoutCreateInfo dlci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+                                                  .bindingCount = 1, .pBindings = &b };
+   VkDescriptorSetLayout dsl;
+   CHECK(vkCreateDescriptorSetLayout(dev, &dlci, NULL, &dsl));
+   const VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 };
+   const VkDescriptorPoolCreateInfo dpci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1,
+                                             .poolSizeCount = 1, .pPoolSizes = &ps };
+   VkDescriptorPool dpool;
+   CHECK(vkCreateDescriptorPool(dev, &dpci, NULL, &dpool));
+   const VkDescriptorSetAllocateInfo dai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                             .descriptorPool = dpool, .descriptorSetCount = 1, .pSetLayouts = &dsl };
+   VkDescriptorSet set;
+   CHECK(vkAllocateDescriptorSets(dev, &dai, &set));
+   const VkDescriptorImageInfo dii = { sampler, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+   const VkWriteDescriptorSet wds = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set,
+                                      .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                      .pImageInfo = &dii };
+   vkUpdateDescriptorSets(dev, 1, &wds, 0, NULL);
+
+   if (make_image(&target, VK_FORMAT_B8G8R8A8_UNORM, W, H, 1,
+                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT))
+      return 1;
+   VkRenderPass rp;
+   VkFramebuffer fb;
+   if (make_pass(VK_FORMAT_B8G8R8A8_UNORM, target.view, VK_ATTACHMENT_LOAD_OP_CLEAR, &rp, &fb))
+      return 1;
+   const VkPipelineLayoutCreateInfo lci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+                                            .setLayoutCount = 1, .pSetLayouts = &dsl };
+   VkPipelineLayout layout;
+   CHECK(vkCreatePipelineLayout(dev, &lci, NULL, &layout));
+   VkPipeline pipe;
+   if (make_pipeline(rp, layout, fs, fs_size, false, &pipe))
+      return 1;
+   /* nearest: uv 0..1 over the target, 8 pixels a texel. Linear: at pixel
+    * (x, y), u = x/8 and v = (y + 1/2)/8, so s = x - 1/2 (halfway between
+    * texels x-1 and x) and t = y (row y's centre); both clamp past the
+    * texture */
+   if (linear ? quad(&vb, 1, -0.5f / TW, 63.5f / TW, 0, 64.0f / TH) : quad(&vb, 1, 0, 1, 0, 1))
+      return 1;
+
+   if (begin(&cmd))
+      return 1;
+   const VkClearValue cv = { .color.float32 = { 0, 0, 0, 0 } };
+   const VkRenderPassBeginInfo rbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = rp,
+                                       .framebuffer = fb, .renderArea = { { 0, 0 }, { W, H } }, .clearValueCount = 1,
+                                       .pClearValues = &cv };
+   vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &set, 0, NULL);
+   const VkDeviceSize zero = 0;
+   vkCmdBindVertexBuffers(cmd, 0, 1, &vb.b, &zero);
+   vkCmdDraw(cmd, 4, 1, 0, 0);
+   vkCmdEndRenderPass(cmd);
+   if (submit(cmd) || read_target(target.image, VK_FORMAT_B8G8R8A8_UNORM, 4, rb))
+      return 1;
+
+   free_buffer(&vb);
+   vkDestroyPipeline(dev, pipe, NULL);
+   vkDestroyPipelineLayout(dev, layout, NULL);
+   vkDestroyFramebuffer(dev, fb, NULL);
+   vkDestroyRenderPass(dev, rp, NULL);
+   vkDestroyDescriptorPool(dev, dpool, NULL);
+   vkDestroyDescriptorSetLayout(dev, dsl, NULL);
+   vkDestroySampler(dev, sampler, NULL);
+   free_image(&target);
+   return 0;
+}
+
 static int
 run_texture(const struct rung *r)
 {
@@ -1186,8 +1331,8 @@ run_texture(const struct rung *r)
    const unsigned levels = r->kind == K_MIP ? 2 : 1, lvl = levels - 1;
    const unsigned w = TW >> lvl, h = TH >> lvl;
    uint8_t texels[2][TW * TH * 16];
-   struct img tex, target;
-   struct buf staging, vb, rb;
+   struct img tex;
+   struct buf staging, rb;
    VkCommandBuffer cmd;
 
    /* the texture, uploaded in a submission of its own */
@@ -1215,51 +1360,8 @@ run_texture(const struct rung *r)
    if (submit(cmd))
       return 1;
 
-   /* sampler, set, target, pipeline */
-   const bool linear = r->kind == K_FILTER;
-   const VkSamplerCreateInfo sci = { .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
-                                     .magFilter = linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
-                                     .minFilter = linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
-                                     .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
-                                     .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-                                     .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-                                     .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-                                     .maxLod = levels > 1 ? VK_LOD_CLAMP_NONE : 0.25f };
-   VkSampler sampler;
-   CHECK(vkCreateSampler(dev, &sci, NULL, &sampler));
-   const VkDescriptorSetLayoutBinding b = { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                                            .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT };
-   const VkDescriptorSetLayoutCreateInfo dlci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-                                                  .bindingCount = 1, .pBindings = &b };
-   VkDescriptorSetLayout dsl;
-   CHECK(vkCreateDescriptorSetLayout(dev, &dlci, NULL, &dsl));
-   const VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 };
-   const VkDescriptorPoolCreateInfo dpci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1,
-                                             .poolSizeCount = 1, .pPoolSizes = &ps };
-   VkDescriptorPool dpool;
-   CHECK(vkCreateDescriptorPool(dev, &dpci, NULL, &dpool));
-   const VkDescriptorSetAllocateInfo dai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-                                             .descriptorPool = dpool, .descriptorSetCount = 1, .pSetLayouts = &dsl };
-   VkDescriptorSet set;
-   CHECK(vkAllocateDescriptorSets(dev, &dai, &set));
-   const VkDescriptorImageInfo dii = { sampler, tex.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-   const VkWriteDescriptorSet wds = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set,
-                                      .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                                      .pImageInfo = &dii };
-   vkUpdateDescriptorSets(dev, 1, &wds, 0, NULL);
-
-   if (make_image(&target, VK_FORMAT_B8G8R8A8_UNORM, W, H, 1,
-                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT))
-      return 1;
-   VkRenderPass rp;
-   VkFramebuffer fb;
-   if (make_pass(VK_FORMAT_B8G8R8A8_UNORM, target.view, VK_ATTACHMENT_LOAD_OP_CLEAR, &rp, &fb))
-      return 1;
-   const VkPipelineLayoutCreateInfo lci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-                                            .setLayoutCount = 1, .pSetLayouts = &dsl };
-   VkPipelineLayout layout;
-   CHECK(vkCreatePipelineLayout(dev, &lci, NULL, &layout));
    /* the fragment program: the format class's compiled-in scale and bias, the integer byte */
+   const bool linear = r->kind == K_FILTER;
    const uint32_t *fs;
    size_t fs_size;
 #define FS(n) (fs = spv_##n##_frag, fs_size = sizeof(spv_##n##_frag))
@@ -1281,30 +1383,7 @@ run_texture(const struct rung *r)
    else
       lod ? FS(samplod_un) : FS(samp_un);
 #undef FS
-   VkPipeline pipe;
-   if (make_pipeline(rp, layout, fs, fs_size, false, &pipe))
-      return 1;
-   /* nearest: uv 0..1 over the target, 8 pixels a texel. Linear: at pixel
-    * (x, y), u = x/8 and v = (y + 1/2)/8, so s = x - 1/2 (halfway between
-    * texels x-1 and x) and t = y (row y's centre); both clamp past the
-    * texture */
-   if (linear ? quad(&vb, 1, -0.5f / TW, 63.5f / TW, 0, 64.0f / TH) : quad(&vb, 1, 0, 1, 0, 1))
-      return 1;
-
-   if (begin(&cmd))
-      return 1;
-   const VkClearValue cv = { .color.float32 = { 0, 0, 0, 0 } };
-   const VkRenderPassBeginInfo rbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = rp,
-                                       .framebuffer = fb, .renderArea = { { 0, 0 }, { W, H } }, .clearValueCount = 1,
-                                       .pClearValues = &cv };
-   vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
-   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
-   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &set, 0, NULL);
-   const VkDeviceSize zero = 0;
-   vkCmdBindVertexBuffers(cmd, 0, 1, &vb.b, &zero);
-   vkCmdDraw(cmd, 4, 1, 0, 0);
-   vkCmdEndRenderPass(cmd);
-   if (submit(cmd) || read_target(target.image, VK_FORMAT_B8G8R8A8_UNORM, 4, &rb))
+   if (draw_sampled(tex.view, linear, levels > 1 ? VK_LOD_CLAMP_NONE : 0.25f, fs, fs_size, &rb))
       return 1;
 
    struct result res = { 0 };
@@ -1320,16 +1399,137 @@ run_texture(const struct rung *r)
    const int ret = report(r, &res);
 
    free_buffer(&rb);
-   free_buffer(&vb);
    free_buffer(&staging);
-   vkDestroyPipeline(dev, pipe, NULL);
-   vkDestroyPipelineLayout(dev, layout, NULL);
-   vkDestroyFramebuffer(dev, fb, NULL);
-   vkDestroyRenderPass(dev, rp, NULL);
-   vkDestroyDescriptorPool(dev, dpool, NULL);
-   vkDestroyDescriptorSetLayout(dev, dsl, NULL);
-   vkDestroySampler(dev, sampler, NULL);
-   free_image(&target);
+   free_image(&tex);
+   return ret;
+}
+
+/* ---- layout rungs ---- */
+
+/* An RGBA8 texture whose texels name themselves (layout_texel()), read at
+ * one level: NPOT and non-square mip chains (each level twiddled over its
+ * own extent padded to powers of two), arrays of mip chains (a layer is the
+ * image's own levels rounded) and 3D images (4x4x4 bricks, the 16 KiB big
+ * layer). 2D rungs read the level over the whole target; array and 3D rungs
+ * read layer or slice c in cell c of a 4x4 grid of 16x16 pixels. Every
+ * level is at most 16 texels a side, so each texel is read at its centre
+ * and none is read at a texel boundary. */
+
+static unsigned
+minify(unsigned v, unsigned l)
+{
+   return v >> l ? v >> l : 1;
+}
+
+/* The bytes of texel (x, y, z) of level l: x, y, z < 16, l < 16 */
+static void
+layout_texel(unsigned x, unsigned y, unsigned z, unsigned l, uint8_t out[4])
+{
+   out[0] = (uint8_t)(x << 4 | l);
+   out[1] = (uint8_t)(y << 4 | z);
+   out[2] = (uint8_t)(z << 4 | ((x + 3 * y) & 15));
+   out[3] = (uint8_t)(0xf0 ^ (7 * z + 5 * l));
+}
+
+/* Whether the device takes the case's image */
+static bool
+layout_supported(const struct layout_case *c)
+{
+   VkImageFormatProperties p;
+   const bool is3d = c->vt == VK_IMAGE_VIEW_TYPE_3D;
+   if (vkGetPhysicalDeviceImageFormatProperties(pd, VK_FORMAT_R8G8B8A8_UNORM,
+                                                is3d ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+                                                VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, 0,
+                                                &p) != VK_SUCCESS)
+      return false;
+   return p.maxMipLevels >= c->levels && p.maxExtent.width >= c->w && p.maxExtent.height >= c->h &&
+          (is3d ? p.maxExtent.depth >= c->d : p.maxArrayLayers >= (c->vt == VK_IMAGE_VIEW_TYPE_2D_ARRAY ? c->d : 1));
+}
+
+static int
+run_layout(const struct rung *r)
+{
+   const struct layout_case *c = r->lay;
+   const bool is3d = c->vt == VK_IMAGE_VIEW_TYPE_3D, array = c->vt == VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+   struct img tex;
+   struct buf staging, rb;
+   VkCommandBuffer cmd;
+   VkBufferImageCopy regs[8];
+   VkDeviceSize off = 0;
+
+   if (make_image_ex(&tex, VK_FORMAT_R8G8B8A8_UNORM, c->vt, c->w, c->h, c->d, c->levels,
+                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))
+      return 1;
+   /* every level of every layer or slice, x fastest, then y, then z */
+   if (make_buffer(&staging, (VkDeviceSize)c->w * c->h * c->d * 4 * 2, VK_BUFFER_USAGE_TRANSFER_SRC_BIT))
+      return 1;
+   for (unsigned l = 0; l < c->levels; l++) {
+      const unsigned lw = minify(c->w, l), lh = minify(c->h, l), ld = is3d ? minify(c->d, l) : c->d;
+      regs[l] = (VkBufferImageCopy){ .bufferOffset = off,
+                                     .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, l, 0, array ? c->d : 1 },
+                                     .imageExtent = { lw, lh, is3d ? ld : 1 } };
+      for (unsigned z = 0; z < ld; z++) {
+         for (unsigned y = 0; y < lh; y++) {
+            for (unsigned x = 0; x < lw; x++, off += 4)
+               layout_texel(x, y, z, l, staging.map + off);
+         }
+      }
+   }
+   if (sync_mem(staging.mem, false) || begin(&cmd))
+      return 1;
+   barrier(cmd, tex.image, c->levels, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+           VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+   vkCmdCopyBufferToImage(cmd, staging.b, tex.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, c->levels, regs);
+   barrier(cmd, tex.image, c->levels, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+           VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+           VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+   if (submit(cmd))
+      return 1;
+   /* FORMATS_DUMP=DIR: the image's memory as the upload left it, DIR/<rung>.bin, for a host check of the
+    * driver's layout (the texture memory is host-visible) */
+   const char *dump = getenv("FORMATS_DUMP");
+   if (dump) {
+      char path[512];
+      void *map;
+      snprintf(path, sizeof(path), "%s/%s.bin", dump, r->name);
+      CHECK(vkMapMemory(dev, tex.mem, 0, VK_WHOLE_SIZE, 0, &map));
+      FILE *fp = fopen(path, "wb");
+      if (!fp || fwrite(map, 1, tex.size, fp) != tex.size) {
+         printf("FORMATS %s FAIL: dump to %s\n", r->name, path);
+         return 1;
+      }
+      fclose(fp);
+      vkUnmapMemory(dev, tex.mem);
+   }
+   if (draw_sampled(tex.view, false, VK_LOD_CLAMP_NONE, c->fs, c->fs_size, &rb))
+      return 1;
+
+   const unsigned l = c->level, lw = minify(c->w, l), lh = minify(c->h, l), ld = is3d ? minify(c->d, l) : c->d;
+   struct result res = { 0 };
+   for (unsigned y = 0; verify && y < H; y++) {
+      for (unsigned x = 0; x < W; x++) {
+         const uint8_t *p = rb.map + ((size_t)y * W + x) * 4;
+         const uint8_t got[4] = { p[2], p[1], p[0], p[3] };
+         unsigned tx, ty, tz = 0;
+         uint8_t want[4];
+
+         if (c->vt == VK_IMAGE_VIEW_TYPE_2D) {
+            /* u = (x + 1/2) / 64 */
+            tx = (2 * x + 1) * lw / (2 * W), ty = (2 * y + 1) * lh / (2 * H);
+         } else {
+            /* cell (x / 16, y / 16), u = (x % 16 + 1/2) / 16; the layer or slice clamps */
+            const unsigned cell = x / 16 + 4 * (y / 16);
+            tx = (2 * (x % 16) + 1) * lw / 32, ty = (2 * (y % 16) + 1) * lh / 32;
+            tz = cell < ld ? cell : ld - 1;
+         }
+         layout_texel(tx, ty, tz, l, want);
+         note(&res, x, y, got, want, 4);
+      }
+   }
+   const int ret = report(r, &res);
+
+   free_buffer(&rb);
+   free_buffer(&staging);
    free_image(&tex);
    return ret;
 }
@@ -1684,7 +1884,7 @@ main(int argc, char **argv)
          continue;
       VkFormatProperties p;
       vkGetPhysicalDeviceFormatProperties(pd, r->f->vk, &p);
-      if (!(p.optimalTilingFeatures & feature_of(r->kind))) {
+      if (!(p.optimalTilingFeatures & feature_of(r->kind)) || (r->kind == K_LAYOUT && !layout_supported(r->lay))) {
          printf("FORMATS %s SKIP: not advertised\n", r->name);
          skipped++;
          continue;
@@ -1693,6 +1893,7 @@ main(int argc, char **argv)
       ran++;
       if (!(r->kind == K_RENDER || r->kind == K_BLEND ? run_render(r)
             : r->kind == K_BLIT                    ? run_blit(r)
+            : r->kind == K_LAYOUT                  ? run_layout(r)
                                                    : run_texture(r)))
          pass++;
    }

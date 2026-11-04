@@ -455,6 +455,7 @@ void pvr_get_image_subresource_layout(const struct pvr_image *image,
    layout->depthPitch = mip_level->pitch * mip_level->height_pitch;
    layout->arrayPitch = plane->layer_size;
    layout->size = mip_level->size;
+   PVR_G5P_HOOK(slice_pitch, image, layout)
 }
 
 void pvr_GetImageSubresourceLayout2(VkDevice device,

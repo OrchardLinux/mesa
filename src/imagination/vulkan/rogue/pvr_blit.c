@@ -223,7 +223,7 @@ static void pvr_setup_transfer_surface(struct pvr_device *device,
    surface->vk_format = format;
    surface->mem_layout = image->memlayout;
    surface->sample_count = image->vk.samples;
-
+   PVR_G5P_HOOK(transfer_slice, image, surface, &info, fdepth)
    if (image->memlayout == PVR_MEMLAYOUT_3DTWIDDLED)
       surface->z_position = fdepth;
    else

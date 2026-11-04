@@ -23,12 +23,16 @@ the rungs that the device's optimal-tiling features ask for, and skips the rest 
 | `r-<fmt>` | `COLOR_ATTACHMENT` | a clear, then a constant colour over the left half, read back by `vkCmdCopyImageToBuffer` |
 | `b-<fmt>` | `COLOR_ATTACHMENT_BLEND` | the same, blended `SRC_ALPHA`, `ONE_MINUS_SRC_ALPHA` (alpha `ONE`, `ONE_MINUS_SRC_ALPHA`) |
 | `k-<fmt>` | `BLIT_SRC` (ETC2/EAC) | an 8×8 compressed image blitted 1:1, nearest, into `B8G8R8A8_UNORM` (`R16G16B16A16_SFLOAT` for signed EAC), read back |
+| `l-<case>` | `SAMPLED_IMAGE` of `R8G8B8A8_UNORM`, and the image type | layouts: an RGBA8 texture whose texels name themselves (x, y, layer or slice, level), read at one level by `textureLod()`. 2D cases over the whole target: 12×10 levels 0–3, 16×4 level 1, 4×16 level 2. Arrays and 3D in a 4×4 grid of cells, cell c reading layer or slice c: 8×8×2 layers level 1, 12×10×3 layers levels 0 and 2, 3D 4×4×2, 8×8×8, 6×5×3, 8×8×8 levels 1 and 2, 6×5×3 level 1 and 16×16×16 (16 KiB). A case the device's image-format query refuses is not advertised |
 
 Render rungs exist for the formats a four-f16 fragment output can fill: 8-bit RGBA and sRGB, 10_10_10_2, R8, RG8,
 half float and 11_11_10 float. A device that advertises a colour attachment of any other format (integers, for
 example) fails `--coverage`, because nothing here checks it. `--coverage` also requires a `k-` rung for every ETC2/EAC
 format that advertises `BLIT_SRC` (Vulkan's `textureCompressionETC2` requires it); blits of uncompressed formats are
 the transfer path's, not a format's, and are not checked here.
+
+`FORMATS_DUMP=DIR` writes each `l-` texture's memory, as its upload left it, to `DIR/<rung>.bin` (the texture memory
+is host-visible), so a host tool can check the driver's layout without a GPU.
 
 Every pixel is compared **exactly** with a CPU reference (the decoders are in `formats.c`, ETC2/EAC included: the
 test writes ETC2 blocks in individual and differential mode, opaque, and EAC blocks, and decodes them itself). The texel values are
