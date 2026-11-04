@@ -33,7 +33,7 @@
 #if defined(PVR_SUPPORT_SERVICES_DRIVER)
 #   include "pvrsrvkm/pvr_srv_public.h"
 #endif
-
+#include "pvr_g5p_publish_hooks.h"
 void pvr_winsys_destroy(struct pvr_winsys *ws)
 {
    const int display_fd = ws->display_fd;

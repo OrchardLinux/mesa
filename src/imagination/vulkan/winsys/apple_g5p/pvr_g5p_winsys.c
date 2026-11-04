@@ -528,12 +528,10 @@ static VkResult g5p_ws_render_submit(const struct pvr_winsys_render_ctx *ctx,
    struct drm_g5p_render_pass_v3 pass;
    int r;
 
-   /* The pass is the fragment stream (pvr_arch_g5p_frag_stream()). The geometry stream holds the generic
-    * driver's Rogue words, which a G5P job has no use for: the TA's part is in the pass. */
-   if (info->fragment.fw_stream_len != sizeof(pass))
+   if (info->fragment.fw_stream_len != sizeof(pass) || info->geometry.fw_stream_len)
       return g5p_ws_refuse(VK_ERROR_FEATURE_NOT_PRESENT,
-                           "a job without a G5P pass (fragment stream %u bytes): not a G5P render",
-                           info->fragment.fw_stream_len);
+                           "a job without a G5P pass (fragment stream %u bytes, geometry %u): not a G5P render",
+                           info->fragment.fw_stream_len, info->geometry.fw_stream_len);
    if (!info->has_fragment_job)
       return g5p_ws_refuse(VK_ERROR_FEATURE_NOT_PRESENT, "a geometry-only job (transform feedback alone is step 8)");
    memcpy(&pass, info->fragment.fw_stream, sizeof(pass));

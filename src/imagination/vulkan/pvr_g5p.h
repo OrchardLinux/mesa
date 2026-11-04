@@ -78,20 +78,11 @@ struct pvr_g5p_job {
    bool enabled;
 };
 
-/* ---- shader compilation (pvr_g5p_nir.c) ---- */
+/* ---- graphics (pvr_arch_g5p_gfx.c, pvr_g5p_nir.c) ---- */
 
 struct pco_g5p_fs_key;
 struct pco_g5p_program;
 struct pco_g5p_vs_link;
-
-/* SPIR-V of one stage -> the G5P backend's program (pvr_g5p_nir.c).
- * false with out->refusal set. */
-bool pvr_g5p_compile_stage(const VkPipelineShaderStageCreateInfo *stage_info, bool half_output,
-                           const uint8_t *attrib_components, const struct pco_g5p_fs_key *key,
-                           const struct pco_g5p_vs_link *link, struct pco_g5p_program *out);
-
-/* ---- graphics (pvr_arch_g5p_gfx.c) ---- */
-
 struct pvr_graphics_pipeline;
 struct vk_graphics_pipeline_state;
 
@@ -103,6 +94,16 @@ struct vk_graphics_pipeline_state;
 struct pvr_g5p_fetch {
    uint8_t binding, dwords, ao;
    uint32_t offset;
+};
+
+/* One common-store upload of the fragment program (the backend's
+ * pco_g5p_upload): `kind` a pco_g5p_upload_kind, read at each draw from the
+ * bound descriptor (set, binding) + offset bytes (the level of an image-size
+ * upload), `dwords` into common-store dword `common` */
+#define PVR_G5P_MAX_FS_UPLOADS 12
+struct pvr_g5p_upload {
+   uint8_t kind, set, binding, dwords;
+   uint16_t offset, common;
 };
 
 /*
@@ -132,12 +133,28 @@ struct pvr_g5p_pipeline {
    /* the fragment program discards (punch-through, no triangle merging);
     * it reads a flat varying */
    bool fs_discard, fs_flat;
+   /* the fragment program's tile read (pco_g5p_program::blend_mode: 0 none)
+    * and colour write mask, for the ISP pass type (pvr_g5p_blend.h) */
+   unsigned fs_blend_mode;
+   uint8_t fs_write_mask;
+   /* the fragment program's uploads (descriptor state, image sizes, blend
+    * constants) and their loader, DOUTD per upload from the per-draw data
+    * behind UNIFORMDATABASE (no uploads: the device HALT) */
+   unsigned fs_num_uploads, fs_common_dwords;
+   struct pvr_g5p_upload fs_uploads[PVR_G5P_MAX_FS_UPLOADS];
+   struct pvr_pds_upload fs_loader;
 };
 
 /* A non-indexed draw (CmdDraw) */
 struct pvr_g5p_draw {
    uint32_t count, instances, first, first_instance;
 };
+
+/* SPIR-V of one stage -> the G5P backend's program (pvr_g5p_nir.c).
+ * false with out->refusal set. */
+bool pvr_g5p_compile_stage(const VkPipelineShaderStageCreateInfo *stage_info, bool half_output,
+                           const uint8_t *attrib_components, const struct pco_g5p_fs_key *key,
+                           const struct pco_g5p_vs_link *link, struct pco_g5p_program *out);
 
 #ifdef PVR_PER_ARCH
 
