@@ -1419,6 +1419,87 @@ emit_txs(struct g9p_ctx *ctx, nir_tex_instr *tex)
  * where the sample reads them (as Apple's code for t.sample(s, uv * 2.0 +
  * 0.25) does; r0-r1 are free until the colour output).
  */
+#ifdef PVR_G9P_ES3
+/*
+ * -Dimagination-g9p-es3: the fragment shader samples a 2D array or a cube,
+ * whose coordinates take r0-r3 (layered_tex())
+ */
+static bool
+uses_layered_tex(nir_function_impl *impl)
+{
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_tex &&
+             (nir_instr_as_tex(instr)->is_array ||
+              nir_instr_as_tex(instr)->sampler_dim == GLSL_SAMPLER_DIM_CUBE))
+            return true;
+      }
+   }
+   return false;
+}
+
+/*
+ * A 2D array or cube sample, as our A9 backend emits it (pco_g5p_general.c
+ * emit_tex_ext(), Apple's operand layout): the coordinates in r0-r2, where
+ * the sample reads them (as g9p_sample_regs() reads r0-r1); an array's layer
+ * as an integer in r2's low half, uint(z + 0.5); a cube's direction turned
+ * into face coordinates in place by the cube op; then the sample with the
+ * dimension in W0. r0-r3 are reserved in such shaders (generate()).
+ */
+static bool
+emit_tex_layered(struct g9p_ctx *ctx, nir_tex_instr *tex)
+{
+   const bool cube = tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE;
+   int ci = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   int slot = texture_slot(ctx, tex);
+   unsigned at;
+   int dst;
+
+   if (ctx->stage != MESA_SHADER_FRAGMENT || ci < 0 || slot < 0 || tex->is_shadow ||
+       (cube && tex->is_array) ||
+       (!cube && tex->sampler_dim != GLSL_SAMPLER_DIM_2D) ||
+       (tex->op != nir_texop_tex && tex->op != nir_texop_txl) ||
+       nir_tex_instr_src_index(tex, nir_tex_src_offset) >= 0) {
+      fprintf(stderr, "g9p: only plain samples of 2D arrays and cubes\n");
+      return false;
+   }
+   for (unsigned c = 0; c < 3; c++) {
+      const int r = src_reg(ctx, nir_get_scalar(tex->src[ci].src.ssa, c));
+
+      if (r < 0)
+         return false;
+      if (c == 2 && !cube) {
+         const int half = const_reg(ctx, 0x3f000000);
+
+         if (half < 0)
+            return false;
+         g9p_alu2(ctx->c, G9P_FADD, 2, r, half, false);
+         g9p_convert(ctx->c, 2, 2, G9P_F2U);
+      } else {
+         g9p_alu2(ctx->c, G9P_OR, c, r, r, false);
+      }
+   }
+   if (cube)
+      g9p_es3_cube_coords(ctx->c, 0, 0);
+   release(ctx, &tex->instr);
+   dst = alloc_range(ctx, 4);
+   if (dst < 0)
+      return false;
+   at = ctx->c->n;
+   g9p_sample_regs(ctx->c, dst, G9P_FS_TEX_BASE + G9P_TEX_STRIDE * slot,
+                   G9P_FS_TEX_BASE + G9P_TEX_STRIDE * slot + 8);
+   ctx->c->w[at] = (ctx->c->w[at] & ~0x0f00) |
+                   (cube ? G9P_ES3_TEX_CUBE : G9P_ES3_TEX_2D_ARRAY) << 8;
+   g9p_wait(ctx->c);
+   for (unsigned c = 0; c < 4; c++) {
+      ctx->reg[key(&tex->def, c)] = dst + c;
+      if (c >= tex->def.num_components || !ctx->last_use[key(&tex->def, c)])
+         ctx->busy &= ~BITFIELD64_BIT(dst + c);
+   }
+   return true;
+}
+#endif
+
 static bool
 emit_tex(struct g9p_ctx *ctx, nir_tex_instr *tex)
 {
@@ -1428,6 +1509,10 @@ emit_tex(struct g9p_ctx *ctx, nir_tex_instr *tex)
 
    if (tex->op == nir_texop_txs)
       return emit_txs(ctx, tex);
+#ifdef PVR_G9P_ES3
+   if (tex->is_array || tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE)
+      return emit_tex_layered(ctx, tex);
+#endif
    if (ctx->stage != MESA_SHADER_FRAGMENT || tex->sampler_dim != GLSL_SAMPLER_DIM_2D ||
        tex->is_array || tex->is_shadow || ci < 0 || slot < 0 ||
        (tex->op != nir_texop_tex && tex->op != nir_texop_txl) ||
@@ -1993,6 +2078,9 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
 #ifdef PVR_G9P_ES3
    if (ctx->stage == MESA_SHADER_FRAGMENT && ctx->out->num_targets > 1)
       ctx->busy = ctx->pinned = BITFIELD64_RANGE(0, 2 * ctx->out->num_targets);
+   /* 2D array and cube samples: their coordinates in r0-r3 (emit_tex_layered()) */
+   if (ctx->stage == MESA_SHADER_FRAGMENT && uses_layered_tex(impl))
+      ctx->busy |= BITFIELD64_RANGE(0, 4), ctx->pinned |= BITFIELD64_RANGE(0, 4);
 #endif
 
    /* compute: r0 holds the local index from the start when it is used */

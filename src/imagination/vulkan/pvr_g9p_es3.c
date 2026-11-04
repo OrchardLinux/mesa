@@ -29,6 +29,9 @@ pvr_g9p_es3_limits(struct vk_device_extension_table *ext, struct vk_features *fe
    props->maxFragmentOutputAttachments = 4;
    features->independentBlend = false;
 
+   /* Textures: 2D, 2D arrays and cube maps (pvr_arch_g9p_es3_gfx.h); no cube arrays */
+   features->imageCubeArray = false;
+
    /* One sample: the render job streams carry no MSAA words */
    props->framebufferColorSampleCounts = VK_SAMPLE_COUNT_1_BIT;
    props->framebufferDepthSampleCounts = VK_SAMPLE_COUNT_1_BIT;

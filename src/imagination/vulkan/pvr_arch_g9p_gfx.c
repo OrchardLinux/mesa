@@ -1374,10 +1374,10 @@ PVR_PER_ARCH(g9p_pack_image_view)(const struct pvr_image_view *iview, uint64_t w
    d[3] = (uint32_t)(addr >> 33);
    if (linear)
       d[3] |= (plane->mip_levels[iview->vk.base_mip_level].pitch / 64 - 1) << 15;
+   PVR_G9P_ES3_HOOK(arch_g9p_gfx_1376)
    words[0] = d[0] | (uint64_t)d[1] << 32;
    words[1] = d[2] | (uint64_t)d[3] << 32;
 }
-
 /*
  * Sampler words: nearest/clamp as captured (000e0000 00c00780). iPadOS's
  * linear-filter-and-repeat sampler (`texfilter` capture) adds dword 0 bits

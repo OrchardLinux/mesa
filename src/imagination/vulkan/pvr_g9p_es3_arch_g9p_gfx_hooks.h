@@ -39,6 +39,7 @@ static void es3_frag_stream_zls(const struct pvr_render_job *job, uint8_t *buf,
 static void es3_draw_isp(const struct pvr_cmd_buffer *cmd_buffer,
                          const struct pvr_g9p_graphics_state *state, bool scissor,
                          uint32_t *ppp_block);
+static void es3_view_state(const struct pvr_image_view *iview, uint32_t d[4]);
 
 /* pvr_arch_g9p_gfx.c, after main line 288: the option-on insertion. */
 #define PVR_G9P_ES3_HOOK_arch_g9p_gfx_288() \
@@ -96,6 +97,10 @@ static void es3_draw_isp(const struct pvr_cmd_buffer *cmd_buffer,
    if (result != VK_SUCCESS || handled) \
    return result; \
    }
+
+/* pvr_arch_g9p_gfx.c, after main line 1376: the option-on insertion. */
+#define PVR_G9P_ES3_HOOK_arch_g9p_gfx_1376() \
+   es3_view_state(iview, d);
 
 /* pvr_arch_g9p_gfx.c, after main line 1456: the option-on insertion. */
 #define PVR_G9P_ES3_HOOK_arch_g9p_gfx_1456() \

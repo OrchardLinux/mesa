@@ -1026,3 +1026,48 @@ es3_ds_clear(struct pvr_cmd_buffer *cmd_buffer, const VkClearAttachment *att,
                     &(const struct pvr_g9p_draw){ .count = 6 * rect_count, .instances = 1 },
                     VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
 }
+/* --- Array and cube textures ----------------------------------------------- */
+
+/*
+ * The image state of a 2D array or cube view, from the 2D one
+ * g9p_pack_image_view() packs. The A9 and A10 image states agree on every
+ * word compared (the 11-02 reply, section 1.1: height - 1 at bit 41, the
+ * twiddled flag at bit 3, the linear pitch at bit 111), so these fields are
+ * our A9 encoder's (g5p_mem.c g5p_view_texture_state(), Apple's
+ * ImageStateFields, hardware-proven on the A9):
+ *  - the layout in bits 0-2: 2 2D, 3 2D array, 6 cube;
+ *  - layers - 1 at bit 111 (0 for a cube), where a linear image has its
+ *    pitch: arrays and cube maps are always twiddled on G9P (pvr_image.c);
+ *  - bit 125 when the layer stride is rounded to 16 KiB (layers past
+ *    16 KiB) rather than 64 bytes.
+ * The address is the view's first layer, as for 2D. Mip chains of arrays
+ * keep the 2D view's single level (as g9p_pack_image_view() does for 2D).
+ * The A9's twiddle pads each mip level over its own extent; whether the A10
+ * CPU copies twiddle NPOT levels the same way is for the A10 to check.
+ */
+static void
+es3_view_state(const struct pvr_image_view *iview, uint32_t d[4])
+{
+   const struct pvr_image *image = pvr_image_view_get_image(iview);
+   const struct pvr_image_plane *plane = pvr_single_plane_const(image);
+   unsigned layout, layers = 0;
+
+   if (image->memlayout != PVR_MEMLAYOUT_TWIDDLED)
+      return;
+   switch (iview->vk.view_type) {
+   case VK_IMAGE_VIEW_TYPE_2D_ARRAY:
+      layout = 3;
+      layers = iview->vk.layer_count - 1;
+      break;
+   case VK_IMAGE_VIEW_TYPE_CUBE:
+      layout = 6;
+      break;
+   default:
+      return;
+   }
+   d[0] = (d[0] & ~7u) | layout;
+   d[3] |= layers << 15;
+   if (plane->layer_size >= 16384)
+      d[3] |= BITFIELD_BIT(29);
+}
+

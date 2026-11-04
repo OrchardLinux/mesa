@@ -48,6 +48,29 @@ g9p_es3_pbe_emit(struct g9p_code *c, unsigned offset_reg, unsigned state8, bool 
 }
 
 /*
+ * Texture dimensions of the sample instruction: W0 bits 8-11 (2D 5, as
+ * g9p_sample_regs()'s f51a; 2D array 7, 3D b, cube d). Our A9 encoder's
+ * values (g5p_usc.c g5p_usc_sample_ext(), hardware-proven on the A9 for
+ * arrays and cubes); sample words were not part of the A9/A10 comparison.
+ */
+#define G9P_ES3_TEX_2D_ARRAY 0x7
+#define G9P_ES3_TEX_CUBE     0xd
+
+/*
+ * The cube op: the direction in halves @src.. (f32 x, y, z) becomes the
+ * cube sample's coordinates in halves @dst.. (Apple's A9 fragment code
+ * 087d dst (src << 1 | 1) 0080 before a cube sample of a computed
+ * direction; a cube sample of raw directions reads them as 2D on the A9,
+ * textypes.md). Its output width is not measured: four registers are kept
+ * free. An A9 form, not compared with the A10.
+ */
+static inline void
+g9p_es3_cube_coords(struct g9p_code *c, unsigned dst_half, unsigned src_half)
+{
+   G9P_EMIT(c, 0x7d08, (uint16_t)(((src_half << 1) | 1) << 8 | dst_half), 0x8000);
+}
+
+/*
  * Several colour targets' device programs (pvr_arch_g9p_es3_gfx.h has the
  * layout of their common store). The end of tile writing the targets in
  * @mask: our A9 generator's program (a9/g5p_mrt_programs.h, byte-equal to
