@@ -118,5 +118,36 @@
                                   pvr_arch_g5p_cmd_draw_indexed(cmd_buffer));  \
       goto end;                                                                \
    }
+/* Textures and samplers (pvr_g5p_tex.h). */
+#if defined(PVR_APPLE_G5P)
+#   include "pvr_g5p_tex.h"
+#endif
+
+/* pvr_arch_image.c, pvr_CreateImageView(): the sampled state of a view is
+ * the A9's three-qword image state (pvr_arch_g5p_pack_image_view()).
+ */
+#define PVR_G5P_HOOK_image_view(device, iview)                              \
+   if (PVR_HAS_FEATURE(&(device)->pdevice->dev_info, apple_g5p))           \
+      pvr_arch_g5p_pack_image_view(                                         \
+         iview, &(iview)->image_state[PVR_TEXTURE_STATE_SAMPLE]);
+
+/* pvr_arch_sampler.c, pvr_CreateSampler(): the A9's sampler words, both
+ * forms (pvr_arch_g5p_pack_sampler()).
+ */
+#define PVR_G5P_HOOK_sampler(device, create_info, sampler)                 \
+   if (PVR_HAS_FEATURE(&(device)->pdevice->dev_info, apple_g5p))           \
+      pvr_arch_g5p_pack_sampler(create_info, &(sampler)->descriptor);
+
+/* pvr_arch_descriptor_set.c, write_image_sampler(): a combined descriptor
+ * takes the sampler form its view needs (pvr_arch_g5p_combine_sampler()).
+ */
+#define PVR_G5P_HOOK_image_sampler(set, image_info, desc)                     \
+   if (PVR_HAS_FEATURE(&container_of((set)->base.device, struct pvr_device, \
+                                     vk)->pdevice->dev_info,                \
+                       apple_g5p))                                          \
+      pvr_arch_g5p_combine_sampler(                                         \
+         desc, (image_info)->imageView                                      \
+                  ? pvr_image_view_from_handle((image_info)->imageView)     \
+                  : NULL);
 
 #endif /* PVR_G5P_HOOKS_H */

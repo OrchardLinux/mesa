@@ -214,7 +214,7 @@ VkResult PVR_PER_ARCH(CreateImageView)(VkDevice _device,
       pvr_arch_g9p_pack_image_view(iview, words);
       memcpy(iview->image_state[PVR_TEXTURE_STATE_SAMPLE].words, words, sizeof(words));
    }
-
+   PVR_G5P_HOOK(image_view, device, iview)
    /* Create an additional texture state for cube type if storage
     * usage flag is set.
     */
