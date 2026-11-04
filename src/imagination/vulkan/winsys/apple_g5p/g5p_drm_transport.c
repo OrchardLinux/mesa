@@ -411,3 +411,5 @@ int g5p_drm_submit_render_typed(struct g5p_drm *ws, uint32_t context, uint32_t r
    if (!r && job_id) *job_id = s.job_id;
    return r;
 }
+
+#include "g5p_drm_compute.inc"

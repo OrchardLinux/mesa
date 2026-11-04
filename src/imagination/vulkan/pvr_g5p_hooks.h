@@ -31,6 +31,7 @@
 #   include "pvr_g5p_memory.h"
 #   include "pvr_g5p_spm.h"
 #   include "pvr_g5p_shm.h"
+#   include "pvr_g5p_compute_hooks.h"
 #endif
 
 /* pvr_arch_image.c, pvr_CreateImageView(): the sampled state of a view is

@@ -76,4 +76,6 @@ int g5p_drm_submit_render_typed(struct g5p_drm *, uint32_t context, uint32_t ren
                                 const struct drm_g5p_render_pass_v3 *pass,
                                 const struct drm_g5p_render_resource *res, uint32_t res_count,
                                 const struct drm_g5p_sync *syncs, uint32_t sync_count, uint64_t *job_id);
+#include "apple_g5p_compute_typed.h"
+int g5p_drm_submit_compute_typed(struct g5p_drm *,uint32_t,const struct drm_g5p_compute_pass *,const struct drm_g5p_render_resource *,uint32_t,const struct drm_g5p_sync *,uint32_t,uint64_t *);
 #endif

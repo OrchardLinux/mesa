@@ -1159,7 +1159,7 @@ pvr_compute_pipeline_init(struct pvr_device *device,
                      PVR_PIPELINE_TYPE_COMPUTE,
                      pCreateInfo->layout,
                      &compute_pipeline->base);
-
+   PVR_G5P_HOOK(compute_pipeline)
    if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p)) {
       result = pvr_arch_g9p_compute_pipeline_compile(device, pCreateInfo,
                                                      compute_pipeline);
@@ -1225,7 +1225,7 @@ static void pvr_compute_pipeline_destroy(
       vk_free2(&device->vk.alloc, allocator, compute_pipeline);
       return;
    }
-
+   PVR_G5P_HOOK(compute_pipeline_destroy)
    pvr_pds_compute_program_destroy(device,
                                    allocator,
                                    &compute_pipeline->pds_cs_program,

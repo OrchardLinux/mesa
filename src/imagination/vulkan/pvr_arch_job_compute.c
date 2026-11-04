@@ -219,7 +219,7 @@ VkResult pvr_arch_compute_job_submit(struct pvr_compute_ctx *ctx,
 {
    struct pvr_winsys_compute_submit_info submit_info;
    struct pvr_device *device = ctx->device;
-
+   PVR_G5P_HOOK(compute_job_submit)
    pvr_compute_job_ws_submit_info_init(ctx, sub_cmd, wait, &submit_info);
 
 #ifdef PVR_BUILD_ARCH_ROGUE

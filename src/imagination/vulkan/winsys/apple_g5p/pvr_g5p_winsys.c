@@ -56,6 +56,7 @@
 #include "pvr_winsys_helper.h"
 
 #include "g5p_drm_transport.h"
+#include "pvr_g5p_compute.h"
 #include "g5p_ws_perf.h"
 #include "pvr_g5p_winsys.h"
 
@@ -1194,23 +1195,7 @@ static VkResult g5p_ws_render_submit(const struct pvr_winsys_render_ctx *ctx,
    return VK_SUCCESS;
 }
 
-static VkResult g5p_ws_compute_ctx_create(struct pvr_winsys *ws, const struct pvr_winsys_compute_ctx_create_info *info,
-                                          const struct pvr_device_info *dev_info,
-                                          struct pvr_winsys_compute_ctx **const out)
-{
-   (void)info, (void)dev_info;
-   return g5p_ws_obj_new(to_ws(ws), (void **)out);
-}
-
-static void g5p_ws_compute_ctx_destroy(struct pvr_winsys_compute_ctx *ctx) { g5p_ws_obj_free(ctx); }
-
-static VkResult g5p_ws_compute_submit(const struct pvr_winsys_compute_ctx *ctx,
-                                      const struct pvr_winsys_compute_submit_info *info,
-                                      const struct pvr_device_info *dev_info, struct vk_sync *sync)
-{
-   (void)ctx, (void)info, (void)dev_info, (void)sync;
-   return vk_errorf(NULL, VK_ERROR_FEATURE_NOT_PRESENT, "apple_g5p: no compute yet");
-}
+#include "g5p_ws_compute.inc"
 
 static VkResult g5p_ws_transfer_ctx_create(struct pvr_winsys *ws,
                                            const struct pvr_winsys_transfer_ctx_create_info *info,

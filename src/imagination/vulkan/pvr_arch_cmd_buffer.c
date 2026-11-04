@@ -2617,7 +2617,7 @@ VkResult pvr_arch_cmd_buffer_end_sub_cmd(struct pvr_cmd_buffer *cmd_buffer)
    case PVR_SUB_CMD_TYPE_QUERY:
    case PVR_SUB_CMD_TYPE_COMPUTE: {
       struct pvr_sub_cmd_compute *const compute_sub_cmd = &sub_cmd->compute;
-
+      PVR_G5P_HOOK(compute_end_pass)
       if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p))
          pvr_arch_g9p_end_pass(cmd_buffer, compute_sub_cmd);
       else
@@ -7073,7 +7073,7 @@ static void pvr_cmd_dispatch(
    result = pvr_flush_push_descriptors(cmd_buffer, &state->compute_desc_state);
    if (result != VK_SUCCESS)
       return;
-
+   PVR_G5P_HOOK(compute_dispatch)
    if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g9p)) {
       /* Indirect dispatches and base groups are not supported yet */
       result = pvr_arch_g9p_cmd_dispatch(cmd_buffer, sub_cmd, workgroup_size);
