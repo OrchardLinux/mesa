@@ -36,7 +36,7 @@
 #include "pvr_macros.h"
 #include "pvr_winsys.h"
 #include "pvr_wsi.h"
-
+#include "pvr_g9p_es3_physical_device_hooks.h"
 #define VK_VENDOR_ID_IMAGINATION 0x1010
 
 void pvr_physical_device_dump_info(const struct pvr_physical_device *pdevice,
@@ -1299,7 +1299,7 @@ VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
       memcpy(supported_properties.optimalTilingLayoutUUID, "G9P layout 1\0\0\0\0", VK_UUID_SIZE);
       supported_properties.identicalMemoryTypeRequirements = true;
    }
-
+   PVR_G9P_ES3_HOOK(physical_device_1301)
    vk_physical_device_dispatch_table_from_entrypoints(
       &dispatch_table,
       &pvr_physical_device_entrypoints,

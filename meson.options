@@ -936,3 +936,10 @@ option(
   value : true,
   description : 'Build panfrost disassemblers. Explicitly setting this option to false will cause the panfrost stack to build without disassemblers. This should be left enabled for distro builds.'
 )
+
+option(
+  'imagination-g9p-es3',
+  type : 'boolean',
+  value : false,
+  description : 'Apple A10 (G9P): build the experimental OpenGL ES 3.0 enablers (several colour targets, transform feedback, depth/stencil formats, array and cube textures, 4x MSAA). Ported from the A9 (G5P) driver, untested on the A10.'
+)

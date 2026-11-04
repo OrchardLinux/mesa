@@ -54,7 +54,7 @@
 #include "vk_format.h"
 #include "vk_log.h"
 #include "vk_util.h"
-
+#include "pvr_g9p_es3_formats_hooks.h"
 uint32_t pvr_get_pbe_accum_format_size_in_bytes(VkFormat vk_format)
 {
    enum pvr_pbe_accum_format pbe_accum_format;
@@ -758,9 +758,9 @@ pvr_get_image_format_properties(struct pvr_physical_device *pdevice,
 
       const uint32_t max_array_layers =
          rogue_get_render_size_max_z(&pdevice->dev_info);
-
       pImageFormatProperties->maxArrayLayers = max_array_layers;
       pImageFormatProperties->sampleCounts = max_sample_bits;
+   PVR_G9P_ES3_HOOK(formats_763)
    }
 
    if (!(tiling_features2 & VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT ||
