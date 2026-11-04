@@ -140,6 +140,14 @@ if with_imagination_srv
   pvr_flags += '-DPVR_SUPPORT_SERVICES_DRIVER'
 endif
 
+# Apple A9 (G5P): its paths of the driver and the G5P backend, opt-in only
+if with_imagination_g5p
+  pvr_files += files(
+    'winsys/apple_g5p/g5p_drm_transport.c',
+    'winsys/apple_g5p/pvr_g5p_winsys.c',
+  )
+endif
+
 rogue_files = files(
   'rogue/pvr_blit.c',
   'rogue/pvr_clear.c',
