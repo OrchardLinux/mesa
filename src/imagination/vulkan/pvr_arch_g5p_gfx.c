@@ -48,6 +48,7 @@
 #include "pvr_g5p_tex.h"
 #include "pvr_g5p_tex_encode.h"
 #include "pvr_g5p_ds.h"
+#include "pvr_g5p_msaa.h"
 #include "pvr_pass.h"
 #include "pvr_pipeline.h"
 
@@ -427,9 +428,15 @@ g5p_check_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo *c
    if (s->rs && (s->rs->line.mode != VK_LINE_RASTERIZATION_MODE_DEFAULT || s->rs->line.stipple.enable))
       return G5P_REFUSE(device, "line rasterization mode %d, stipple %d", s->rs->line.mode,
                         s->rs->line.stipple.enable);
-   if (s->ms && (s->ms->rasterization_samples > VK_SAMPLE_COUNT_1_BIT || s->ms->sample_shading_enable ||
-                 s->ms->alpha_to_coverage_enable || s->ms->alpha_to_one_enable || !(s->ms->sample_mask & 1)))
-      return G5P_REFUSE(device, "multisample state (one sample, no sample shading or alpha to coverage)");
+   /* 1 or 4 samples (pvr_g5p_msaa.c); sample shading, alpha to coverage and a partial sample mask need the
+    * program's coverage feedback, which is not built */
+   if (s->ms && ((s->ms->rasterization_samples != VK_SAMPLE_COUNT_1_BIT &&
+                  s->ms->rasterization_samples != VK_SAMPLE_COUNT_4_BIT) ||
+                 s->ms->sample_shading_enable || s->ms->alpha_to_coverage_enable || s->ms->alpha_to_one_enable ||
+                 (s->ms->sample_mask & BITFIELD_MASK(s->ms->rasterization_samples)) !=
+                    BITFIELD_MASK(s->ms->rasterization_samples)))
+      return G5P_REFUSE(device, "multisample state (1 or 4 samples, every sample, no sample shading or alpha to "
+                        "coverage)");
    /* pvr_* gives a render pass without multiview the view mask 1 */
    if (s->mv && util_bitcount(s->mv->view_mask) > 1)
       return G5P_REFUSE(device, "multiview (view mask %#x)", s->mv->view_mask);
@@ -485,6 +492,7 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
    VkResult result = g5p_check_state(device, create_info, s, &key);
    if (result != VK_SUCCESS)
       return result;
+   g->samples = s->ms ? MAX2(s->ms->rasterization_samples, VK_SAMPLE_COUNT_1_BIT) : VK_SAMPLE_COUNT_1_BIT;
 
    for (uint32_t i = 0; i < create_info->stageCount; i++) {
       const VkPipelineShaderStageCreateInfo *st = &create_info->pStages[i];
@@ -507,12 +515,12 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
 
    /* the fragment program first: the vertex program is compiled against the
     * varyings it reads (Apple's VertexProgramKey; Rogue's pco_rev_link_nir) */
-   if (!pvr_g5p_compile_stage(fs_info, true, NULL, &key, NULL, fs))
+   if (!pvr_g5p_compile_stage(fs_info, true, g->samples, NULL, &key, NULL, fs))
       return G5P_REFUSE(device, "fragment shader: %s", fs->refusal);
    struct pco_g5p_vs_link link = { .valid = true };
    for (unsigned i = 0; i < fs->num_varyings; i++)
       link.interp[fs->vary[i].location] = fs->vary[i].interp;
-   if (!pvr_g5p_compile_stage(vs_info, false, components, NULL, &link, vs))
+   if (!pvr_g5p_compile_stage(vs_info, false, 1, components, NULL, &link, vs))
       return G5P_REFUSE(device, "vertex shader: %s", vs->refusal);
    for (unsigned i = 0; i < fs->num_varyings; i++)
       if (!vs->vout_dword[fs->vary[i].location])
@@ -597,7 +605,8 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
 
    /* PDS: the fragment launch, data {DOUTU} and its code at +0x20 */
    {
-      const uint64_t doutu = doutu_src0(usc_off(device, g->fs_usc), g->fs_temps);
+      /* at 4x the fragment program runs at sample rate (pvr_g5p_msaa_doutu()) */
+      const uint64_t doutu = pvr_g5p_msaa_doutu(doutu_src0(usc_off(device, g->fs_usc), g->fs_temps), g->samples);
       const uint32_t launch_data[4] = { (uint32_t)doutu, (uint32_t)(doutu >> 32), 0, 0 };
       n = launch_program(code);
       result = pvr_gpu_upload_pds(device, launch_data, ARRAY_SIZE(launch_data), 16, code, n, 0x20, 64,
@@ -920,6 +929,10 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
       return G5P_REFUSE(cmd_buffer, "rasterizer discard (rung A rasterizes every draw)");
    if (!info->rstate)
       return G5P_REFUSE(cmd_buffer, "a draw outside a render pass");
+   /* the pipeline rasterizes the pass's sample count (its launch's sample rate, the ISP user pass) */
+   if (info->hw_render && MAX2(info->hw_render->sample_count, 1) != g->samples)
+      return G5P_REFUSE(cmd_buffer, "a %u-sample pipeline in a %u-sample pass", g->samples,
+                        info->hw_render->sample_count);
 
    VkResult result = pvr_arch_cmd_buffer_start_sub_cmd(cmd_buffer, PVR_SUB_CMD_TYPE_GRAPHICS);
    if (result != VK_SUCCESS)
@@ -1022,7 +1035,9 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
          h.pres_ispctl_bb = true;
       }
       pvr_csb_pack (&w[1], TA_STATE_ISPCTL, ctl) {
-         ctl.upass = isp.upass;
+         /* 0 for a program that writes no colour (pvr_g5p_blend.h), else the sample rate's user pass
+          * (pvr_g5p_msaa.h: 15, or 7 at 4x) */
+         ctl.upass = isp.upass ? pvr_g5p_msaa_upass(g->samples) : 0;
          ctl.bpres = true;
          ctl.tagwritedisable = isp.tag_write_disable;
       }
@@ -1047,7 +1062,7 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
       w[5] = 0;
       /* with a depth/stencil attachment: its tests, Apple's face form */
       if (ds_aspects)
-         pvr_arch_g5p_ds_isp(dyn, ds_aspects, 1, lines, pass, false, dbias, false, &w[1]);
+         pvr_arch_g5p_ds_isp(dyn, ds_aspects, g->samples, lines, pass, false, dbias, false, &w[1]);
       PPP_BLOCK(w, 6);
    }
    /* 7. region clip (32-pixel tiles) and the viewport */

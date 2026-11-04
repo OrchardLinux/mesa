@@ -37,6 +37,7 @@
 #include "pvr_device.h"
 #include "pvr_g5p.h"
 #include "pvr_g5p_ds.h"
+#include "pvr_g5p_msaa.h"
 #include "pvr_hw_pass.h"
 #include "pvr_image.h"
 #include "pvr_job_render.h"
@@ -142,11 +143,13 @@ g5p_usc_off(const struct pvr_device *device, const struct pvr_suballoc_bo *bo)
    return (uint32_t)(bo->dev_addr.addr - device->heaps.usc_heap->base_addr.addr);
 }
 
-/* A kick of a USC program, its code at data + 0x20 as the registers expect */
+/* A kick of a USC program, its code at data + 0x20 as the registers expect;
+ * a fragment-side program at `samples` (4: sample rate, pvr_g5p_msaa_doutu()) */
 static VkResult
-g5p_upload_kick(struct pvr_device *device, const struct pvr_suballoc_bo *usc, struct pvr_pds_upload *out)
+g5p_upload_kick(struct pvr_device *device, const struct pvr_suballoc_bo *usc, uint32_t samples,
+                struct pvr_pds_upload *out)
 {
-   const uint64_t doutu = g5p_doutu_src0(g5p_usc_off(device, usc), G5P_TEMPS);
+   const uint64_t doutu = pvr_g5p_msaa_doutu(g5p_doutu_src0(g5p_usc_off(device, usc), G5P_TEMPS), samples);
    const uint32_t data[4] = { (uint32_t)doutu, (uint32_t)(doutu >> 32), 0, 0 };
    uint32_t code[8];
    const unsigned n = g5p_pds_kick_code(code);
@@ -175,6 +178,8 @@ g5p_free_programs(struct pvr_g5p_programs *p)
    pvr_bo_suballoc_free(p->scratch);
    pvr_bo_suballoc_free(p->scissor_pool);
    pvr_bo_suballoc_free(p->dbias_pool);
+   pvr_bo_suballoc_free(p->eot_usc_ms);
+   pvr_bo_suballoc_free(p->clear_kick_ms.pvr_bo);
 }
 
 static VkResult
@@ -217,7 +222,19 @@ g5p_upload_programs(struct pvr_device *device, struct pvr_g5p_programs *p)
       result = pvr_gpu_upload_usc(device, code, size, 64, &p->eot_usc[i]);
       if (result != VK_SUCCESS)
          return result;
-      result = g5p_upload_kick(device, p->clear_usc[i], &p->clear_kick[i]);
+      result = g5p_upload_kick(device, p->clear_usc[i], 1, &p->clear_kick[i]);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+   /* 4x (one target): the multisample store's end of tile, and the clear's
+    * kick at sample rate */
+   {
+      uint8_t code[G5P_MRT_EOT_USC_MAX];
+      const unsigned size = pvr_g5p_msaa_eot_usc(code);
+      result = pvr_gpu_upload_usc(device, code, size, 64, &p->eot_usc_ms);
+      if (result != VK_SUCCESS)
+         return result;
+      result = g5p_upload_kick(device, p->clear_usc[0], 4, &p->clear_kick_ms);
       if (result != VK_SUCCESS)
          return result;
    }
@@ -243,7 +260,7 @@ g5p_upload_programs(struct pvr_device *device, struct pvr_g5p_programs *p)
       result = pvr_gpu_upload_usc(device, usc, ALIGN_POT(at, 64), 64, &p->ta_usc);
       if (result != VK_SUCCESS)
          return result;
-      result = g5p_upload_kick(device, p->ta_usc, &p->ta_kick);
+      result = g5p_upload_kick(device, p->ta_usc, 1, &p->ta_kick);
       if (result != VK_SUCCESS)
          return result;
    }
@@ -335,9 +352,11 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
    VkResult admit = pvr_arch_g5p_ds_admit(cmd_buffer, hw_render);
    if (admit != VK_SUCCESS)
       return admit;
-   if (hw_render->sample_count > 1)
-      return G5P_REFUSE(cmd_buffer, "%u samples (4x: the pass's MSAA fields are not wired yet)",
-                        hw_render->sample_count);
+   /* 4 samples: what the captured 4x pass is (pvr_arch_g5p_msaa.c) */
+   admit = pvr_arch_g5p_msaa_admit(cmd_buffer, hw_render);
+   if (admit != VK_SUCCESS)
+      return admit;
+   g->samples = MAX2(hw_render->sample_count, 1);
    /* the render's depth-bias table (upstream's, uploaded before this hook):
     * the kernel takes its entries from ISP_DBIAS_BASE */
    if (sub_cmd->depth_bias_bo)
@@ -361,15 +380,27 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
       const uint64_t addr = image->dev_addr.addr + plane->offset + level->offset +
                             iview->vk.base_array_layer * plane->layer_size;
       uint32_t key;
+      /* 4x (admitted above: one target): the samples stored as they are, or the PBE resolve into the
+       * one-sample view this surface names (pvr_g5p_msaa.c) */
+      const bool ms_store = g->samples == 4 && !hw_render->eot_surfaces[t].need_resolve;
 
-      if (image->memlayout != PVR_MEMLAYOUT_LINEAR)
+      if (image->memlayout != PVR_MEMLAYOUT_LINEAR && !ms_store)
          return G5P_REFUSE(cmd_buffer, "a non-linear colour target (twiddled PBE is step 7)");
       if (!g5p_pbe_key(iview->vk.format, &key))
          return G5P_REFUSE(cmd_buffer, "colour target format %s", vk_Format_to_str(iview->vk.format));
-      if (level->pitch % 16 || addr % 64)
+      if ((level->pitch % 16 && !ms_store) || addr % 64)
          return G5P_REFUSE(cmd_buffer, "a colour target at %#" PRIx64 " with pitch %u (64-byte base, 16-byte rows)",
                            addr, level->pitch);
-      g5p_pbe_encode(pbe[t], key, addr, iview->vk.extent.width, iview->vk.extent.height, level->pitch);
+      if (ms_store) {
+         pvr_g5p_msaa_pbe_store(pbe[t], key, addr, iview->vk.extent.width, iview->vk.extent.height,
+                                vk_format_is_srgb(iview->vk.format));
+      } else {
+         g5p_pbe_encode(pbe[t], key, addr, iview->vk.extent.width, iview->vk.extent.height, level->pitch);
+         if (g->samples == 4) {
+            pvr_g5p_msaa_pbe_resolve(pbe[t]);
+            g->msaa_resolve = true;
+         }
+      }
       if (!t) {
          g->width = iview->vk.extent.width;
          g->height = iview->vk.extent.height;
@@ -406,7 +437,9 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
          return result;
    }
    {
-      const uint64_t doutu = g5p_doutu_src0(g5p_usc_off(device, p->eot_usc[v]), G5P_TEMPS);
+      /* a 4x store's end of tile emits per sample (pvr_g5p_msaa_eot_usc()); a resolve keeps the 1x one */
+      const struct pvr_suballoc_bo *eot_usc = g->samples == 4 && !g->msaa_resolve ? p->eot_usc_ms : p->eot_usc[v];
+      const uint64_t doutu = g5p_doutu_src0(g5p_usc_off(device, eot_usc), G5P_TEMPS);
       const uint32_t data[8] = { (uint32_t)block->dev_addr.addr, (uint32_t)(block->dev_addr.addr >> 32),
                                  g5p_doutd_control(pbe_dwords), 0, (uint32_t)doutu, (uint32_t)(doutu >> 32),
                                  0, 0 };
@@ -419,7 +452,7 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
    /* PDS_BGRND0..3: the clear kick, the clear DMA, its data; sizes */
    uint64_t bgnd[4] = { 0 };
    pvr_csb_pack (&bgnd[0], CR_PDS_BGRND0_BASE, b0) {
-      b0.shader_addr = PVR_DEV_ADDR(p->clear_kick[v].data_offset);
+      b0.shader_addr = PVR_DEV_ADDR(g->samples == 4 ? p->clear_kick_ms.data_offset : p->clear_kick[v].data_offset);
       b0.texunicode_addr = PVR_DEV_ADDR(p->clear_dma.code_offset);
    }
    pvr_csb_pack (&bgnd[2], CR_PDS_BGRND2_BASE, b2) {
@@ -482,6 +515,13 @@ PVR_PER_ARCH(g5p_frag_stream)(const struct pvr_device *device, const struct pvr_
    memcpy(b->eot_resume, g->eot, sizeof(b->eot_resume));
    b->restore[0] = G5P_RESTORE0;
    b->restore[1] = g5p_mrt_restore1(g->targets);
+   /* 4x: the kernel's AA words take the sample count, positions and the PBE resolve (pvr_g5p_msaa.c); all
+    * zero at one sample, the one-sample pass as before */
+   STATIC_ASSERT(PVR_G5P_MSAA_FLAG_RESOLVE == DRM_G5P_RENDER_MSAA_RESOLVE);
+   const struct pvr_g5p_msaa_words ms = pvr_g5p_msaa_pass(g->samples, g->msaa_resolve);
+   b->samples = ms.samples;
+   b->msaa_flags = ms.flags;
+   b->sample_positions = ms.positions;
 
    /* the V2 extension: the device's tables, the background object, the output width */
    struct drm_g5p_render_pass_ext *e = &pass.ext;

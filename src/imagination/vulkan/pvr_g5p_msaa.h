@@ -81,6 +81,19 @@ uint32_t pvr_g5p_msaa_upass(uint32_t samples);
 void pvr_g5p_msaa_resolve_cpu(const uint8_t *src, uint8_t *dst, uint32_t dst_stride, uint32_t width,
                               uint32_t height, uint32_t cpp);
 
+struct pvr_physical_device;
+struct vk_properties;
+
+/* pvr_g5p_image.c: the device's sample counts (4 for framebuffers when the
+ * kernel takes 4-sample passes, 1 for sampled and storage images) and an
+ * image format's (4 only for an attachment-only 2D optimal image of 4-byte
+ * colour samples or a ZLS depth/stencil format) */
+void pvr_g5p_msaa_limits(struct pvr_physical_device *pdevice, struct vk_properties *p);
+/* the PBE resolves this colour attachment (pvr_g5p_image.c) */
+bool pvr_g5p_msaa_pbe_resolvable(VkFormat format, uint32_t samples, VkResolveModeFlagBits mode);
+void pvr_g5p_msaa_image_samples(struct pvr_physical_device *pdevice, const VkPhysicalDeviceImageFormatInfo2 *info,
+                                VkImageTiling tiling, VkImageFormatProperties *props);
+
 #ifdef PVR_PER_ARCH
 
 struct pvr_cmd_buffer;

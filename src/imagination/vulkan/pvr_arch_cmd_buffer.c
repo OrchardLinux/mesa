@@ -30,7 +30,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <vulkan/vulkan.h>
-
+#include "pvr_g5p_ds_hooks.h"
 #include "hwdef/rogue_hw_defs.h"
 #include "hwdef/rogue_hw_utils.h"
 #include "pvr_blit.h"
@@ -4424,7 +4424,7 @@ static VkResult pvr_dynamic_rendering_output_attachments_setup(
          iview->vk.view_format,
          image->vk.samples,
          attachment_info->resolveMode);
-
+      PVR_G5P_HOOK(msaa_pbe_resolve, &cmd_buffer->device->pdevice->dev_info, attachment, iview->vk.view_format, image->vk.samples, attachment_info->resolveMode)
       dr_info->color_attachments[i].index_color = cur_attach_idx;
       dr_info->hw_render.sample_count =
          MAX2(dr_info->hw_render.sample_count, attachment->sample_count);

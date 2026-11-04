@@ -383,8 +383,20 @@ struct drm_g5p_render_pass {
 	__u32 eot[4];			/* the end-of-tile (pixel event) PDS */
 	__u32 eot_resume[4];
 	__u32 restore[4];
-	__u64 reserved[8];
+	/* TYPED_V3 with DRM_G5P_CAP_RENDER_MSAA (kernel a9/gpu-msaa): 0 or 1
+	 * sample needs a 1-sample render target, 4 a 4-sample one; zero keeps
+	 * the one-sample pass */
+	__u32 samples;			/* @296 */
+	__u32 msaa_flags;		/* @300 DRM_G5P_RENDER_MSAA_* */
+	__u64 sample_positions;		/* @304 x0 | y0 << 4 | x1 << 8 ..., 1/16 px */
+	__u64 reserved[6];
 };
+
+/* RESOLVE: the end of tile's PBE averages the samples into a one-sample
+ * target, and the kernel sets the 3D's resolve words with it (ISP_CTL bit
+ * 17, W86c). It needs 4 samples. */
+#define DRM_G5P_CAP_RENDER_MSAA (1ULL << 31)
+#define DRM_G5P_RENDER_MSAA_RESOLVE (1U << 0)
 
 /* The V2 extension (128 bytes). Non-zero selects the V2 dialect: the pools
  * become the named scissor and depth-bias tables, the pixel output width moves

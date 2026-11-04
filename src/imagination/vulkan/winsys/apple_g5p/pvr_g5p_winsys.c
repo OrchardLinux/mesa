@@ -122,6 +122,16 @@ struct g5p_ws_obj { /* free lists, datasets and contexts: winsys-side only for n
 };
 
 static inline struct g5p_ws *to_ws(struct pvr_winsys *ws) { return container_of(ws, struct g5p_ws, base); }
+
+/* 4-sample render targets and the pass's MSAA fields (kernel a9/gpu-msaa):
+ * TYPED_V3 and CAP_RENDER_MSAA, which the kernel reports only with its
+ * kernel-computed render-target geometry and the V3 dialect on */
+bool
+pvr_g5p_winsys_msaa(struct pvr_winsys *ws)
+{
+   const uint64_t need = DRM_G5P_CAP_TYPED_RENDER_V3 | DRM_G5P_CAP_RENDER_MSAA;
+   return (to_ws(ws)->drm.info.capabilities & need) == need;
+}
 static inline struct g5p_ws_bo *to_bo(struct pvr_winsys_bo *bo) { return container_of(bo, struct g5p_ws_bo, base); }
 static inline struct g5p_ws_vma *to_vma(struct pvr_winsys_vma *v) { return container_of(v, struct g5p_ws_vma, base); }
 
@@ -552,6 +562,10 @@ static VkResult g5p_ws_render_submit(const struct pvr_winsys_render_ctx *ctx,
    if (!info->has_fragment_job)
       return g5p_ws_refuse(VK_ERROR_FEATURE_NOT_PRESENT, "a geometry-only job (transform feedback alone is step 8)");
    memcpy(&pass, info->fragment.fw_stream, sizeof(pass));
+   if (pass.base.samples > 1 && !pvr_g5p_winsys_msaa(ctx->ws))
+      return g5p_ws_refuse(VK_ERROR_FEATURE_NOT_PRESENT,
+                           "a %u-sample pass on a kernel without DRM_G5P_CAP_RENDER_MSAA (and TYPED_V3)",
+                           pass.base.samples);
 
    simple_mtx_lock(&ws->lock);
    if (!c->context && (r = g5p_drm_render_context_create(&ws->drm, &c->context))) {

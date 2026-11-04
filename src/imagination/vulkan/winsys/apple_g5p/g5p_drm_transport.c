@@ -336,6 +336,9 @@ int g5p_drm_render_info(struct g5p_drm *ws, struct drm_g5p_get_render_info *info
  * passes were proven with on the device). */
 _Static_assert(sizeof(struct drm_g5p_render_resource) == 32, "render resource is 32 bytes");
 _Static_assert(sizeof(struct drm_g5p_render_pass) == 360, "TYPED_V1 pass is 360 bytes");
+_Static_assert(offsetof(struct drm_g5p_render_pass, samples) == 296, "pass samples @296 (a9/gpu-msaa)");
+_Static_assert(offsetof(struct drm_g5p_render_pass, msaa_flags) == 300, "pass msaa_flags @300");
+_Static_assert(offsetof(struct drm_g5p_render_pass, sample_positions) == 304, "pass sample_positions @304");
 _Static_assert(offsetof(struct drm_g5p_render_pass_ext, dbias_va) == 16, "ext dbias_va @16");
 _Static_assert(offsetof(struct drm_g5p_render_pass_ext, bgobj_depth) == 32, "ext bgobj_depth @32");
 _Static_assert(offsetof(struct drm_g5p_render_pass_ext, zls) == 48, "ext zls @48");

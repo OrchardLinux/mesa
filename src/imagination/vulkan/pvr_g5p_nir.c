@@ -347,14 +347,17 @@ drop_unattached_output(nir_builder *b, nir_intrinsic_instr *in, void *data)
 static bool
 lower_sample_mask_1x(nir_builder *b, nir_intrinsic_instr *in, void *data)
 {
+   bool *used = data;
    b->cursor = nir_before_instr(&in->instr);
    if (in->intrinsic == nir_intrinsic_load_sample_mask_in) {
+      *used = true;
       nir_def_replace(&in->def, nir_imm_int(b, 1));
       return true;
    }
    if (in->intrinsic != nir_intrinsic_store_output ||
        nir_intrinsic_io_semantics(in).location != FRAG_RESULT_SAMPLE_MASK)
       return false;
+   *used = true;
    nir_def *mask = nir_channel(b, in->src[0].ssa, 0);
    nir_demote_if(b, nir_ieq_imm(b, nir_iand_imm(b, mask, 1), 0));
    nir_instr_remove(&in->instr);
@@ -385,7 +388,8 @@ xfb_captures(const nir_shader *nir, gl_varying_slot slot)
 }
 
 static nir_shader *
-graphics_nir(const uint32_t *spv, size_t words, mesa_shader_stage stage, const char *entry, unsigned color_targets)
+graphics_nir(const uint32_t *spv, size_t words, mesa_shader_stage stage, const char *entry, unsigned color_targets,
+             bool *sample_mask)
 {
    nir_shader *nir = g5p_nir(spv, words, stage, entry);
    if (nir && stage == MESA_SHADER_VERTEX && !xfb_captures(nir, VARYING_SLOT_PSIZ) &&
@@ -400,7 +404,7 @@ graphics_nir(const uint32_t *spv, size_t words, mesa_shader_stage stage, const c
       nir_index_ssa_defs(nir_shader_get_entrypoint(nir));
    }
    if (nir && stage == MESA_SHADER_FRAGMENT &&
-       nir_shader_intrinsics_pass(nir, lower_sample_mask_1x, nir_metadata_control_flow, NULL)) {
+       nir_shader_intrinsics_pass(nir, lower_sample_mask_1x, nir_metadata_control_flow, sample_mask)) {
       nir->info.outputs_written &= ~BITFIELD64_BIT(FRAG_RESULT_SAMPLE_MASK);
       BITSET_CLEAR(nir->info.system_values_read, SYSTEM_VALUE_SAMPLE_MASK_IN);
       nir_opt_constant_folding(nir);
@@ -443,7 +447,7 @@ vs_sysvals(nir_shader *nir)
 }
 
 bool
-pvr_g5p_compile_stage(const VkPipelineShaderStageCreateInfo *stage_info, bool half_output,
+pvr_g5p_compile_stage(const VkPipelineShaderStageCreateInfo *stage_info, bool half_output, uint32_t samples,
                       const uint8_t *attrib_components, const struct pco_g5p_fs_key *key,
                       const struct pco_g5p_vs_link *link, struct pco_g5p_program *out)
 {
@@ -483,10 +487,16 @@ pvr_g5p_compile_stage(const VkPipelineShaderStageCreateInfo *stage_info, bool ha
 
    glsl_type_singleton_init_or_ref();
    const char *entry = stage_info->pName ? stage_info->pName : "main";
-   nir_shader *nir = graphics_nir(spv, bytes / 4, stage, entry, key && key->color_targets ? key->color_targets : 1);
+   bool sample_mask = false;
+   nir_shader *nir = graphics_nir(spv, bytes / 4, stage, entry, key && key->color_targets ? key->color_targets : 1,
+                                  &sample_mask);
    bool ok = false;
    if (!nir) {
       snprintf(out->refusal, sizeof(out->refusal), "SPIR-V -> NIR failed");
+   } else if (sample_mask && samples > 1) {
+      /* the lowering above is the one-sample rule; at 4x the mask needs the program's coverage feedback */
+      snprintf(out->refusal, sizeof(out->refusal), "gl_SampleMask or gl_SampleMaskIn at %u samples "
+               "(the coverage feedback is not built)", samples);
    } else {
       if (stage == MESA_SHADER_VERTEX)
          vs_sysvals(nir);

@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * The Apple A9 (G5P) depth/stencil hooks in the shared PowerVR driver files,
+ * The Apple A9 (G5P) depth/stencil and multisample hooks in the shared
+ * PowerVR driver files,
  * in the form of pvr_g5p_hooks.h: one line, PVR_G5P_HOOK(name, ...), in the
  * place of a blank line, which expands to nothing without
  * -Dimagination-g5p-experimental, so the option-off build keeps every line
@@ -12,6 +13,7 @@
 
 #if defined(PVR_APPLE_G5P)
 #   include "pvr_g5p_ds.h"
+#   include "pvr_g5p_msaa.h"
 #endif
 
 #ifndef PVR_G5P_HOOK
@@ -41,5 +43,25 @@
 #define PVR_G5P_HOOK_ds_format_features(pdevice, vk_format, flags)                          \
    if (PVR_HAS_FEATURE(&(pdevice)->dev_info, apple_g5p) && vk_format_is_depth_or_stencil(vk_format)) \
       (flags) &= pvr_g5p_ds_format(vk_format) ? VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT : 0;
+
+/* pvr_physical_device.c, pvr_physical_device_init(): the sample counts of
+ * the A9 path (pvr_g5p_msaa_limits()) in place of upstream's 1 | 4 everywhere */
+#define PVR_G5P_HOOK_msaa_limits(pdevice, props)                 \
+   if (PVR_HAS_FEATURE(&(pdevice)->dev_info, apple_g5p)) \
+      pvr_g5p_msaa_limits((pdevice), (props));
+
+/* pvr_formats.c, pvr_get_image_format_properties(): an image format's
+ * sample counts (pvr_g5p_msaa_image_samples()) */
+#define PVR_G5P_HOOK_msaa_image_samples(pdevice, info, tiling, props) \
+   if (PVR_HAS_FEATURE(&(pdevice)->dev_info, apple_g5p))      \
+      pvr_g5p_msaa_image_samples((pdevice), (info), (tiling), (props));
+
+/* pvr_arch_cmd_buffer.c, the dynamic render's colour attachments: a 4x
+ * AVERAGE resolve of 4-byte colour samples is the PBE's at the end of tile
+ * (pvr_g5p_msaa_pbe_resolvable()). Upstream answers with gs_rta_support,
+ * which the A9 lacks, and stores the samples for a transfer resolve. */
+#define PVR_G5P_HOOK_msaa_pbe_resolve(dev_info, attachment, format, samples, mode) \
+   if (PVR_HAS_FEATURE((dev_info), apple_g5p))                                  \
+      (attachment)->is_pbe_downscalable = pvr_g5p_msaa_pbe_resolvable((format), (samples), (mode));
 
 #endif /* PVR_G5P_DS_HOOKS_H */

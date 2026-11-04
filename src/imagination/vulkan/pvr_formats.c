@@ -851,7 +851,7 @@ pvr_get_image_format_properties(struct pvr_physical_device *pdevice,
 
       pImageFormatProperties->maxMipLevels = util_logbase2(max_size) + 1U;
    }
-
+   PVR_G5P_HOOK(msaa_image_samples, pdevice, info, tiling, pImageFormatProperties)
    /* Return 2GB (minimum required from spec).
     *
     * From the Vulkan spec:
