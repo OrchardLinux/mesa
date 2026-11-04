@@ -65,6 +65,15 @@
  * (GET_RENDER_INFO.code_window) bounds the arena; GET_EXEC_INFO.window_size (0x34000) is the older compute path's
  * and does not bound render programs. */
 #define G5P_WS_MAX_CODE_WINDOW (1ull << 32)
+/* The pvr_* heaps are address bookkeeping only (see the top of this file): heap_alloc reserves a range, and
+ * vma_map then gives the bound BO's own address. So their bookkeeping range is not the arena's size: every bind of
+ * a heap reserves its whole size there, own BOs (display buffers, imports: the 1 GiB window) included, and an
+ * arena-sized range capped everything bound at once at 64 MiB (zink10's nested Hyprland: vkBindImageMemory failed
+ * with the arena and the window still free). heap->size stays the arena's. */
+#define G5P_WS_BOOKKEEPING (1ull << 40)
+/* How long a VM edit (CREATE_RENDER_TARGET, an own BO's create, import or destroy) waits for the render contexts
+ * to idle when the kernel says EBUSY (g5p_render_vm_idle()): its own job timeout. */
+#define G5P_WS_BUSY_NS 2000000000ll
 
 /* A refusal at winsys creation, on stderr too: vk_errorf() is silent in release builds, and a device that is not
  * found should say why. */
@@ -90,6 +99,9 @@ struct g5p_ws {
    struct list_head own_bos;
    unsigned own_count;
    bool vma_heaps_ready; /* slices and dedicated are initialized */
+
+   /* every live render context (g5p_ws_render_ctx::link): a VM edit waits for all of their last jobs */
+   struct list_head render_ctxs;
 
    struct pvr_winsys_heap general_heap, pds_heap, usc_heap, vis_test_heap, transfer_frag_heap;
 };
@@ -205,7 +217,7 @@ static void g5p_ws_heap_init(struct g5p_ws *ws, struct pvr_winsys_heap *heap, ui
    heap->size = size;
    heap->page_size = G5P_WS_PAGE;
    heap->log2_page_size = util_logbase2(G5P_WS_PAGE);
-   util_vma_heap_init(&heap->vma_heap, base, size);
+   util_vma_heap_init(&heap->vma_heap, base, G5P_WS_BOOKKEEPING);
    pthread_mutex_init(&heap->lock, NULL);
 }
 
@@ -230,7 +242,8 @@ static VkResult g5p_ws_heap_alloc(struct pvr_winsys_heap *heap, uint64_t size, u
    VkResult r = pvr_winsys_helper_heap_alloc(heap, size, alignment, &v->base);
    if (r != VK_SUCCESS) {
       vk_free(ws->base.alloc, v);
-      return r;
+      return g5p_ws_fail(r, "bind of %" PRIu64 " bytes (alignment %" PRIu64 "): the heap's bookkeeping is full",
+                         size, alignment);
    }
    v->reserved = v->base.dev_addr;
    *vma_out = &v->base;
@@ -252,7 +265,9 @@ static VkResult g5p_ws_vma_map(struct pvr_winsys_vma *vma, struct pvr_winsys_bo 
 {
    struct g5p_ws_bo *b = to_bo(bo);
    if (offset + size > b->alloc_size || offset + size < offset)
-      return vk_error(NULL, VK_ERROR_MEMORY_MAP_FAILED);
+      return g5p_ws_fail(VK_ERROR_MEMORY_MAP_FAILED,
+                         "bind of %" PRIu64 " bytes at offset %" PRIu64 " past the end of a %s BO of %" PRIu64 " bytes",
+                         size, offset, b->base.is_imported ? "imported" : b->own ? "own" : "slice", b->alloc_size);
    p_atomic_inc(&b->refs);
    vma->bo = bo;
    vma->bo_offset = offset;
@@ -281,6 +296,21 @@ static void g5p_ws_vma_unmap(struct pvr_winsys_vma *vma)
 
 /* ---- buffers ---- */
 
+/* One wait of a VM edit the kernel refused with EBUSY: every live render context's last job, the lock not held */
+static void g5p_ws_wait_jobs(struct g5p_ws *ws, int64_t deadline);
+
+/* A VM edit (own BO create, import, destroy) that the kernel refuses with EBUSY while a render job of this file
+ * is queued (g5p_render_vm_idle(): "G5P VM_BIND busy=render-idle" in dmesg): wait for the jobs and try again, for
+ * G5P_WS_BUSY_NS at most. The lock must not be held. */
+#define G5P_WS_VM_RETRY(ws, r, waits, call)                                                                     \
+   do {                                                                                                         \
+      const int64_t deadline_ = os_time_get_nano() + G5P_WS_BUSY_NS;                                           \
+      while (((r) = (call)) == -EBUSY && os_time_get_nano() < deadline_) {                                      \
+         g5p_ws_wait_jobs((ws), deadline_);                                                                     \
+         (waits)++;                                                                                             \
+      }                                                                                                         \
+   } while (0)
+
 static struct g5p_ws_bo *g5p_ws_bo_new(struct g5p_ws *ws, uint64_t size)
 {
    struct g5p_ws_bo *b = vk_zalloc(ws->base.alloc, sizeof(*b), 8, VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
@@ -301,14 +331,21 @@ static VkResult g5p_ws_own_create(struct g5p_ws *ws, uint64_t size, struct g5p_w
    uint64_t va = util_vma_heap_alloc(&ws->dedicated, alloc, G5P_WS_PAGE);
    simple_mtx_unlock(&ws->lock);
    if (!va)
-      return vk_error(NULL, VK_ERROR_OUT_OF_DEVICE_MEMORY);
-   int r = g5p_drm_bo_create(&ws->drm, &b->kbo, va, alloc, DRM_G5P_BO_READ | DRM_G5P_BO_WRITE);
+      return g5p_ws_fail(VK_ERROR_OUT_OF_DEVICE_MEMORY, "own BO of %" PRIu64 " bytes: the %" PRIu64
+                         " MiB window for display buffers and imports is full", alloc, (uint64_t)(G5P_WS_DEDICATED_SIZE >> 20));
+   int r;
+   unsigned waits = 0;
+   G5P_WS_VM_RETRY(ws, r, waits,
+                   g5p_drm_bo_create(&ws->drm, &b->kbo, va, alloc, DRM_G5P_BO_READ | DRM_G5P_BO_WRITE));
    if (r) {
       simple_mtx_lock(&ws->lock);
       util_vma_heap_free(&ws->dedicated, va, alloc);
       simple_mtx_unlock(&ws->lock);
-      return vk_errorf(NULL, VK_ERROR_OUT_OF_DEVICE_MEMORY, "apple_g5p: own BO of %" PRIu64 " bytes: %s", alloc,
-                       strerror(-r));
+      if (r == -EBUSY)
+         return g5p_ws_fail(VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                            "own BO of %" PRIu64 " bytes refused: the VM stayed busy (%u waits for the render jobs, "
+                            "%lld ms): not out of memory", alloc, waits, G5P_WS_BUSY_NS / 1000000);
+      return g5p_ws_fail(VK_ERROR_OUT_OF_DEVICE_MEMORY, "own BO of %" PRIu64 " bytes: %s", alloc, strerror(-r));
    }
    b->own = true;
    b->va = va;
@@ -335,9 +372,9 @@ static VkResult g5p_ws_buffer_create(struct pvr_winsys *ws_, uint64_t size, uint
       const uint64_t va = util_vma_heap_alloc(&ws->slices, alloc, MAX2(alignment, G5P_WS_PAGE));
       simple_mtx_unlock(&ws->lock);
       if (!va) {
-         r = vk_errorf(NULL, VK_ERROR_OUT_OF_DEVICE_MEMORY,
-                       "apple_g5p: arena full (%" PRIu64 " bytes asked, arena %" PRIu64 "; PVR_G5P_ARENA_MIB)", alloc,
-                       ws->arena_size);
+         r = g5p_ws_fail(VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                         "arena full (%" PRIu64 " bytes asked, arena %" PRIu64 "; PVR_G5P_ARENA_MIB)", alloc,
+                         ws->arena_size);
       } else {
          b->va = va;
          b->cpu = ws->arena_cpu + (va - ws->arena_va);
@@ -390,7 +427,10 @@ static VkResult g5p_ws_buffer_create_from_fd(struct pvr_winsys *ws_, int fd, str
    const uint64_t va = util_vma_heap_alloc(&ws->dedicated, alloc, G5P_WS_PAGE);
    simple_mtx_unlock(&ws->lock);
    uint64_t size = 0;
-   int r = va ? g5p_drm_bo_import(&ws->drm, &b->kbo, fd, va, &size) : -ENOSPC;
+   int r = -ENOSPC;
+   unsigned waits = 0;
+   if (va)
+      G5P_WS_VM_RETRY(ws, r, waits, g5p_drm_bo_import(&ws->drm, &b->kbo, fd, va, &size));
    if (r) {
       if (va) {
          simple_mtx_lock(&ws->lock);
@@ -398,7 +438,14 @@ static VkResult g5p_ws_buffer_create_from_fd(struct pvr_winsys *ws_, int fd, str
          simple_mtx_unlock(&ws->lock);
       }
       vk_free(ws->base.alloc, b);
-      return vk_errorf(NULL, VK_ERROR_INVALID_EXTERNAL_HANDLE, "apple_g5p: import: %s", strerror(-r));
+      if (r == -ENOSPC)
+         return g5p_ws_fail(VK_ERROR_OUT_OF_DEVICE_MEMORY, "import of %" PRIu64 " bytes: the %" PRIu64
+                            " MiB window for display buffers and imports is full", alloc, (uint64_t)(G5P_WS_DEDICATED_SIZE >> 20));
+      if (r == -EBUSY)
+         return g5p_ws_fail(VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                            "import of %" PRIu64 " bytes refused: the VM stayed busy (%u waits for the render jobs, "
+                            "%lld ms): not a bad handle", alloc, waits, G5P_WS_BUSY_NS / 1000000);
+      return g5p_ws_fail(VK_ERROR_INVALID_EXTERNAL_HANDLE, "import of %" PRIu64 " bytes: %s", alloc, strerror(-r));
    }
    b->own = true;
    b->va = va;
@@ -421,8 +468,15 @@ static void g5p_ws_buffer_destroy(struct pvr_winsys_bo *bo)
       const uint64_t va = b->va;
       list_del(&b->link);
       ws->own_count--;
-      if (g5p_drm_bo_destroy(&ws->drm, &b->kbo))
-         mesa_logw("apple_g5p: own BO at %#" PRIx64 " not released (context busy); its VA stays reserved", va);
+      simple_mtx_unlock(&ws->lock);
+      /* the UNMAP is a VM edit: it waits for the render jobs like the others (the BO is off the job lists) */
+      int r;
+      unsigned waits = 0;
+      G5P_WS_VM_RETRY(ws, r, waits, g5p_drm_bo_destroy(&ws->drm, &b->kbo));
+      simple_mtx_lock(&ws->lock);
+      if (r)
+         fprintf(stderr, "apple_g5p winsys: own BO at %#" PRIx64 " of %" PRIu64 " bytes not released (%s, %u waits): "
+                 "its VA stays reserved\n", va, b->alloc_size, strerror(-r), waits);
       else
          util_vma_heap_free(&ws->dedicated, va, b->alloc_size);
    } else {
@@ -542,7 +596,24 @@ struct g5p_ws_render_ctx {
     * kernel creates a render target only on an idle context, so a new size
     * waits on it (g5p_ws_rt_create_idle()) */
    uint32_t last;
+   struct list_head link; /* in g5p_ws::render_ctxs */
 };
+
+static void g5p_ws_wait_jobs(struct g5p_ws *ws, int64_t deadline)
+{
+   uint32_t syncs[16];
+   unsigned n = 0;
+
+   simple_mtx_lock(&ws->lock);
+   list_for_each_entry (struct g5p_ws_render_ctx, c, &ws->render_ctxs, link)
+      if (c->last && n < ARRAY_SIZE(syncs))
+         syncs[n++] = c->last;
+   simple_mtx_unlock(&ws->lock);
+   if (n)
+      drmSyncobjWait(ws->base.render_fd, syncs, n, deadline, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL);
+   /* the kernel drops its queued count before it signals, and a job may have been queued since: a short pause */
+   os_time_sleep(1000);
+}
 
 static VkResult g5p_ws_rt_dataset_create(struct pvr_winsys *ws, const struct pvr_winsys_rt_dataset_create_info *info,
                                          const struct pvr_device_info *dev_info,
@@ -579,6 +650,9 @@ static VkResult g5p_ws_render_ctx_create(struct pvr_winsys *ws, struct pvr_winsy
    if (!c)
       return vk_error(NULL, VK_ERROR_OUT_OF_HOST_MEMORY);
    c->base.ws = ws;
+   simple_mtx_lock(&to_ws(ws)->lock);
+   list_addtail(&c->link, &to_ws(ws)->render_ctxs);
+   simple_mtx_unlock(&to_ws(ws)->lock);
    *out = &c->base;
    return VK_SUCCESS;
 }
@@ -586,6 +660,9 @@ static VkResult g5p_ws_render_ctx_create(struct pvr_winsys *ws, struct pvr_winsy
 static void g5p_ws_render_ctx_destroy(struct pvr_winsys_render_ctx *ctx)
 {
    struct g5p_ws_render_ctx *c = container_of(ctx, struct g5p_ws_render_ctx, base);
+   simple_mtx_lock(&to_ws(ctx->ws)->lock);
+   list_del(&c->link);
+   simple_mtx_unlock(&to_ws(ctx->ws)->lock);
    if (c->context)
       g5p_drm_render_context_destroy(&to_ws(ctx->ws)->drm, c->context);
    if (c->last)
@@ -956,6 +1033,7 @@ VkResult pvr_g5p_winsys_create(int render_fd, int display_fd, const VkAllocation
       return vk_error(NULL, VK_ERROR_OUT_OF_HOST_MEMORY);
    simple_mtx_init(&ws->lock, mtx_plain);
    list_inithead(&ws->own_bos);
+   list_inithead(&ws->render_ctxs);
    ws->base.ops = &g5p_ws_ops;
    ws->base.alloc = alloc;
    ws->base.render_fd = render_fd;
