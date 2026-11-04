@@ -33,7 +33,7 @@
 
 #include "vk_alloc.h"
 #include "vk_command_buffer.h"
-
+#include "pvr_g9p_es3_arch_xfb_hooks.h"
 static uint32_t
 pvr_get_output_primitive_vertex_count(VkPrimitiveTopology topology)
 {
@@ -810,7 +810,7 @@ void PVR_PER_ARCH(CmdBeginTransformFeedbackEXT)(
    struct pvr_cmd_buffer_xfb_state *xfb_state = &state->xfb_state;
 
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
-
+   PVR_G9P_ES3_HOOK(arch_xfb_813)
    xfb_state->counter_buffer_count = counterBufferCount;
 
    for (uint32_t i = 0; i < ARRAY_SIZE(xfb_state->bindings); i++) {
@@ -855,7 +855,7 @@ void PVR_PER_ARCH(CmdEndTransformFeedbackEXT)(
    VkResult result;
 
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
-
+   PVR_G9P_ES3_HOOK(arch_xfb_857)
    xfb_state->counter_buffer_count = counterBufferCount;
 
    for (uint32_t i = 0; i < ARRAY_SIZE(xfb_state->bindings); i++) {

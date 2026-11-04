@@ -5,6 +5,11 @@ imagination_c_args = cc.get_supported_arguments(
   '-Werror=pointer-arith',
 )
 
+# Apple A10 (G9P): the OpenGL ES 3.0 enablers, opt-in only (untested on the A10)
+if get_option('imagination-g9p-es3')
+  imagination_c_args += ['-DPVR_G9P_ES3']
+endif
+
 inc_imagination = include_directories([
   '.',
   'common',

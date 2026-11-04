@@ -59,6 +59,11 @@ pvr_files = files(
   'pvr_utrace.c',
 )
 
+# Apple G9P: the OpenGL ES 3.0 enablers, opt-in (-Dimagination-g9p-es3)
+if get_option('imagination-g9p-es3')
+  pvr_files += files('pvr_g9p_es3.c')
+endif
+
 pvr_includes = [
   include_directories('winsys'),
   libpowervr_pds_includes,

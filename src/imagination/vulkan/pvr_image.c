@@ -27,7 +27,6 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
-
 #include "drm-uapi/drm_fourcc.h"
 #include "pvr_buffer.h"
 #include "pvr_device.h"
@@ -45,7 +44,7 @@
 #include "vk_object.h"
 #include "vk_util.h"
 #include "wsi_common.h"
-
+#include "pvr_g9p_es3_image_hooks.h"
 static void pvr_image_init_memlayout(const struct pvr_device *device,
                                      struct pvr_image *image)
 {
@@ -64,6 +63,7 @@ static void pvr_image_init_memlayout(const struct pvr_device *device,
        * MESA.md "The GPU desktop against pixman"); the GPU samples and
        * renders linear images as well.
        */
+   PVR_G9P_ES3_HOOK(image_66)
       else if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p) &&
                image->vk.image_type == VK_IMAGE_TYPE_2D && image->vk.mip_levels == 1 &&
                image->vk.samples == VK_SAMPLE_COUNT_1_BIT &&
@@ -206,9 +206,9 @@ static void pvr_image_plane_setup_mip_levels(struct pvr_image *image, uint8_t i)
     * RGX_CR_TPU_TAG_CEM_4K_FACE_PACKING_EN, assuming this is where the
     * requirement comes from.
     */
+   PVR_G9P_ES3_HOOK(image_208)
    if (image->vk.array_layers > 1)
       plane->layer_size = align64(plane->layer_size, image->alignment);
-
    plane->size = plane->layer_size * image->vk.array_layers;
 }
 

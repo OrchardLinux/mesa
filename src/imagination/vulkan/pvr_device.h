@@ -114,6 +114,19 @@ struct pvr_device {
          struct pvr_suballoc_bo *ctx_state;
          /* zeros (texture state dwords 4-7) */
          struct pvr_suballoc_bo *zeros;
+#ifdef PVR_G9P_ES3
+         /*
+          * -Dimagination-g9p-es3: several colour targets' programs
+          * (pvr_arch_g9p_es3_gfx.h): clear and load of 2 and 4 targets
+          * ([0], [1]) and their kicks, end of tile by the set of stored targets
+          */
+         struct pvr_suballoc_bo *es3_clear_usc[2], *es3_load_usc[2];
+         struct pvr_pds_upload es3_clear_kick[2], es3_load_kick[2];
+         struct pvr_suballoc_bo *es3_eot_usc[16];
+         /* 4 samples: the end of tile storing the samples, the clear kick at sample rate */
+         struct pvr_suballoc_bo *es3_eot_ms_usc;
+         struct pvr_pds_upload es3_clear_ms_kick;
+#endif
       } gfx;
       /*
        * The parameter buffer every render-target dataset shares as its local

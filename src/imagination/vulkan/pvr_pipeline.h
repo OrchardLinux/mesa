@@ -166,6 +166,11 @@ struct pvr_g9p_graphics_state {
    struct {
       unsigned set, binding;
    } textures[4];
+#ifdef PVR_G9P_ES3
+   /* -Dimagination-g9p-es3: the vertex shader's transform feedback buffers and strides */
+   unsigned es3_xfb_buffers;
+   unsigned es3_xfb_stride[4];
+#endif
 };
 
 struct pvr_compute_pipeline {

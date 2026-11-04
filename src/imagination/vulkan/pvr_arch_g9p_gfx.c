@@ -45,7 +45,7 @@
 #include "pvr_job_render.h"
 #include "pvr_physical_device.h"
 #include "pvr_pipeline.h"
-
+#include "pvr_g9p_es3_arch_g9p_gfx_hooks.h"
 static_assert(ARRAY_SIZE(((struct pvr_g9p_graphics_state *)0)->buffers) == G9P_MAX_BUFFERS &&
                  ARRAY_SIZE(((struct pvr_g9p_graphics_state *)0)->fs_buffers) == G9P_MAX_BUFFERS,
               "pvr_pipeline.h sizes the shaders' buffer slots by G9P_MAX_BUFFERS");
@@ -286,8 +286,8 @@ PVR_PER_ARCH(g9p_gfx_device_init)(struct pvr_device *device)
       result = pvr_gpu_upload(device, device->heaps.general_heap, zeros, sizeof(zeros),
                               64, &p->ctx_state);
    if (result == VK_SUCCESS)
+   PVR_G9P_ES3_HOOK(arch_g9p_gfx_288)
       result = pvr_gpu_upload(device, device->heaps.general_heap, zeros, 64, 64, &p->zeros);
-
 out:
    free(c);
    return result;
@@ -319,8 +319,8 @@ PVR_PER_ARCH(g9p_gfx_device_finish)(struct pvr_device *device)
    pvr_bo_suballoc_free(p->load_usc);
    pvr_bo_suballoc_free(p->load_kick.pvr_bo);
    pvr_bo_suballoc_free(p->clear_vs_kick.pvr_bo);
+   PVR_G9P_ES3_HOOK(arch_g9p_gfx_321)
 }
-
 /* --- Pipelines ------------------------------------------------------------ */
 
 /*
@@ -505,19 +505,18 @@ PVR_PER_ARCH(g9p_graphics_pipeline_compile)(struct pvr_device *device,
          };
       }
    }
-
    {
       /* gl_FragCoord's varying follows the vertex shader's own */
       nir_shader *vs_nir, *fs_nir;
       nir_lower_blend_options blend;
       unsigned slot;
-
       result = stage_nir(device, pipeline, vs_info, mem_ctx, &vs_nir);
       if (result == VK_SUCCESS)
          result = stage_nir(device, pipeline, fs_info, mem_ctx, &fs_nir);
       if (result != VK_SUCCESS)
          goto out;
       slot = g9p_frag_coord_slot(vs_nir);
+   PVR_G9P_ES3_HOOK(arch_g9p_gfx_520)
       result = compile_stage(device, fs_nir, fs_info, NULL, slot,
                              blend_options(vk_state, &blend) ? &blend : NULL, &fs, mem_ctx);
       if (result == VK_SUCCESS)
@@ -526,6 +525,7 @@ PVR_PER_ARCH(g9p_graphics_pipeline_compile)(struct pvr_device *device,
    }
    if (result != VK_SUCCESS)
       goto out;
+   PVR_G9P_ES3_HOOK(arch_g9p_gfx_528)
    if (fs.num_varyings > vs.num_varyings) {
       result = g9p_error(device,
                          "G9P: the fragment shader reads varyings the vertex shader "
@@ -554,12 +554,12 @@ PVR_PER_ARCH(g9p_graphics_pipeline_compile)(struct pvr_device *device,
    result = pvr_gpu_upload_usc(device, fs.code, fs.code_size, 64, &state->fs_bo);
    if (result != VK_SUCCESS)
       goto out;
-
    state->num_varyings = vs.num_varyings;
    state->vs_outputs = vs.num_outputs;
    state->uses_discard = fs.uses_discard;
    state->uses_fbfetch = fs.uses_fbfetch;
    state->vs_regs = vs.num_regs;
+   PVR_G9P_ES3_HOOK(arch_g9p_gfx_562)
    state->num_buffers = vs.num_buffers;
    for (unsigned i = 0; i < vs.num_buffers; i++) {
       state->buffers[i].set = vs.buffers[i].set;
@@ -581,13 +581,13 @@ PVR_PER_ARCH(g9p_graphics_pipeline_compile)(struct pvr_device *device,
          g9p_pds_dout(G9P_DOUTU, 0, G9P_PDS_DATA, 0, G9P_PDS_END | G9P_PDS_CC),
          g9p_pds_halt(),
       };
-
       result = pvr_gpu_upload_pds(device, data, ARRAY_SIZE(data), 16, code,
                                   ARRAY_SIZE(code), 16, 64, &state->vs_kick);
       if (result != VK_SUCCESS)
          goto out;
    }
    result = upload_kick(device, state->fs_bo, fs.num_regs, 0, &state->fs_kick);
+   PVR_G9P_ES3_HOOK(arch_g9p_gfx_590)
    if (result == VK_SUCCESS)
       result = upload_varyings(device, state, &fs);
    if (result == VK_SUCCESS && dumping()) {
@@ -806,7 +806,6 @@ buffer_addrs(struct pvr_cmd_buffer *cmd_buffer, unsigned n, const unsigned (*set
 
          if (pc->dirty || !pc->dev_addr.addr) {
             struct pvr_suballoc_bo *pbo;
-
             result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, pc->data,
                                                         MAX2(pc->bytes_updated, 4), &pbo);
             if (result != VK_SUCCESS)
@@ -815,6 +814,7 @@ buffer_addrs(struct pvr_cmd_buffer *cmd_buffer, unsigned n, const unsigned (*set
             pc->dirty = false;
          }
          addrs[k] = pc->dev_addr.addr;
+   PVR_G9P_ES3_HOOK(arch_g9p_gfx_817)
       } else if (set == G9P_VIEWPORT) {
          /* scale/offset x, y, z of viewport 0 (gl_FragCoord's varying) */
          const struct vk_dynamic_graphics_state *dyn = &cmd_buffer->vk.dynamic_graphics_state;
@@ -917,8 +917,8 @@ struct g9p_draw_programs {
    /* the depth test (a depth attachment and the test enabled), its write and compare op */
    bool depth_test, depth_write;
    VkCompareOp depth_compare;
+   PVR_G9P_ES3_HOOK(arch_g9p_gfx_919)
 };
-
 /*
  * A scissor table entry for the render (the scissor capture: {left << 16 |
  * right, top << 16 | bottom}, right and bottom exclusive), reusing the
@@ -1002,7 +1002,6 @@ PVR_PER_ARCH(g9p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer,
    if (cs->push_consts[PVR_STAGE_ALLOCATION_VERTEX_GEOMETRY].dirty) {
       struct pvr_push_constants *pc = &cs->push_consts[PVR_STAGE_ALLOCATION_VERTEX_GEOMETRY];
       struct pvr_suballoc_bo *bo;
-
       result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, pc->data,
                                                   MAX2(pc->bytes_updated, 4), &bo);
       if (result != VK_SUCCESS)
@@ -1010,6 +1009,7 @@ PVR_PER_ARCH(g9p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer,
       pc->dev_addr = bo->dev_addr;
       pc->dirty = false;
    }
+   PVR_G9P_ES3_HOOK(arch_g9p_gfx_1012)
    result = upload_vs_uniforms(cmd_buffer, state, &dma);
    if (result != VK_SUCCESS)
       return result;
@@ -1130,13 +1130,13 @@ emit_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state
    if (dp->depth_test) {
       const uint32_t a = 0x00100f00 | pass << 24 | (uint32_t)dp->depth_compare << 17 |
                          (dp->depth_write ? 0 : BITFIELD_BIT(21));
-
       PPP_BLOCK(0x1f, 0x03c00000 | (dp->scissor >= 0 ? BITFIELD_BIT(16) : 0), a, 0x0e000000, a,
                 0x0e000000);
    } else {
       PPP_BLOCK(0x1f, 0x03c40000 | (dp->scissor >= 0 ? BITFIELD_BIT(16) : 0),
                 0x003e0f00 | pass << 24, 0x0e000000, 0x00100f00 | pass << 24, 0);
    }
+   PVR_G9P_ES3_HOOK(arch_g9p_gfx_1139)
    /*
     * 4: region clip (32-pixel tiles, inclusive; mode OUTSIDE drops what lies
     * outside) and the viewport (a0 m0 a1 m1 a2 m2). The clip is the draw's
@@ -1264,7 +1264,7 @@ PVR_PER_ARCH(g9p_clear_attachments)(struct pvr_cmd_buffer *cmd_buffer, uint32_t 
    struct pvr_suballoc_bo *verts_bo, *table_bo, *colour_bo;
    float *verts;
    VkResult result;
-
+   PVR_G9P_ES3_HOOK(arch_g9p_gfx_1267)
    for (uint32_t i = 0; i < attachment_count; i++) {
       if ((attachments[i].aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) &&
           attachments[i].colorAttachment == 0)
@@ -1374,10 +1374,10 @@ PVR_PER_ARCH(g9p_pack_image_view)(const struct pvr_image_view *iview, uint64_t w
    d[3] = (uint32_t)(addr >> 33);
    if (linear)
       d[3] |= (plane->mip_levels[iview->vk.base_mip_level].pitch / 64 - 1) << 15;
+   PVR_G9P_ES3_HOOK(arch_g9p_gfx_1376)
    words[0] = d[0] | (uint64_t)d[1] << 32;
    words[1] = d[2] | (uint64_t)d[3] << 32;
 }
-
 /*
  * Sampler words: nearest/clamp as captured (000e0000 00c00780). iPadOS's
  * linear-filter-and-repeat sampler (`texfilter` capture) adds dword 0 bits
@@ -1453,7 +1453,7 @@ PVR_PER_ARCH(g9p_job_init)(struct pvr_cmd_buffer *cmd_buffer,
    struct pvr_pds_upload up;
    uint32_t image[8];
    VkResult result;
-
+   PVR_G9P_ES3_HOOK(arch_g9p_gfx_1456)
    memset(&job->g9p, 0, sizeof(job->g9p));
    job->g9p.enabled = true;
 
@@ -1683,6 +1683,9 @@ PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
    put64(&s, job->scissor_table_addr.addr);
    put64(&s, 0);
    put64(&s, 0);
+#ifdef PVR_G9P_ES3
+   const uint32_t es3_zlsctl_at = ALIGN_POT(s.len, 8);
+#endif
    put64(&s, g9p_zlsctl(job));
    put64(&s, job->has_depth_attachment ? job->ds.addr.addr : 0);
    /*
@@ -1700,6 +1703,9 @@ PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
    for (unsigned i = 0; i < 8; i++)
       put32(&s, 0); /* USC clear registers */
    put32(&s, 0);
+#ifdef PVR_G9P_ES3
+   const uint32_t es3_bgobj_at = s.len;
+#endif
    put32(&s, job->has_depth_attachment ? fui(job->ds_clear_value.depth)
                                         : 0x3f800000); /* ISP_BGOBJDEPTH: the depth clear */
    put32(&s, 0x300);      /* ISP_BGOBJVALS */
@@ -1718,6 +1724,9 @@ PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
    put32(&s, (job->g9p.load || job->g9p.load_op == G9P_LOAD_OP_NONE) && !getenv("G9P_ALL_TILES")
                 ? 0x21000f
                 : 0x23000f);
+#ifdef PVR_G9P_ES3
+   const uint32_t es3_info_at = s.len;
+#endif
    put32(&s, 0x402);    /* EVENT_PIXEL_PDS_INFO */
    put32(&s, 0);
    put32(&s, job->view_state.view[0].pds_pixel_event_data_offset);
@@ -1726,11 +1735,17 @@ PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
    *(uint32_t *)buf = s.len;
 
    put32(&s, G9P_EXTHDR_APPLE);
+#ifdef PVR_G9P_ES3
+   const uint32_t es3_pos_at = ALIGN_POT(s.len, 8);
+#endif
    put64(&s, 0x88); /* 0xfa8 sample positions */
    for (unsigned i = 0; i < 4; i++)
       put64(&s, job->g9p.bgnd[i]);
    for (unsigned i = 0; i < 6; i++)
       put64(&s, 0);     /* cluster 0 */
+#ifdef PVR_G9P_ES3
+   const uint32_t es3_cluster1_at = ALIGN_POT(s.len, 8);
+#endif
    for (unsigned i = 0; i < 6; i++)
       put64(&s, 0x1d3); /* cluster 1 */
    put64(&s, 0);        /* 0xfd0 */
@@ -1759,6 +1774,9 @@ PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
    put32(&s, job->has_depth_attachment
                 ? (job->ds.physical_extent.width - 1) | (job->ds.physical_extent.height - 1) << 15
                 : 4);
+#ifdef PVR_G9P_ES3
+   const uint32_t es3_r4070_at = s.len;
+#endif
    put32(&s, 0xf9);
    /* line rasterization (iOS 10): tan 15° / size, tan 60° / size, 16 x width */
    put32(&s, fui(t15 / w));
@@ -1767,6 +1785,15 @@ PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
    put32(&s, fui(t60 / h));
    put32(&s, fui(16.0f * w));
    put32(&s, fui(t15 / w));
+#ifdef PVR_G9P_ES3
+   es3_frag_stream_patch(job, buf, es3_info_at, es3_cluster1_at, es3_r4070_at);
+   es3_frag_stream_zls(job, buf, es3_zlsctl_at, es3_bgobj_at);
+   es3_frag_stream_ms(job, buf, es3_bgobj_at, es3_pos_at, es3_cluster1_at);
+#endif
    dump32("frag stream", 0, (const uint32_t *)buf, s.len / 4);
    return s.len;
 }
+
+#ifdef PVR_G9P_ES3
+#include "pvr_arch_g9p_es3_gfx.h"
+#endif

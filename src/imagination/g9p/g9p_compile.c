@@ -28,11 +28,17 @@
 #include <vulkan/vulkan_core.h>
 
 #include "compiler/nir/nir_builder.h"
+#ifdef PVR_G9P_ES3
+#include "compiler/nir/nir_xfb_info.h"
+#endif
 #include "compiler/nir/nir_builtin_builder.h"
 #include "compiler/nir/nir_format_convert.h"
 #include "util/format/u_format.h"
 #include "g9p_compile.h"
 #include "g9p_isa.h"
+#ifdef PVR_G9P_ES3
+#include "g9p_es3_isa.h"
+#endif
 
 /* r0-r29 for values, the mask stack after them (G9P_REGS: debug override) */
 static unsigned
@@ -115,6 +121,10 @@ struct g9p_ctx {
    } outputs[4 + 4 * G9P_MAX_VARYINGS];
    unsigned num_outputs;
    int colour[4];
+#ifdef PVR_G9P_ES3
+   /* -Dimagination-g9p-es3: the colour components of targets 1-3, as colour[] */
+   int colour_mrt[G9P_ES3_MAX_TARGETS - 1][4];
+#endif
 
    /* Per SSA scalar (def index * 4 + component) */
    int8_t *reg;
@@ -1217,6 +1227,12 @@ emit_output(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
          release(ctx, &intr->instr);
          return true;
       }
+#ifdef PVR_G9P_ES3
+   } else if (sem.location > FRAG_RESULT_DATA0 &&
+              sem.location < FRAG_RESULT_DATA0 + G9P_ES3_MAX_TARGETS) {
+      /* -Dimagination-g9p-es3: colour target 1-3, its halves at the end */
+      slot = sem.location - FRAG_RESULT_DATA0;
+#endif
    } else if (sem.location > FRAG_RESULT_DATA0 && sem.location < FRAG_RESULT_DATA0 + 8) {
       /* one colour attachment so far: the others' outputs are dropped */
       release(ctx, &intr->instr);
@@ -1239,6 +1255,13 @@ emit_output(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
       r = own;
    }
    pin(ctx, r);
+#ifdef PVR_G9P_ES3
+   if (ctx->stage == MESA_SHADER_FRAGMENT && slot > 0) {
+      ctx->colour_mrt[slot - 1][comp] = r;
+      release(ctx, &intr->instr);
+      return true;
+   }
+#endif
    if (ctx->stage == MESA_SHADER_VERTEX) {
       ctx->outputs[ctx->num_outputs].reg = r;
       ctx->outputs[ctx->num_outputs].slot = slot;
@@ -1396,6 +1419,87 @@ emit_txs(struct g9p_ctx *ctx, nir_tex_instr *tex)
  * where the sample reads them (as Apple's code for t.sample(s, uv * 2.0 +
  * 0.25) does; r0-r1 are free until the colour output).
  */
+#ifdef PVR_G9P_ES3
+/*
+ * -Dimagination-g9p-es3: the fragment shader samples a 2D array or a cube,
+ * whose coordinates take r0-r3 (layered_tex())
+ */
+static bool
+uses_layered_tex(nir_function_impl *impl)
+{
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_tex &&
+             (nir_instr_as_tex(instr)->is_array ||
+              nir_instr_as_tex(instr)->sampler_dim == GLSL_SAMPLER_DIM_CUBE))
+            return true;
+      }
+   }
+   return false;
+}
+
+/*
+ * A 2D array or cube sample, as our A9 backend emits it (pco_g5p_general.c
+ * emit_tex_ext(), Apple's operand layout): the coordinates in r0-r2, where
+ * the sample reads them (as g9p_sample_regs() reads r0-r1); an array's layer
+ * as an integer in r2's low half, uint(z + 0.5); a cube's direction turned
+ * into face coordinates in place by the cube op; then the sample with the
+ * dimension in W0. r0-r3 are reserved in such shaders (generate()).
+ */
+static bool
+emit_tex_layered(struct g9p_ctx *ctx, nir_tex_instr *tex)
+{
+   const bool cube = tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE;
+   int ci = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   int slot = texture_slot(ctx, tex);
+   unsigned at;
+   int dst;
+
+   if (ctx->stage != MESA_SHADER_FRAGMENT || ci < 0 || slot < 0 || tex->is_shadow ||
+       (cube && tex->is_array) ||
+       (!cube && tex->sampler_dim != GLSL_SAMPLER_DIM_2D) ||
+       (tex->op != nir_texop_tex && tex->op != nir_texop_txl) ||
+       nir_tex_instr_src_index(tex, nir_tex_src_offset) >= 0) {
+      fprintf(stderr, "g9p: only plain samples of 2D arrays and cubes\n");
+      return false;
+   }
+   for (unsigned c = 0; c < 3; c++) {
+      const int r = src_reg(ctx, nir_get_scalar(tex->src[ci].src.ssa, c));
+
+      if (r < 0)
+         return false;
+      if (c == 2 && !cube) {
+         const int half = const_reg(ctx, 0x3f000000);
+
+         if (half < 0)
+            return false;
+         g9p_alu2(ctx->c, G9P_FADD, 2, r, half, false);
+         g9p_convert(ctx->c, 2, 2, G9P_F2U);
+      } else {
+         g9p_alu2(ctx->c, G9P_OR, c, r, r, false);
+      }
+   }
+   if (cube)
+      g9p_es3_cube_coords(ctx->c, 0, 0);
+   release(ctx, &tex->instr);
+   dst = alloc_range(ctx, 4);
+   if (dst < 0)
+      return false;
+   at = ctx->c->n;
+   g9p_sample_regs(ctx->c, dst, G9P_FS_TEX_BASE + G9P_TEX_STRIDE * slot,
+                   G9P_FS_TEX_BASE + G9P_TEX_STRIDE * slot + 8);
+   ctx->c->w[at] = (ctx->c->w[at] & ~0x0f00) |
+                   (cube ? G9P_ES3_TEX_CUBE : G9P_ES3_TEX_2D_ARRAY) << 8;
+   g9p_wait(ctx->c);
+   for (unsigned c = 0; c < 4; c++) {
+      ctx->reg[key(&tex->def, c)] = dst + c;
+      if (c >= tex->def.num_components || !ctx->last_use[key(&tex->def, c)])
+         ctx->busy &= ~BITFIELD64_BIT(dst + c);
+   }
+   return true;
+}
+#endif
+
 static bool
 emit_tex(struct g9p_ctx *ctx, nir_tex_instr *tex)
 {
@@ -1405,6 +1509,10 @@ emit_tex(struct g9p_ctx *ctx, nir_tex_instr *tex)
 
    if (tex->op == nir_texop_txs)
       return emit_txs(ctx, tex);
+#ifdef PVR_G9P_ES3
+   if (tex->is_array || tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE)
+      return emit_tex_layered(ctx, tex);
+#endif
    if (ctx->stage != MESA_SHADER_FRAGMENT || tex->sampler_dim != GLSL_SAMPLER_DIM_2D ||
        tex->is_array || tex->is_shadow || ci < 0 || slot < 0 ||
        (tex->op != nir_texop_tex && tex->op != nir_texop_txl) ||
@@ -1881,6 +1989,37 @@ emit_cf_list(struct g9p_ctx *ctx, struct exec_list *list)
    return true;
 }
 
+#ifdef PVR_G9P_ES3
+/*
+ * -Dimagination-g9p-es3: the end of a fragment shader with several colour
+ * targets. Target t's components go to output halves 4t..4t+3 (r(2t) =
+ * {g:r}, r(2t+1) = {a:b}, Apple's A9 layout, mrt.md), unwritten ones 0, and
+ * one emit writes all 2n output registers (g9p_es3_end_fragment()).
+ */
+static bool
+end_targets(struct g9p_ctx *ctx)
+{
+   const unsigned n = ctx->out->num_targets;
+
+   for (unsigned t = 0; t < n; t++) {
+      int *colour = t ? ctx->colour_mrt[t - 1] : ctx->colour;
+
+      for (unsigned i = 0; i < 4; i++) {
+         if (colour[i] < 0) {
+            colour[i] = alloc_reg(ctx);
+            if (colour[i] < 0)
+               return false;
+            g9p_mov_imm(ctx->c, colour[i], 0);
+         }
+      }
+      for (unsigned i = 0; i < 4; i++)
+         g9p_to_half(ctx->c, 4 * t + i, colour[i]);
+   }
+   g9p_es3_end_fragment(ctx->c, 2 * n);
+   return true;
+}
+#endif
+
 /* One code generation with the mask stack in @st */
 static bool
 generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
@@ -1908,6 +2047,26 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
    ctx->num_outputs = 0;
    for (unsigned i = 0; i < 4; i++)
       ctx->colour[i] = -1;
+#ifdef PVR_G9P_ES3
+   for (unsigned t = 0; t < G9P_ES3_MAX_TARGETS - 1; t++) {
+      for (unsigned i = 0; i < 4; i++)
+         ctx->colour_mrt[t][i] = -1;
+   }
+   /*
+    * Several colour targets: target t's halves are r(2t)-r(2t+1) at the
+    * end, as Apple's A9 compiler places them (two output registers per
+    * 8-bit RGBA target), so r0-r(2n-1) stay reserved like r0-r1
+    */
+   ctx->out->num_targets = 0;
+   if (ctx->stage == MESA_SHADER_FRAGMENT) {
+      const uint64_t written = impl->function->shader->info.outputs_written;
+
+      ctx->out->num_targets =
+         util_last_bit64((written >> FRAG_RESULT_DATA0) & BITFIELD64_MASK(G9P_ES3_MAX_TARGETS));
+      if ((written & BITFIELD64_BIT(FRAG_RESULT_COLOR)) && !ctx->out->num_targets)
+         ctx->out->num_targets = 1;
+   }
+#endif
 
    /*
     * Vertex shaders: r0 is the vertex index and r1 the instance index
@@ -1916,6 +2075,13 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
     */
    if (ctx->stage == MESA_SHADER_VERTEX || ctx->stage == MESA_SHADER_FRAGMENT)
       ctx->busy = ctx->pinned = BITFIELD64_RANGE(0, 2);
+#ifdef PVR_G9P_ES3
+   if (ctx->stage == MESA_SHADER_FRAGMENT && ctx->out->num_targets > 1)
+      ctx->busy = ctx->pinned = BITFIELD64_RANGE(0, 2 * ctx->out->num_targets);
+   /* 2D array and cube samples: their coordinates in r0-r3 (emit_tex_layered()) */
+   if (ctx->stage == MESA_SHADER_FRAGMENT && uses_layered_tex(impl))
+      ctx->busy |= BITFIELD64_RANGE(0, 4), ctx->pinned |= BITFIELD64_RANGE(0, 4);
+#endif
 
    /* compute: r0 holds the local index from the start when it is used */
    nir_foreach_block(block, impl) {
@@ -1967,6 +2133,13 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
       break;
    case MESA_SHADER_FRAGMENT: {
       bool colour = false;
+#ifdef PVR_G9P_ES3
+      if (ctx->out->num_targets > 1) {
+         if (!end_targets(ctx))
+            return false;
+         break;
+      }
+#endif
 
       for (unsigned i = 0; i < 4; i++)
          colour |= ctx->colour[i] >= 0;
@@ -2220,6 +2393,10 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
    nir_index_ssa_defs(impl);
    if (getenv("G9P_DEBUG"))
       nir_print_shader(nir, stderr);
+#ifdef PVR_G9P_ES3
+   /* the colour targets written, for generate() (outputs_written) */
+   nir_shader_gather_info(nir, impl);
+#endif
 
    if (stage == MESA_SHADER_COMPUTE) {
       for (unsigned i = 0; i < 3; i++)
@@ -2429,15 +2606,124 @@ lower_attrib_format(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return true;
 }
 
+#ifdef PVR_G9P_ES3
+/*
+ * -Dimagination-g9p-es3: transform feedback in the vertex shader, as our A9
+ * driver does it (hardware-proven there: two buffers, 3000 vertices captured
+ * once, xfb.md) and as nir_lower_xfb_to_stores() lays the records out: each
+ * captured output component is stored at
+ *
+ *    base[b] + record * stride[b] + offset,
+ *    record = instance * vertices + (vertex index - first vertex)
+ *
+ * by the G9P 32-bit store (g9p_mem_at() U32). On the A9 only the 4-byte
+ * store form lands in a vertex task; its 16-byte form is a no-op there
+ * (xfb.md, device run 2b), so every component is stored on its own. The
+ * stores run only for record < limit: the recorder sets the limit to the
+ * whole primitives that fit in every buffer, 0 when capture is not active.
+ * The outputs stay (capture and rasterization in one draw).
+ */
+static nir_def *
+xfb_param(nir_builder *b, unsigned dword)
+{
+   nir_def *index = nir_vulkan_resource_index(b, 2, 32, nir_imm_int(b, 0), .desc_set = G9P_XFB,
+                                              .binding = G9P_XFB_PARAMS,
+                                              .desc_type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
+
+   return nir_load_ubo(b, 1, 32, index, nir_imm_int(b, 4 * dword), .align_mul = 4,
+                       .range = ~0);
+}
+
+static bool
+lower_xfb_store(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   struct g9p_shader *out = data;
+   nir_io_xfb xfb;
+   nir_def *record, *limit;
+   bool any = false;
+
+   if (intr->intrinsic != nir_intrinsic_store_output)
+      return false;
+   xfb = nir_intrinsic_io_xfb(intr);
+   for (unsigned i = 0; i < 4; i++)
+      any |= xfb.out[i].num_components != 0;
+   if (!any)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   record = nir_iadd(b, nir_imul(b, nir_load_instance_id(b), xfb_param(b, G9P_XFB_PARAM_VERTICES)),
+                     nir_isub(b, nir_load_vertex_id(b), xfb_param(b, G9P_XFB_PARAM_FIRST)));
+   limit = xfb_param(b, G9P_XFB_PARAM_LIMIT);
+   nir_push_if(b, nir_ult(b, record, limit));
+   for (unsigned i = 0; i < 4; i++) {
+      const unsigned n = xfb.out[i].num_components;
+      const unsigned buffer = xfb.out[i].buffer;
+      const unsigned stride = b->shader->info.xfb_stride[buffer] * 4;
+      nir_def *index;
+
+      if (!n)
+         continue;
+      index = nir_vulkan_resource_index(b, 2, 32, nir_imm_int(b, 0), .desc_set = G9P_XFB,
+                                        .binding = buffer,
+                                        .desc_type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+      out->xfb_buffers |= BITFIELD_BIT(buffer);
+      out->xfb_stride[buffer] = stride;
+      for (unsigned c = 0; c < n; c++) {
+         /* start_component i is absolute; the source starts at the intrinsic's component */
+         nir_def *v = nir_channel(b, intr->src[0].ssa, i + c - nir_intrinsic_component(intr));
+         nir_def *offset = nir_iadd_imm(b, nir_imul_imm(b, record, stride),
+                                        4 * (xfb.out[i].offset + c));
+
+         nir_store_ssbo(b, v, index, offset, .write_mask = 1, .align_mul = 4);
+      }
+   }
+   nir_pop_if(b, NULL);
+   return true;
+}
+
+/*
+ * A vertex shader that captures outputs: false for what the store path
+ * cannot take (16-bit data, streams other than 0)
+ */
+static bool
+lower_xfb(nir_shader *nir, struct g9p_shader *out)
+{
+   if (!nir->xfb_info || !nir->xfb_info->buffers_written)
+      return true;
+   if (nir->xfb_info->streams_written > 1) {
+      fprintf(stderr, "g9p: transform feedback streams other than 0 not supported\n");
+      return false;
+   }
+   for (unsigned i = 0; i < nir->xfb_info->output_count; i++) {
+      if (nir->xfb_info->outputs[i].data_is_16bit) {
+         fprintf(stderr, "g9p: 16-bit transform feedback data not supported\n");
+         return false;
+      }
+   }
+   NIR_PASS(_, nir, nir_io_add_intrinsic_xfb_info);
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_xfb_store, nir_metadata_none, out);
+   return true;
+}
+#endif
+
 bool
 g9p_compile_vertex(nir_shader *nir, const struct g9p_vertex_attrib *attribs,
                    int frag_coord_slot, struct g9p_shader *out, void *mem_ctx)
 {
+#ifdef PVR_G9P_ES3
+   /* vk_spirv_to_nir() gathers it; a shader built otherwise may not have it */
+   if (nir->info.has_transform_feedback_varyings && !nir->xfb_info)
+      nir_shader_gather_xfb_info(nir);
+#endif
    memset(out, 0, sizeof(*out));
    lower_front(nir);
    if (frag_coord_slot >= 0)
       add_frag_coord_output(nir, frag_coord_slot);
    lower_io(nir);
+#ifdef PVR_G9P_ES3
+   if (!lower_xfb(nir, out))
+      return false;
+#endif
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_attrib_format,
             nir_metadata_control_flow, (void *)attribs);
    return compile_back(nir, out, MESA_SHADER_VERTEX, attribs, 0, mem_ctx);
