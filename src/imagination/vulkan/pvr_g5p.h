@@ -65,6 +65,19 @@ struct pvr_g5p_programs {
     * rate (DOUTU src0[34:33] 2) */
    struct pvr_suballoc_bo *eot_usc_ms;
    struct pvr_pds_upload clear_kick_ms;
+   /* the background of a loaded colour attachment (loadOp LOAD): the
+    * compiled load program (pvr_g5p_compile_load()), its kick, and the PDS
+    * code of its uploads, one DOUTD each (data per render: the sources,
+    * then the controls). NULL load_usc: the backend refused it, and a LOAD
+    * render is refused with load_refusal. */
+   struct pvr_suballoc_bo *load_usc;
+   struct pvr_pds_upload load_kick, load_dma;
+   unsigned load_temps, load_common_dwords, load_uploads;
+   struct {
+      unsigned kind; /* PCO_G5P_UPLOAD_IMAGE, _SAMPLER or _IMAGE_SIZE */
+      unsigned dwords, common;
+   } load_upload[3];
+   char load_refusal[128];
 };
 
 /* G5P's per-device state (pvr_device::g5p), allocated by g5p_device_init() */
@@ -165,6 +178,10 @@ struct pvr_g5p_draw {
 bool pvr_g5p_compile_stage(const VkPipelineShaderStageCreateInfo *stage_info, bool half_output, uint32_t samples,
                            const uint8_t *attrib_components, const struct pco_g5p_fs_key *key,
                            const struct pco_g5p_vs_link *link, struct pco_g5p_program *out);
+/* The background program of a loaded colour attachment (pvr_g5p_nir.c):
+ * texture() of the attachment, bound as set 0 binding 0, at the fragment's
+ * pixel centre. false with out->refusal set. */
+bool pvr_g5p_compile_load(struct pco_g5p_program *out);
 
 #ifdef PVR_PER_ARCH
 

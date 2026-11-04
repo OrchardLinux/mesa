@@ -26,6 +26,7 @@
 #include "util/u_math.h"
 
 #include "g5p_mrt_programs.h"
+#include "pco_g5p_general.h"
 #include "g5p_usc.h"
 #include "pdsc.h"
 #include "pdsc_internal.h"
@@ -38,6 +39,7 @@
 #include "pvr_g5p.h"
 #include "pvr_g5p_ds.h"
 #include "pvr_g5p_msaa.h"
+#include "pvr_g5p_tex_encode.h"
 #include "pvr_hw_pass.h"
 #include "pvr_image.h"
 #include "pvr_job_render.h"
@@ -113,6 +115,22 @@ g5p_pds_dma_code(uint32_t *code, bool eot)
    return n;
 }
 
+/* n DOUTDs, source i from data dwords 2i..2i+1 and its control in dword
+ * 2n + 2i, the last one ending; HALT (the A9 ICD's uniform loader) */
+static unsigned
+g5p_pds_loader_code(uint32_t *code, unsigned n)
+{
+   pdsc_init();
+   pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-loader");
+   for (unsigned i = 0; i < n; i++)
+      pdsc_dout(p, pdsc_ref_const64(2 * i), pdsc_ref_const32(2 * n + 2 * i), pdsc_ref_null(),
+                .dstdout = PDSC_DSTDOUT_D, .end = i == n - 1);
+   pdsc_halt(p);
+   const unsigned c = g5p_pds_pack(p, code);
+   ralloc_free(p);
+   return c;
+}
+
 static uint64_t
 g5p_doutu_src0(uint32_t exe_off, unsigned temps)
 {
@@ -120,6 +138,18 @@ g5p_doutu_src0(uint32_t exe_off, unsigned temps)
    pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-doutu");
    struct pdsc_doutu_src0 s = { .exe_off = exe_off, .temps = temps };
    const uint64_t v = pdsc_doutu_src0_pack(p, &s);
+   ralloc_free(p);
+   return v;
+}
+
+static uint32_t
+g5p_doutd_control_at(unsigned common, unsigned dwords, bool last)
+{
+   pdsc_init();
+   pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-doutd");
+   struct pdsc_doutd_src1 s = { .last_issue = last, .store_dest = PDSC_STORE_DEST_COMMON, .ao = common,
+                                .bsize = dwords };
+   const uint32_t v = pdsc_doutd_src1_pack(p, &s);
    ralloc_free(p);
    return v;
 }
@@ -146,10 +176,10 @@ g5p_usc_off(const struct pvr_device *device, const struct pvr_suballoc_bo *bo)
 /* A kick of a USC program, its code at data + 0x20 as the registers expect;
  * a fragment-side program at `samples` (4: sample rate, pvr_g5p_msaa_doutu()) */
 static VkResult
-g5p_upload_kick(struct pvr_device *device, const struct pvr_suballoc_bo *usc, uint32_t samples,
-                struct pvr_pds_upload *out)
+g5p_upload_kick_temps(struct pvr_device *device, const struct pvr_suballoc_bo *usc, unsigned temps,
+                      uint32_t samples, struct pvr_pds_upload *out)
 {
-   const uint64_t doutu = pvr_g5p_msaa_doutu(g5p_doutu_src0(g5p_usc_off(device, usc), G5P_TEMPS), samples);
+   const uint64_t doutu = pvr_g5p_msaa_doutu(g5p_doutu_src0(g5p_usc_off(device, usc), temps), samples);
    const uint32_t data[4] = { (uint32_t)doutu, (uint32_t)(doutu >> 32), 0, 0 };
    uint32_t code[8];
    const unsigned n = g5p_pds_kick_code(code);
@@ -160,6 +190,13 @@ g5p_upload_kick(struct pvr_device *device, const struct pvr_suballoc_bo *usc, ui
                        "G5P: a kick's code is at data + %#x, not + %#x", out->code_offset - out->data_offset,
                        G5P_KICK_CODE);
    return result;
+}
+
+static VkResult
+g5p_upload_kick(struct pvr_device *device, const struct pvr_suballoc_bo *usc, uint32_t samples,
+                struct pvr_pds_upload *out)
+{
+   return g5p_upload_kick_temps(device, usc, G5P_TEMPS, samples, out);
 }
 
 static void
@@ -180,6 +217,65 @@ g5p_free_programs(struct pvr_g5p_programs *p)
    pvr_bo_suballoc_free(p->dbias_pool);
    pvr_bo_suballoc_free(p->eot_usc_ms);
    pvr_bo_suballoc_free(p->clear_kick_ms.pvr_bo);
+   pvr_bo_suballoc_free(p->load_usc);
+   pvr_bo_suballoc_free(p->load_kick.pvr_bo);
+   pvr_bo_suballoc_free(p->load_dma.pvr_bo);
+}
+
+/* The load background's programs (a loaded colour attachment): the program
+ * the backend compiles from NIR, its kick, its uploads' DMA code. A program
+ * the backend refuses is not an error here: a LOAD render is refused by
+ * name then. */
+static VkResult
+g5p_upload_load(struct pvr_device *device, struct pvr_g5p_programs *p)
+{
+   struct pco_g5p_program prog;
+   VkResult result = VK_SUCCESS;
+
+   if (!pvr_g5p_compile_load(&prog)) {
+      snprintf(p->load_refusal, sizeof(p->load_refusal), "%s", prog.refusal);
+      free(prog.code);
+      return VK_SUCCESS;
+   }
+   if (prog.num_uploads < 1 || prog.num_uploads > ARRAY_SIZE(p->load_upload)) {
+      snprintf(p->load_refusal, sizeof(p->load_refusal), "a load program with %u uploads", prog.num_uploads);
+      free(prog.code);
+      return VK_SUCCESS;
+   }
+   for (unsigned i = 0; i < prog.num_uploads; i++) {
+      const struct pco_g5p_upload *u = &prog.uploads[i];
+      if ((u->kind != PCO_G5P_UPLOAD_IMAGE && u->kind != PCO_G5P_UPLOAD_SAMPLER &&
+           u->kind != PCO_G5P_UPLOAD_IMAGE_SIZE) || u->set || u->binding) {
+         snprintf(p->load_refusal, sizeof(p->load_refusal), "a load program upload of kind %u at %u.%u",
+                  u->kind, u->set, u->binding);
+         free(prog.code);
+         return VK_SUCCESS;
+      }
+      p->load_upload[i].kind = u->kind;
+      p->load_upload[i].dwords = u->dwords;
+      p->load_upload[i].common = u->common;
+   }
+   p->load_uploads = prog.num_uploads;
+   p->load_temps = prog.temps;
+   p->load_common_dwords = prog.common_dwords;
+
+   result = pvr_gpu_upload_usc(device, prog.code, prog.size, 64, &p->load_usc);
+   if (result == VK_SUCCESS && getenv("PVR_G5P_WS_LOG")) {
+      fprintf(stderr, "g5p load program: %zu bytes, temps %u, common %u dwords, %u uploads:", prog.size,
+              prog.temps, prog.common_dwords, prog.num_uploads);
+      for (unsigned i = 0; i < prog.size; i++)
+         fprintf(stderr, "%s%02x", i % 4 ? "" : " ", prog.code[i]);
+      fprintf(stderr, "\n");
+   }
+   free(prog.code);
+   if (result != VK_SUCCESS)
+      return result;
+   result = g5p_upload_kick_temps(device, p->load_usc, p->load_temps, 1, &p->load_kick);
+   if (result != VK_SUCCESS)
+      return result;
+   uint32_t code[2 * ARRAY_SIZE(p->load_upload) + 2];
+   const unsigned n = g5p_pds_loader_code(code, p->load_uploads);
+   return pvr_gpu_upload_pds(device, NULL, 0, 0, code, n, 16, 64, &p->load_dma);
 }
 
 static VkResult
@@ -270,6 +366,8 @@ g5p_upload_programs(struct pvr_device *device, struct pvr_g5p_programs *p)
       result = g5p_upload_zeroed(device, G5P_SCISSOR_POOL_BYTES, &p->scissor_pool);
    if (result == VK_SUCCESS)
       result = g5p_upload_zeroed(device, G5P_DBIAS_POOL_BYTES, &p->dbias_pool);
+   if (result == VK_SUCCESS)
+      result = g5p_upload_load(device, p);
    return result;
 }
 
@@ -329,6 +427,88 @@ g5p_pbe_encode(uint64_t q[3], uint32_t key, uint64_t va, uint32_t width, uint32_
    (fprintf(stderr, "G5P refuses: " __VA_ARGS__), fprintf(stderr, "\n"),                                          \
     vk_errorf((cmd_buffer), VK_ERROR_FEATURE_NOT_PRESENT, "G5P: " __VA_ARGS__))
 
+/*
+ * The background of a loaded colour attachment (loadOp LOAD; plan step 7,
+ * rung B): the load program (a texelFetch of the attachment at the
+ * fragment's pixel, compiled by the backend) with its uploads, the
+ * attachment's own texture state and a nearest, clamped single-level
+ * sampler, DMA'd into the common store. BGRND0 = {the program's kick, the
+ * DMA code}, BGRND2 = the DMA data (the sources, then the controls), BGRND3
+ * = the data and common-store sizes, as the A9 ICD's load background has
+ * them. Apple's LOAD program is not used.
+ */
+static VkResult
+g5p_load_background(struct pvr_cmd_buffer *cmd_buffer, const uint64_t state[4], uint32_t width, uint32_t height,
+                    uint64_t bgnd[4])
+{
+   const struct pvr_g5p_programs *p = &cmd_buffer->device->g5p->programs;
+   const VkSamplerCreateInfo sci = {
+      .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+      .magFilter = VK_FILTER_NEAREST,
+      .minFilter = VK_FILTER_NEAREST,
+      .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+      .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+      .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+      .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+   };
+   uint64_t sampler[2] = { 0 };
+   const char *why = pvr_g5p_sampler_encode(&sci, false, false, &sampler[0]);
+   if (why)
+      return G5P_REFUSE(cmd_buffer, "the load sampler: %s", why);
+
+   /* textureSize()'s block (PCO_G5P_UPLOAD_IMAGE_SIZE): width, height, layers, levels */
+   const uint32_t size[4] = { width, height, 1, 1 };
+   struct pvr_suballoc_bo *state_bo, *sampler_bo, *size_bo;
+   VkResult result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, state, 4 * sizeof(state[0]), &state_bo);
+   if (result != VK_SUCCESS)
+      return result;
+   result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, sampler, sizeof(sampler), &sampler_bo);
+   if (result != VK_SUCCESS)
+      return result;
+   result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, size, sizeof(size), &size_bo);
+   if (result != VK_SUCCESS)
+      return result;
+
+   const unsigned n = p->load_uploads;
+   uint32_t data[4 * ARRAY_SIZE(p->load_upload)] = { 0 };
+   for (unsigned i = 0; i < n; i++) {
+      const unsigned kind = p->load_upload[i].kind;
+      const uint64_t src = kind == PCO_G5P_UPLOAD_IMAGE   ? state_bo->dev_addr.addr
+                           : kind == PCO_G5P_UPLOAD_SAMPLER ? sampler_bo->dev_addr.addr
+                                                            : size_bo->dev_addr.addr;
+      if (p->load_upload[i].dwords > (kind == PCO_G5P_UPLOAD_IMAGE ? 8u : kind == PCO_G5P_UPLOAD_SAMPLER ? 2u : 4u))
+         return G5P_REFUSE(cmd_buffer, "a load program upload of %u dwords", p->load_upload[i].dwords);
+      data[2 * i] = (uint32_t)src;
+      data[2 * i + 1] = (uint32_t)(src >> 32);
+      data[2 * n + 2 * i] = g5p_doutd_control_at(p->load_upload[i].common, p->load_upload[i].dwords, i == n - 1);
+   }
+   struct pvr_pds_upload load_data;
+   result = pvr_arch_cmd_buffer_upload_pds(cmd_buffer, data, 4 * n, 16, NULL, 0, 0, 16, &load_data);
+   if (result != VK_SUCCESS)
+      return result;
+
+   pvr_csb_pack (&bgnd[0], CR_PDS_BGRND0_BASE, b0) {
+      b0.shader_addr = PVR_DEV_ADDR(p->load_kick.data_offset);
+      b0.texunicode_addr = PVR_DEV_ADDR(p->load_dma.code_offset);
+   }
+   pvr_csb_pack (&bgnd[2], CR_PDS_BGRND2_BASE, b2) {
+      b2.uniformdata_addr = PVR_DEV_ADDR(load_data.data_offset);
+   }
+   pvr_csb_pack (&bgnd[3], CR_PDS_BGRND3_SIZEINFO, b3) {
+      b3.pds_uniformsize = DIV_ROUND_UP(4 * n, ROGUE_CR_PDS_BGRND3_SIZEINFO_PDS_UNIFORMSIZE_UNIT_SIZE);
+      b3.usc_sharedsize = DIV_ROUND_UP(p->load_common_dwords, ROGUE_CR_PDS_BGRND3_SIZEINFO_USC_SHAREDSIZE_UNIT_SIZE);
+   }
+   if (getenv("PVR_G5P_WS_LOG")) {
+      const uint32_t *w = (const uint32_t *)state, *sw = (const uint32_t *)sampler;
+      fprintf(stderr, "g5p load: state %08x %08x %08x %08x %08x %08x %08x %08x sampler %08x %08x data", w[0],
+              w[1], w[2], w[3], w[4], w[5], w[6], w[7], sw[0], sw[1]);
+      for (unsigned i = 0; i < 4 * n; i++)
+         fprintf(stderr, " %08x", data[i]);
+      fprintf(stderr, "\n");
+   }
+   return VK_SUCCESS;
+}
+
 VkResult
 PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd_gfx *sub_cmd,
                            const struct pvr_renderpass_hwsetup_render *hw_render,
@@ -372,6 +552,8 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
    /* targets: PBE words and clear colours */
    uint64_t pbe[4][3];
    float clear[4][4] = { { 0 } };
+   /* a loaded target: its texture state (q0, q1, q2, 0), the load program's image upload */
+   uint64_t load_state[4] = { 0 };
    for (unsigned t = 0; t < n; t++) {
       const struct pvr_image_view *iview = info->attachments[hw_render->eot_surfaces[t].attachment_idx];
       const struct pvr_image *image = pvr_image_view_get_image(iview);
@@ -401,15 +583,26 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
             g->msaa_resolve = true;
          }
       }
+      if (!t)
+         pvr_g5p_tex_linear(load_state, key, false, addr, iview->vk.extent.width, iview->vk.extent.height,
+                            level->pitch);
       if (!t) {
          g->width = iview->vk.extent.width;
          g->height = iview->vk.extent.height;
       }
    }
+   bool load = false;
    for (unsigned i = 0; i < hw_render->color_init_count; i++) {
       const unsigned t = i; /* color_init follows the EOT surfaces' order */
-      if (hw_render->color_init[i].op == VK_ATTACHMENT_LOAD_OP_LOAD)
-         return G5P_REFUSE(cmd_buffer, "LOAD of a colour attachment (the background LOAD program is step 7)");
+      if (hw_render->color_init[i].op == VK_ATTACHMENT_LOAD_OP_LOAD) {
+         if (n != 1 || t)
+            return G5P_REFUSE(cmd_buffer, "LOAD of colour attachment %u of %u (one target is built)", t, n);
+         if (!p->load_usc)
+            return G5P_REFUSE(cmd_buffer, "LOAD of a colour attachment: the load program: %s", p->load_refusal);
+         if (g->samples == 4)
+            return G5P_REFUSE(cmd_buffer, "LOAD of a 4x colour attachment (the load program runs per pixel)");
+         load = true;
+      }
       if (t < n && hw_render->color_init[i].op == VK_ATTACHMENT_LOAD_OP_CLEAR &&
           hw_render->color_init[i].index < info->clear_value_count)
          memcpy(clear[t], info->clear_values[hw_render->color_init[i].index].color.float32, sizeof(clear[t]));
@@ -451,17 +644,24 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
 
    /* PDS_BGRND0..3: the clear kick, the clear DMA, its data; sizes */
    uint64_t bgnd[4] = { 0 };
-   pvr_csb_pack (&bgnd[0], CR_PDS_BGRND0_BASE, b0) {
-      b0.shader_addr = PVR_DEV_ADDR(g->samples == 4 ? p->clear_kick_ms.data_offset : p->clear_kick[v].data_offset);
-      b0.texunicode_addr = PVR_DEV_ADDR(p->clear_dma.code_offset);
-   }
-   pvr_csb_pack (&bgnd[2], CR_PDS_BGRND2_BASE, b2) {
-      b2.uniformdata_addr = PVR_DEV_ADDR(clear_data.data_offset);
-   }
-   pvr_csb_pack (&bgnd[3], CR_PDS_BGRND3_SIZEINFO, b3) {
-      b3.pds_uniformsize = DIV_ROUND_UP(4, ROGUE_CR_PDS_BGRND3_SIZEINFO_PDS_UNIFORMSIZE_UNIT_SIZE);
-      b3.usc_sharedsize = DIV_ROUND_UP(G5P_MRT_CLEAR_DWORDS * n,
-                                       ROGUE_CR_PDS_BGRND3_SIZEINFO_USC_SHAREDSIZE_UNIT_SIZE);
+   if (load) {
+      result = g5p_load_background(cmd_buffer, load_state, g->width, g->height, bgnd);
+      if (result != VK_SUCCESS)
+         return result;
+   } else {
+      pvr_csb_pack (&bgnd[0], CR_PDS_BGRND0_BASE, b0) {
+         b0.shader_addr = PVR_DEV_ADDR(g->samples == 4 ? p->clear_kick_ms.data_offset
+                                                     : p->clear_kick[v].data_offset);
+         b0.texunicode_addr = PVR_DEV_ADDR(p->clear_dma.code_offset);
+      }
+      pvr_csb_pack (&bgnd[2], CR_PDS_BGRND2_BASE, b2) {
+         b2.uniformdata_addr = PVR_DEV_ADDR(clear_data.data_offset);
+      }
+      pvr_csb_pack (&bgnd[3], CR_PDS_BGRND3_SIZEINFO, b3) {
+         b3.pds_uniformsize = DIV_ROUND_UP(4, ROGUE_CR_PDS_BGRND3_SIZEINFO_PDS_UNIFORMSIZE_UNIT_SIZE);
+         b3.usc_sharedsize = DIV_ROUND_UP(G5P_MRT_CLEAR_DWORDS * n,
+                                          ROGUE_CR_PDS_BGRND3_SIZEINFO_USC_SHAREDSIZE_UNIT_SIZE);
+      }
    }
    memcpy(g->background, bgnd, sizeof(g->background));
    g->eot[0] = eot_data.data_offset;
