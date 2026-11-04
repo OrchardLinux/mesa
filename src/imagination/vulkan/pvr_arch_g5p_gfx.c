@@ -49,6 +49,7 @@
 #include "pvr_g5p_tex.h"
 #include "pvr_g5p_tex_encode.h"
 #include "pvr_g5p_upload.h"
+#include "pvr_g5p_xfb.h"
 #include "pvr_g5p_ds.h"
 #include "pvr_g5p_msaa.h"
 #include "pvr_g5p_vertex.h"
@@ -422,6 +423,7 @@ g5p_pipeline_free(struct pvr_device *device, struct pvr_g5p_pipeline *g)
    pvr_arch_g5p_vs_uploads_destroy(device, g->vs_uploads);
    pvr_bo_suballoc_free(g->static_vary);
    pvr_bo_suballoc_free(g->static_frag);
+   g5p_pipeline_free(device, g->xfb);
    vk_free(&device->vk.alloc, g);
 }
 
@@ -471,8 +473,12 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
    struct pco_g5p_vs_link link = { .valid = true };
    for (unsigned i = 0; i < fs->num_varyings; i++)
       link.interp[fs->vary[i].location] = fs->vary[i].interp;
-   if (!pvr_g5p_compile_stage(vs_info, false, 1, &vertex, NULL, &link, vs))
-      return G5P_REFUSE(device, "vertex shader: %s", vs->refusal);
+   /* the transform feedback variant (pvr_g5p_xfb.h): the capturing vertex program */
+   if (g->xfb_variant ? !pvr_g5p_compile_vs_xfb(vs_info, &vertex, &link, &g->xfb_layout, vs)
+                      : !pvr_g5p_compile_stage(vs_info, false, 1, &vertex, NULL, &link, vs))
+      return G5P_REFUSE(device, "vertex shader%s: %s", g->xfb_variant ? " (transform feedback)" : "", vs->refusal);
+   if (g->xfb_variant && !g->xfb_layout.buffers)
+      return VK_SUCCESS; /* captures nothing: no variant */
    for (unsigned i = 0; i < fs->num_varyings; i++)
       if (!vs->vout_dword[fs->vary[i].location])
          return G5P_REFUSE(device, "the fragment program reads VAR%u, which the vertex program does not write",
@@ -502,8 +508,9 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
    }
    g->fs_num_uploads = fs->num_uploads;
    g->fs_common_dwords = fs->common_dwords;
-   if (vs->xfb_buffers)
-      return G5P_REFUSE(device, "transform feedback");
+   if (vs->xfb_buffers & ~(g->xfb_variant ? g->xfb_layout.buffers : 0))
+      return G5P_REFUSE(device, "transform feedback stores to buffers %#x outside the capture layout %#x",
+                        vs->xfb_buffers, g->xfb_variant ? g->xfb_layout.buffers : 0);
 
    /* DOUTU temps (the ICD's vs_temps()): every register within the flown
     * envelope, else only the written ones (the inputs are in the unified store) */
@@ -698,6 +705,34 @@ PVR_PER_ARCH(g5p_graphics_pipeline_compile)(struct pvr_device *device,
       return result;
    }
    pipeline->g5p = g;
+
+   /* transform feedback: the same pipeline with the capturing vertex
+    * program, for draws while capturing (pvr_g5p_xfb.h) */
+   const VkPipelineShaderStageCreateInfo *vs_info = NULL;
+   for (uint32_t i = 0; i < create_info->stageCount; i++)
+      if (create_info->pStages[i].stage == VK_SHADER_STAGE_VERTEX_BIT)
+         vs_info = &create_info->pStages[i];
+   if (vs_info && pvr_g5p_stage_has_xfb(vs_info)) {
+      struct pco_g5p_program xvs = { 0 }, xfs = { 0 };
+      struct pvr_g5p_pipeline *x =
+         vk_zalloc(&device->vk.alloc, sizeof(*x), 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+      if (!x)
+         return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+      x->xfb_variant = true;
+      result = g5p_pipeline_build(device, create_info, vk_state, x, &xvs, &xfs);
+      free(xvs.code);
+      free(xfs.code);
+      if (result == VK_SUCCESS && x->xfb_layout.buffers) {
+         g->xfb = x;
+      } else {
+         g5p_pipeline_free(device, x);
+         if (result != VK_SUCCESS) {
+            g5p_pipeline_free(device, g);
+            pipeline->g5p = NULL;
+            return result;
+         }
+      }
+   }
    return VK_SUCCESS;
 }
 
@@ -869,6 +904,15 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
 
    if (!g)
       return G5P_REFUSE(cmd_buffer, "a draw without a G5P graphics pipeline");
+   /* transform feedback: while capturing, the pipeline's capturing variant
+    * (pvr_g5p_xfb.h); a pipeline that captures nothing draws as it is */
+   const bool xfb = g->xfb && pvr_arch_g5p_xfb_capturing(cmd_buffer);
+   if (xfb) {
+      VkResult xr = pvr_arch_g5p_xfb_draw_check(cmd_buffer, dyn->ia.primitive_topology);
+      if (xr != VK_SUCCESS)
+         return xr;
+      g = g->xfb;
+   }
    if (!draw->count || !draw->instances)
       return VK_SUCCESS;
    if (!g5p_topology(dyn->ia.primitive_topology, &hw_topology, &split, &lines))
@@ -877,13 +921,16 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
    VkResult result = pvr_arch_g5p_vertex_draw_check(cmd_buffer, g, draw);
    if (result != VK_SUCCESS)
       return result;
-   if (dyn->vp.viewport_count != 1 || dyn->vp.scissor_count != 1)
+   /* rasterizer discard: the vertex program runs (transform feedback), no
+    * fragment is shaded or tested (pvr_g5p_xfb.h; the ISP words below); a
+    * pipeline that discards has no viewport state: the render area stands
+    * in for its viewport and scissor (our A9 driver's form) */
+   const bool discard = dyn->rs.rasterizer_discard_enable;
+   if (!discard && (dyn->vp.viewport_count != 1 || dyn->vp.scissor_count != 1))
       return G5P_REFUSE(cmd_buffer, "%u viewports, %u scissors (one of each)", dyn->vp.viewport_count,
                         dyn->vp.scissor_count);
    if (dyn->rs.cull_mode == VK_CULL_MODE_FRONT_AND_BACK)
       return G5P_REFUSE(cmd_buffer, "culling front and back");
-   if (dyn->rs.rasterizer_discard_enable)
-      return G5P_REFUSE(cmd_buffer, "rasterizer discard (rung A rasterizes every draw)");
    if (!info->rstate)
       return G5P_REFUSE(cmd_buffer, "a draw outside a render pass");
    /* the pipeline rasterizes the pass's sample count (its launch's sample rate, the ISP user pass) */
@@ -903,7 +950,7 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
     * emits nothing. Rung A draws at the whole attachment only (the ISP
     * scissor table is not part of its pass yet). */
    const uint32_t width = info->rstate->width, height = info->rstate->height;
-   const VkRect2D *sc = &dyn->vp.scissors[0], *ra = &info->render_area;
+   const VkRect2D *ra = &info->render_area, *sc = discard ? ra : &dyn->vp.scissors[0];
    const int32_t x0 = MAX2(sc->offset.x, ra->offset.x), y0 = MAX2(sc->offset.y, ra->offset.y);
    const int32_t x1 = MIN2((int64_t)sc->offset.x + sc->extent.width, (int64_t)ra->offset.x + ra->extent.width);
    const int32_t y1 = MIN2((int64_t)sc->offset.y + sc->extent.height, (int64_t)ra->offset.y + ra->extent.height);
@@ -917,7 +964,8 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
    if (dyn->ia.primitive_topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN && g->fs_flat)
       return G5P_REFUSE(cmd_buffer, "flat varyings with a triangle fan");
    /* a depth/stencil attachment: its tests and bias (pvr_arch_g5p_ds.c) */
-   const VkImageAspectFlags ds_aspects = pvr_arch_g5p_ds_aspects(cmd_buffer);
+   /* rasterizer discard: no depth/stencil aspects (Rogue's rule), the colour-only ISP form */
+   const VkImageAspectFlags ds_aspects = discard ? 0 : pvr_arch_g5p_ds_aspects(cmd_buffer);
    const bool dbias = ds_aspects && dyn->rs.depth_bias.enable;
    uint32_t dbias_index = 0;
    if (ds_aspects && g->fs_discard && (dyn->ds.depth.test_enable || dyn->ds.stencil.test_enable))
@@ -993,7 +1041,7 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
     * TRANSLUCENT, a discarding one punch-through, else OPAQUE */
    {
       struct pvr_g5p_blend_isp isp;
-      pvr_arch_g5p_blend_isp(g->fs_blend_mode, g->fs_discard, g->fs_write_mask, false, &isp);
+      pvr_arch_g5p_blend_isp(g->fs_blend_mode, g->fs_discard, g->fs_write_mask, discard, &isp);
       const enum ROGUE_TA_PASSTYPE pass = isp.pass_type;
       uint32_t lw = util_unsigned_fixed(dyn->rs.line.width, 4);
       lw = MIN2(lw ? lw - 1 : 0, 255);
@@ -1050,7 +1098,8 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
          c1.top = y0 / G5P_TILE;
          c1.bottom = DIV_ROUND_UP(y1, G5P_TILE) - 1;
       }
-      const VkViewport *vp = &dyn->vp.viewports[0];
+      const VkViewport area_vp = { ra->offset.x, ra->offset.y, ra->extent.width, ra->extent.height, 0.0f, 1.0f };
+      const VkViewport *vp = discard ? &area_vp : &dyn->vp.viewports[0];
       const float f[6] = { vp->x + vp->width * 0.5f, vp->width * 0.5f, vp->y + vp->height * 0.5f,
                            vp->height * 0.5f, vp->minDepth, vp->maxDepth - vp->minDepth };
       memcpy(&w[3], f, sizeof(f));
@@ -1124,6 +1173,13 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
    struct pvr_g5p_vs_upload_draw vs_up = { 0 };
    if (g->vs_uploads) {
       result = pvr_arch_g5p_vs_uploads_draw(cmd_buffer, g->vs_uploads, &vs_up);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+   /* the captured draw's event: its block is filled when the job is submitted */
+   if (xfb) {
+      result = pvr_arch_g5p_xfb_draw(cmd_buffer, &g->xfb_layout, (uint8_t *)vs_up.xfb_block, draw->count,
+                                     draw->instances, draw->first, dyn->ia.primitive_topology);
       if (result != VK_SUCCESS)
          return result;
    }

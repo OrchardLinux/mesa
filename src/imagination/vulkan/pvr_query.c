@@ -352,7 +352,7 @@ VkResult pvr_GetQueryPoolResults(VkDevice _device,
    const uint32_t core_count = device->pdevice->dev_runtime_info.core_count;
    uint8_t *data = (uint8_t *)pData;
    VkResult result = VK_SUCCESS;
-
+   PVR_G5P_HOOK(xfb_query_results, device, pool, firstQuery, queryCount, pData, stride, flags)
    /* TODO: Instead of making the memory defined here for valgrind, to better
     * catch out of bounds access and other memory errors we should move them
     * where where the query buffers are changed by the driver or device (e.g.

@@ -260,7 +260,8 @@ PVR_PER_ARCH(g5p_vs_uploads_draw)(struct pvr_cmd_buffer *cmd_buffer, const struc
       case PCO_G5P_UPLOAD_XFB: {
          /* zeroed here; the transform feedback resolve fills it before the
           * job runs */
-         const uint32_t zero[PCO_G5P_XFB_DWORDS] = { 0 };
+         uint32_t zero[PCO_G5P_XFB_DWORDS];
+         memset(zero, 0, sizeof(zero));
          if (u->dwords != PCO_G5P_XFB_DWORDS || out->xfb_block)
             return G5P_UP_REFUSE(cmd_buffer, "a transform feedback block of %u dwords", u->dwords);
          result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, zero, sizeof(zero), &bo);

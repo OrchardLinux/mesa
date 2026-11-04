@@ -17,6 +17,7 @@
 #include "compiler/nir/nir_builder.h"
 #include "compiler/nir/nir_xfb_info.h"
 #include "compiler/spirv/nir_spirv.h"
+#include "compiler/spirv/spirv.h"
 #include "compiler/spirv/spirv_info.h"
 #include "util/u_call_once.h"
 #include "util/u_math.h"
@@ -466,10 +467,65 @@ vs_sysvals(nir_shader *nir)
    nir_index_ssa_defs(nir_shader_get_entrypoint(nir));
 }
 
-bool
-pvr_g5p_compile_stage(const VkPipelineShaderStageCreateInfo *stage_info, bool half_output, uint32_t samples,
-                      struct pvr_g5p_vertex_layout *vertex, const struct pco_g5p_fs_key *key,
-                      const struct pco_g5p_vs_link *link, struct pco_g5p_program *out)
+/* The SPIR-V module declares ExecutionMode Xfb (execution modes precede
+ * every function) */
+static bool
+spirv_xfb(const uint32_t *spv, size_t words)
+{
+   for (size_t i = 5; i < words;) {
+      const unsigned op = spv[i] & 0xffff, n = spv[i] >> 16;
+      if (!n)
+         return false;
+      if (op == SpvOpExecutionMode && n >= 3 && i + 2 < words && spv[i + 2] == SpvExecutionModeXfb)
+         return true;
+      if (op == SpvOpFunction)
+         return false;
+      i += n;
+   }
+   return false;
+}
+
+/* The transform feedback variant (xfb != NULL): the capture layout from the
+ * shader's xfb_info, then nir_lower_xfb_to_stores (64-bit global addresses,
+ * outputs kept, so the same draw rasterizes). The backend turns those stores
+ * into 4-byte vertex stores at the per-draw block's addresses
+ * (PCO_G5P_UPLOAD_XFB). The A9 ICD's pvr_g5p_general_xfb(). */
+static bool
+xfb_lower(nir_shader *nir, struct g5p_xfb_layout *layout, char *refusal, size_t refusal_size)
+{
+   const nir_xfb_info *x = nir->xfb_info;
+   memset(layout, 0, sizeof(*layout));
+   if (!x || !x->buffers_written)
+      return true; /* nothing captured: no variant */
+   if (x->output_count > G5P_XFB_MAX_RANGES || x->streams_written > 1) {
+      snprintf(refusal, refusal_size, "transform feedback: %u outputs (at most %u), streams %#x (stream 0 only)",
+               x->output_count, G5P_XFB_MAX_RANGES, x->streams_written);
+      return false;
+   }
+   layout->buffers = x->buffers_written;
+   for (unsigned b = 0; b < G5P_XFB_BUFFERS; b++)
+      layout->stride[b] = x->buffers[b].stride;
+   for (unsigned i = 0; i < x->output_count; i++) {
+      const nir_xfb_output_info *o = &x->outputs[i];
+      if (o->data_is_16bit) {
+         snprintf(refusal, refusal_size, "transform feedback of 16-bit data");
+         return false;
+      }
+      const unsigned r = layout->nranges++;
+      layout->ranges[r].buffer = o->buffer;
+      layout->ranges[r].offset = o->offset;
+      layout->ranges[r].size = 4 * util_bitcount(o->component_mask);
+   }
+   const nir_lower_xfb_to_stores_options opts = { .address_format = nir_address_format_64bit_global,
+                                                  .keep_outputs = true };
+   NIR_PASS(_, nir, nir_lower_xfb_to_stores, &opts);
+   return true;
+}
+
+static bool
+compile_stage(const VkPipelineShaderStageCreateInfo *stage_info, bool half_output, uint32_t samples,
+              struct pvr_g5p_vertex_layout *vertex, const struct pco_g5p_fs_key *key,
+              const struct pco_g5p_vs_link *link, struct g5p_xfb_layout *xfb, struct pco_g5p_program *out)
 {
    memset(out, 0, sizeof(*out));
 
@@ -504,6 +560,10 @@ pvr_g5p_compile_stage(const VkPipelineShaderStageCreateInfo *stage_info, bool ha
       snprintf(out->refusal, sizeof(out->refusal), "SPIR-V of %zu bytes", bytes);
       return false;
    }
+   if (xfb && (stage != MESA_SHADER_VERTEX || !spirv_xfb(spv, bytes / 4))) {
+      memset(xfb, 0, sizeof(*xfb)); /* no capture: no variant */
+      return true;
+   }
 
    glsl_type_singleton_init_or_ref();
    const char *entry = stage_info->pName ? stage_info->pName : "main";
@@ -520,6 +580,10 @@ pvr_g5p_compile_stage(const VkPipelineShaderStageCreateInfo *stage_info, bool ha
    } else if (stage == MESA_SHADER_VERTEX && vertex && !pvr_g5p_vertex_lower(nir, vertex)) {
       /* the vertex input layout (pvr_g5p_vertex_nir.c) */
       snprintf(out->refusal, sizeof(out->refusal), "%s", vertex->refusal);
+   } else if (xfb && !xfb_lower(nir, xfb, out->refusal, sizeof(out->refusal))) {
+      /* refused by name */
+   } else if (xfb && !xfb->buffers) {
+      ok = true; /* Xfb mode, nothing captured: no variant */
    } else {
       if (stage == MESA_SHADER_VERTEX)
          vs_sysvals(nir);
@@ -528,6 +592,34 @@ pvr_g5p_compile_stage(const VkPipelineShaderStageCreateInfo *stage_info, bool ha
    ralloc_free(nir);
    glsl_type_singleton_decref();
    return ok;
+}
+
+bool
+pvr_g5p_compile_stage(const VkPipelineShaderStageCreateInfo *stage_info, bool half_output, uint32_t samples,
+                      struct pvr_g5p_vertex_layout *vertex, const struct pco_g5p_fs_key *key,
+                      const struct pco_g5p_vs_link *link, struct pco_g5p_program *out)
+{
+   return compile_stage(stage_info, half_output, samples, vertex, key, link, NULL, out);
+}
+
+bool
+pvr_g5p_stage_has_xfb(const VkPipelineShaderStageCreateInfo *stage_info)
+{
+   VK_FROM_HANDLE(vk_shader_module, module, stage_info->module);
+   const VkShaderModuleCreateInfo *inline_ci = vk_find_struct_const(stage_info->pNext, SHADER_MODULE_CREATE_INFO);
+   if (stage_info->stage != VK_SHADER_STAGE_VERTEX_BIT)
+      return false;
+   if (module && !module->nir)
+      return spirv_xfb((const uint32_t *)module->data, module->size / 4);
+   return inline_ci && spirv_xfb(inline_ci->pCode, inline_ci->codeSize / 4);
+}
+
+bool
+pvr_g5p_compile_vs_xfb(const VkPipelineShaderStageCreateInfo *stage_info, struct pvr_g5p_vertex_layout *vertex,
+                       const struct pco_g5p_vs_link *link, struct g5p_xfb_layout *layout,
+                       struct pco_g5p_program *out)
+{
+   return compile_stage(stage_info, false, 1, vertex, NULL, link, layout, out);
 }
 
 /*
