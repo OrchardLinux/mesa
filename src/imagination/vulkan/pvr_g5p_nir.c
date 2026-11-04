@@ -564,7 +564,12 @@ pvr_g5p_compile_load(struct pco_g5p_program *out)
 
    bool sample_mask = false; /* the load program reads no sample mask */
    nir_shader *nir = graphics_lower(g5p_nir_prepare(b.shader), 1, &sample_mask);
-   bool ok = nir && pco_g5p_compile_general_link(nir, true, NULL, NULL, NULL, out);
+   /* Apple's source groups, as every pipeline's fragment program (g5p_check_state()): 1 only on a register's last
+    * read. The default, 1 on every read, returns a wrong value on a re-read: the LOAD probe's texelFetch wrote only
+    * output component 0 (B G R A = 0 0 R 0). */
+   struct pco_g5p_fs_key key = PCO_G5P_FS_KEY_DEFAULT;
+   key.last_read_groups = true;
+   bool ok = nir && pco_g5p_compile_general_link(nir, true, NULL, &key, NULL, out);
    if (!nir)
       snprintf(out->refusal, sizeof(out->refusal), "the load program's NIR");
    ralloc_free(nir);
