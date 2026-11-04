@@ -1331,6 +1331,8 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
    result = pvr_arch_cmd_buffer_start_sub_cmd(cmd_buffer, PVR_SUB_CMD_TYPE_GRAPHICS);
    if (result != VK_SUCCESS)
       return result;
+   /* what the draw can read outside the arena, for the job's resource list (pvr_g5p_perf.h) */
+   pvr_arch_g5p_perf_draw(cmd_buffer, draw->indexed);
 
    /* the clip: the scissor within the render area and the attachment; a
     * fully clipped draw emits nothing. A clip smaller than the attachment is
