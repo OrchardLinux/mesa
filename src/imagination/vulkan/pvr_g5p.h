@@ -162,6 +162,9 @@ struct pvr_g5p_pipeline {
     * 0 for one, else 2 or 4), checked against the pass per draw
     * (pvr_g5p_mrt.h) */
    unsigned color_targets;
+   /* the vertex program's common-store uploads and their loader, NULL
+    * without any (pvr_g5p_upload.h) */
+   struct pvr_g5p_stage_uploads *vs_uploads;
    /* the fragment program's uploads (descriptor state, image sizes, blend
     * constants) and their loader, DOUTD per upload from the per-draw data
     * behind UNIFORMDATABASE (no uploads: the device HALT) */
