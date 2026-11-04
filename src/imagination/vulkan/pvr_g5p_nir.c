@@ -267,6 +267,8 @@ clamp_dyn_ubo(nir_shader *nir)
    return progress;
 }
 
+static nir_shader *g5p_nir_prepare(nir_shader *nir);
+
 /* SPIR-V -> optimised NIR (the ICD's g5p_nir()) */
 static nir_shader *
 g5p_nir(const uint32_t *spv, size_t words, mesa_shader_stage stage, const char *entry)
@@ -290,6 +292,14 @@ g5p_nir(const uint32_t *spv, size_t words, mesa_shader_stage stage, const char *
    nir_shader *nir = spirv_to_nir(spv, words, NULL, stage, entry, &opts, &g5p_options);
    if (!nir)
       return NULL;
+   return g5p_nir_prepare(nir);
+}
+
+/* The ICD's passes after spirv_to_nir(), for any stage's NIR */
+static nir_shader *
+g5p_nir_prepare(nir_shader *nir)
+{
+   const mesa_shader_stage stage = nir->info.stage;
    nir_lower_variable_initializers(nir, nir_var_function_temp);
    nir_lower_returns(nir);
    nir_inline_functions(nir);
@@ -387,11 +397,12 @@ xfb_captures(const nir_shader *nir, gl_varying_slot slot)
    return false;
 }
 
+/* The graphics lowerings of a prepared stage (the ICD's graphics_nir()) */
 static nir_shader *
-graphics_nir(const uint32_t *spv, size_t words, mesa_shader_stage stage, const char *entry, unsigned color_targets,
-             bool *sample_mask)
+graphics_lower(nir_shader *nir, unsigned color_targets, bool *sample_mask)
 {
-   nir_shader *nir = g5p_nir(spv, words, stage, entry);
+   const mesa_shader_stage stage = nir ? nir->info.stage : MESA_SHADER_NONE;
+
    if (nir && stage == MESA_SHADER_VERTEX && !xfb_captures(nir, VARYING_SLOT_PSIZ) &&
        nir_shader_intrinsics_pass(nir, drop_point_size, nir_metadata_control_flow, NULL)) {
       nir->info.outputs_written &= ~BITFIELD64_BIT(VARYING_SLOT_PSIZ);
@@ -413,6 +424,13 @@ graphics_nir(const uint32_t *spv, size_t words, mesa_shader_stage stage, const c
       nir_index_ssa_defs(nir_shader_get_entrypoint(nir));
    }
    return nir;
+}
+
+static nir_shader *
+graphics_nir(const uint32_t *spv, size_t words, mesa_shader_stage stage, const char *entry, unsigned color_targets,
+             bool *sample_mask)
+{
+   return graphics_lower(g5p_nir(spv, words, stage, entry), color_targets, sample_mask);
 }
 
 /* Vertex system values: the hardware index the PDS writes is the draw's
@@ -502,6 +520,53 @@ pvr_g5p_compile_stage(const VkPipelineShaderStageCreateInfo *stage_info, bool ha
          vs_sysvals(nir);
       ok = pco_g5p_compile_general_link(nir, half_output, attrib_components, key, link, out);
    }
+   ralloc_free(nir);
+   glsl_type_singleton_decref();
+   return ok;
+}
+
+/*
+ * The background program of a render whose colour attachment is loaded
+ * (loadOp LOAD): the attachment, bound as a combined image/sampler at set 0
+ * binding 0, sampled at the fragment's own pixel centre,
+ *   color = texture(prev, gl_FragCoord.xy / vec2(textureSize(prev, 0))),
+ * built with nir_builder (Mesa's way for a driver's own shaders), then the
+ * same preparation and backend as every graphics stage. Its uploads are
+ * the image state, the sampler and the size block at that binding
+ * (out->uploads).
+ */
+bool
+pvr_g5p_compile_load(struct pco_g5p_program *out)
+{
+   static util_once_flag once = UTIL_ONCE_FLAG_INIT;
+   util_call_once(&once, g5p_init_options);
+   memset(out, 0, sizeof(*out));
+   glsl_type_singleton_init_or_ref();
+
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT, &g5p_options, "g5p-load");
+   nir_variable *prev = nir_variable_create(b.shader, nir_var_uniform,
+                                            glsl_sampler_type(GLSL_SAMPLER_DIM_2D, false, false, GLSL_TYPE_FLOAT),
+                                            "prev");
+   prev->data.descriptor_set = 0;
+   prev->data.binding = 0;
+   nir_variable *color = nir_variable_create(b.shader, nir_var_shader_out, glsl_vec4_type(), "color");
+   color->data.location = FRAG_RESULT_DATA0;
+   /* texture() at the pixel's centre, not texelFetch(): the backend's read op returns one channel in the wrong lane
+    * on the A9 (the LOAD probe, 2026-11-04), while its sample op is proven (lane b's tex-blend, 13/13). The
+    * centre (x + 0.5) / size lands on the texel itself, so the nearest sample is the texel, exact. */
+   nir_deref_instr *tex_deref = nir_build_deref_var(&b, prev);
+   nir_def *size = nir_i2f32(&b, nir_txs(&b, .texture_deref = tex_deref, .lod = nir_imm_int(&b, 0),
+                                          .dim = GLSL_SAMPLER_DIM_2D, .dest_type = nir_type_int32));
+   nir_def *uv = nir_fdiv(&b, nir_trim_vector(&b, nir_load_frag_coord(&b), 2), size);
+   nir_def *texel = nir_tex(&b, uv, .texture_deref = tex_deref, .sampler_deref = tex_deref,
+                            .dim = GLSL_SAMPLER_DIM_2D, .dest_type = nir_type_float32);
+   nir_store_var(&b, color, texel, 0xf);
+
+   bool sample_mask = false; /* the load program reads no sample mask */
+   nir_shader *nir = graphics_lower(g5p_nir_prepare(b.shader), 1, &sample_mask);
+   bool ok = nir && pco_g5p_compile_general_link(nir, true, NULL, NULL, NULL, out);
+   if (!nir)
+      snprintf(out->refusal, sizeof(out->refusal), "the load program's NIR");
    ralloc_free(nir);
    glsl_type_singleton_decref();
    return ok;
