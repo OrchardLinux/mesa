@@ -4,7 +4,7 @@
  * samplers, written into upstream's pvr_* descriptors (pvr_g5p_tex.h).
  * Compiled only with -Dimagination-g5p-experimental=true.
  *
- * In the shape of G9P's image and sampler states (Henrik Klee,
+ * In the shape of G9P's image and sampler states (the G9P driver,
  * pvr_arch_g9p_gfx.c "Image and sampler states"): upstream's objects, the
  * hardware words from a G5P function at the call site.
  */
@@ -58,8 +58,8 @@ g5p_view_state(const struct pvr_image_view *iview, uint64_t q[3])
 
       if (iview->vk.view_type != VK_IMAGE_VIEW_TYPE_2D || iview->vk.base_mip_level)
          return "array/3D/cube or mip view of a linear image (Apple samples those twiddled only)";
-      if (va % 64 || level->pitch % 16)
-         return "linear texture off a 64-byte base or 16-byte rows";
+      if (va % 16 || level->pitch % 16)
+         return "linear texture off a 16-byte base or 16-byte rows";
       pvr_g5p_tex_linear(q, key, f->srgb, va, iview->vk.extent.width, iview->vk.extent.height,
                          level->pitch);
       return NULL;

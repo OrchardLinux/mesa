@@ -52,6 +52,22 @@
     (uint32_t)(r) << PVR_G5P_TEX_SEL_SHIFT(0) | (uint32_t)(g) << PVR_G5P_TEX_SEL_SHIFT(1) |           \
     (uint32_t)(b) << PVR_G5P_TEX_SEL_SHIFT(2) | (uint32_t)(a) << PVR_G5P_TEX_SEL_SHIFT(3))
 
+/* Linear ImageStateFields (AGXMetalA9 ImageStateEncoderGen2, G5 revision):
+ * base[38:6] at q1[37:5]; pitch_code=(bytes/16)-1, high bits at q1[62:47].
+ * q1[63] enables q2's pitch_code[1:0] and base[5:4]. Without it, hardware
+ * supplies pitch low bits=3 and base low bits=0. Source decode sites:
+ * 0x207d17c3c..0x207d17c84 and0x207d17de4, differential shmtex field tests.
+ * This encodes fields; it contains no captured state/program words.
+ */
+#define PVR_G5P_TEX_LINEAR_BASE_BLOCK 64ull
+#define PVR_G5P_TEX_LINEAR_BASE_LOW_UNIT 16u
+#define PVR_G5P_TEX_LINEAR_PITCH_UNIT 16u
+#define PVR_G5P_TEX_LINEAR_PITCH_BITS 18u
+#define PVR_G5P_TEX_LINEAR_LOW_MASK 3u
+#define PVR_G5P_TEX_LINEAR_PITCH_HIGH_SHIFT 45u
+#define PVR_G5P_TEX_LINEAR_EXT_ENABLE_BIT 63u
+#define PVR_G5P_TEX_LINEAR_PITCH_LOW_SHIFT 62u
+#define PVR_G5P_TEX_LINEAR_BASE_LOW_SHIFT 58u
 #define PVR_G5P_TEX_SRGB_BIT 45
 #define PVR_G5P_TEX_DEPTH_SHIFT 47
 #define PVR_G5P_TEX_BIG_LAYER_BIT 61
@@ -109,18 +125,28 @@ pvr_g5p_tex_swizzle_key(uint32_t key, const VkComponentMapping *m)
 }
 
 /*
- * The state of a linear 2D image (also the PBE layout, without the PBE's
- * bit 63). row_stride: bytes, a multiple of 16.
+ * The sampled state of a linear2D image. Bit63 enables extended base/pitch
+ * fields here; PBE uses its own always-enabled form. Rows/base are16-byte units.
  */
 static inline void
 pvr_g5p_tex_linear(uint64_t q[3], uint32_t key, bool srgb, uint64_t va, uint32_t width,
                    uint32_t height, uint32_t row_stride)
 {
-   const uint32_t s = row_stride / 16 - 1;
+   const uint32_t pitch = row_stride / PVR_G5P_TEX_LINEAR_PITCH_UNIT - 1;
+   const uint32_t high_mask = ((1u << PVR_G5P_TEX_LINEAR_PITCH_BITS) - 1) &
+                              ~PVR_G5P_TEX_LINEAR_LOW_MASK;
+   const uint32_t base_low = (va / PVR_G5P_TEX_LINEAR_BASE_LOW_UNIT) & PVR_G5P_TEX_LINEAR_LOW_MASK;
+   const uint32_t pitch_low = pitch & PVR_G5P_TEX_LINEAR_LOW_MASK;
 
    q[0] = (uint64_t)(height - 1) << 41 | (uint64_t)(width - 1) << 27 | (key & ~PVR_G5P_TEX_TWIDDLED);
-   q[1] = va >> 1 | (uint64_t)(s & 0x3fffc) << 45 | (uint64_t)srgb << PVR_G5P_TEX_SRGB_BIT;
-   q[2] = (uint64_t)(s & 3) << 62;
+   q[1] = (va & ~(PVR_G5P_TEX_LINEAR_BASE_BLOCK - 1)) >> 1 |
+          (uint64_t)(pitch & high_mask) << PVR_G5P_TEX_LINEAR_PITCH_HIGH_SHIFT |
+          (uint64_t)srgb << PVR_G5P_TEX_SRGB_BIT;
+   q[2] = (uint64_t)pitch_low << PVR_G5P_TEX_LINEAR_PITCH_LOW_SHIFT;
+   if (pitch_low != PVR_G5P_TEX_LINEAR_LOW_MASK || base_low) {
+      q[1] |= 1ull << PVR_G5P_TEX_LINEAR_EXT_ENABLE_BIT;
+      q[2] |= (uint64_t)base_low << PVR_G5P_TEX_LINEAR_BASE_LOW_SHIFT;
+   }
 }
 
 /* A view of a twiddled image */
