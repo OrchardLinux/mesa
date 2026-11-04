@@ -184,14 +184,15 @@ pvr_g5p_vertex_buffer_format(VkFormat vk_format)
 
 #define PVR_G5P_HOOK_pub_pvr_physical_device_1275() \
    PVR_G5P_HOOK_msaa_limits(pdevice, &supported_properties) \
-   /* G5P: no transform feedback is built yet (G5P refuses every XFB pipeline), \
-    * so none is advertised: Zink derives its GL/ES version from what is real. \
-    * Nor dynamic colour-write enables: G5P compiles the write mask into the \
-    * fragment program, and Zink makes them dynamic whenever they exist. */ \
+   /* G5P: transform feedback is the vertex program's own stores and a CPU \
+    * resolve (pvr_g5p_xfb.h): stream 0, no byte-count draws; its stream \
+    * queries count on the CPU too. No dynamic colour-write enables: G5P compiles the write \
+    * mask into the fragment program, and Zink makes them dynamic whenever \
+    * they exist. */ \
    if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g5p)) { \
-      supported_extensions.EXT_transform_feedback = false; \
-      supported_features.transformFeedback = false; \
       supported_features.geometryStreams = false; \
+      supported_properties.transformFeedbackDraw = false; \
+      supported_properties.transformFeedbackQueries = true; \
       supported_extensions.EXT_color_write_enable = false; \
       supported_features.colorWriteEnable = false; \
    }

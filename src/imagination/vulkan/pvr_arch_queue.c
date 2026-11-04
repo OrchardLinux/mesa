@@ -559,6 +559,7 @@ static VkResult pvr_process_graphics_cmd(struct pvr_device *device,
                                          struct pvr_sub_cmd_gfx *sub_cmd)
 {
    const pvr_dev_addr_t ds_addr = sub_cmd->job.ds.addr;
+   PVR_G5P_HOOK(xfb_before_job, device, cmd_buffer, sub_cmd)
 
    if (util_dynarray_num_elements(&sub_cmd->g9p_realigns, char)) {
       struct vk_sync *wait = queue->next_job_wait_sync[PVR_JOB_TYPE_GEOM];
@@ -615,6 +616,7 @@ static VkResult pvr_process_graphics_cmd(struct pvr_device *device,
       if (result != VK_SUCCESS)
          return result;
    }
+   PVR_G5P_HOOK(xfb_after_job, device, queue, cmd_buffer, sub_cmd)
 
    return PVR_PER_ARCH(g9p_xfb_after_job)(device, queue, cmd_buffer, sub_cmd);
 }
@@ -1221,6 +1223,7 @@ static VkResult pvr_process_cmd_buffer(struct pvr_device *device,
 
       p_atomic_inc(&device->global_cmd_buffer_submit_count);
    }
+   PVR_G5P_HOOK(xfb_end_cmd_buffer, device, cmd_buffer)
 
    return PVR_PER_ARCH(g9p_xfb_end_cmd_buffer)(device, cmd_buffer);
 }

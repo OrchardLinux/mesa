@@ -21,6 +21,7 @@
 
 #include "pvr_common.h"
 #include "pvr_macros.h"
+#include "pvr_g5p_xfb_core.h"
 
 struct pvr_cmd_buffer;
 struct pvr_device;
@@ -188,6 +189,13 @@ struct pvr_g5p_pipeline {
    struct pvr_pds_upload fs_loader;
    /* rasterization samples, 1 or 4: the fragment launch's sample rate and the draws' ISP user pass */
    uint32_t samples;
+   /* transform feedback (pvr_g5p_xfb.h): the same pipeline with the vertex
+    * program's capturing variant, used by draws while capturing (NULL: the
+    * vertex shader captures nothing); in that variant, xfb_variant is set and
+    * xfb_layout is what it stores */
+   struct pvr_g5p_pipeline *xfb;
+   bool xfb_variant;
+   struct g5p_xfb_layout xfb_layout;
 };
 
 /* A draw (CmdDraw, CmdDrawIndexed): `first` is the first vertex, or the
@@ -211,6 +219,14 @@ bool pvr_g5p_compile_stage(const VkPipelineShaderStageCreateInfo *stage_info, bo
  * texture() of the attachment, bound as set 0 binding 0, at the fragment's
  * pixel centre. false with out->refusal set. */
 bool pvr_g5p_compile_load(struct pco_g5p_program *out);
+/* A vertex stage whose SPIR-V declares ExecutionMode Xfb */
+bool pvr_g5p_stage_has_xfb(const VkPipelineShaderStageCreateInfo *stage_info);
+/* The vertex shader's transform feedback variant (pvr_g5p_nir.c): true with
+ * layout->buffers == 0 when it captures nothing (no variant); false with
+ * out->refusal set. */
+bool pvr_g5p_compile_vs_xfb(const VkPipelineShaderStageCreateInfo *stage_info, struct pvr_g5p_vertex_layout *vertex,
+                            const struct pco_g5p_vs_link *link, struct g5p_xfb_layout *layout,
+                            struct pco_g5p_program *out);
 
 #ifdef PVR_PER_ARCH
 

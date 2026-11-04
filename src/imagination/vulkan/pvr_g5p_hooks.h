@@ -25,6 +25,7 @@
 /* Textures and samplers (pvr_g5p_tex.h). */
 #if defined(PVR_APPLE_G5P)
 #   include "pvr_g5p_tex.h"
+#   include "pvr_g5p_xfb.h"
 #endif
 
 /* pvr_arch_image.c, pvr_CreateImageView(): the sampled state of a view is
@@ -79,5 +80,87 @@
          *(data) = (uint8_t *)(mem)->bo->map + (offset);                  \
       return r_;                                                          \
    }
+
+/* pvr_arch_xfb.c, vkCmdBind/Begin/EndTransformFeedbackEXT(): G5P records
+ * its own events (pvr_g5p_xfb.h); Rogue's stream-out programs and End's
+ * render split (a colour LOAD) are not used.
+ */
+#define PVR_G5P_HOOK_xfb_bind(cmd_buffer, first, count, buffers, offsets, sizes) \
+   if (PVR_HAS_FEATURE(&(cmd_buffer)->device->pdevice->dev_info, apple_g5p)) {   \
+      pvr_arch_g5p_xfb_bind(cmd_buffer, first, count, buffers, offsets, sizes);   \
+      return;                                                                     \
+   }
+#define PVR_G5P_HOOK_xfb_begin(cmd_buffer, first, count, counters, offsets)     \
+   if (PVR_HAS_FEATURE(&(cmd_buffer)->device->pdevice->dev_info, apple_g5p)) { \
+      pvr_arch_g5p_xfb_begin(cmd_buffer, first, count, counters, offsets);      \
+      return;                                                                   \
+   }
+#define PVR_G5P_HOOK_xfb_end(cmd_buffer, first, count, counters, offsets)       \
+   if (PVR_HAS_FEATURE(&(cmd_buffer)->device->pdevice->dev_info, apple_g5p)) { \
+      pvr_arch_g5p_xfb_end(cmd_buffer, first, count, counters, offsets);        \
+      return;                                                                   \
+   }
+
+/* pvr_arch_queue.c, pvr_process_graphics_cmd(): a sub-command's transform
+ * feedback events run on the CPU just before it is submitted, and a draw
+ * that overflowed is copied once the job retired (pvr_g5p_xfb.h). Nothing
+ * for a command buffer without transform feedback.
+ */
+#define PVR_G5P_HOOK_xfb_before_job(device, cmd_buffer, sub_cmd)                       \
+   {                                                                                   \
+      const VkResult xfb_r_ = pvr_arch_g5p_xfb_before_job(device, cmd_buffer, sub_cmd); \
+      if (xfb_r_ != VK_SUCCESS)                                                        \
+         return xfb_r_;                                                                \
+   }
+#define PVR_G5P_HOOK_xfb_after_job(device, queue, cmd_buffer, sub_cmd)                        \
+   {                                                                                          \
+      const VkResult xfb_r_ = pvr_arch_g5p_xfb_after_job(device, queue, cmd_buffer, sub_cmd); \
+      if (xfb_r_ != VK_SUCCESS)                                                               \
+         return xfb_r_;                                                                       \
+   }
+
+/* pvr_arch_queue.c, pvr_process_cmd_buffer(): the transform feedback events
+ * after the command buffer's last render (query resets and copies).
+ */
+#define PVR_G5P_HOOK_xfb_end_cmd_buffer(device, cmd_buffer)                              \
+   {                                                                                     \
+      const VkResult xfb_r_ = pvr_arch_g5p_xfb_end_cmd_buffer(device, cmd_buffer);         \
+      if (xfb_r_ != VK_SUCCESS)                                                          \
+         return xfb_r_;                                                                  \
+   }
+
+/* pvr_arch_cmd_query.c and pvr_query.c: a transform feedback stream query
+ * pool's commands and results are G5P's (pvr_g5p_xfb.h); occlusion pools go
+ * on as they are.
+ */
+#define PVR_G5P_XFB_QUERY_POOL(device, pool) pvr_g5p_xfb_query_pool(device, pool)
+#define PVR_G5P_HOOK_xfb_query_begin(cmd_buffer, pool, query, index)     \
+   if (PVR_G5P_XFB_QUERY_POOL((cmd_buffer)->device, pool)) {             \
+      pvr_arch_g5p_xfb_query_begin(cmd_buffer, pool, query, index);      \
+      return;                                                            \
+   }
+#define PVR_G5P_HOOK_xfb_query_end(cmd_buffer, pool, query)              \
+   if (PVR_G5P_XFB_QUERY_POOL((cmd_buffer)->device, pool)) {             \
+      pvr_arch_g5p_xfb_query_end(cmd_buffer, pool, query);               \
+      return;                                                            \
+   }
+#define PVR_G5P_HOOK_xfb_query_reset(cmd_buffer, query_pool, first, count)                     \
+   if (PVR_G5P_XFB_QUERY_POOL((cmd_buffer)->device, pvr_query_pool_from_handle(query_pool))) { \
+      pvr_arch_g5p_xfb_query_reset(cmd_buffer, pvr_query_pool_from_handle(query_pool), first,  \
+                                   count);                                                     \
+      return;                                                                                  \
+   }
+#define PVR_G5P_HOOK_xfb_query_copy(cmd_buffer, query_pool, first, count, dst, offset, stride, flags) \
+   if (PVR_G5P_XFB_QUERY_POOL((cmd_buffer)->device, pvr_query_pool_from_handle(query_pool))) {        \
+      pvr_arch_g5p_xfb_query_copy(cmd_buffer, pvr_query_pool_from_handle(query_pool), first, count,   \
+                                  dst, offset, stride, flags);                                        \
+      return;                                                                                         \
+   }
+#define PVR_G5P_HOOK_xfb_query_results(device, pool, first, count, data, stride, flags) \
+   if (PVR_G5P_XFB_QUERY_POOL(device, pool))                                            \
+      return pvr_g5p_xfb_query_results(device, pool, first, count, data, stride, flags);
+
+/* pvr_arch_cmd_buffer.c, pvr_cmd_buffer_free_resources() */
+#define PVR_G5P_HOOK_xfb_free(cmd_buffer) pvr_arch_g5p_xfb_free(cmd_buffer);
 
 #endif /* PVR_G5P_HOOKS_H */

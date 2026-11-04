@@ -153,10 +153,12 @@ if with_imagination_g5p
     'pvr_arch_g5p_mrt.c',
     'pvr_arch_g5p_vertex.c',
     'pvr_arch_g5p_upload.c',
+    'pvr_arch_g5p_xfb.c',
   )
   pvr_files += files(
     'pvr_g5p_image.c',
     'pvr_g5p_nir.c',
+    'pvr_g5p_xfb_query.c',
     'pvr_g5p_ds.c',
     'pvr_g5p_msaa.c',
     'pvr_g5p_vertex_nir.c',
