@@ -62,7 +62,7 @@
 #define G5P_WS_PAGE 16384ull
 #define G5P_WS_CHUNK (64ull << 20)         /* the kernel's largest BO */
 #define G5P_WS_MAX_CHUNKS 8                /* the arena grows in up to 8 BOs; 256 MiB, the kernel's per-VM cap */
-#define G5P_WS_ARENA_DEFAULT (64ull << 20) /* the most the arena grows to; PVR_G5P_ARENA_MIB overrides */
+#define G5P_WS_ARENA_DEFAULT (128ull << 20) /* the most the arena grows to; PVR_G5P_ARENA_MIB overrides */
 #define G5P_WS_ARENA_FIRST (8ull << 20)    /* what device creation commits; PVR_G5P_ARENA_FIRST_MIB overrides */
 #define G5P_WS_DEDICATED_SIZE (1ull << 30) /* VA window for display BOs and imports */
 /* Render programs are 32-bit USC/PDS offsets from the code base, so no code window is larger. The kernel's
@@ -98,6 +98,8 @@ struct g5p_ws {
    uint64_t arena_max;      /* the most the chunks may total (PVR_G5P_ARENA_MIB) */
    uint64_t arena_next;     /* the offset of the next chunk */
    uint64_t arena_committed; /* bytes in chunks */
+   uint64_t arena_live, arena_peak, arena_allocs, arena_reused; /* slice bytes, high-water, allocation/reuse counts */
+   bool arena_log; /* optional allocation accounting; no per-allocation logging by default */
    uint8_t *arena_cpu;
    uint64_t *arena_used;    /* one bit per page of [arena_va, +arena_size): handed out before (memset on reuse) */
    struct g5p_drm_bo chunks[G5P_WS_MAX_CHUNKS];
@@ -364,6 +366,15 @@ static int g5p_ws_arena_grow(struct g5p_ws *ws, uint64_t need)
    return 0;
 }
 
+/* lock held: requested slice bytes versus physically committed chunk bytes, never a device-pinned estimate */
+static void g5p_ws_arena_stats(struct g5p_ws *ws, const char *why)
+{
+   fprintf(stderr, "apple_g5p winsys: arena stats pid=%ld why=%s committed_kib=%" PRIu64 " live_kib=%" PRIu64
+           " peak_kib=%" PRIu64 " allocs=%" PRIu64 " reused_pages=%" PRIu64 " chunks=%u max_kib=%" PRIu64 "\n",
+           (long)getpid(), why, ws->arena_committed >> 10, ws->arena_live >> 10, ws->arena_peak >> 10,
+           ws->arena_allocs, ws->arena_reused, ws->chunk_count, ws->arena_max >> 10);
+}
+
 /* A slice [va, va + size) is handed out (lock held): zero the pages handed out before; a page never handed out
  * is still the kernel's zero page of a fresh chunk */
 static void g5p_ws_arena_take(struct g5p_ws *ws, uint64_t va, uint64_t size)
@@ -372,10 +383,17 @@ static void g5p_ws_arena_take(struct g5p_ws *ws, uint64_t va, uint64_t size)
    for (uint64_t p = first; p < first + n; p++) {
       uint64_t *w = &ws->arena_used[p / 64];
       const uint64_t bit = 1ull << (p % 64);
-      if (*w & bit)
+      if (*w & bit) {
          memset(ws->arena_cpu + p * G5P_WS_PAGE, 0, G5P_WS_PAGE);
+         ws->arena_reused++;
+      }
       *w |= bit;
    }
+   ws->arena_live += size;
+   ws->arena_peak = MAX2(ws->arena_peak, ws->arena_live);
+   ws->arena_allocs++;
+   if (ws->arena_log && (ws->arena_allocs % 256 == 0))
+      g5p_ws_arena_stats(ws, "alloc");
 }
 
 
@@ -553,6 +571,7 @@ static void g5p_ws_buffer_destroy(struct pvr_winsys_bo *bo)
          util_vma_heap_free(&ws->dedicated, va, b->alloc_size);
    } else {
       util_vma_heap_free(&ws->slices, b->va, b->alloc_size);
+      ws->arena_live -= b->alloc_size;
    }
    simple_mtx_unlock(&ws->lock);
    vk_free(ws->base.alloc, b);
@@ -1024,6 +1043,8 @@ static void g5p_ws_destroy(struct pvr_winsys *ws_)
    for (unsigned i = 0; i < ARRAY_SIZE(heaps); i++)
       if (heaps[i]->ws && !pvr_winsys_helper_winsys_heap_finish(heaps[i]))
          mesa_logw("apple_g5p: heap %u still has reservations at destroy", i);
+   if (ws->arena_log)
+      g5p_ws_arena_stats(ws, "destroy");
    for (unsigned i = 0; i < ws->chunk_count; i++)
       (void)g5p_drm_bo_destroy(&ws->drm, &ws->chunks[i]);
    if (ws->arena_cpu)
@@ -1083,6 +1104,7 @@ static VkResult g5p_ws_arena_init(struct g5p_ws *ws)
       return g5p_ws_fail(VK_ERROR_INITIALIZATION_FAILED, "arena of %" PRIu64 " MiB is too large",
                        max >> 20);
 
+   ws->arena_log = getenv("PVR_G5P_ARENA_LOG") != NULL;
    ws->arena_va = ws->drm.exec.usc_base;
    ws->arena_size = size;
    ws->arena_max = max;
