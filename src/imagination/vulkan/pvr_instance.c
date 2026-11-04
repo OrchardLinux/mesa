@@ -114,7 +114,7 @@ pvr_drm_device_is_compatible(drmDevicePtr drm_dev)
 #if defined(PVR_SUPPORT_SERVICES_DRIVER)
    is_pvr |= !strcmp(version->name, PVR_SRV_DRIVER_NAME);
 #endif /* defined(PVR_SUPPORT_SERVICES_DRIVER) */
-
+   PVR_G5P_HOOK(drm_name, is_pvr, version->name)
    drmFreeVersion(version);
    close(fd);
 
