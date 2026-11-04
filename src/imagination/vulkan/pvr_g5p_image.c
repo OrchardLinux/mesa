@@ -1,13 +1,29 @@
 /* SPDX-License-Identifier: MIT */
 /*
  * Apple's A9 GPU (G5P): image memory and the sample counts the device
- * reports. The ZLS stores each depth/stencil plane in its twiddled order
- * over a power-of-two square of 32-pixel tiles, and the stencil plane after
- * the depth plane (pvr_g5p_ds_layout()), so a depth/stencil image takes at
- * least that; a 4-sample colour image is the PBE's 2D-multisample surface,
- * 16 bytes a pixel over power-of-two sides (pvr_g5p_msaa_layout()).
- * pvr_image_init()'s G5P hook calls pvr_g5p_ds_image_layout() after
- * upstream's own layout. Built only with -Dimagination-g5p-experimental=true.
+ * reports. Built only with -Dimagination-g5p-experimental=true.
+ *
+ * Colour images (lane b; the A9 ICD's image_layout()/twiddled_layout()):
+ * Apple's image state takes a linear layout for plain 2D only, so the A9
+ * twiddles exactly the images that need it:
+ *  - mip chains, cube-compatible images, sampled arrays and compressed
+ *    formats are twiddled: Morton order with y in bit 0, levels back to back
+ *    from the image base, each the power-of-two level-0 extent shifted
+ *    (upstream's twiddled levels, unchanged), a layer the image's own levels
+ *    rounded to 64 bytes, or to 16 KiB from 16 KiB up (Apple's
+ *    getMipmapSize; the image state marks the 16 KiB case);
+ *  - every other optimal 2D colour image is linear, its rows a multiple of
+ *    64 bytes (pvr_image_init()'s stride alignment on G5P). The G5P render
+ *    path writes only linear colour targets, as the ICD's desktop did.
+ * 3D (Rogue's 3DTWIDDLED bricks) keeps the layout the rest of the driver gives it.
+ *
+ * Depth/stencil and 4-sample images (lane c): the ZLS stores each
+ * depth/stencil plane in its twiddled order over a power-of-two square of
+ * 32-pixel tiles, and the stencil plane after the depth plane
+ * (pvr_g5p_ds_layout()), so a depth/stencil image takes at least that; a
+ * 4-sample colour image is the PBE's 2D-multisample surface, 16 bytes a pixel
+ * over power-of-two sides (pvr_g5p_msaa_layout()). pvr_image_init()'s G5P hook
+ * calls pvr_g5p_ds_image_layout() after upstream's own layout.
  */
 
 #include "util/u_math.h"
@@ -16,9 +32,54 @@
 
 #include "pvr_g5p_ds.h"
 #include "pvr_g5p_msaa.h"
+#include "pvr_g5p_tex.h"
 #include "pvr_image.h"
 #include "pvr_physical_device.h"
 #include "winsys/apple_g5p/pvr_g5p_winsys.h"
+
+void
+pvr_g5p_image_layout(struct pvr_image *image, unsigned stride_align)
+{
+   struct pvr_image_plane *plane = &image->planes[0];
+   const VkDeviceSize alignment = image->alignment;
+
+   if (image->plane_count != 1 || image->vk.image_type != VK_IMAGE_TYPE_2D ||
+       image->vk.samples != VK_SAMPLE_COUNT_1_BIT || vk_format_is_depth_or_stencil(image->vk.format) ||
+       image->memlayout != PVR_MEMLAYOUT_TWIDDLED)
+      return;
+
+   const bool twiddled = image->vk.mip_levels > 1 ||
+                         (image->vk.create_flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) ||
+                         (image->vk.array_layers > 1 && (image->vk.usage & VK_IMAGE_USAGE_SAMPLED_BIT)) ||
+                         vk_format_is_compressed(image->vk.format);
+
+   if (!twiddled) {
+      const unsigned cpp = vk_format_get_blocksize(image->vk.format);
+      struct pvr_mip_level *level = &plane->mip_levels[0];
+
+      image->memlayout = PVR_MEMLAYOUT_LINEAR;
+      plane->physical_extent = image->vk.extent;
+      plane->physical_extent.width = align(plane->physical_extent.width, stride_align);
+      level->pitch = cpp * plane->physical_extent.width;
+      level->height_pitch = plane->physical_extent.height;
+      level->size = (VkDeviceSize)level->pitch * level->height_pitch;
+      level->offset = 0;
+      plane->layer_size = level->size;
+      if (image->vk.array_layers > 1)
+         plane->layer_size = align64(plane->layer_size, alignment);
+   } else {
+      VkDeviceSize size = 0;
+
+      for (uint32_t l = 0; l < image->vk.mip_levels; l++)
+         size += plane->mip_levels[l].size;
+      plane->layer_size = image->vk.array_layers > 1
+                             ? align64(size, size >= PVR_G5P_IMAGE_BIG_LAYER ? PVR_G5P_IMAGE_BIG_LAYER : 64)
+                             : size;
+   }
+   plane->size = plane->layer_size * image->vk.array_layers;
+   plane->offset = 0;
+   image->total_size = plane->size;
+}
 
 void
 pvr_g5p_ds_image_layout(struct pvr_image *image)

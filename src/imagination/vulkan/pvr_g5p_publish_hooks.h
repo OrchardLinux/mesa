@@ -110,6 +110,18 @@
       return pvr_arch_g5p_graphics_pipeline_compile(device, pCreateInfo, gfx_pipeline, \
                                                     state);
 
+#define PVR_G5P_HOOK_pub_pvr_arch_queue_619() \
+   /* G5P: the A9's firmware has no transfer engine either (the apple_g5p \
+    * winsys refuses transfer jobs); the CPU does them, as on G9P \
+    */ \
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p)) \
+      result = pvr_arch_g9p_transfer_submit( \
+         device, \
+         sub_cmd, \
+         queue->next_job_wait_sync[PVR_JOB_TYPE_TRANSFER], \
+         sync); \
+   else
+
 #define PVR_G5P_HOOK_pub_pvr_device_245() \
    /* G5P: memory that may become a dma-buf (exportable, or a WSI image) is a \
     * kernel BO of its own; the winsys's arena slices cannot be exported. */ \
@@ -117,6 +129,27 @@
        (vk_find_struct_const(pAllocateInfo->pNext, EXPORT_MEMORY_ALLOCATE_INFO) || \
         vk_find_struct_const(pAllocateInfo->pNext, WSI_MEMORY_ALLOCATE_INFO_MESA))) \
       type = PVR_WINSYS_BO_TYPE_DISPLAY;
+
+#define PVR_G5P_HOOK_pub_pvr_device_567() \
+   /* G5P: its CPU transfers find memory by device address too */ \
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p)) { \
+      simple_mtx_lock(&device->g9p_vmas.lock); \
+      util_dynarray_append_typed(&device->g9p_vmas.vmas, struct pvr_winsys_vma *, vma); \
+      simple_mtx_unlock(&device->g9p_vmas.lock); \
+   }
+
+#define PVR_G5P_HOOK_pub_pvr_device_592() \
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p)) { \
+      simple_mtx_lock(&device->g9p_vmas.lock); \
+      util_dynarray_delete_unordered(&device->g9p_vmas.vmas, struct pvr_winsys_vma *, vma); \
+      simple_mtx_unlock(&device->g9p_vmas.lock); \
+   }
+
+#define PVR_G5P_HOOK_pub_pvr_image_347() \
+   /* G5P: the A9's colour layouts (pvr_g5p_image.c) */ \
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p)) \
+      pvr_g5p_image_layout(image, pbe_stride_align); \
+   PVR_G5P_HOOK_ds_image(device, image)
 
 #define PVR_G5P_HOOK_pub_pvr_instance_117() \
    /* Apple A9 (G5P): our kernel's typed UAPI (winsys/apple_g5p) */ \

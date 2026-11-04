@@ -380,6 +380,10 @@ PVR_PER_ARCH(g5p_device_init)(struct pvr_device *device)
    if (!device->g5p)
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
 
+   /* the bound memory the CPU transfers address (pvr_arch_g9p_transfer.c) */
+   simple_mtx_init(&device->g9p_vmas.lock, mtx_plain);
+   util_dynarray_init(&device->g9p_vmas.vmas, NULL);
+
    VkResult result = g5p_upload_programs(device, &device->g5p->programs);
    if (result != VK_SUCCESS)
       PVR_PER_ARCH(g5p_device_finish)(device);
@@ -393,6 +397,8 @@ PVR_PER_ARCH(g5p_device_finish)(struct pvr_device *device)
       return;
 
    g5p_free_programs(&device->g5p->programs);
+   util_dynarray_fini(&device->g9p_vmas.vmas);
+   simple_mtx_destroy(&device->g9p_vmas.lock);
    vk_free(&device->vk.alloc, device->g5p);
    device->g5p = NULL;
 }

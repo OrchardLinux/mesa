@@ -26,8 +26,15 @@ pixel with a CPU reference:
 | `blend-sa-one` | `SRC_ALPHA`, `ONE` on colour and alpha (glmark2 pulsar, terrain) | ±1 |
 | `blend-sa-omsa-z1` | `SRC_ALPHA`, `ONE_MINUS_SRC_ALPHA`; alpha `ZERO`, `ONE` (glmark2 desktop) | ±1 |
 | `blend-sa-omsa-10` | `SRC_ALPHA`, `ONE_MINUS_SRC_ALPHA`; alpha `ONE`, `ZERO` (vkmark desktop) | ±1 |
+| `tex-optimal` | an 8×8 optimal texture uploaded by `vkCmdCopyBufferToImage`, nearest | exact |
+| `tex-mip0` | level 0 of a 16×16 five-level optimal chain, magnified (LOD < 0) | exact |
+| `tex-mip2` | level 2 of the same chain, `textureLod(…, 2.0)` | exact |
+| `tex-array` | layer 2 of an 8×8 three-layer 2D array | exact |
+| `tex-cube` | the −Z face of a 4×4 cube, direction (2u−1, 2v−1, −1) | exact |
 
-Textures are linear and written by the host, so the test doesn't use the transfer path. The ±1 tolerance covers
+The first rungs' textures are linear and written by the host, so they don't use the transfer path. The
+optimal rungs upload theirs from a buffer with `vkCmdCopyBufferToImage` in a submission of their own, and each
+level, layer and face holds texels of its own, so a wrong level, layer or face offset fails. The ±1 tolerance covers
 the blend arithmetic's rounding, which belongs to the hardware.
 
 The output is one line per rung, `TEX-BLEND <rung> PASS|FAIL ...` (a failure names its first bad pixel, got and

@@ -556,7 +556,7 @@ VkResult pvr_bind_memory(struct pvr_device *device,
       util_dynarray_append_typed(&device->g9p_vmas.vmas, struct pvr_winsys_vma *, vma);
       simple_mtx_unlock(&device->g9p_vmas.lock);
    }
-
+   PVR_G5P_HOOK(pub_pvr_device_567)
    return VK_SUCCESS;
 
 err_free_vma:
@@ -573,7 +573,7 @@ void pvr_unbind_memory(struct pvr_device *device, struct pvr_winsys_vma *vma)
       util_dynarray_delete_unordered(&device->g9p_vmas.vmas, struct pvr_winsys_vma *, vma);
       simple_mtx_unlock(&device->g9p_vmas.lock);
    }
-
+   PVR_G5P_HOOK(pub_pvr_device_592)
    device->ws->ops->vma_unmap(vma);
    device->ws->ops->heap_free(vma);
 }

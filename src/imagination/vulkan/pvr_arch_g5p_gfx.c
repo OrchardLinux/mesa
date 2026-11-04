@@ -464,6 +464,15 @@ g5p_check_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo *c
    /* blending and the write mask compile into the fragment program
     * (pvr_g5p_blend.h) */
    *key = PCO_G5P_FS_KEY_DEFAULT;
+   /* Apple's source groups: 1 only on a register's last read. With group 1 on
+    * every read, a register read again returns a wrong value on the A9: a
+    * general sample's result read back for its outputs (texture() of an
+    * array or cube, textureLod: red right, green to alpha scaled by a
+    * coordinate), blending's destination term (labwc113). The A9 ICD ran
+    * every device suite and the desktop with them (PVR_G5P_GROUPS=last-read,
+    * automatic since Mesa117).
+    */
+   key->last_read_groups = true;
    const char *why = pvr_arch_g5p_blend_fs_key(s, colors, key);
    if (why)
       return G5P_REFUSE(device, "colour blend state: %s", why);
