@@ -199,6 +199,10 @@ g5p_upload_programs(struct pvr_device *device, struct pvr_g5p_programs *p)
                                         &p->halt);
    if (result != VK_SUCCESS)
       return result;
+   /* a draw's stream-out program is this HALT too: its 16 data bytes, the code right after */
+   if (p->halt.code_offset != p->halt.data_offset + 16)
+      return vk_errorf(device, VK_ERROR_INITIALIZATION_FAILED, "G5P: the HALT's code is at data + %#x, not + 0x10",
+                       p->halt.code_offset - p->halt.data_offset);
 
    for (unsigned i = 0; i < PVR_G5P_MRT_VARIANTS; i++) {
       const unsigned n = g5p_mrt_variant_targets[i];

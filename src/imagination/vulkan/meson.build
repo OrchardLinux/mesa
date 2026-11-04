@@ -145,6 +145,7 @@ endif
 if with_imagination_g5p
   common_per_arch_files += files(
     'pvr_arch_g5p.c',
+    'pvr_arch_g5p_gfx.c',
   )
   pvr_files += files(
     'pvr_g5p_nir.c',
