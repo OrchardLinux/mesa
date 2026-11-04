@@ -20,6 +20,6 @@
 /* pvr_formats.c, after main line 763: the option-on insertion. */
 #define PVR_G9P_ES3_HOOK_formats_763() \
    if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g9p)) \
-   pImageFormatProperties->sampleCounts &= pvr_g9p_es3_sample_counts();
+   pImageFormatProperties->sampleCounts &= pvr_g9p_es3_sample_counts(info->usage);
 #endif
 #endif

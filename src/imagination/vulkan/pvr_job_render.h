@@ -166,6 +166,8 @@ struct pvr_render_job {
        */
       unsigned num_targets;
       uint32_t eot_info;
+      /* the render's samples (4: es3_job_init_ms()), 0 for one */
+      unsigned samples;
 #endif
    } g9p;
 

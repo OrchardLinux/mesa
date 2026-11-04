@@ -56,6 +56,28 @@ es3_mrt_index(unsigned n)
    return n == 4;
 }
 
+/*
+ * A kick bundle at sample rate, as upload_kick() builds one: DOUTU source 0
+ * bits 33-34 (the data's second dword, bits 1-2, above which the temps
+ * start at bit 3) are Rogue's sample rate; 2 runs the program for every
+ * sample. Apple's A9 driver kicks the background and every fragment program
+ * of a 4x render at rate 2 (msaa.md: 0x10 -> 0x14 in that dword). An A9
+ * value, untested on the A10.
+ */
+static VkResult
+es3_upload_kick_ms(struct pvr_device *device, const struct pvr_suballoc_bo *usc, unsigned regs,
+                   struct pvr_pds_upload *out)
+{
+   const uint32_t data[2] = { usc_offset(device, usc), usc_temps(regs) | 2u << 1 };
+   const uint32_t code[2] = {
+      g9p_pds_dout(G9P_DOUTU, 0, G9P_PDS_DATA, 0, G9P_PDS_END),
+      g9p_pds_halt(),
+   };
+
+   return pvr_gpu_upload_pds(device, data, ARRAY_SIZE(data), 16, code, ARRAY_SIZE(code), 32, 64,
+                             out);
+}
+
 static VkResult
 es3_gfx_device_init(struct pvr_device *device, struct g9p_code *c)
 {
@@ -76,6 +98,13 @@ es3_gfx_device_init(struct pvr_device *device, struct g9p_code *c)
       if (result == VK_SUCCESS)
          result = upload_kick(device, p->es3_load_usc[i], 2 * n + 2, 0, &p->es3_load_kick[i]);
    }
+   /* 4 samples: the end of tile storing the samples, the clear at sample rate */
+   if (result == VK_SUCCESS) {
+      g9p_es3_eot_ms_program(c);
+      result = upload_usc(device, c, &p->es3_eot_ms_usc);
+   }
+   if (result == VK_SUCCESS)
+      result = es3_upload_kick_ms(device, p->clear_usc, 8, &p->es3_clear_ms_kick);
    /* end of tile: every non-empty set of stored targets of four */
    for (unsigned mask = 1; mask < 16 && result == VK_SUCCESS; mask++) {
       g9p_es3_eot_program(c, mask);
@@ -99,6 +128,9 @@ es3_gfx_device_finish(struct pvr_device *device)
    }
    for (unsigned mask = 1; mask < 16; mask++)
       pvr_bo_suballoc_free(p->es3_eot_usc[mask]);
+   pvr_bo_suballoc_free(p->es3_eot_ms_usc);
+   if (p->es3_clear_ms_kick.pvr_bo)
+      pvr_bo_suballoc_free(p->es3_clear_ms_kick.pvr_bo);
 }
 
 /* --- Several colour targets: pipelines ------------------------------------ */
@@ -224,9 +256,14 @@ es3_color_init(const struct pvr_renderpass_hwsetup_render *hw_render, unsigned t
    return NULL;
 }
 
+static VkResult es3_job_init_ms(struct pvr_cmd_buffer *cmd_buffer,
+                                const struct pvr_renderpass_hwsetup_render *hw_render,
+                                struct pvr_render_job *job);
+
 /*
- * g9p_job_init() for a render with several colour targets; *@handled false
- * leaves it to the one-target path
+ * g9p_job_init() for a render with several colour targets, or with 4
+ * samples (es3_job_init_ms()); *@handled false leaves it to the one-target
+ * path
  */
 static VkResult
 es3_job_init(struct pvr_cmd_buffer *cmd_buffer,
@@ -245,6 +282,10 @@ es3_job_init(struct pvr_cmd_buffer *cmd_buffer,
    struct pvr_pds_upload up;
    VkResult result;
 
+   if (hw_render->sample_count > 1) {
+      *handled = true;
+      return es3_job_init_ms(cmd_buffer, hw_render, job);
+   }
    *handled = n > 1;
    if (n <= 1)
       return VK_SUCCESS;
@@ -470,9 +511,15 @@ es3_clear_attachments(struct pvr_cmd_buffer *cmd_buffer, uint32_t attachment_cou
             return result;
       }
    }
-   *handled = n > 1;
-   if (n <= 1)
+   /* 4 samples: the one-target clear program at sample rate (es3_gfx_device_init()) */
+   const bool ms = info->hw_render && info->hw_render->sample_count > 1;
+
+   *handled = n > 1 || ms;
+   if (!*handled)
       return VK_SUCCESS;
+   if (ms && n > 1)
+      return vk_errorf(cmd_buffer, VK_ERROR_FEATURE_NOT_PRESENT,
+                       "G9P: a clear of %u colour targets with 4 samples", n);
    for (uint32_t i = 0; i < attachment_count; i++) {
       const unsigned t = attachments[i].colorAttachment;
 
@@ -487,7 +534,7 @@ es3_clear_attachments(struct pvr_cmd_buffer *cmd_buffer, uint32_t attachment_cou
       return vk_errorf(cmd_buffer, VK_ERROR_FEATURE_NOT_PRESENT,
                        "G9P: a clear of colour targets %#x of %u", cleared, n);
 
-   state.fs_kick = p->es3_clear_kick[es3_mrt_index(n)];
+   state.fs_kick = ms ? p->es3_clear_ms_kick : p->es3_clear_kick[es3_mrt_index(n)];
    dp.fs_common_dwords = 4 * n;
    result = pvr_arch_cmd_buffer_start_sub_cmd(cmd_buffer, PVR_SUB_CMD_TYPE_GRAPHICS);
    if (result != VK_SUCCESS)
@@ -701,6 +748,8 @@ PVR_PER_ARCH(g9p_es3_xfb_end)(struct pvr_cmd_buffer *cmd_buffer, uint32_t first,
       }
       *c = x->written[first + j];
    }
+}
+
 /* --- Depth/stencil formats ------------------------------------------------- */
 
 /*
@@ -809,6 +858,12 @@ es3_ds_check(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_renderpass_hwse
 
    if (!hw || hw->ds_attach_idx == VK_ATTACHMENT_UNUSED)
       return VK_SUCCESS;
+   /* 4 samples: depth and stencil on chip only, as on the A9 (no 4x ZLS capture) */
+   if (hw->sample_count > 1 &&
+       (hw->depth_init == VK_ATTACHMENT_LOAD_OP_LOAD || hw->stencil_init == VK_ATTACHMENT_LOAD_OP_LOAD ||
+        hw->depth_store || hw->stencil_store))
+      return vk_errorf(cmd_buffer, VK_ERROR_FEATURE_NOT_PRESENT,
+                       "G9P: a 4x depth/stencil attachment loaded or stored (on chip only)");
    iview = info->attachments[hw->ds_attach_idx];
    plane = pvr_single_plane_const(pvr_image_view_get_image(iview));
    if (!es3_ds_format(iview->vk.format))
@@ -1026,6 +1081,7 @@ es3_ds_clear(struct pvr_cmd_buffer *cmd_buffer, const VkClearAttachment *att,
                     &(const struct pvr_g9p_draw){ .count = 6 * rect_count, .instances = 1 },
                     VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
 }
+
 /* --- Array and cube textures ----------------------------------------------- */
 
 /*
@@ -1071,3 +1127,238 @@ es3_view_state(const struct pvr_image_view *iview, uint32_t d[4])
       d[3] |= BITFIELD_BIT(29);
 }
 
+/* --- 4x MSAA ----------------------------------------------------------------- */
+
+/*
+ * 4x multisampling with one colour target, as our A9 driver renders it
+ * (exact on A9 hardware in 8 cases: msaa.md). The render target's sample
+ * count and its geometry (TE_AA, the multisample control, the macrotile
+ * size, the region headers) are upstream's render-target dataset with 4
+ * samples; the A10 kernel sets TE_AA as iOS does (5 for 4 samples, which
+ * is also the A9's value). What userspace adds:
+ *  - the fragment stream: ISP_AA mode 4X, ISP_CTL's low nibble 7 where one
+ *    sample has 0xf, the sample positions (6,2) (14,6) (2,10) (10,14) in
+ *    sixteenths, the standard ones, in the A10's 0xfa8 word (one sample:
+ *    0x88, (8,8)), and the per-cluster pixel-output words for 4 samples;
+ *  - the end of tile: storing the samples writes the PBE with the
+ *    multisample layout 4 and emit 1c09 (g9p_es3_eot_ms_program()); a
+ *    render whose target is not stored but resolved (upstream's PBE
+ *    resolve) writes the one-sample target's state with dword 5 bit 10 and
+ *    the one-sample emit; upstream's transfer resolve runs on the CPU in
+ *    pvr_arch_g9p_transfer.c (pvr_arch_g9p_es3_transfer.h);
+ *  - the background and every fragment program at sample rate (DOUTU rate
+ *    2), ISPCTL upass 7 in the draws.
+ * A 4x image is 16 bytes per pixel, sample s at +4s, twiddled (upstream's
+ * size; G9P keeps multisample images twiddled already).
+ * The A10 differences, inferred and untested:
+ *  - the per-cluster words. On the A9 they are (2 count - 1) << 6 |
+ *    log2(width / 2) << 4 | 3 with count = 0x4000 / (width << 10), << 11
+ *    for 4 samples, checked against all five A9 values. The A10's
+ *    one-target value 0x1d3 is that rule at width 4, so 4 samples give
+ *    0xd3. The A9 also changes W3c8 (4 -> 2 here), which the A10 stream
+ *    does not carry;
+ *  - the multisample control word of the TA (sample positions) comes from
+ *    the kernel's dataset code, not from here;
+ *  - the DOUTU sample-rate bits and the multisample PBE layout are A9
+ *    values.
+ * Refused by name: 2 or 8 samples, several colour targets, a target both
+ * stored and PBE-resolved, sample shading, alpha to coverage or to one, a
+ * partial sample mask, tile reads (blending done in the shader), a LOAD of
+ * a 4x target, and loads or stores of a 4x depth/stencil attachment.
+ */
+
+/* The sample positions word (0xfa8): x then y of each sample, 4 bits each */
+static uint64_t
+es3_sample_positions(unsigned samples)
+{
+   /* Vulkan's standard 4-sample locations, in sixteenths of a pixel */
+   static const uint8_t pos4[4][2] = { { 6, 2 }, { 14, 6 }, { 2, 10 }, { 10, 14 } };
+   uint64_t w = 0;
+
+   if (samples != 4)
+      return 0x88;
+   for (unsigned i = 0; i < 4; i++)
+      w |= (uint64_t)(pos4[i][0] | pos4[i][1] << 4) << (8 * i);
+   return w;
+}
+
+/* A per-cluster pixel-output word: @width output registers, @samples */
+static uint32_t
+es3_cluster_word(unsigned width, unsigned samples)
+{
+   const unsigned count = 0x4000 / (width << (samples > 1 ? 11 : 10));
+
+   return (2 * count - 1) << 6 | util_logbase2(width / 2) << 4 | 3;
+}
+
+/* After the fragment shader's kick: the pipeline's samples */
+static VkResult
+es3_ms_pipeline(struct pvr_device *device, const struct vk_graphics_pipeline_state *vk_state,
+                struct pvr_g9p_graphics_state *state, const struct g9p_shader *fs)
+{
+   const struct vk_multisample_state *ms = vk_state->ms;
+   const unsigned samples = ms ? ms->rasterization_samples : 1;
+
+   if (samples <= 1)
+      return VK_SUCCESS;
+   if (samples != 4)
+      return g9p_error(device, "G9P: %u samples (1 or 4 only)", samples);
+   if (vk_state->rp && vk_state->rp->color_attachment_count > 1)
+      return g9p_error(device, "G9P: 4 samples with several colour targets");
+   if (fs->uses_fbfetch || fs->native_blend)
+      return g9p_error(device, "G9P: tile reads with 4 samples");
+   if (ms->sample_shading_enable || ms->alpha_to_coverage_enable || ms->alpha_to_one_enable ||
+       (ms->sample_mask & 0xf) != 0xf)
+      return g9p_error(device, "G9P: sample shading, alpha to coverage or one, or a sample "
+                       "mask with 4 samples");
+   /* the fragment kick at sample rate, in place of upload_kick()'s */
+   pvr_bo_suballoc_free(state->fs_kick.pvr_bo);
+   memset(&state->fs_kick, 0, sizeof(state->fs_kick));
+   return es3_upload_kick_ms(device, state->fs_bo, fs->num_regs, &state->fs_kick);
+}
+
+/* A draw in a 4x render: ISPCTL upass 7 where one sample has 15 */
+static void
+es3_draw_ms(const struct pvr_cmd_buffer *cmd_buffer, uint32_t *ispctl)
+{
+   const struct pvr_renderpass_hwsetup_render *hw = cmd_buffer->state.render_pass_info.hw_render;
+
+   if (hw && hw->sample_count > 1 && ((*ispctl >> 22) & 0xf) == 0xf)
+      *ispctl = (*ispctl & ~(0xfu << 22)) | 7u << 22;
+}
+
+/* g9p_job_init() for a 4x render */
+static VkResult
+es3_job_init_ms(struct pvr_cmd_buffer *cmd_buffer,
+                const struct pvr_renderpass_hwsetup_render *hw_render, struct pvr_render_job *job)
+{
+   struct pvr_device *device = cmd_buffer->device;
+   const struct pvr_g9p_gfx_programs *p = &device->g9p.gfx;
+   const struct pvr_render_pass_info *info = &cmd_buffer->state.render_pass_info;
+   const struct pvr_renderpass_hwsetup_eot_surface *store = NULL, *resolve = NULL;
+   const struct pvr_renderpass_colorinit *ci = hw_render->color_init_count ? &hw_render->color_init[0]
+                                                                          : NULL;
+   const struct pvr_suballoc_bo *eot_usc = p->eot_usc;
+   uint32_t image[8] = { 0 }, bg[4] = { 0 };
+   struct pvr_suballoc_bo *bo;
+   struct pvr_pds_upload up;
+   VkResult result;
+
+   if (hw_render->sample_count != 4)
+      return vk_errorf(cmd_buffer, VK_ERROR_FEATURE_NOT_PRESENT, "G9P: %u samples (1 or 4 only)",
+                       hw_render->sample_count);
+   if (es3_render_targets(hw_render) > 1)
+      return vk_errorf(cmd_buffer, VK_ERROR_FEATURE_NOT_PRESENT,
+                       "G9P: 4 samples with several colour targets");
+   for (unsigned i = 0; i < hw_render->eot_surface_count; i++) {
+      const struct pvr_renderpass_hwsetup_eot_surface *s = &hw_render->eot_surfaces[i];
+
+      if (!s->need_resolve)
+         store = s;
+      else if (s->resolve_type == PVR_RESOLVE_TYPE_PBE)
+         resolve = s;
+      else if (s->resolve_type != PVR_RESOLVE_TYPE_TRANSFER)
+         return vk_errorf(cmd_buffer, VK_ERROR_FEATURE_NOT_PRESENT,
+                          "G9P: a 4x target both stored and resolved by the PBE");
+   }
+   if (store && resolve)
+      return vk_errorf(cmd_buffer, VK_ERROR_FEATURE_NOT_PRESENT,
+                       "G9P: a 4x target both stored and resolved by the PBE");
+   if (ci && ci->op == VK_ATTACHMENT_LOAD_OP_LOAD)
+      return vk_errorf(cmd_buffer, VK_ERROR_FEATURE_NOT_PRESENT,
+                       "G9P: a LOAD of a 4x target (no multisample background load)");
+
+   memset(&job->g9p, 0, sizeof(job->g9p));
+   job->g9p.enabled = true;
+   job->g9p.samples = 4;
+   if (store || resolve) {
+      const struct pvr_image_view *iview = info->attachments[(store ? store : resolve)->attachment_idx];
+      const struct pvr_image *img = pvr_image_view_get_image(iview);
+      const struct pvr_image_plane *plane = pvr_single_plane_const(img);
+      const uint64_t addr = img->dev_addr.addr + plane->offset +
+                            plane->mip_levels[iview->vk.base_mip_level].offset +
+                            iview->vk.base_array_layer * plane->layer_size;
+      const bool linear = img->memlayout == PVR_MEMLAYOUT_LINEAR;
+      const uint32_t pitch = plane->mip_levels[iview->vk.base_mip_level].pitch;
+
+      if (store && linear)
+         return vk_errorf(cmd_buffer, VK_ERROR_FEATURE_NOT_PRESENT,
+                          "G9P: a linear 4x target (multisample surfaces are twiddled)");
+      pack_image_state(image, addr, iview->vk.extent.width, iview->vk.extent.height, linear,
+                       pitch, iview->vk.format);
+      if (store) {
+         /* the multisample layout 4, twiddled (A9 PBE word 0: ...0c) */
+         image[0] = (image[0] & ~0xfu) | 0xc;
+         eot_usc = p->es3_eot_ms_usc;
+      } else {
+         /* the PBE resolves the samples into the one-sample target (A9: q2 bit 42) */
+         image[5] |= BITFIELD_BIT(10);
+      }
+      job->g9p.target_addr = addr;
+      job->g9p.target_pitch = pitch;
+      job->g9p.target_linear = linear;
+      job->g9p.width = iview->vk.extent.width;
+      job->g9p.height = iview->vk.extent.height;
+   }
+   result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, image, 7 * 4, &bo);
+   if (result != VK_SUCCESS)
+      return result;
+   {
+      const uint32_t data[8] = { bo->dev_addr.addr, bo->dev_addr.addr >> 32,
+                                 doutd_ctrl(0, 7, true), 0, usc_offset(device, eot_usc),
+                                 usc_temps(8), 0, 0 };
+
+      result = pvr_arch_cmd_buffer_upload_pds(cmd_buffer, data, ARRAY_SIZE(data), 16, NULL,
+                                              0, 0, 64, &up);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+   job->view_state.view[0].pds_pixel_event_data_offset = up.data_offset;
+   job->g9p.eot_code = p->eot.code_offset;
+
+   /* background: the clear colour (don't care: transparent black) at sample rate */
+   if (ci && ci->op == VK_ATTACHMENT_LOAD_OP_CLEAR && ci->index < info->clear_value_count)
+      memcpy(bg, info->clear_values[ci->index].color.float32, sizeof(bg));
+   job->g9p.load_op = !hw_render->eot_surface_count ? VK_ATTACHMENT_LOAD_OP_CLEAR
+                      : ci                          ? (int)ci->op
+                                                    : G9P_LOAD_OP_NONE;
+   result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, bg, sizeof(bg), &bo);
+   if (result != VK_SUCCESS)
+      return result;
+   {
+      const uint32_t data[4] = { bo->dev_addr.addr, bo->dev_addr.addr >> 32,
+                                 doutd_ctrl(0, 4, true), 0 };
+
+      result = pvr_arch_cmd_buffer_upload_pds(cmd_buffer, data, ARRAY_SIZE(data), 16, NULL,
+                                              0, 0, 64, &up);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+   job->g9p.bgnd[0] = (uint64_t)p->dma.code_offset << 32 | p->es3_clear_ms_kick.data_offset;
+   job->g9p.bgnd[1] = 0;
+   job->g9p.bgnd[2] = up.data_offset;
+   job->g9p.bgnd[3] = 0x0080000000800000ull;
+   return VK_SUCCESS;
+}
+
+/*
+ * The fragment stream's 4x words (offsets of the words g9p_frag_stream()
+ * put: ISP_BGOBJDEPTH, then BGOBJVALS, ISP_AA and ISP_CTL; the sample
+ * positions; cluster 1's six words)
+ */
+static void
+es3_frag_stream_ms(const struct pvr_render_job *job, uint8_t *buf, uint32_t bgobj_at,
+                   uint32_t pos_at, uint32_t cluster1_at)
+{
+   uint32_t *ctl = (uint32_t *)(buf + bgobj_at + 12);
+
+   if (job->g9p.samples != 4)
+      return;
+   pvr_csb_pack ((uint32_t *)(buf + bgobj_at + 8), CR_ISP_AA, aa) {
+      aa.mode = ROGUE_CR_ISP_AA_MODE_TYPE_AA_4X;
+   }
+   *ctl = (*ctl & ~0xfu) | 0x7;
+   *(uint64_t *)(buf + pos_at) = es3_sample_positions(4);
+   for (unsigned i = 0; i < 6; i++)
+      *(uint64_t *)(buf + cluster1_at + 8 * i) = es3_cluster_word(4, 4);
+}

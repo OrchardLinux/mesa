@@ -123,6 +123,9 @@ struct pvr_device {
          struct pvr_suballoc_bo *es3_clear_usc[2], *es3_load_usc[2];
          struct pvr_pds_upload es3_clear_kick[2], es3_load_kick[2];
          struct pvr_suballoc_bo *es3_eot_usc[16];
+         /* 4 samples: the end of tile storing the samples, the clear kick at sample rate */
+         struct pvr_suballoc_bo *es3_eot_ms_usc;
+         struct pvr_pds_upload es3_clear_ms_kick;
 #endif
       } gfx;
       /*

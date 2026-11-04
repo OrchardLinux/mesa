@@ -32,11 +32,15 @@ pvr_g9p_es3_limits(struct vk_device_extension_table *ext, struct vk_features *fe
    /* Textures: 2D, 2D arrays and cube maps (pvr_arch_g9p_es3_gfx.h); no cube arrays */
    features->imageCubeArray = false;
 
-   /* One sample: the render job streams carry no MSAA words */
-   props->framebufferColorSampleCounts = VK_SAMPLE_COUNT_1_BIT;
-   props->framebufferDepthSampleCounts = VK_SAMPLE_COUNT_1_BIT;
-   props->framebufferStencilSampleCounts = VK_SAMPLE_COUNT_1_BIT;
-   props->framebufferNoAttachmentsSampleCounts = VK_SAMPLE_COUNT_1_BIT;
+   /*
+    * 1 or 4 samples (pvr_arch_g9p_es3_gfx.h "4x MSAA"); a 4x image is
+    * rendered and resolved, never sampled
+    */
+   props->framebufferColorSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT;
+   props->framebufferDepthSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT;
+   props->framebufferStencilSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT;
+   props->framebufferNoAttachmentsSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT;
+   props->standardSampleLocations = true;
    props->sampledImageColorSampleCounts = VK_SAMPLE_COUNT_1_BIT;
    props->sampledImageIntegerSampleCounts = VK_SAMPLE_COUNT_1_BIT;
    props->sampledImageDepthSampleCounts = VK_SAMPLE_COUNT_1_BIT;
@@ -61,9 +65,12 @@ pvr_g9p_es3_limits(struct vk_device_extension_table *ext, struct vk_features *fe
 }
 
 VkSampleCountFlags
-pvr_g9p_es3_sample_counts(void)
+pvr_g9p_es3_sample_counts(VkImageUsageFlags usage)
 {
-   return VK_SAMPLE_COUNT_1_BIT;
+   /* sampling and storing a multisample image are not built */
+   if (usage & (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT))
+      return VK_SAMPLE_COUNT_1_BIT;
+   return VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT;
 }
 
 VkFormatFeatureFlags2

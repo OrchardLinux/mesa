@@ -143,4 +143,21 @@ g9p_es3_load_program(struct g9p_code *c, unsigned n)
    g9p_es3_end_fragment(c, 2 * n);
 }
 
+/*
+ * The end of tile of a 4x render that stores its samples (one target): the
+ * PBE write's multisample form, emit 1c09 where a one-sample store (and a
+ * PBE resolve) uses 1c05 (Apple's A9 msaa4-store end of tile, hardware-
+ * proven on the A9: 16384 of 16384 samples exact). An A9 form, untested on
+ * the A10.
+ */
+static inline void
+g9p_es3_eot_ms_program(struct g9p_code *c)
+{
+   c->n = 0;
+   c->fragment = true;
+   g9p_mov_imm(c, 0, 0);
+   G9P_EMIT(c, 0x091c, 0x5100, 0x0800);
+   g9p_end(c);
+}
+
 #endif /* G9P_ES3_ISA_H */

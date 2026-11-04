@@ -26,7 +26,6 @@
 #include "util/format/u_format.h"
 #include "util/u_dynarray.h"
 #include "util/u_math.h"
-
 #include "pvr_cmd_buffer.h"
 #include "pvr_device.h"
 #include "pvr_entrypoints.h"
@@ -34,7 +33,8 @@
 #include "pvr_image.h"
 #include "pvr_job_transfer.h"
 #include "pvr_winsys.h"
-
+#include "pvr_g9p_es3_arch_g9p_transfer_hooks.h"
+   PVR_G9P_ES3_HOOK(arch_g9p_transfer_36)
 /* The CPU address of a device address in a bound buffer or image, or NULL */
 uint8_t *
 PVR_PER_ARCH(g9p_cpu_addr)(struct pvr_device *device, uint64_t addr)
@@ -232,7 +232,7 @@ run(struct pvr_device *device, const struct pvr_transfer_cmd *cmd)
    for (unsigned i = 0; i < cmd->source_count; i++) {
       const struct pvr_transfer_cmd_source *source = &cmd->sources[i];
       struct surface src;
-
+   PVR_G9P_ES3_HOOK(arch_g9p_transfer_235)
       if (!surface_init(device, &source->surface, &src))
          continue;
       if (!source->mapping_count) {
@@ -411,3 +411,7 @@ PVR_PER_ARCH(TransitionImageLayout)(VkDevice device, uint32_t transitionCount,
 {
    return VK_SUCCESS;
 }
+
+#ifdef PVR_G9P_ES3
+#include "pvr_arch_g9p_es3_transfer.h"
+#endif

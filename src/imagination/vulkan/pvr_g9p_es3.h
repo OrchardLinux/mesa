@@ -34,8 +34,15 @@ struct vk_properties;
 void pvr_g9p_es3_limits(struct vk_device_extension_table *ext, struct vk_features *features,
                         struct vk_properties *props);
 
-/* The sample counts a G9P attachment image may have */
-VkSampleCountFlags pvr_g9p_es3_sample_counts(void);
+/* The sample counts a G9P attachment image with @usage may have */
+VkSampleCountFlags pvr_g9p_es3_sample_counts(VkImageUsageFlags usage);
+
+/*
+ * The depth/stencil formats a G9P attachment can have: D16, D32F, S8 and
+ * D32F_S8, attachments only (not sampled: the A10 keeps depth in a layout of
+ * its own), never 24-bit depth
+ */
+VkFormatFeatureFlags2 pvr_g9p_es3_ds_features(VkFormat format);
 
 #ifdef PVR_PER_ARCH
 struct pvr_cmd_buffer;
@@ -53,12 +60,6 @@ void PVR_PER_ARCH(g9p_es3_xfb_end)(struct pvr_cmd_buffer *cmd_buffer, uint32_t f
 #   define pvr_arch_g9p_es3_xfb_begin PVR_PER_ARCH(g9p_es3_xfb_begin)
 #   define pvr_arch_g9p_es3_xfb_end PVR_PER_ARCH(g9p_es3_xfb_end)
 #endif
-/*
- * The depth/stencil formats a G9P attachment can have: D16, D32F, S8 and
- * D32F_S8, attachments only (not sampled: the A10 keeps depth in a layout of
- * its own), never 24-bit depth
- */
-VkFormatFeatureFlags2 pvr_g9p_es3_ds_features(VkFormat format);
 
 #endif /* PVR_G9P_ES3 */
 

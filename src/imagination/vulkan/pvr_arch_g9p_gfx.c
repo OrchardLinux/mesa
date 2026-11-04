@@ -581,13 +581,13 @@ PVR_PER_ARCH(g9p_graphics_pipeline_compile)(struct pvr_device *device,
          g9p_pds_dout(G9P_DOUTU, 0, G9P_PDS_DATA, 0, G9P_PDS_END | G9P_PDS_CC),
          g9p_pds_halt(),
       };
-
       result = pvr_gpu_upload_pds(device, data, ARRAY_SIZE(data), 16, code,
                                   ARRAY_SIZE(code), 16, 64, &state->vs_kick);
       if (result != VK_SUCCESS)
          goto out;
    }
    result = upload_kick(device, state->fs_bo, fs.num_regs, 0, &state->fs_kick);
+   PVR_G9P_ES3_HOOK(arch_g9p_gfx_590)
    if (result == VK_SUCCESS)
       result = upload_varyings(device, state, &fs);
    if (result == VK_SUCCESS && dumping()) {
@@ -1735,6 +1735,9 @@ PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
    *(uint32_t *)buf = s.len;
 
    put32(&s, G9P_EXTHDR_APPLE);
+#ifdef PVR_G9P_ES3
+   const uint32_t es3_pos_at = ALIGN_POT(s.len, 8);
+#endif
    put64(&s, 0x88); /* 0xfa8 sample positions */
    for (unsigned i = 0; i < 4; i++)
       put64(&s, job->g9p.bgnd[i]);
@@ -1785,6 +1788,7 @@ PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
 #ifdef PVR_G9P_ES3
    es3_frag_stream_patch(job, buf, es3_info_at, es3_cluster1_at, es3_r4070_at);
    es3_frag_stream_zls(job, buf, es3_zlsctl_at, es3_bgobj_at);
+   es3_frag_stream_ms(job, buf, es3_bgobj_at, es3_pos_at, es3_cluster1_at);
 #endif
    dump32("frag stream", 0, (const uint32_t *)buf, s.len / 4);
    return s.len;
