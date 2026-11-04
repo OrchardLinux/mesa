@@ -541,35 +541,43 @@ compile_stage(const VkPipelineShaderStageCreateInfo *stage_info, bool half_outpu
       return false;
    }
 
-   /* the SPIR-V words: the module's, or an inline module (maintenance5) */
+   /* the SPIR-V words: the module's, or an inline module (maintenance5); or the driver's own NIR (an internal
+    * module, vk_shader_module_handle_from_nir(): the clear quad's stages) */
    VK_FROM_HANDLE(vk_shader_module, module, stage_info->module);
    const VkShaderModuleCreateInfo *inline_ci = vk_find_struct_const(stage_info->pNext, SHADER_MODULE_CREATE_INFO);
-   const uint32_t *spv;
-   size_t bytes;
+   const nir_shader *internal = module ? module->nir : NULL;
+   const uint32_t *spv = NULL;
+   size_t bytes = 0;
    if (module && !module->nir) {
       spv = (const uint32_t *)module->data;
       bytes = module->size;
-   } else if (inline_ci) {
+   } else if (!internal && inline_ci) {
       spv = inline_ci->pCode;
       bytes = inline_ci->codeSize;
-   } else {
-      snprintf(out->refusal, sizeof(out->refusal), "a shader stage without SPIR-V (an internal NIR module)");
+   } else if (!internal) {
+      snprintf(out->refusal, sizeof(out->refusal), "a shader stage without SPIR-V");
       return false;
    }
-   if (bytes < 20 || bytes % 4) {
+   if (!internal && (bytes < 20 || bytes % 4)) {
       snprintf(out->refusal, sizeof(out->refusal), "SPIR-V of %zu bytes", bytes);
       return false;
    }
-   if (xfb && (stage != MESA_SHADER_VERTEX || !spirv_xfb(spv, bytes / 4))) {
+   if (internal && internal->info.stage != stage) {
+      snprintf(out->refusal, sizeof(out->refusal), "an internal module of another stage");
+      return false;
+   }
+   if (xfb && (stage != MESA_SHADER_VERTEX || internal || !spirv_xfb(spv, bytes / 4))) {
       memset(xfb, 0, sizeof(*xfb)); /* no capture: no variant */
       return true;
    }
 
    glsl_type_singleton_init_or_ref();
    const char *entry = stage_info->pName ? stage_info->pName : "main";
+   const unsigned color_targets = key && key->color_targets ? key->color_targets : 1;
    bool sample_mask = false;
-   nir_shader *nir = graphics_nir(spv, bytes / 4, stage, entry, key && key->color_targets ? key->color_targets : 1,
-                                  &sample_mask);
+   nir_shader *nir = internal ? graphics_lower(g5p_nir_prepare(nir_shader_clone(NULL, internal)), color_targets,
+                                               &sample_mask)
+                              : graphics_nir(spv, bytes / 4, stage, entry, color_targets, &sample_mask);
    bool ok = false;
    if (!nir) {
       snprintf(out->refusal, sizeof(out->refusal), "SPIR-V -> NIR failed");
@@ -668,4 +676,36 @@ pvr_g5p_compile_load(struct pco_g5p_program *out)
    ralloc_free(nir);
    glsl_type_singleton_decref();
    return ok;
+}
+
+/* The clear quad's stages (pvr_g5p.h) */
+nir_shader *
+pvr_g5p_clear_nir(bool vertex)
+{
+   static util_once_flag once = UTIL_ONCE_FLAG_INIT;
+   util_call_once(&once, g5p_init_options);
+   glsl_type_singleton_init_or_ref();
+
+   nir_builder b = nir_builder_init_simple_shader(vertex ? MESA_SHADER_VERTEX : MESA_SHADER_FRAGMENT, &g5p_options,
+                                                  vertex ? "g5p-clear-vs" : "g5p-clear-fs");
+   if (vertex) {
+      nir_variable *pos = nir_variable_create(b.shader, nir_var_shader_in, glsl_vec4_type(), "pos");
+      pos->data.location = VERT_ATTRIB_GENERIC0;
+      nir_variable *out = nir_variable_create(b.shader, nir_var_shader_out, glsl_vec4_type(), "gl_Position");
+      out->data.location = VARYING_SLOT_POS;
+      nir_store_var(&b, out, nir_load_var(&b, pos), 0xf);
+   } else {
+      nir_variable *color = nir_variable_create(b.shader, nir_var_shader_out, glsl_vec4_type(), "color");
+      color->data.location = FRAG_RESULT_DATA0;
+      nir_store_var(&b, color, nir_load_push_constant(&b, 4, 32, nir_imm_int(&b, 0), .base = 0, .range = 16), 0xf);
+      b.shader->num_uniforms = 16;
+   }
+   return b.shader;
+}
+
+void
+pvr_g5p_clear_nir_free(nir_shader *nir)
+{
+   ralloc_free(nir);
+   glsl_type_singleton_decref();
 }

@@ -21,6 +21,7 @@
 
 #include "pvr_common.h"
 #include "pvr_macros.h"
+#include "util/simple_mtx.h"
 #include "pvr_g5p_xfb_core.h"
 
 struct pvr_cmd_buffer;
@@ -84,6 +85,16 @@ struct pvr_g5p_programs {
 /* G5P's per-device state (pvr_device::g5p), allocated by g5p_device_init() */
 struct pvr_g5p_device {
    struct pvr_g5p_programs programs;
+   /* vkCmdClearAttachments' clear quad (pvr_arch_g5p_gfx.c): its pipeline
+    * layout (fragment push constants 0..15) and a pipeline per colour
+    * format, made at first use */
+   simple_mtx_t clear_lock;
+   VkPipelineLayout clear_layout;
+   struct {
+      VkFormat format;
+      VkPipeline pipeline;
+   } clear[8];
+   unsigned clear_count;
 };
 
 /* What a G5P render job hands its fragment stream (pvr_render_job::g5p) */
@@ -225,6 +236,15 @@ bool pvr_g5p_compile_stage(const VkPipelineShaderStageCreateInfo *stage_info, bo
  * texture() of the attachment, bound as set 0 binding 0, at the fragment's
  * pixel centre. false with out->refusal set. */
 bool pvr_g5p_compile_load(struct pco_g5p_program *out);
+/* The clear quad's stages, built with nir_builder (pvr_g5p_nir.c): the
+ * vertex stage passes its vec4 position at location 0 through, the
+ * fragment stage writes the push constant's colour (bytes 0..15) to colour
+ * target 0. A pipeline takes them as internal NIR modules
+ * (vk_shader_module_handle_from_nir()); pvr_g5p_clear_nir_free() frees
+ * one. */
+struct nir_shader;
+struct nir_shader *pvr_g5p_clear_nir(bool vertex);
+void pvr_g5p_clear_nir_free(struct nir_shader *nir);
 /* A vertex stage whose SPIR-V declares ExecutionMode Xfb */
 bool pvr_g5p_stage_has_xfb(const VkPipelineShaderStageCreateInfo *stage_info);
 /* The vertex shader's transform feedback variant (pvr_g5p_nir.c): true with
