@@ -42,6 +42,7 @@
 #include "pvr_g5p_msaa.h"
 #include "pvr_g5p_tex_encode.h"
 #include "pvr_g5p_mrt.h"
+#include "pvr_g5p_perf.h"
 #include "pvr_hw_pass.h"
 #include "pvr_image.h"
 #include "pvr_job_render.h"
@@ -707,6 +708,8 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
    g->eot[0] = eot_data.data_offset;
    g->eot[1] = p->eot.code_offset;
    g->eot[2] = g5p_mrt_eot_info(n);
+   /* what the render writes, for the winsys's resource list (pvr_g5p_perf.h) */
+   pvr_arch_g5p_perf_job(cmd_buffer, hw_render, &g->perf);
    g->enabled = true;
    return VK_SUCCESS;
 }
@@ -793,5 +796,6 @@ PVR_PER_ARCH(g5p_frag_stream)(const struct pvr_device *device, const struct pvr_
    pass.ta_program_size = 0x40;
    pass.vdm_end = g->vdm_bytes;
    memcpy(buf, &pass, sizeof(pass));
-   return sizeof(pass);
+   /* then what the job writes (pvr_g5p_perf.h) */
+   return sizeof(pass) + pvr_g5p_perf_stream_tail(&g->perf, buf + sizeof(pass), size - sizeof(pass));
 }
