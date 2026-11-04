@@ -12,6 +12,7 @@ libpowervr_g5p = static_library(
     'g5p_blend.c',
     'g5p_recipes.c',
     'g5p_usc.c',
+    '../vulkan/pvr_arch_g5p_dgl.c',
     'pco_g5p.c',
     'pco_g5p_general.c',
   ),
