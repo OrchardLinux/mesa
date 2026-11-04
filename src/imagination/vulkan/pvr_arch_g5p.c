@@ -38,6 +38,7 @@
 #include "pvr_device.h"
 #include "pvr_g5p.h"
 #include "pvr_g5p_ds.h"
+#include "pvr_g5p_formats.h"
 #include "pvr_g5p_msaa.h"
 #include "pvr_g5p_tex_encode.h"
 #include "pvr_g5p_mrt.h"
@@ -416,27 +417,25 @@ PVR_PER_ARCH(g5p_device_finish)(struct pvr_device *device)
 
 /* ---- render jobs ---- */
 
-/* PBE state of a linear colour target (the A9 ICD's g5p_pbe_encode; keys
- * of the two formats rendered so far) */
-#define G5P_PBE_KEY(code, r, g, b, a) (0xau | (code) << 5 | (r) << 15 | (g) << 18 | (b) << 21 | (a) << 24)
+/* PBE state of a linear colour target (the A9 ICD's g5p_pbe_encode). The
+ * key and the sRGB bit (q1 bit 45, fmt-srgb8's EOT PBE) are the A9 format
+ * table's (pvr_g5p_formats.h): the formats the two-word fragment program
+ * renders. */
+#define G5P_PBE_SRGB_BIT 45
 
 static bool
-g5p_pbe_key(VkFormat format, uint32_t *key)
+g5p_pbe_key(VkFormat format, uint32_t *key, bool *srgb)
 {
-   switch (format) {
-   case VK_FORMAT_B8G8R8A8_UNORM: *key = G5P_PBE_KEY(0x28, 2, 1, 0, 3); return true;
-   case VK_FORMAT_R8G8B8A8_UNORM: *key = G5P_PBE_KEY(0x28, 0, 1, 2, 3); return true;
-   default: return false;
-   }
+   return pvr_g5p_format_pbe(format, key, srgb);
 }
 
 static void
-g5p_pbe_encode(uint64_t q[3], uint32_t key, uint64_t va, uint32_t width, uint32_t height,
+g5p_pbe_encode(uint64_t q[3], uint32_t key, bool srgb, uint64_t va, uint32_t width, uint32_t height,
                uint32_t row_stride)
 {
    const uint32_t s = row_stride / 16 - 1;
    q[0] = (uint64_t)(height - 1) << 41 | (uint64_t)(width - 1) << 27 | (key & ~8u);
-   q[1] = va >> 1 | (uint64_t)(s & 0x3fffc) << 45 | 1ull << 63;
+   q[1] = va >> 1 | (uint64_t)(s & 0x3fffc) << 45 | (uint64_t)srgb << G5P_PBE_SRGB_BIT | 1ull << 63;
    q[2] = (uint64_t)(s & 3) << 62;
 }
 
@@ -587,13 +586,14 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
       const uint64_t addr = image->dev_addr.addr + plane->offset + level->offset +
                             iview->vk.base_array_layer * plane->layer_size;
       uint32_t key;
+      bool srgb;
       /* 4x (admitted above: one target): the samples stored as they are, or the PBE resolve into the
        * one-sample view this surface names (pvr_g5p_msaa.c) */
       const bool ms_store = g->samples == 4 && !hw_render->eot_surfaces[t].need_resolve;
 
       if (image->memlayout != PVR_MEMLAYOUT_LINEAR && !ms_store)
          return G5P_REFUSE(cmd_buffer, "a non-linear colour target (twiddled PBE is step 7)");
-      if (!g5p_pbe_key(iview->vk.format, &key))
+      if (!g5p_pbe_key(iview->vk.format, &key, &srgb))
          return G5P_REFUSE(cmd_buffer, "colour target format %s", vk_Format_to_str(iview->vk.format));
       if ((level->pitch % 16 && !ms_store) || addr % 64)
          return G5P_REFUSE(cmd_buffer, "a colour target at %#" PRIx64 " with pitch %u (64-byte base, 16-byte rows)",
@@ -602,14 +602,14 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
          pvr_g5p_msaa_pbe_store(pbe[t], key, addr, iview->vk.extent.width, iview->vk.extent.height,
                                 vk_format_is_srgb(iview->vk.format));
       } else {
-         g5p_pbe_encode(pbe[t], key, addr, iview->vk.extent.width, iview->vk.extent.height, level->pitch);
+         g5p_pbe_encode(pbe[t], key, srgb, addr, iview->vk.extent.width, iview->vk.extent.height, level->pitch);
          if (g->samples == 4) {
             pvr_g5p_msaa_pbe_resolve(pbe[t]);
             g->msaa_resolve = true;
          }
       }
       if (!t)
-         pvr_g5p_tex_linear(load_state, key, false, addr, iview->vk.extent.width, iview->vk.extent.height,
+         pvr_g5p_tex_linear(load_state, key, srgb, addr, iview->vk.extent.width, iview->vk.extent.height,
                             level->pitch);
       if (!t) {
          g->width = iview->vk.extent.width;

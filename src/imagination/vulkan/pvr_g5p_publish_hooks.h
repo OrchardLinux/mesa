@@ -131,10 +131,11 @@ pvr_g5p_vertex_buffer_format(VkFormat vk_format)
 
 #define PVR_G5P_HOOK_pub_pvr_arch_queue_619() \
    /* G5P: the A9's firmware has no transfer engine either (the apple_g5p \
-    * winsys refuses transfer jobs); the CPU does them, as on G9P \
+    * winsys refuses transfer jobs); the CPU does them, as on G9P, plus what \
+    * only the A9's copies know (pvr_g5p_layout.h) \
     */ \
    if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p)) \
-      result = pvr_arch_g9p_transfer_submit( \
+      result = pvr_arch_g5p_transfer_submit( \
          device, \
          sub_cmd, \
          queue->next_job_wait_sync[PVR_JOB_TYPE_TRANSFER], \

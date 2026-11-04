@@ -345,7 +345,7 @@ pvr_get_image_format_features2(struct pvr_physical_device *pdevice,
       flags |= VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |
                VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
    }
-
+   PVR_G5P_HOOK(color_format_features, pdevice, vk_format, vk_tiling, flags)
    /*
     * Apple G9P: textures only in the colour formats its image state is
     * decoded for, so that Zink and others pick one of those (Qt's 8-bit
@@ -706,7 +706,7 @@ pvr_get_image_format_properties(struct pvr_physical_device *pdevice,
       result = vk_error(pdevice, VK_ERROR_FORMAT_NOT_SUPPORTED);
       goto err_unsupported_format;
    }
-
+   PVR_G5P_HOOK(image_format, pdevice, info, tiling, result)
    /* If VK_IMAGE_CREATE_EXTENDED_USAGE_BIT is set, the driver can't decide if a
     * specific format isn't supported based on the usage.
     */
