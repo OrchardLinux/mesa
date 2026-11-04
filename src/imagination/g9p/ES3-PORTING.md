@@ -19,7 +19,7 @@ Run names are retained so a missing result is not replaced with an inference.
 
 | Piece | A9 evidence | Check first on A10 | G9P status in this series |
 |---|---|---|---|
-| MRT | `mrt-3331b2b41c2`: one/mrt2/mrt4 exact; `mrt-e77c2137632`: same; `mrt-3331b2b41c2-r2`: 4 rungs including mrt4-vary | MRT2 first, then MRT4 output width and per-cluster words; A9's W3c8/W6b0 have no direct A10 stream slot | adapted implementation and primary test retained |
+| MRT | `groups-8fd3928b47a/device-run`: one/mrt2/mrt4/mrt4-vary, **12 jobs exact**; earlier mrt-3331b2b41c2 had only the three constant-output cases passing | MRT2 first, then MRT4 output width and per-cluster words; A9's W3c8/W6b0 have no direct A10 stream slot | adapted implementation and primary test retained |
 | XFB queries + discard | `xfb-eb1aa2ce790`, run `xfb-20261104T143005Z`: rec/two/overflow/resume/query/discard, **6/6 exact** | Capture/counters before queries; whole-primitive overflow; resubmission and query availability; discard must suppress colour/depth while keeping vertex stores | existing XFB retained; new six-case `tests/xfb-stream` probe; query/discard implementation remains follow-up |
 | Sampled D32F/D32F_S8 + compare | `dsms-6dec648c9d4`, run `dsamp-20261104T144703Z`: depth control plus raw/cmp/raw8/cmp8/stencil8, **6/6** | Stored depth layout and plane base first; raw sampling before compare operand order | attachment implementation retained; typed sampling recipe below and `tests/depthstencil/build/ds-sample-vk` |
 | Vertex input | `vtxin-71fa6eb573e`, `device-run-13`: **45/45** | Fetch byte/norm conversion, firstInstance, divisor 0/1/>1, restart sentinels, point-size output ordering | recipe and API-only `tests/vertex-input`; no untested vertex-format/divisor caps added |
