@@ -176,8 +176,9 @@ g5p_up_buffer(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_stage_uplo
    const struct pvr_descriptor_state *ds = &cmd_buffer->state.gfx_desc_state;
    const struct pvr_descriptor_set *set = ds->sets[u->set];
 
-   if (!set || u->binding >= set->layout->binding_count)
-      return G5P_UP_REFUSE(cmd_buffer, "vertex upload: set %u binding %u is not bound", u->set, u->binding);
+   /* a set without a layout: a pushed set not instantiated (never dereferenced) */
+   if (!set || !set->layout || u->binding >= set->layout->binding_count)
+      return G5P_UP_REFUSE(cmd_buffer, "upload: set %u binding %u is not bound", u->set, u->binding);
    const struct pvr_descriptor_set_layout_binding *lb = &set->layout->bindings[u->binding];
    struct pvr_buffer_descriptor d;
    switch (lb->type) {
@@ -191,15 +192,26 @@ g5p_up_buffer(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_stage_uplo
       d = set->dynamic_buffers[lb->dynamic_buffer_idx];
       break;
    default:
-      return G5P_UP_REFUSE(cmd_buffer, "vertex upload: set %u binding %u is a %s, not a buffer", u->set,
+      return G5P_UP_REFUSE(cmd_buffer, "upload: set %u binding %u is a %s, not a buffer", u->set,
                            u->binding, vk_DescriptorType_to_str(lb->type));
    }
    if (!d.addr)
-      return G5P_UP_REFUSE(cmd_buffer, "vertex upload: set %u binding %u holds no buffer", u->set, u->binding);
+      return G5P_UP_REFUSE(cmd_buffer, "upload: set %u binding %u holds no buffer", u->set, u->binding);
    /* a dynamic buffer's range starts at its dynamic offset (VkDescriptorBufferInfo.range from there) */
    *addr = d.addr + d.offset;
    *size = d.size;
    return VK_SUCCESS;
+}
+
+/* The same lookup for the fragment stage's uploads (pvr_arch_g5p_gfx.c fs_uploads()) */
+VkResult
+PVR_PER_ARCH(g5p_upload_buffer)(struct pvr_cmd_buffer *cmd_buffer, unsigned set, unsigned binding, uint64_t *addr,
+                                uint64_t *size)
+{
+   const struct pvr_g5p_stage_upload u = { .set = set, .binding = binding };
+   if (set >= PVR_MAX_DESCRIPTOR_SETS)
+      return G5P_UP_REFUSE(cmd_buffer, "upload: set %u", set);
+   return g5p_up_buffer(cmd_buffer, &u, addr, size);
 }
 
 VkResult

@@ -495,11 +495,20 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
       case PCO_G5P_UPLOAD_SAMPLER:
       case PCO_G5P_UPLOAD_IMAGE_SIZE:
       case PCO_G5P_UPLOAD_BLEND_CONSTANTS:
+         if (u->dwords > 8)
+            return G5P_REFUSE(device, "fragment upload %u: %u dwords of descriptor words", i, u->dwords);
+         break;
+      case PCO_G5P_UPLOAD_PUSH:
+      case PCO_G5P_UPLOAD_UBO:
+      case PCO_G5P_UPLOAD_UBO_ADDR:
+      case PCO_G5P_UPLOAD_SSBO_ADDR:
+         /* read where they are (the vertex stage's uploads, pvr_arch_g5p_upload.c) */
          break;
       default:
-         return G5P_REFUSE(device, "fragment upload kind %u (push constants and buffers are not built)", u->kind);
+         return G5P_REFUSE(device, "fragment upload kind %u", u->kind);
       }
-      if (u->dwords > 8 || u->set > UINT8_MAX || u->binding > UINT8_MAX || u->offset > UINT16_MAX)
+      if (!u->dwords || u->dwords > UINT8_MAX || u->set > UINT8_MAX || u->binding > UINT8_MAX ||
+          u->offset > UINT16_MAX)
          return G5P_REFUSE(device, "fragment upload %u: set %u binding %u offset %u, %u dwords", i, u->set,
                            u->binding, u->offset, u->dwords);
       g->fs_uploads[i] = (struct pvr_g5p_upload){ .kind = u->kind, .set = u->set, .binding = u->binding,
@@ -810,26 +819,75 @@ fs_uploads(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_pipeline *g, 
 {
    const struct pvr_descriptor_state *ds = &cmd_buffer->state.gfx_desc_state;
    const struct vk_dynamic_graphics_state *dyn = &cmd_buffer->vk.dynamic_graphics_state;
+   const struct pvr_push_constants *push = &cmd_buffer->state.push_consts[PVR_STAGE_ALLOCATION_FRAGMENT];
    const unsigned n = g->fs_num_uploads;
+   /* descriptor words and blend constants are copied into one block (8 dwords per upload); push constants,
+    * uniform buffers and buffer addresses are read where they are, as the vertex stage's uploads are
+    * (pvr_arch_g5p_upload.c): each upload has its own DOUTD source address */
    uint32_t words[PVR_G5P_MAX_FS_UPLOADS][8] = { { 0 } }, data[4 * PVR_G5P_MAX_FS_UPLOADS];
+   uint64_t src[PVR_G5P_MAX_FS_UPLOADS] = { 0 };
+   bool copied[PVR_G5P_MAX_FS_UPLOADS] = { false };
    struct pvr_suballoc_bo *bo;
    struct pvr_pds_upload up;
    VkResult result;
 
    for (unsigned i = 0; i < n; i++) {
       const struct pvr_g5p_upload *u = &g->fs_uploads[i];
+      const unsigned bytes = 4 * u->dwords;
       uint32_t *out = words[i];
+      uint64_t addr, size;
 
-      if (u->kind == PCO_G5P_UPLOAD_BLEND_CONSTANTS) {
+      switch (u->kind) {
+      case PCO_G5P_UPLOAD_BLEND_CONSTANTS: {
          float bc[4];
          if (u->dwords != 4)
             return G5P_REFUSE(cmd_buffer, "blend constants of %u dwords", u->dwords);
          pvr_g5p_blend_constants(dyn->cb.blend_constants, bc);
          memcpy(out, bc, sizeof(bc));
+         copied[i] = true;
          continue;
       }
+      case PCO_G5P_UPLOAD_PUSH:
+         /* the bytes the program reads, as they are now (a copy per draw) */
+         if (u->offset + bytes > PVR_MAX_PUSH_CONSTANTS_SIZE)
+            return G5P_REFUSE(cmd_buffer, "fragment push constants [%u, %u) past %u bytes", u->offset,
+                              u->offset + bytes, PVR_MAX_PUSH_CONSTANTS_SIZE);
+         result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, push->data + u->offset, bytes, &bo);
+         if (result != VK_SUCCESS)
+            return result;
+         src[i] = bo->dev_addr.addr;
+         continue;
+      case PCO_G5P_UPLOAD_UBO:
+         /* the buffer itself: the DOUTD reads it when the job runs */
+         result = pvr_arch_g5p_upload_buffer(cmd_buffer, u->set, u->binding, &addr, &size);
+         if (result != VK_SUCCESS)
+            return result;
+         if (u->offset + bytes > size)
+            return G5P_REFUSE(cmd_buffer, "fragment uniform buffer at set %u binding %u: [%u, %u) past its %" PRIu64
+                              " bytes", u->set, u->binding, u->offset, u->offset + bytes, size);
+         src[i] = addr + u->offset;
+         continue;
+      case PCO_G5P_UPLOAD_UBO_ADDR:
+      case PCO_G5P_UPLOAD_SSBO_ADDR: {
+         /* the 64-bit address a register-indexed or storage access adds to */
+         result = pvr_arch_g5p_upload_buffer(cmd_buffer, u->set, u->binding, &addr, &size);
+         if (result != VK_SUCCESS)
+            return result;
+         if (u->dwords != 2 || (u->kind == PCO_G5P_UPLOAD_UBO_ADDR && u->offset >= size))
+            return G5P_REFUSE(cmd_buffer, "fragment buffer address: %u dwords at offset %u of %" PRIu64 " bytes",
+                              u->dwords, u->offset, size);
+         const uint64_t va = addr + (u->kind == PCO_G5P_UPLOAD_UBO_ADDR ? u->offset : 0);
+         result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, &va, sizeof(va), &bo);
+         if (result != VK_SUCCESS)
+            return result;
+         src[i] = bo->dev_addr.addr;
+         continue;
+      }
+      default:
+         break;
+      }
       const struct pvr_descriptor_set *set = u->set < PVR_MAX_DESCRIPTOR_SETS ? ds->sets[u->set] : NULL;
-      if (!set || u->binding >= set->layout->binding_count)
+      if (!set || !set->layout || u->binding >= set->layout->binding_count)
          return G5P_REFUSE(cmd_buffer, "fragment upload: set %u binding %u is not bound", u->set, u->binding);
       const struct pvr_descriptor_set_layout_binding *lb = &set->layout->bindings[u->binding];
       const uint32_t *desc = (const uint32_t *)((const uint8_t *)set->mapping + lb->offset);
@@ -857,16 +915,24 @@ fs_uploads(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_pipeline *g, 
       default:
          return G5P_REFUSE(cmd_buffer, "fragment upload kind %u", u->kind);
       }
+      copied[i] = true;
    }
-   result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, words, sizeof(words[0]) * n, &bo);
-   if (result != VK_SUCCESS)
-      return result;
+   bool any_copied = false;
+   for (unsigned i = 0; i < n; i++)
+      any_copied |= copied[i];
+   if (any_copied) {
+      result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, words, sizeof(words[0]) * n, &bo);
+      if (result != VK_SUCCESS)
+         return result;
+      for (unsigned i = 0; i < n; i++)
+         if (copied[i])
+            src[i] = bo->dev_addr.addr + sizeof(words[0]) * i;
+   }
    for (unsigned i = 0; i < n; i++) {
       const struct pvr_g5p_upload *u = &g->fs_uploads[i];
-      const uint64_t src = bo->dev_addr.addr + sizeof(words[0]) * i;
 
-      data[2 * i] = (uint32_t)src;
-      data[2 * i + 1] = (uint32_t)(src >> 32);
+      data[2 * i] = (uint32_t)src[i];
+      data[2 * i + 1] = (uint32_t)(src[i] >> 32);
       data[2 * n + 2 * i] = doutd_control(u->common, u->dwords, i == n - 1);
       data[2 * n + 2 * i + 1] = 0;
    }
