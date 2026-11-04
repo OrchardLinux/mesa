@@ -144,6 +144,8 @@ endif
 if with_imagination_g5p
   common_per_arch_files += files(
     'pvr_arch_g5p.c',
+    'pvr_arch_g5p_blend.c',
+    'pvr_arch_g5p_tex.c',
   )
   pvr_files += files(
     'winsys/apple_g5p/g5p_drm_transport.c',
