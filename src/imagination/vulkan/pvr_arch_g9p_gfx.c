@@ -45,7 +45,7 @@
 #include "pvr_job_render.h"
 #include "pvr_physical_device.h"
 #include "pvr_pipeline.h"
-
+#include "pvr_g9p_es3_arch_g9p_gfx_hooks.h"
 static_assert(ARRAY_SIZE(((struct pvr_g9p_graphics_state *)0)->buffers) == G9P_MAX_BUFFERS &&
                  ARRAY_SIZE(((struct pvr_g9p_graphics_state *)0)->fs_buffers) == G9P_MAX_BUFFERS,
               "pvr_pipeline.h sizes the shaders' buffer slots by G9P_MAX_BUFFERS");
@@ -286,8 +286,8 @@ PVR_PER_ARCH(g9p_gfx_device_init)(struct pvr_device *device)
       result = pvr_gpu_upload(device, device->heaps.general_heap, zeros, sizeof(zeros),
                               64, &p->ctx_state);
    if (result == VK_SUCCESS)
+   PVR_G9P_ES3_HOOK(arch_g9p_gfx_288)
       result = pvr_gpu_upload(device, device->heaps.general_heap, zeros, 64, 64, &p->zeros);
-
 out:
    free(c);
    return result;
@@ -319,8 +319,8 @@ PVR_PER_ARCH(g9p_gfx_device_finish)(struct pvr_device *device)
    pvr_bo_suballoc_free(p->load_usc);
    pvr_bo_suballoc_free(p->load_kick.pvr_bo);
    pvr_bo_suballoc_free(p->clear_vs_kick.pvr_bo);
+   PVR_G9P_ES3_HOOK(arch_g9p_gfx_321)
 }
-
 /* --- Pipelines ------------------------------------------------------------ */
 
 /*
@@ -505,19 +505,18 @@ PVR_PER_ARCH(g9p_graphics_pipeline_compile)(struct pvr_device *device,
          };
       }
    }
-
    {
       /* gl_FragCoord's varying follows the vertex shader's own */
       nir_shader *vs_nir, *fs_nir;
       nir_lower_blend_options blend;
       unsigned slot;
-
       result = stage_nir(device, pipeline, vs_info, mem_ctx, &vs_nir);
       if (result == VK_SUCCESS)
          result = stage_nir(device, pipeline, fs_info, mem_ctx, &fs_nir);
       if (result != VK_SUCCESS)
          goto out;
       slot = g9p_frag_coord_slot(vs_nir);
+   PVR_G9P_ES3_HOOK(arch_g9p_gfx_520)
       result = compile_stage(device, fs_nir, fs_info, NULL, slot,
                              blend_options(vk_state, &blend) ? &blend : NULL, &fs, mem_ctx);
       if (result == VK_SUCCESS)
@@ -526,6 +525,7 @@ PVR_PER_ARCH(g9p_graphics_pipeline_compile)(struct pvr_device *device,
    }
    if (result != VK_SUCCESS)
       goto out;
+   PVR_G9P_ES3_HOOK(arch_g9p_gfx_528)
    if (fs.num_varyings > vs.num_varyings) {
       result = g9p_error(device,
                          "G9P: the fragment shader reads varyings the vertex shader "
@@ -1264,7 +1264,7 @@ PVR_PER_ARCH(g9p_clear_attachments)(struct pvr_cmd_buffer *cmd_buffer, uint32_t 
    struct pvr_suballoc_bo *verts_bo, *table_bo, *colour_bo;
    float *verts;
    VkResult result;
-
+   PVR_G9P_ES3_HOOK(arch_g9p_gfx_1267)
    for (uint32_t i = 0; i < attachment_count; i++) {
       if ((attachments[i].aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) &&
           attachments[i].colorAttachment == 0)
@@ -1453,7 +1453,7 @@ PVR_PER_ARCH(g9p_job_init)(struct pvr_cmd_buffer *cmd_buffer,
    struct pvr_pds_upload up;
    uint32_t image[8];
    VkResult result;
-
+   PVR_G9P_ES3_HOOK(arch_g9p_gfx_1456)
    memset(&job->g9p, 0, sizeof(job->g9p));
    job->g9p.enabled = true;
 
@@ -1718,6 +1718,9 @@ PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
    put32(&s, (job->g9p.load || job->g9p.load_op == G9P_LOAD_OP_NONE) && !getenv("G9P_ALL_TILES")
                 ? 0x21000f
                 : 0x23000f);
+#ifdef PVR_G9P_ES3
+   const uint32_t es3_info_at = s.len;
+#endif
    put32(&s, 0x402);    /* EVENT_PIXEL_PDS_INFO */
    put32(&s, 0);
    put32(&s, job->view_state.view[0].pds_pixel_event_data_offset);
@@ -1731,6 +1734,9 @@ PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
       put64(&s, job->g9p.bgnd[i]);
    for (unsigned i = 0; i < 6; i++)
       put64(&s, 0);     /* cluster 0 */
+#ifdef PVR_G9P_ES3
+   const uint32_t es3_cluster1_at = ALIGN_POT(s.len, 8);
+#endif
    for (unsigned i = 0; i < 6; i++)
       put64(&s, 0x1d3); /* cluster 1 */
    put64(&s, 0);        /* 0xfd0 */
@@ -1759,6 +1765,9 @@ PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
    put32(&s, job->has_depth_attachment
                 ? (job->ds.physical_extent.width - 1) | (job->ds.physical_extent.height - 1) << 15
                 : 4);
+#ifdef PVR_G9P_ES3
+   const uint32_t es3_r4070_at = s.len;
+#endif
    put32(&s, 0xf9);
    /* line rasterization (iOS 10): tan 15° / size, tan 60° / size, 16 x width */
    put32(&s, fui(t15 / w));
@@ -1767,6 +1776,13 @@ PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
    put32(&s, fui(t60 / h));
    put32(&s, fui(16.0f * w));
    put32(&s, fui(t15 / w));
+#ifdef PVR_G9P_ES3
+   es3_frag_stream_patch(job, buf, es3_info_at, es3_cluster1_at, es3_r4070_at);
+#endif
    dump32("frag stream", 0, (const uint32_t *)buf, s.len / 4);
    return s.len;
 }
+
+#ifdef PVR_G9P_ES3
+#include "pvr_arch_g9p_es3_gfx.h"
+#endif

@@ -159,6 +159,14 @@ struct pvr_render_job {
        * (don't care: the render pass setup initializes nothing)
        */
       int load_op;
+#ifdef PVR_G9P_ES3
+      /*
+       * -Dimagination-g9p-es3: the colour targets (0 or 1: the paths above)
+       * and the end of tile's EVENT_PIXEL_PDS_INFO with several
+       */
+      unsigned num_targets;
+      uint32_t eot_info;
+#endif
    } g9p;
 
    /*

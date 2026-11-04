@@ -129,6 +129,13 @@ struct g9p_shader {
    struct {
       unsigned set, binding;
    } textures[G9P_MAX_TEXTURES];
+#ifdef PVR_G9P_ES3
+   /*
+    * Fragment, -Dimagination-g9p-es3: the colour targets written (the last
+    * FRAG_RESULT_DATAn + 1), each in output halves 4t..4t+3
+    */
+   unsigned num_targets;
+#endif
 };
 
 const struct spirv_to_nir_options *g9p_spirv_options(void);

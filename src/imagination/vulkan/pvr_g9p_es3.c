@@ -20,9 +20,14 @@ void
 pvr_g9p_es3_limits(struct vk_device_extension_table *ext, struct vk_features *features,
                    struct vk_properties *props)
 {
-   /* Colour targets: the fragment shader writes the first one only */
-   props->maxColorAttachments = 1;
-   props->maxFragmentOutputAttachments = 1;
+   /*
+    * Colour targets: 1, 2 or 4 of the same 8-bit RGBA format, without
+    * blending past the first (pvr_arch_g9p_es3_gfx.h); three are refused
+    * when a pipeline is created
+    */
+   props->maxColorAttachments = 4;
+   props->maxFragmentOutputAttachments = 4;
+   features->independentBlend = false;
 
    /* One sample: the render job streams carry no MSAA words */
    props->framebufferColorSampleCounts = VK_SAMPLE_COUNT_1_BIT;

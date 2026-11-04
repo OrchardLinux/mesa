@@ -33,6 +33,9 @@
 #include "util/format/u_format.h"
 #include "g9p_compile.h"
 #include "g9p_isa.h"
+#ifdef PVR_G9P_ES3
+#include "g9p_es3_isa.h"
+#endif
 
 /* r0-r29 for values, the mask stack after them (G9P_REGS: debug override) */
 static unsigned
@@ -115,6 +118,10 @@ struct g9p_ctx {
    } outputs[4 + 4 * G9P_MAX_VARYINGS];
    unsigned num_outputs;
    int colour[4];
+#ifdef PVR_G9P_ES3
+   /* -Dimagination-g9p-es3: the colour components of targets 1-3, as colour[] */
+   int colour_mrt[G9P_ES3_MAX_TARGETS - 1][4];
+#endif
 
    /* Per SSA scalar (def index * 4 + component) */
    int8_t *reg;
@@ -1217,6 +1224,12 @@ emit_output(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
          release(ctx, &intr->instr);
          return true;
       }
+#ifdef PVR_G9P_ES3
+   } else if (sem.location > FRAG_RESULT_DATA0 &&
+              sem.location < FRAG_RESULT_DATA0 + G9P_ES3_MAX_TARGETS) {
+      /* -Dimagination-g9p-es3: colour target 1-3, its halves at the end */
+      slot = sem.location - FRAG_RESULT_DATA0;
+#endif
    } else if (sem.location > FRAG_RESULT_DATA0 && sem.location < FRAG_RESULT_DATA0 + 8) {
       /* one colour attachment so far: the others' outputs are dropped */
       release(ctx, &intr->instr);
@@ -1239,6 +1252,13 @@ emit_output(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
       r = own;
    }
    pin(ctx, r);
+#ifdef PVR_G9P_ES3
+   if (ctx->stage == MESA_SHADER_FRAGMENT && slot > 0) {
+      ctx->colour_mrt[slot - 1][comp] = r;
+      release(ctx, &intr->instr);
+      return true;
+   }
+#endif
    if (ctx->stage == MESA_SHADER_VERTEX) {
       ctx->outputs[ctx->num_outputs].reg = r;
       ctx->outputs[ctx->num_outputs].slot = slot;
@@ -1881,6 +1901,37 @@ emit_cf_list(struct g9p_ctx *ctx, struct exec_list *list)
    return true;
 }
 
+#ifdef PVR_G9P_ES3
+/*
+ * -Dimagination-g9p-es3: the end of a fragment shader with several colour
+ * targets. Target t's components go to output halves 4t..4t+3 (r(2t) =
+ * {g:r}, r(2t+1) = {a:b}, Apple's A9 layout, mrt.md), unwritten ones 0, and
+ * one emit writes all 2n output registers (g9p_es3_end_fragment()).
+ */
+static bool
+end_targets(struct g9p_ctx *ctx)
+{
+   const unsigned n = ctx->out->num_targets;
+
+   for (unsigned t = 0; t < n; t++) {
+      int *colour = t ? ctx->colour_mrt[t - 1] : ctx->colour;
+
+      for (unsigned i = 0; i < 4; i++) {
+         if (colour[i] < 0) {
+            colour[i] = alloc_reg(ctx);
+            if (colour[i] < 0)
+               return false;
+            g9p_mov_imm(ctx->c, colour[i], 0);
+         }
+      }
+      for (unsigned i = 0; i < 4; i++)
+         g9p_to_half(ctx->c, 4 * t + i, colour[i]);
+   }
+   g9p_es3_end_fragment(ctx->c, 2 * n);
+   return true;
+}
+#endif
+
 /* One code generation with the mask stack in @st */
 static bool
 generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
@@ -1908,6 +1959,26 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
    ctx->num_outputs = 0;
    for (unsigned i = 0; i < 4; i++)
       ctx->colour[i] = -1;
+#ifdef PVR_G9P_ES3
+   for (unsigned t = 0; t < G9P_ES3_MAX_TARGETS - 1; t++) {
+      for (unsigned i = 0; i < 4; i++)
+         ctx->colour_mrt[t][i] = -1;
+   }
+   /*
+    * Several colour targets: target t's halves are r(2t)-r(2t+1) at the
+    * end, as Apple's A9 compiler places them (two output registers per
+    * 8-bit RGBA target), so r0-r(2n-1) stay reserved like r0-r1
+    */
+   ctx->out->num_targets = 0;
+   if (ctx->stage == MESA_SHADER_FRAGMENT) {
+      const uint64_t written = impl->function->shader->info.outputs_written;
+
+      ctx->out->num_targets =
+         util_last_bit64((written >> FRAG_RESULT_DATA0) & BITFIELD64_MASK(G9P_ES3_MAX_TARGETS));
+      if ((written & BITFIELD64_BIT(FRAG_RESULT_COLOR)) && !ctx->out->num_targets)
+         ctx->out->num_targets = 1;
+   }
+#endif
 
    /*
     * Vertex shaders: r0 is the vertex index and r1 the instance index
@@ -1916,6 +1987,10 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
     */
    if (ctx->stage == MESA_SHADER_VERTEX || ctx->stage == MESA_SHADER_FRAGMENT)
       ctx->busy = ctx->pinned = BITFIELD64_RANGE(0, 2);
+#ifdef PVR_G9P_ES3
+   if (ctx->stage == MESA_SHADER_FRAGMENT && ctx->out->num_targets > 1)
+      ctx->busy = ctx->pinned = BITFIELD64_RANGE(0, 2 * ctx->out->num_targets);
+#endif
 
    /* compute: r0 holds the local index from the start when it is used */
    nir_foreach_block(block, impl) {
@@ -1967,6 +2042,13 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
       break;
    case MESA_SHADER_FRAGMENT: {
       bool colour = false;
+#ifdef PVR_G9P_ES3
+      if (ctx->out->num_targets > 1) {
+         if (!end_targets(ctx))
+            return false;
+         break;
+      }
+#endif
 
       for (unsigned i = 0; i < 4; i++)
          colour |= ctx->colour[i] >= 0;
@@ -2220,6 +2302,10 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
    nir_index_ssa_defs(impl);
    if (getenv("G9P_DEBUG"))
       nir_print_shader(nir, stderr);
+#ifdef PVR_G9P_ES3
+   /* the colour targets written, for generate() (outputs_written) */
+   nir_shader_gather_info(nir, impl);
+#endif
 
    if (stage == MESA_SHADER_COMPUTE) {
       for (unsigned i = 0; i < 3; i++)
