@@ -65,4 +65,19 @@
       align = cpp_ && 64 % cpp_ == 0 ? 64 / cpp_ : 64;                      \
    }
 
+/* pvr_device.c, pvr_MapMemory2(): the CPU transfer path G5P shares with G9P
+ * (pvr_arch_g9p_cpu_addr()) maps a bound BO and leaves it mapped. That is the
+ * driver's mapping, not the application's, so a vkMapMemory of that memory
+ * maps it again (the same CPU address, or a placed one) instead of being
+ * refused as "already mapped".
+ */
+#define PVR_G5P_HOOK_map_again(device, mem, addr, offset, data)          \
+   if (PVR_HAS_FEATURE(&(device)->pdevice->dev_info, apple_g5p) &&        \
+       (mem)->bo->map) {                                                  \
+      VkResult r_ = (device)->ws->ops->buffer_map((mem)->bo, addr);       \
+      if (r_ == VK_SUCCESS)                                               \
+         *(data) = (uint8_t *)(mem)->bo->map + (offset);                  \
+      return r_;                                                          \
+   }
+
 #endif /* PVR_G5P_HOOKS_H */
