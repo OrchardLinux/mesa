@@ -27,6 +27,7 @@
 #include "pco/pco.h"
 #include "pco_g5p_general.h"
 #include "pvr_g5p.h"
+#include "pvr_g5p_vertex.h"
 
 /* nir->options must outlive the shader (the general backend runs NIR passes
  * after the preparation returns), so the options are static. */
@@ -434,8 +435,9 @@ graphics_nir(const uint32_t *spv, size_t words, mesa_shader_stage stage, const c
 }
 
 /* Vertex system values: the hardware index the PDS writes is the draw's
- * first vertex + i, which is gl_VertexIndex; the base instance is 0 (the
- * draw refuses firstInstance != 0). */
+ * first vertex + i, which is gl_VertexIndex; the base instance is 0, as the
+ * instance index already holds it (the fetch program adds the first instance
+ * to t1, Apple's g3b-basevertex form). */
 static bool
 lower_vs_sysvals(nir_builder *b, nir_intrinsic_instr *in, void *data)
 {
@@ -466,7 +468,7 @@ vs_sysvals(nir_shader *nir)
 
 bool
 pvr_g5p_compile_stage(const VkPipelineShaderStageCreateInfo *stage_info, bool half_output, uint32_t samples,
-                      const uint8_t *attrib_components, const struct pco_g5p_fs_key *key,
+                      struct pvr_g5p_vertex_layout *vertex, const struct pco_g5p_fs_key *key,
                       const struct pco_g5p_vs_link *link, struct pco_g5p_program *out)
 {
    memset(out, 0, sizeof(*out));
@@ -515,10 +517,13 @@ pvr_g5p_compile_stage(const VkPipelineShaderStageCreateInfo *stage_info, bool ha
       /* the lowering above is the one-sample rule; at 4x the mask needs the program's coverage feedback */
       snprintf(out->refusal, sizeof(out->refusal), "gl_SampleMask or gl_SampleMaskIn at %u samples "
                "(the coverage feedback is not built)", samples);
+   } else if (stage == MESA_SHADER_VERTEX && vertex && !pvr_g5p_vertex_lower(nir, vertex)) {
+      /* the vertex input layout (pvr_g5p_vertex_nir.c) */
+      snprintf(out->refusal, sizeof(out->refusal), "%s", vertex->refusal);
    } else {
       if (stage == MESA_SHADER_VERTEX)
          vs_sysvals(nir);
-      ok = pco_g5p_compile_general_link(nir, half_output, attrib_components, key, link, out);
+      ok = pco_g5p_compile_general_link(nir, half_output, vertex ? vertex->components : NULL, key, link, out);
    }
    ralloc_free(nir);
    glsl_type_singleton_decref();

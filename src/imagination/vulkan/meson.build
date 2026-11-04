@@ -150,6 +150,7 @@ if with_imagination_g5p
     'pvr_arch_g5p_ds.c',
     'pvr_arch_g5p_msaa.c',
     'pvr_arch_g5p_mrt.c',
+    'pvr_arch_g5p_vertex.c',
     'pvr_arch_g5p_upload.c',
   )
   pvr_files += files(
@@ -157,6 +158,7 @@ if with_imagination_g5p
     'pvr_g5p_nir.c',
     'pvr_g5p_ds.c',
     'pvr_g5p_msaa.c',
+    'pvr_g5p_vertex_nir.c',
     'winsys/apple_g5p/g5p_drm_transport.c',
     'winsys/apple_g5p/pvr_g5p_winsys.c',
   )

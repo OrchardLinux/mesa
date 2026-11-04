@@ -10185,7 +10185,7 @@ void PVR_PER_ARCH(CmdNextSubpass2)(VkCommandBuffer commandBuffer,
 
    hw_subpass = &next_hw_render->subpasses[next_map->subpass];
    hw_subpass_load_op = hw_subpass->load_op;
-   PVR_G5P_HOOK(pub_pvr_arch_cmd_buffer_10235)
+   PVR_G5P_HOOK(pub_pvr_arch_cmd_buffer_10237)
    if (hw_subpass_load_op &&
        !PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g9p)) {
       result = pvr_cs_write_load_op(cmd_buffer,

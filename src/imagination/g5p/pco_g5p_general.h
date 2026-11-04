@@ -192,6 +192,21 @@ struct pco_g5p_program {
    char refusal[512];
 };
 
+/* A converted vertex input (8- and 16-bit vertex formats): a load_input
+ * whose base is PCO_G5P_VS_CONVERT_BASE + 4 * format + byte reads byte
+ * 0..3 (a 16-bit format: 0 or 2) of the fetched dword at its location and
+ * component, and converts it to 32 bits by the format below; the program
+ * converts each at its start, as Apple's vertex programs do. A load_input
+ * with a lower base reads the dword itself. */
+#define PCO_G5P_VS_CONVERT_BASE 0x100
+enum pco_g5p_vs_format {
+   /* to float: as enum g5p_small_format */
+   PCO_G5P_VSF_U8, PCO_G5P_VSF_S8, PCO_G5P_VSF_UN8, PCO_G5P_VSF_SN8,
+   PCO_G5P_VSF_U16, PCO_G5P_VSF_S16, PCO_G5P_VSF_UN16, PCO_G5P_VSF_SN16,
+   PCO_G5P_VSF_F16,
+   PCO_G5P_VSF_COUNT
+};
+
 /* attrib_components[L] (VS only, may be NULL): components the bound vertex
  * format of location L provides; components read beyond it are (0,0,0,1)
  * as Vulkan requires. half_output: FS colour is packed f16 (8-bit UNORM).

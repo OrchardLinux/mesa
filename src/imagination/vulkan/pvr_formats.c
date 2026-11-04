@@ -417,9 +417,9 @@ pvr_get_buffer_format_features2(struct pvr_physical_device *pdevice,
    VkFormatFeatureFlags2 flags = 0;
 
    const struct pvr_format *pvr_format = pvr_get_format(pdevice, vk_format);
+   PVR_G5P_HOOK(pub_pvr_formats_437)
    if (!pvr_format)
       return 0;
-
    assert(pvr_format->bind != 0);
 
    if (!vk_format_is_color(vk_format))
@@ -429,7 +429,7 @@ pvr_get_buffer_format_features2(struct pvr_physical_device *pdevice,
 
    if (pvr_format->bind & PVR_BIND_VERTEX_BUFFER)
       flags |= VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT;
-   PVR_G5P_HOOK(pub_pvr_formats_432)
+   PVR_G5P_HOOK(pub_pvr_formats_454)
    if (vk_format_is_scaled(vk_format))
       return flags;
 
