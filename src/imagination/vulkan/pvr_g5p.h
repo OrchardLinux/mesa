@@ -78,7 +78,82 @@ struct pvr_g5p_job {
    bool enabled;
 };
 
+/* ---- shader compilation (pvr_g5p_nir.c) ---- */
+
+struct pco_g5p_fs_key;
+struct pco_g5p_program;
+struct pco_g5p_vs_link;
+
+/* SPIR-V of one stage -> the G5P backend's program (pvr_g5p_nir.c).
+ * false with out->refusal set. */
+bool pvr_g5p_compile_stage(const VkPipelineShaderStageCreateInfo *stage_info, bool half_output,
+                           const uint8_t *attrib_components, const struct pco_g5p_fs_key *key,
+                           const struct pco_g5p_vs_link *link, struct pco_g5p_program *out);
+
+/* ---- graphics (pvr_arch_g5p_gfx.c) ---- */
+
+struct pvr_graphics_pipeline;
+struct vk_graphics_pipeline_state;
+
+/* The most vertex attributes and fetches of a G5P pipeline (PCO_G5P_MAX_ATTRIBS) */
+#define PVR_G5P_MAX_FETCH 16
+
+/* One vertex fetch: a DDMAD of `dwords` from binding `binding` at `offset`
+ * into the unified store at dword `ao` (the A9 ICD's g5p_fetch) */
+struct pvr_g5p_fetch {
+   uint8_t binding, dwords, ao;
+   uint32_t offset;
+};
+
+/*
+ * A G5P graphics pipeline (pvr_graphics_pipeline::g5p): the programs of its
+ * draws, uploaded once, and what each draw's words derive from. The PDS
+ * programs are pdsc's, the USC programs the G5P backend's.
+ */
+struct pvr_g5p_pipeline {
+   struct pvr_suballoc_bo *vs_usc, *fs_usc;
+   uint32_t vs_usc_size, fs_usc_size;
+   /* PDS: the vertex fetch code (VDM_STATE3), the fragment launch (data
+    * {DOUTU}, DOUTU.end at +0x20: the PPP shader base), the coefficient
+    * program (data, then its code; none without varyings) */
+   struct pvr_pds_upload fetch, fs_launch, varying;
+   /* static PPP blocks: the varying format (4 words) and the fragment
+    * pointers and sizes (6 words) */
+   struct pvr_suballoc_bo *static_vary, *static_frag;
+   uint32_t static_vary_words[4], static_frag_words[6];
+   /* the vertex program: DOUTU temps, output dwords, unified-store size,
+    * system values the fetch writes (bit 0 vertex index, 1 instance index)
+    * and their registers */
+   unsigned vs_temps, vs_outputs, vs_unified, vs_written_temps;
+   uint8_t vs_id_mask, vs_id_reg[2];
+   unsigned fs_temps;
+   unsigned fetch_count;
+   struct pvr_g5p_fetch fetch_list[PVR_G5P_MAX_FETCH];
+   /* the fragment program discards (punch-through, no triangle merging);
+    * it reads a flat varying */
+   bool fs_discard, fs_flat;
+};
+
+/* A non-indexed draw (CmdDraw) */
+struct pvr_g5p_draw {
+   uint32_t count, instances, first, first_instance;
+};
+
 #ifdef PVR_PER_ARCH
+
+VkResult PVR_PER_ARCH(g5p_graphics_pipeline_compile)(struct pvr_device *device,
+                                                     const VkGraphicsPipelineCreateInfo *create_info,
+                                                     struct pvr_graphics_pipeline *pipeline,
+                                                     const struct vk_graphics_pipeline_state *vk_state);
+void PVR_PER_ARCH(g5p_graphics_pipeline_destroy)(struct pvr_device *device,
+                                                 struct pvr_graphics_pipeline *pipeline);
+VkResult PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_draw *draw);
+VkResult PVR_PER_ARCH(g5p_cmd_draw_indexed)(struct pvr_cmd_buffer *cmd_buffer);
+
+#   define pvr_arch_g5p_graphics_pipeline_compile PVR_PER_ARCH(g5p_graphics_pipeline_compile)
+#   define pvr_arch_g5p_graphics_pipeline_destroy PVR_PER_ARCH(g5p_graphics_pipeline_destroy)
+#   define pvr_arch_g5p_cmd_draw PVR_PER_ARCH(g5p_cmd_draw)
+#   define pvr_arch_g5p_cmd_draw_indexed PVR_PER_ARCH(g5p_cmd_draw_indexed)
 
 VkResult PVR_PER_ARCH(g5p_device_init)(struct pvr_device *device);
 void PVR_PER_ARCH(g5p_device_finish)(struct pvr_device *device);

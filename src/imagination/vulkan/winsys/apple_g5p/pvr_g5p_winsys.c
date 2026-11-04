@@ -600,6 +600,14 @@ static VkResult g5p_ws_render_submit(const struct pvr_winsys_render_ctx *ctx,
       g5p_ws_dump(ws, "ta usc", ta_doutu & ~0xfu, 17);
       g5p_ws_dump(ws, "ta ctx", pass.base.ta_pds[1] & ~0xfu, 4);
       g5p_ws_dump(ws, "ta ctx code", pass.base.ta_pds[2], 2);
+      /* the control stream, and the PPP block of its tail (pvr's terminate: PPP_STATE, STREAM_TERMINATE) */
+      const uint64_t vdm = pass.base.vdm_va - ws->arena_va;
+      if (pass.base.vdm_size >= 12 && vdm + pass.base.vdm_size <= ws->arena_size) {
+         const uint32_t *t = (const uint32_t *)(ws->arena_cpu + vdm + pass.base.vdm_size - 12);
+         const uint64_t ppp = ((uint64_t)(t[0] & 0xff) << 32 | t[1]) - ws->arena_va;
+         g5p_ws_dump(ws, "vdm", (uint32_t)vdm, pass.base.vdm_size / 4);
+         g5p_ws_dump(ws, "ppp terminate", (uint32_t)ppp, (t[0] >> 8) & 0xff);
+      }
    }
    uint64_t job_id = 0;
    r = g5p_drm_submit_render_typed(&ws->drm, c->context, rt->handle, &pass, res, ws->chunk_count, syncs, n,

@@ -1,0 +1,1047 @@
+/* SPDX-License-Identifier: MIT */
+/*
+ * Graphics on Apple's A9 GPU (G5P, has_apple_g5p), in the shape of Henrik
+ * Klee's G9P (pvr_arch_g9p_gfx.c): pipelines compiled by the G5P backend
+ * (src/imagination/g5p, through pvr_g5p_nir.c), and draws as Rogue VDM/PPP
+ * words with pdsc PDS programs (Apple's DOUT form). Every word is derived as
+ * the A9 ICD's recorder derives it (g5p_record.c of the route-b tree:
+ * place_pipeline(), g5p_job_draw()); its template, prologue, epilogue and
+ * static arena are not used, so a draw is only what pvr_* records here plus
+ * the render job of pvr_arch_g5p.c. Compiled only with
+ * -Dimagination-g5p-experimental=true.
+ *
+ * Rung A of step 7 (docs: orchard-mesa-pr-plan.md "Step 7 design"): one
+ * linear colour target without blending, no depth/stencil, no descriptors
+ * or push constants, one vertex buffer, non-indexed single-instance draws,
+ * the scissor at the whole attachment. Everything else is refused by name.
+ */
+
+#include <inttypes.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "vk_enum_to_str.h"
+#include "vk_format.h"
+#include "vk_graphics_state.h"
+#include "vk_log.h"
+
+#include "util/ralloc.h"
+#include "util/u_dynarray.h"
+#include "util/u_math.h"
+
+#include "pco_g5p_general.h"
+#include "pdsc.h"
+#include "pdsc_internal.h"
+#include "pdsc_isa_pack.h"
+#include "pdsc_ops.h"
+#include "pvr_bo.h"
+#include "pvr_buffer.h"
+#include "pvr_cmd_buffer.h"
+#include "pvr_csb.h"
+#include "pvr_device.h"
+#include "pvr_framebuffer.h"
+#include "pvr_g5p.h"
+#include "pvr_pass.h"
+#include "pvr_pipeline.h"
+
+/* Named register values of a draw (the A9 ICD's g5p_record.c, from the
+ * captured round6/round16 user draws; Henrik's G9P carries the same) */
+/* VDM_STATE5: PDS temps 2, PDS data and unified store set per draw */
+#define G5P_VS_STATE5 0x1082u
+/* VDM_STATE0 cam_size of a vertex up to 32 dwords (output dwords + 5) */
+#define G5P_VDM_CAM_SIZE 95
+/* TA W clamp of every captured draw (~1e-20f; not Mesa's 1e-13f) */
+#define G5P_WCLAMP 0x1e3ce508u
+/* STATE_STREAM_OUT1: PDS temps 2, PDS data 2, and bit 14, which has no
+ * csbgen field (the A9 captures and G9P's 0x4022) */
+#define G5P_STREAM_OUT1 0x4022u
+/* Region clip granularity in pixels */
+#define G5P_TILE 32
+
+/* PVR_G5P_WS_LOG: the words of every pipeline and draw (step7-compare.py reads them) */
+static bool
+g5p_logging(void)
+{
+   static int on = -1;
+   if (on < 0)
+      on = getenv("PVR_G5P_WS_LOG") != NULL;
+   return on;
+}
+
+static void
+g5p_dump(const char *who, const char *what, uint64_t addr, const uint32_t *w, unsigned n)
+{
+   if (!g5p_logging())
+      return;
+   fprintf(stderr, "g5p %s: %-16s @%#" PRIx64 ":", who, what, addr);
+   for (unsigned i = 0; i < n; i++)
+      fprintf(stderr, " %08x", w[i]);
+   fprintf(stderr, "\n");
+}
+
+/* A refusal, by name, on stderr too (vk_errorf() is silent in release builds) */
+#define G5P_REFUSE(obj, ...)                                                                                       \
+   (fprintf(stderr, "G5P refuses: " __VA_ARGS__), fprintf(stderr, "\n"),                                          \
+    vk_errorf((obj), VK_ERROR_FEATURE_NOT_PRESENT, "G5P: " __VA_ARGS__))
+
+/* ---- PDS programs (pdsc, Apple's DOUT form: the A9 ICD's) ---- */
+
+static unsigned
+pds_pack(pdsc_program *p, uint32_t *dest)
+{
+   const unsigned n = util_dynarray_num_elements(&p->instrs, pdsc_instr);
+   for (unsigned i = 0; i < n; i++)
+      dest[i] = pdsc_instr_pack(p, i, util_dynarray_element(&p->instrs, pdsc_instr, i)->op);
+   return n;
+}
+
+static uint64_t
+doutu_src0(uint32_t exe_off, unsigned temps)
+{
+   pdsc_init();
+   pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-doutu");
+   struct pdsc_doutu_src0 s = { .exe_off = exe_off, .temps = temps };
+   const uint64_t v = pdsc_doutu_src0_pack(p, &s);
+   ralloc_free(p);
+   return v;
+}
+
+/* DOUTW control: one 32-bit half of t0:t1 into unified register `reg` */
+static uint32_t
+doutw_control(unsigned reg, bool upper, bool last)
+{
+   pdsc_init();
+   pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-doutw");
+   struct pdsc_doutw_src1 s = { .last_issue = last, .store_dest = PDSC_STORE_DEST_UNIFIED, .ao = reg,
+                                .bsize = upper ? PDSC_DOUTW_BSIZE_UPPER : PDSC_DOUTW_BSIZE_LOWER };
+   const uint32_t v = pdsc_doutw_src1_pack(p, &s);
+   ralloc_free(p);
+   return v;
+}
+
+static uint64_t
+ddmad_src3(unsigned dwords, unsigned ao, bool last)
+{
+   pdsc_init();
+   pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-ddmad");
+   struct pdsc_ddmad_src3 s = { .last_issue = last, .bsize = dwords, .ao = ao };
+   const uint64_t v = pdsc_ddmad_src3_pack(p, &s);
+   ralloc_free(p);
+   return v;
+}
+
+/*
+ * Vertex fetch: per fetch f, DDMAD stride * t0 + base -> unified store, then
+ * DOUTU (CC), HALT. Data per fetch: c(8f) base, c(8f+4) control, c(8f+6)
+ * stride; the DOUTU word at c2:3 (c0:1 without fetches). The vertex and
+ * instance indices are DOUTWs of t0:t1, their controls in a 16-byte unit
+ * after the fetches. One fetch is the captured `e0180002 fc00000a d3000000`;
+ * the LAST bit is set on the final DDMAD and the final DOUTW, as Apple does.
+ */
+static unsigned
+fetch_doutu(unsigned fetches)
+{
+   return fetches ? 2 : 0;
+}
+
+static unsigned
+fetch_ids(unsigned fetches)
+{
+   return fetches ? 8 * fetches : 2;
+}
+
+static unsigned
+fetch_data_bytes(unsigned fetches, unsigned id_mask)
+{
+   return fetches ? 32 * fetches + (id_mask ? 16 : 0) : 16;
+}
+
+static unsigned
+fetch_program(uint32_t *dest, unsigned fetches, unsigned id_mask)
+{
+   pdsc_init();
+   pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-vertex-fetch");
+   for (unsigned f = 0; f < fetches; f++) {
+      const unsigned c = f * 8;
+      pdsc_ddmad(p, pdsc_ref_const32(c + 6), pdsc_ref_temp32(0), pdsc_ref_const64(c), pdsc_ref_const64(c + 4));
+   }
+   unsigned k = 0;
+   u_foreach_bit (i, id_mask)
+      pdsc_dout(p, pdsc_ref_temp64(0), pdsc_ref_const32(fetch_ids(fetches) + k++), pdsc_ref_null(),
+                .dstdout = PDSC_DSTDOUT_W);
+   pdsc_dout(p, pdsc_ref_const64(fetch_doutu(fetches)), pdsc_ref_null(), pdsc_ref_null(), .dstdout = PDSC_DSTDOUT_U,
+             .end = true, .cc = true);
+   pdsc_halt(p);
+   const unsigned n = pds_pack(p, dest);
+   ralloc_free(p);
+   return n;
+}
+
+/* The fragment launch: one DOUTU.end from c0:1, no CC and no HALT (the
+ * captured form) */
+static unsigned
+launch_program(uint32_t *dest)
+{
+   pdsc_init();
+   pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-fragment");
+   pdsc_dout(p, pdsc_ref_const64(0), pdsc_ref_null(), pdsc_ref_null(), .dstdout = PDSC_DSTDOUT_U, .end = true);
+   const unsigned n = pds_pack(p, dest);
+   ralloc_free(p);
+   return n;
+}
+
+/*
+ * The coefficient (varying) program, as Apple's PDSEncoderGen1<G5>::
+ * EncodeFragmentVaryingsPDSProgram builds it: one DOUTI per item, item i's
+ * source in c(2i), the data first and padded to 16 bytes (the code starts
+ * at VARYINGBASE + 16 * PDS_VARYINGSIZE). Items: W at coefficient set 0
+ * when some varying is perspective-correct, then every varying the fragment
+ * program reads (dest: its first set; offset: its vertex output dword in
+ * the TA vertex, which drops x, y, z: dword d is TA dword d - 3, in 16-bit
+ * units). Returns the data dwords; *code_dwords the code's.
+ */
+static unsigned
+varying_program(const struct pco_g5p_program *fs, const struct pco_g5p_program *vs, uint32_t *data,
+                uint32_t *code, unsigned *code_dwords)
+{
+   pdsc_init();
+   pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-varying");
+   struct pdsc_douti_src0 item[1 + PCO_G5P_MAX_FS_VARYINGS];
+   unsigned items = 0;
+   if (fs->w_set)
+      item[items++] = (struct pdsc_douti_src0){ .shademodel = PDSC_DOUTI_SHADEMODEL_GOURAUD };
+   for (unsigned i = 0; i < fs->num_varyings; i++) {
+      const struct pco_g5p_varying *v = &fs->vary[i];
+      const unsigned off = 2 * (vs->vout_dword[v->location] - 3);
+      const bool flat = v->interp == PCO_G5P_INTERP_FLAT;
+      item[items++] = (struct pdsc_douti_src0){
+         .dest = v->set,
+         /* PPP_CTRL flatshade_vtx is VERTEX_0 */
+         .shademodel = flat ? PDSC_DOUTI_SHADEMODEL_FLAT_VERTEX0 : PDSC_DOUTI_SHADEMODEL_GOURAUD,
+         .size = PDSC_DOUTI_SIZE_4D,
+         .perspective = v->interp == PCO_G5P_INTERP_SMOOTH,
+         .f32_offset = off,
+         .f16_offset = off,
+      };
+   }
+   item[items - 1].last_issue = true;
+   for (unsigned i = 0; i < items; i++) {
+      const uint64_t w = pdsc_douti_src0_pack(p, &item[i]);
+      data[2 * i] = (uint32_t)w;
+      data[2 * i + 1] = (uint32_t)(w >> 32);
+   }
+   const unsigned data_dwords = ALIGN_POT(2 * items, 4);
+   memset(data + 2 * items, 0, 4 * (data_dwords - 2 * items));
+   for (unsigned i = 0; i < items; i++)
+      pdsc_dout(p, pdsc_ref_const64(i * 2), pdsc_ref_null(), pdsc_ref_null(), .dstdout = PDSC_DSTDOUT_I,
+                .end = i == items - 1);
+   *code_dwords = pds_pack(p, code);
+   ralloc_free(p);
+   return data_dwords;
+}
+
+/* USC offsets are from the USC heap base (the A9 kernel's usc_base == pds_base) */
+static uint32_t
+usc_off(const struct pvr_device *device, const struct pvr_suballoc_bo *bo)
+{
+   return (uint32_t)(bo->dev_addr.addr - device->heaps.usc_heap->base_addr.addr);
+}
+
+/* ---- pipelines ---- */
+
+/* The vertex attribute formats rung A fetches: 32-bit floats, 1 to 4
+ * components (one DDMAD of the format's dwords) */
+static unsigned
+attrib_dwords(VkFormat format)
+{
+   switch (format) {
+   case VK_FORMAT_R32_SFLOAT: return 1;
+   case VK_FORMAT_R32G32_SFLOAT: return 2;
+   case VK_FORMAT_R32G32B32_SFLOAT: return 3;
+   case VK_FORMAT_R32G32B32A32_SFLOAT: return 4;
+   default: return 0;
+   }
+}
+
+/* Vertex fetches (the ICD's vertex_input_ok() and fetch_per_binding()):
+ * each binding whose attributes are consecutive whole vec4s is one DDMAD
+ * into r4L.. of its first location; otherwise one DDMAD per attribute,
+ * format-sized. Only attributes the vertex program reads are fetched. */
+static VkResult
+g5p_fetches(struct pvr_device *device, struct pvr_g5p_pipeline *g, const struct vk_vertex_input_state *vi,
+            bool dynamic_strides, uint32_t read)
+{
+   struct {
+      unsigned location, binding;
+      uint32_t offset;
+      VkFormat format;
+   } a[PVR_G5P_MAX_FETCH];
+   unsigned n = 0;
+
+   if (read & ~(vi ? vi->attributes_valid : 0))
+      return G5P_REFUSE(device, "the vertex shader reads location %u, which has no vertex attribute",
+                        u_bit_scan(&(uint32_t){ read & ~(vi ? vi->attributes_valid : 0) }));
+   if (!vi)
+      return VK_SUCCESS;
+   u_foreach_bit (loc, vi->attributes_valid) {
+      const struct vk_vertex_attribute_state *at = &vi->attributes[loc];
+      if (vi->bindings[at->binding].input_rate != VK_VERTEX_INPUT_RATE_VERTEX)
+         return G5P_REFUSE(device, "vertex attribute %u: per-instance input rate", loc);
+      if (!attrib_dwords(at->format))
+         return G5P_REFUSE(device, "vertex attribute %u: format %s (rung A fetches 32-bit floats)", loc,
+                           vk_Format_to_str(at->format));
+      if (!(read & BITFIELD_BIT(loc)))
+         continue; /* bound but not read: not fetched */
+      if (loc >= PVR_G5P_MAX_FETCH)
+         return G5P_REFUSE(device, "vertex attribute at location %u", loc);
+      a[n++] = (__typeof__(a[0])){ loc, at->binding, at->offset, at->format };
+   }
+
+   /* per binding, when every attribute is a vec4 and they are consecutive */
+   bool per_binding = true;
+   for (unsigned i = 0; i < n && per_binding; i++)
+      per_binding = a[i].format == VK_FORMAT_R32G32B32A32_SFLOAT;
+   for (unsigned i = 0; i < n && per_binding; i++) {
+      unsigned first = ~0u, cnt = 0;
+      uint32_t min_off = ~0u;
+      for (unsigned k = 0; k < n; k++) {
+         if (a[k].binding != a[i].binding)
+            continue;
+         first = MIN2(first, a[k].location);
+         min_off = MIN2(min_off, a[k].offset);
+         cnt++;
+      }
+      if (a[i].offset != min_off + 16 * (a[i].location - first) ||
+          (!dynamic_strides && vi->bindings[a[i].binding].stride < 16 * cnt))
+         per_binding = false;
+   }
+   g->fetch_count = 0;
+   if (per_binding) {
+      for (unsigned b = 0; b < MESA_VK_MAX_VERTEX_BINDINGS; b++) {
+         unsigned first = ~0u, cnt = 0;
+         uint32_t min_off = ~0u;
+         for (unsigned i = 0; i < n; i++) {
+            if (a[i].binding != b)
+               continue;
+            first = MIN2(first, a[i].location);
+            min_off = MIN2(min_off, a[i].offset);
+            cnt++;
+         }
+         if (cnt)
+            g->fetch_list[g->fetch_count++] =
+               (struct pvr_g5p_fetch){ .binding = b, .offset = min_off, .dwords = 4 * cnt, .ao = 4 * first };
+      }
+   } else {
+      for (unsigned i = 0; i < n; i++)
+         g->fetch_list[g->fetch_count++] = (struct pvr_g5p_fetch){
+            .binding = a[i].binding, .offset = a[i].offset, .dwords = attrib_dwords(a[i].format),
+            .ao = 4 * a[i].location };
+   }
+   for (unsigned i = 1; i < g->fetch_count; i++)
+      if (g->fetch_list[i].binding != g->fetch_list[0].binding)
+         return G5P_REFUSE(device, "vertex input from bindings %u and %u (rung A: one vertex buffer)",
+                           g->fetch_list[0].binding, g->fetch_list[i].binding);
+   return VK_SUCCESS;
+}
+
+/* What rung A draws: refused by name otherwise (the ICD's validate_state()
+ * with rung A's limits) */
+static VkResult
+g5p_check_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo *create_info,
+                const struct vk_graphics_pipeline_state *s, struct pco_g5p_fs_key *key)
+{
+   /* the subpass's attachments: from the render pass object (pvr_* hands the
+    * runtime only their aspects), or the dynamic rendering state */
+   unsigned colors;
+   VkFormat cf;
+   bool ds;
+   if (create_info->renderPass) {
+      VK_FROM_HANDLE(pvr_render_pass, pass, create_info->renderPass);
+      const struct pvr_render_subpass *sub = &pass->subpasses[create_info->subpass];
+      colors = 0;
+      cf = VK_FORMAT_UNDEFINED;
+      for (unsigned i = 0; i < sub->color_count; i++) {
+         if (sub->color_attachments[i] == VK_ATTACHMENT_UNUSED)
+            continue;
+         if (!colors++)
+            cf = pass->attachments[sub->color_attachments[i]].vk_format;
+      }
+      ds = sub->depth_stencil_attachment != VK_ATTACHMENT_UNUSED;
+   } else if (s->rp) {
+      colors = s->rp->color_attachment_count;
+      cf = colors ? s->rp->color_attachment_formats[0] : VK_FORMAT_UNDEFINED;
+      ds = s->rp->depth_attachment_format != VK_FORMAT_UNDEFINED ||
+           s->rp->stencil_attachment_format != VK_FORMAT_UNDEFINED;
+   } else {
+      return G5P_REFUSE(device, "no render pass state");
+   }
+
+   if (s->shader_stages != (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT) || s->ts)
+      return G5P_REFUSE(device, "shader stages %#x (a vertex and a fragment shader)", s->shader_stages);
+   if (s->ia && !BITSET_TEST(s->dynamic, MESA_VK_DYNAMIC_IA_PRIMITIVE_RESTART_ENABLE) &&
+       s->ia->primitive_restart_enable)
+      return G5P_REFUSE(device, "primitive restart");
+   if (s->rs && (s->rs->depth_clamp_enable || s->rs->polygon_mode != VK_POLYGON_MODE_FILL))
+      return G5P_REFUSE(device, "depth clamp or polygon mode %d", s->rs->polygon_mode);
+   if (s->rs && (s->rs->line.mode != VK_LINE_RASTERIZATION_MODE_DEFAULT || s->rs->line.stipple.enable))
+      return G5P_REFUSE(device, "line rasterization mode %d, stipple %d", s->rs->line.mode,
+                        s->rs->line.stipple.enable);
+   if (s->ms && (s->ms->rasterization_samples > VK_SAMPLE_COUNT_1_BIT || s->ms->sample_shading_enable ||
+                 s->ms->alpha_to_coverage_enable || s->ms->alpha_to_one_enable || !(s->ms->sample_mask & 1)))
+      return G5P_REFUSE(device, "multisample state (one sample, no sample shading or alpha to coverage)");
+   /* pvr_* gives a render pass without multiview the view mask 1 */
+   if (s->mv && util_bitcount(s->mv->view_mask) > 1)
+      return G5P_REFUSE(device, "multiview (view mask %#x)", s->mv->view_mask);
+   if (colors != 1)
+      return G5P_REFUSE(device, "%u colour attachments (rung A: 1)", colors);
+   if (cf != VK_FORMAT_B8G8R8A8_UNORM && cf != VK_FORMAT_R8G8B8A8_UNORM)
+      return G5P_REFUSE(device, "colour attachment format %s", vk_Format_to_str(cf));
+   if (ds)
+      return G5P_REFUSE(device, "a depth/stencil attachment (rung A has none)");
+   *key = PCO_G5P_FS_KEY_DEFAULT;
+   if (s->cb) {
+      if (s->cb->logic_op_enable || s->cb->attachment_count != 1 ||
+          BITSET_TEST(s->dynamic, MESA_VK_DYNAMIC_CB_BLEND_ENABLES) ||
+          BITSET_TEST(s->dynamic, MESA_VK_DYNAMIC_CB_BLEND_EQUATIONS) ||
+          BITSET_TEST(s->dynamic, MESA_VK_DYNAMIC_CB_WRITE_MASKS) ||
+          BITSET_TEST(s->dynamic, MESA_VK_DYNAMIC_CB_COLOR_WRITE_ENABLES))
+         return G5P_REFUSE(device, "logic op or dynamic blend state");
+      const struct vk_color_blend_attachment_state *a = &s->cb->attachments[0];
+      if (a->blend_enable)
+         return G5P_REFUSE(device, "blending (rung A draws without)");
+      if (a->write_mask != 0xf || !(s->cb->color_write_enables & 1))
+         return G5P_REFUSE(device, "colour write mask %#x (rung A writes all channels)", a->write_mask);
+   }
+   return VK_SUCCESS;
+}
+
+static void
+g5p_pipeline_free(struct pvr_device *device, struct pvr_g5p_pipeline *g)
+{
+   if (!g)
+      return;
+   pvr_bo_suballoc_free(g->vs_usc);
+   pvr_bo_suballoc_free(g->fs_usc);
+   pvr_bo_suballoc_free(g->fetch.pvr_bo);
+   pvr_bo_suballoc_free(g->fs_launch.pvr_bo);
+   pvr_bo_suballoc_free(g->varying.pvr_bo);
+   pvr_bo_suballoc_free(g->static_vary);
+   pvr_bo_suballoc_free(g->static_frag);
+   vk_free(&device->vk.alloc, g);
+}
+
+void
+PVR_PER_ARCH(g5p_graphics_pipeline_destroy)(struct pvr_device *device, struct pvr_graphics_pipeline *pipeline)
+{
+   g5p_pipeline_free(device, pipeline->g5p);
+   pipeline->g5p = NULL;
+}
+
+/* The programs and static state of a pipeline (the ICD's create_graphics()
+ * and place_pipeline()) */
+static VkResult
+g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo *create_info,
+                   const struct vk_graphics_pipeline_state *s, struct pvr_g5p_pipeline *g,
+                   struct pco_g5p_program *vs, struct pco_g5p_program *fs)
+{
+   const struct pvr_g5p_programs *dp = &device->g5p->programs;
+   const VkPipelineShaderStageCreateInfo *vs_info = NULL, *fs_info = NULL;
+   struct pco_g5p_fs_key key;
+   VkResult result = g5p_check_state(device, create_info, s, &key);
+   if (result != VK_SUCCESS)
+      return result;
+
+   for (uint32_t i = 0; i < create_info->stageCount; i++) {
+      const VkPipelineShaderStageCreateInfo *st = &create_info->pStages[i];
+      if (st->stage == VK_SHADER_STAGE_VERTEX_BIT && !vs_info)
+         vs_info = st;
+      else if (st->stage == VK_SHADER_STAGE_FRAGMENT_BIT && !fs_info)
+         fs_info = st;
+      else
+         return G5P_REFUSE(device, "shader stage %#x", st->stage);
+   }
+   if (!vs_info || !fs_info)
+      return G5P_REFUSE(device, "a pipeline without a vertex and a fragment shader");
+
+   /* format components per location: the VS sees (0,0,0,1) beyond them */
+   uint8_t components[PCO_G5P_MAX_ATTRIBS] = { 0 };
+   if (s->vi)
+      u_foreach_bit (loc, s->vi->attributes_valid)
+         if (loc < PCO_G5P_MAX_ATTRIBS)
+            components[loc] = attrib_dwords(s->vi->attributes[loc].format);
+
+   /* the fragment program first: the vertex program is compiled against the
+    * varyings it reads (Apple's VertexProgramKey; Rogue's pco_rev_link_nir) */
+   if (!pvr_g5p_compile_stage(fs_info, true, NULL, &key, NULL, fs))
+      return G5P_REFUSE(device, "fragment shader: %s", fs->refusal);
+   struct pco_g5p_vs_link link = { .valid = true };
+   for (unsigned i = 0; i < fs->num_varyings; i++)
+      link.interp[fs->vary[i].location] = fs->vary[i].interp;
+   if (!pvr_g5p_compile_stage(vs_info, false, components, NULL, &link, vs))
+      return G5P_REFUSE(device, "vertex shader: %s", vs->refusal);
+   for (unsigned i = 0; i < fs->num_varyings; i++)
+      if (!vs->vout_dword[fs->vary[i].location])
+         return G5P_REFUSE(device, "the fragment program reads VAR%u, which the vertex program does not write",
+                           fs->vary[i].location);
+   if (vs->num_uploads || fs->num_uploads)
+      return G5P_REFUSE(device, "common-store uploads (descriptors or push constants: %u vertex, %u fragment; "
+                        "rung A has none)", vs->num_uploads, fs->num_uploads);
+   if (fs->blend_mode)
+      return G5P_REFUSE(device, "a fragment program that reads the tile (blend mode %u)", fs->blend_mode);
+   if (vs->xfb_buffers)
+      return G5P_REFUSE(device, "transform feedback");
+
+   /* DOUTU temps (the ICD's vs_temps()): every register within the flown
+    * envelope, else only the written ones (the inputs are in the unified store) */
+   g->vs_temps = vs->temps <= PCO_G5P_VS_TEMPS_FLOWN ? vs->temps : vs->written_temps;
+   if (g->vs_temps > 32)
+      return G5P_REFUSE(device, "vertex shader needs %u temps (> 32, the register file)", g->vs_temps);
+   g->vs_written_temps = vs->written_temps;
+   g->fs_temps = fs->temps;
+   g->vs_outputs = vs->outputs;
+   g->vs_id_mask = vs->id_mask;
+   memcpy(g->vs_id_reg, vs->id_reg, sizeof(g->vs_id_reg));
+   g->fs_discard = (fs->evidence & PCO_G5P_EV_DISCARD) != 0;
+   for (unsigned i = 0; i < fs->num_varyings; i++)
+      g->fs_flat |= fs->vary[i].interp == PCO_G5P_INTERP_FLAT;
+
+   result = g5p_fetches(device, g, s->vi, BITSET_TEST(s->dynamic, MESA_VK_DYNAMIC_VI_BINDING_STRIDES),
+                        vs->input_mask);
+   if (result != VK_SUCCESS)
+      return result;
+   if (!g->fetch_count && !(g->vs_id_mask & 1))
+      return G5P_REFUSE(device, "a vertex shader without attributes or vertex index (no fetch-less PDS form)");
+
+   /* The unified store holds every input dword: Apple's sizes fit 4 units
+    * per 8 input dwords; above 8 temps or 8 input dwords it grows with the
+    * program, 2 * ceil(max(temps, inputs + 2) / 4) (the ICD's g5p_job_draw()) */
+   unsigned inputs = 0;
+   for (unsigned f = 0; f < g->fetch_count; f++)
+      inputs = MAX2(inputs, g->fetch_list[f].ao + g->fetch_list[f].dwords);
+   u_foreach_bit (i, g->vs_id_mask)
+      inputs = MAX2(inputs, g->vs_id_reg[i] + 1u);
+   g->vs_unified = 4 * DIV_ROUND_UP(inputs, 8);
+   if (g->vs_temps > 8 || inputs > 8)
+      g->vs_unified = MAX2(g->vs_unified, 2 * DIV_ROUND_UP(MAX2(g->vs_temps, inputs + 2), 4));
+
+   /* USC programs */
+   g->vs_usc_size = vs->size;
+   g->fs_usc_size = fs->size;
+   result = pvr_gpu_upload_usc(device, vs->code, vs->size, 64, &g->vs_usc);
+   if (result == VK_SUCCESS)
+      result = pvr_gpu_upload_usc(device, fs->code, fs->size, 64, &g->fs_usc);
+   if (result != VK_SUCCESS)
+      return result;
+
+   /* PDS: vertex fetch code */
+   uint32_t code[96], data[2 * (1 + PCO_G5P_MAX_FS_VARYINGS) + 4];
+   unsigned n = fetch_program(code, g->fetch_count, g->vs_id_mask);
+   result = pvr_gpu_upload_pds(device, NULL, 0, 0, code, n, 16, 64, &g->fetch);
+   if (result != VK_SUCCESS)
+      return result;
+
+   /* PDS: the fragment launch, data {DOUTU} and its code at +0x20 */
+   {
+      const uint64_t doutu = doutu_src0(usc_off(device, g->fs_usc), g->fs_temps);
+      const uint32_t launch_data[4] = { (uint32_t)doutu, (uint32_t)(doutu >> 32), 0, 0 };
+      n = launch_program(code);
+      result = pvr_gpu_upload_pds(device, launch_data, ARRAY_SIZE(launch_data), 16, code, n, 0x20, 64,
+                                  &g->fs_launch);
+      if (result != VK_SUCCESS)
+         return result;
+      if (g->fs_launch.code_offset != g->fs_launch.data_offset + 0x20)
+         return vk_errorf(device, VK_ERROR_INITIALIZATION_FAILED, "G5P: the fragment launch's code is at data + %#x",
+                          g->fs_launch.code_offset - g->fs_launch.data_offset);
+   }
+
+   /* PDS: the coefficient program (the device HALT without varyings) */
+   unsigned varying_data_dwords = 0;
+   if (fs->num_varyings) {
+      unsigned code_dwords;
+      varying_data_dwords = varying_program(fs, vs, data, code, &code_dwords);
+      result = pvr_gpu_upload_pds(device, data, varying_data_dwords, 16, code, code_dwords, 16, 64, &g->varying);
+      if (result != VK_SUCCESS)
+         return result;
+      if (g->varying.code_offset != g->varying.data_offset + 4 * varying_data_dwords)
+         return vk_errorf(device, VK_ERROR_INITIALIZATION_FAILED, "G5P: the coefficient code is at data + %#x, not + %#x",
+                          g->varying.code_offset - g->varying.data_offset, 4 * varying_data_dwords);
+   }
+
+   /* the static PPP blocks: the varying format (output dwords per
+    * interpolation, in the vertex program's grouped order) */
+   {
+      uint32_t *w = g->static_vary_words;
+      pvr_csb_pack (&w[0], TA_STATE_HEADER, h) {
+         h.pres_varying_word0 = true;
+         h.pres_varying_word1 = true;
+         h.pres_varying_word2 = true;
+      }
+      pvr_csb_pack (&w[1], TA_STATE_VARYING0, v0) {
+         for (unsigned l = 0; l < PCO_G5P_VARYING_SLOTS; l++) {
+            if (!vs->vout_dword[l])
+               continue;
+            if (vs->vout_interp[l] == PCO_G5P_INTERP_FLAT)
+               v0.f32_flat += 4;
+            else if (vs->vout_interp[l] == PCO_G5P_INTERP_NOPERSPECTIVE)
+               v0.f32_npc += 4;
+            else
+               v0.f32_linear += 4;
+         }
+      }
+      w[2] = w[3] = 0;
+      result = pvr_gpu_upload(device, device->heaps.general_heap, w, 16, 16, &g->static_vary);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+   /* ... and the fragment pointers and sizes */
+   {
+      uint32_t *w = g->static_frag_words;
+      pvr_csb_pack (&w[0], TA_STATE_HEADER, h) {
+         h.pres_pds_state_ptr0 = true;
+         h.pres_pds_state_ptr1 = true;
+      }
+      pvr_csb_pack (&w[1], TA_STATE_PDS_SHADERBASE, sb) {
+         sb.addr = PVR_DEV_ADDR(g->fs_launch.data_offset);
+      }
+      /* no uniforms: the uniform/texture program is the device HALT */
+      pvr_csb_pack (&w[2], TA_STATE_PDS_TEXUNICODEBASE, tb) {
+         tb.addr = PVR_DEV_ADDR(dp->halt.code_offset);
+      }
+      pvr_csb_pack (&w[3], TA_STATE_PDS_SIZEINFO1, s1) {
+         s1.pds_uniformsize = 1;
+         if (fs->num_varyings) {
+            s1.pds_varyingsize = DIV_ROUND_UP(varying_data_dwords, 4);
+            /* coefficient sets: W, then four per varying (4 dwords each) */
+            s1.usc_varyingsize = DIV_ROUND_UP(4 * ((fs->w_set ? 1 : 0) + 4 * fs->num_varyings), 16);
+         }
+      }
+      /* A discarding program runs punch-through with triangle merging off
+       * (Apple's discard capture; Henrik's G9P; Rogue's pvr) */
+      pvr_csb_pack (&w[4], TA_STATE_PDS_SIZEINFO2, s2) {
+         s2.pds_tri_merge_disable = g->fs_discard;
+      }
+      pvr_csb_pack (&w[5], TA_STATE_PDS_VARYINGBASE, vb) {
+         vb.addr = PVR_DEV_ADDR(fs->num_varyings ? g->varying.data_offset : dp->halt.code_offset);
+      }
+      result = pvr_gpu_upload(device, device->heaps.general_heap, w, 24, 16, &g->static_frag);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+
+   if (g5p_logging()) {
+      fprintf(stderr, "g5p pipeline: vs %u bytes temps %u (program %u, written %u) outputs %u unified %u ids %#x "
+              "fetches %u; fs %u bytes temps %u varyings %u w_set %u discard %u\n",
+              g->vs_usc_size, g->vs_temps, vs->temps, vs->written_temps, g->vs_outputs, g->vs_unified,
+              g->vs_id_mask, g->fetch_count, g->fs_usc_size, g->fs_temps, fs->num_varyings, fs->w_set,
+              g->fs_discard);
+      g5p_dump("pipeline", "vs usc", usc_off(device, g->vs_usc), (const uint32_t *)vs->code,
+               DIV_ROUND_UP(vs->size, 4));
+      g5p_dump("pipeline", "fs usc", usc_off(device, g->fs_usc), (const uint32_t *)fs->code,
+               DIV_ROUND_UP(fs->size, 4));
+   }
+   return VK_SUCCESS;
+}
+
+VkResult
+PVR_PER_ARCH(g5p_graphics_pipeline_compile)(struct pvr_device *device,
+                                            const VkGraphicsPipelineCreateInfo *create_info,
+                                            struct pvr_graphics_pipeline *pipeline,
+                                            const struct vk_graphics_pipeline_state *vk_state)
+{
+   struct pco_g5p_program vs = { 0 }, fs = { 0 };
+   struct pvr_g5p_pipeline *g =
+      vk_zalloc(&device->vk.alloc, sizeof(*g), 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   if (!g)
+      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   VkResult result = g5p_pipeline_build(device, create_info, vk_state, g, &vs, &fs);
+   /* the program bytes are the backend's (malloc'd); uploaded or refused */
+   free(vs.code);
+   free(fs.code);
+   if (result != VK_SUCCESS) {
+      g5p_pipeline_free(device, g);
+      return result;
+   }
+   pipeline->g5p = g;
+   return VK_SUCCESS;
+}
+
+/* ---- draws ---- */
+
+/* Apple's PrimitiveTypeToVDMCTRLType and the captured split counts (170
+ * list, 510 strip) */
+static bool
+g5p_topology(VkPrimitiveTopology t, uint32_t *hw, uint32_t *split, bool *lines)
+{
+   *lines = false;
+   switch (t) {
+   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST:
+      *hw = ROGUE_VDMCTRL_PRIMITIVE_TOPOLOGY_TRI_LIST;
+      *split = 170;
+      return true;
+   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP:
+      *hw = ROGUE_VDMCTRL_PRIMITIVE_TOPOLOGY_TRI_STRIP;
+      *split = 510;
+      return true;
+   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN:
+      *hw = ROGUE_VDMCTRL_PRIMITIVE_TOPOLOGY_TRI_FAN;
+      *split = 510;
+      return true;
+   case VK_PRIMITIVE_TOPOLOGY_LINE_LIST:
+      *hw = ROGUE_VDMCTRL_PRIMITIVE_TOPOLOGY_LINE_LIST;
+      *split = 255;
+      *lines = true;
+      return true;
+   case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP:
+      *hw = ROGUE_VDMCTRL_PRIMITIVE_TOPOLOGY_LINE_STRIP;
+      *split = 510;
+      *lines = true;
+      return true;
+   default:
+      return false;
+   }
+}
+
+static void
+emit_words(struct pvr_csb *csb, const char *what, const uint32_t *w, unsigned n)
+{
+   uint32_t *dst = pvr_arch_csb_alloc_dwords(csb, n);
+   if (dst)
+      memcpy(dst, w, 4 * n);
+   g5p_dump("draw", what, 0, w, n);
+}
+
+/* VDM PPP_STATE: a block of `words` at `addr` */
+static void
+emit_ppp(struct pvr_csb *csb, const char *what, uint64_t addr, const uint32_t *block, unsigned words)
+{
+   uint32_t w[2];
+   pvr_csb_pack (&w[0], VDMCTRL_PPP_STATE0, s0) {
+      s0.word_count = words;
+      s0.addrmsb = PVR_DEV_ADDR(addr);
+   }
+   pvr_csb_pack (&w[1], VDMCTRL_PPP_STATE1, s1) {
+      s1.addrlsb = PVR_DEV_ADDR(addr);
+   }
+   emit_words(csb, "ppp state", w, 2);
+   g5p_dump("draw", what, addr, block, words);
+}
+
+VkResult
+PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_draw *draw)
+{
+   struct pvr_device *device = cmd_buffer->device;
+   const struct pvr_g5p_programs *dp = &device->g5p->programs;
+   struct pvr_cmd_buffer_state *cs = &cmd_buffer->state;
+   const struct pvr_graphics_pipeline *pipeline = cs->gfx_pipeline;
+   const struct pvr_g5p_pipeline *g = pipeline ? pipeline->g5p : NULL;
+   const struct vk_dynamic_graphics_state *dyn = &cmd_buffer->vk.dynamic_graphics_state;
+   const struct pvr_render_pass_info *info = &cs->render_pass_info;
+   uint32_t hw_topology, split;
+   bool lines;
+
+   if (!g)
+      return G5P_REFUSE(cmd_buffer, "a draw without a G5P graphics pipeline");
+   if (!draw->count || !draw->instances)
+      return VK_SUCCESS;
+   if (draw->instances != 1 || draw->first_instance)
+      return G5P_REFUSE(cmd_buffer, "%u instances from %u (rung A draws one instance)", draw->instances,
+                        draw->first_instance);
+   if (!g5p_topology(dyn->ia.primitive_topology, &hw_topology, &split, &lines))
+      return G5P_REFUSE(cmd_buffer, "topology %d", dyn->ia.primitive_topology);
+   if (dyn->ia.primitive_restart_enable)
+      return G5P_REFUSE(cmd_buffer, "primitive restart");
+   if (dyn->vp.viewport_count != 1 || dyn->vp.scissor_count != 1)
+      return G5P_REFUSE(cmd_buffer, "%u viewports, %u scissors (one of each)", dyn->vp.viewport_count,
+                        dyn->vp.scissor_count);
+   if (dyn->rs.cull_mode == VK_CULL_MODE_FRONT_AND_BACK)
+      return G5P_REFUSE(cmd_buffer, "culling front and back");
+   if (dyn->rs.rasterizer_discard_enable)
+      return G5P_REFUSE(cmd_buffer, "rasterizer discard (rung A rasterizes every draw)");
+   if (!info->rstate)
+      return G5P_REFUSE(cmd_buffer, "a draw outside a render pass");
+
+   VkResult result = pvr_arch_cmd_buffer_start_sub_cmd(cmd_buffer, PVR_SUB_CMD_TYPE_GRAPHICS);
+   if (result != VK_SUCCESS)
+      return result;
+
+   /* the clip: the scissor within the render area; a fully clipped draw
+    * emits nothing. Rung A draws at the whole attachment only (the ISP
+    * scissor table is not part of its pass yet). */
+   const uint32_t width = info->rstate->width, height = info->rstate->height;
+   const VkRect2D *sc = &dyn->vp.scissors[0], *ra = &info->render_area;
+   const int32_t x0 = MAX2(sc->offset.x, ra->offset.x), y0 = MAX2(sc->offset.y, ra->offset.y);
+   const int32_t x1 = MIN2((int64_t)sc->offset.x + sc->extent.width, (int64_t)ra->offset.x + ra->extent.width);
+   const int32_t y1 = MIN2((int64_t)sc->offset.y + sc->extent.height, (int64_t)ra->offset.y + ra->extent.height);
+   if (x1 <= x0 || y1 <= y0)
+      return VK_SUCCESS;
+   if (x0 || y0 || x1 != (int32_t)width || y1 != (int32_t)height)
+      return G5P_REFUSE(cmd_buffer, "a scissor or render area of %d,%d..%d,%d in %ux%u (rung A: the whole attachment)",
+                        x0, y0, x1, y1, width, height);
+
+   /* flat varyings take vertex 0; a fan's first vertex is the hardware's vertex 1 */
+   if (dyn->ia.primitive_topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN && g->fs_flat)
+      return G5P_REFUSE(cmd_buffer, "flat varyings with a triangle fan");
+
+   /* 3. the vertex fetch data: bases, controls, strides, the DOUTU word */
+   uint32_t fdata[4 * 2 * PVR_G5P_MAX_FETCH + 4] = { 0 };
+   const unsigned fbytes = fetch_data_bytes(g->fetch_count, g->vs_id_mask);
+   {
+      const uint64_t doutu = doutu_src0(usc_off(device, g->vs_usc), g->vs_temps);
+      fdata[fetch_doutu(g->fetch_count)] = (uint32_t)doutu;
+      fdata[fetch_doutu(g->fetch_count) + 1] = (uint32_t)(doutu >> 32);
+      unsigned k = 0;
+      const unsigned last_id = g->vs_id_mask ? util_last_bit(g->vs_id_mask) - 1 : 0;
+      u_foreach_bit (i, g->vs_id_mask)
+         fdata[fetch_ids(g->fetch_count) + k++] = doutw_control(g->vs_id_reg[i], i == 1, i == last_id);
+      for (unsigned f = 0; f < g->fetch_count; f++) {
+         const struct pvr_g5p_fetch *fe = &g->fetch_list[f];
+         const struct pvr_vertex_binding *vb = &cs->vertex_bindings[fe->binding];
+         if (!vb->buffer)
+            return G5P_REFUSE(cmd_buffer, "no vertex buffer bound at binding %u", fe->binding);
+         const uint64_t base = vb->buffer->dev_addr.addr + vb->offset + fe->offset;
+         const uint64_t ctl = ddmad_src3(fe->dwords, fe->ao, f == g->fetch_count - 1);
+         fdata[8 * f] = (uint32_t)base;
+         fdata[8 * f + 1] = (uint32_t)(base >> 32);
+         fdata[8 * f + 4] = (uint32_t)ctl;
+         fdata[8 * f + 5] = (uint32_t)(ctl >> 32);
+         fdata[8 * f + 6] = dyn->vi_binding_strides[fe->binding];
+      }
+   }
+   struct pvr_pds_upload fetch_data;
+   result = pvr_arch_cmd_buffer_upload_pds(cmd_buffer, fdata, fbytes / 4, 16, NULL, 0, 0, 16, &fetch_data);
+   if (result != VK_SUCCESS)
+      return result;
+
+   /* the draw's PPP blocks, each 16-byte aligned in one buffer (as Henrik's G9P) */
+   uint32_t ppp[64] = { 0 }, at = 0, blocks[8][2], nb = 0;
+#define PPP_BLOCK(words, n)                                                                                        \
+   do {                                                                                                            \
+      blocks[nb][0] = at;                                                                                          \
+      blocks[nb++][1] = (n);                                                                                       \
+      memcpy(&ppp[at], (words), 4 * (n));                                                                          \
+      at += ALIGN_POT((n), 4);                                                                                     \
+   } while (0)
+   uint32_t w[16];
+   /* 5. output select */
+   pvr_csb_pack (&w[0], TA_STATE_HEADER, h) {
+      h.pres_outselects = true;
+   }
+   pvr_csb_pack (&w[1], TA_OUTPUT_SEL, os) {
+      os.vtxsize = g->vs_outputs;
+      os.rhw_pres = true;
+   }
+   PPP_BLOCK(w, 2);
+   /* 6. ISP: the colour-only form (no depth/stencil attachment); Apple's
+    * pass rule: a discarding program runs FAST_PUNCH_THROUGH, else OPAQUE */
+   {
+      const enum ROGUE_TA_PASSTYPE pass =
+         g->fs_discard ? ROGUE_TA_PASSTYPE_FAST_PUNCH_THROUGH : ROGUE_TA_PASSTYPE_OPAQUE;
+      uint32_t lw = util_unsigned_fixed(dyn->rs.line.width, 4);
+      lw = MIN2(lw ? lw - 1 : 0, 255);
+      pvr_csb_pack (&w[0], TA_STATE_HEADER, h) {
+         h.pres_ispctl = true;
+         h.pres_ispctl_fa = true;
+         h.pres_ispctl_fb = true;
+         h.pres_ispctl_ba = true;
+         h.pres_ispctl_bb = true;
+      }
+      pvr_csb_pack (&w[1], TA_STATE_ISPCTL, ctl) {
+         ctl.upass = 15;
+         ctl.bpres = true;
+      }
+      pvr_csb_pack (&w[2], TA_STATE_ISPA, fa) {
+         fa.objtype = lines ? ROGUE_TA_OBJTYPE_LINE : ROGUE_TA_OBJTYPE_TRIANGLE;
+         fa.passtype = pass;
+         fa.dwritedisable = true;
+         fa.dfbztestenable = true;
+         fa.dcmpmode = ROGUE_TA_CMPMODE_ALWAYS;
+         fa.pointlinewidth = lw;
+      }
+      pvr_csb_pack (&w[3], TA_STATE_ISPB, fb) {
+         fb.scmpmode = ROGUE_TA_CMPMODE_ALWAYS;
+      }
+      /* the captured back words: single-sided ISPCTL ignores them */
+      pvr_csb_pack (&w[4], TA_STATE_ISPA, ba) {
+         ba.objtype = lines ? ROGUE_TA_OBJTYPE_LINE : ROGUE_TA_OBJTYPE_TRIANGLE;
+         ba.passtype = pass;
+         ba.dfbztestenable = true;
+         ba.pointlinewidth = lw;
+      }
+      w[5] = 0;
+      PPP_BLOCK(w, 6);
+   }
+   /* 7. region clip (32-pixel tiles) and the viewport */
+   {
+      pvr_csb_pack (&w[0], TA_STATE_HEADER, h) {
+         h.pres_region_clip = true;
+         h.pres_viewport = true;
+      }
+      pvr_csb_pack (&w[1], TA_REGION_CLIP0, c0) {
+         c0.mode = ROGUE_TA_REGION_CLIP_MODE_OUTSIDE;
+         c0.left = x0 / G5P_TILE;
+         c0.right = DIV_ROUND_UP(x1, G5P_TILE) - 1;
+      }
+      pvr_csb_pack (&w[2], TA_REGION_CLIP1, c1) {
+         c1.top = y0 / G5P_TILE;
+         c1.bottom = DIV_ROUND_UP(y1, G5P_TILE) - 1;
+      }
+      const VkViewport *vp = &dyn->vp.viewports[0];
+      const float f[6] = { vp->x + vp->width * 0.5f, vp->width * 0.5f, vp->y + vp->height * 0.5f,
+                           vp->height * 0.5f, vp->minDepth, vp->maxDepth - vp->minDepth };
+      memcpy(&w[3], f, sizeof(f));
+      PPP_BLOCK(w, 9);
+   }
+   /* 8. W clamp and PPP control */
+   {
+      pvr_csb_pack (&w[0], TA_STATE_HEADER, h) {
+         h.pres_wclamp = true;
+         h.pres_ppp_ctrl = true;
+      }
+      w[1] = G5P_WCLAMP;
+      pvr_csb_pack (&w[2], TA_STATE_PPP_CTRL, c) {
+         c.clip_mode = ROGUE_TA_CLIP_MODE_FRONT_REAR;
+         c.flatshade_vtx = ROGUE_TA_FLATSHADE_VTX_VERTEX_0;
+         c.wclampen = true;
+         if (dyn->rs.cull_mode == VK_CULL_MODE_BACK_BIT || dyn->rs.cull_mode == VK_CULL_MODE_FRONT_BIT) {
+            /* Rogue's rule (pvr_setup_ppp_control) */
+            const bool ccw = dyn->rs.front_face == VK_FRONT_FACE_COUNTER_CLOCKWISE;
+            c.cullmode = (ccw ^ (dyn->rs.cull_mode == VK_CULL_MODE_FRONT_BIT)) ? ROGUE_TA_CULLMODE_CULL_CW
+                                                                                : ROGUE_TA_CULLMODE_CULL_CCW;
+         }
+      }
+      PPP_BLOCK(w, 3);
+   }
+   /* 9. depth bias and scissor indices: none */
+   {
+      pvr_csb_pack (&w[0], TA_STATE_HEADER, h) {
+         h.pres_ispctl_dbsc = true;
+      }
+      pvr_csb_pack (&w[1], TA_STATE_ISPDBSC, dbsc) {
+         dbsc.dbindex = 0;
+         dbsc.scindex = 0;
+      }
+      PPP_BLOCK(w, 2);
+   }
+   /* 10. stream out to the TA: the device HALT's 16 zero bytes of data, its
+    * HALT at +0x10 (as Henrik's G9P stream_out) */
+   {
+      pvr_csb_pack (&w[0], TA_STATE_HEADER, h) {
+         h.pres_stream_out_size = true;
+         h.pres_stream_out_program = true;
+      }
+      pvr_csb_pack (&w[1], TA_STATE_STREAM_OUT0, s0) {
+         s0.stream0_ta_output = true;
+      }
+      w[2] = G5P_STREAM_OUT1;
+      pvr_csb_pack (&w[3], TA_STATE_STREAM_OUT2, s2) {
+         s2.pds_data_addr = PVR_DEV_ADDR(dp->halt.data_offset);
+      }
+      PPP_BLOCK(w, 4);
+   }
+#undef PPP_BLOCK
+
+   struct pvr_suballoc_bo *ppp_bo;
+   result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, ppp, 4 * at, &ppp_bo);
+   if (result != VK_SUCCESS)
+      return result;
+   const uint64_t ppp_va = ppp_bo->dev_addr.addr;
+
+   /* the draw's words move whole into the next block when the stream fills
+    * up mid-draw (pvr_csb's relocation mark) */
+   struct pvr_csb *csb = &cs->current_sub_cmd->gfx.control_stream;
+   pvr_csb_set_relocation_mark(csb);
+
+   /* 1. VS code, outputs, allocation */
+   {
+      const unsigned vector = g->vs_outputs + 5;
+      const unsigned cam = vector <= 32 ? G5P_VDM_CAM_SIZE : vector <= 48 ? 63 : vector <= 64 ? 31 : 15;
+      pvr_csb_pack (&w[0], VDMCTRL_VDM_STATE0, v0) {
+         v0.vs_other_present = true;
+         v0.cam_size = cam;
+      }
+      pvr_csb_pack (&w[1], VDMCTRL_VDM_STATE3, v3) {
+         v3.vs_pds_code_base_addr = PVR_DEV_ADDR(g->fetch.code_offset);
+      }
+      pvr_csb_pack (&w[2], VDMCTRL_VDM_STATE4, v4) {
+         v4.vs_output_size = g->vs_outputs;
+      }
+      struct ROGUE_VDMCTRL_VDM_STATE5 v5;
+      const uint32_t state5 = G5P_VS_STATE5;
+      ROGUE_VDMCTRL_VDM_STATE5_unpack(&state5, &v5);
+      v5.vs_pds_data_size = fbytes / 16;
+      v5.vs_usc_unified_size = g->vs_unified;
+      ROGUE_VDMCTRL_VDM_STATE5_pack(&w[3], &v5);
+      /* a vertex above 64 output dwords: bit 30 (no csbgen field; AGXMetalA9) */
+      if (vector > 64)
+         w[3] |= BITFIELD_BIT(30);
+      emit_words(csb, "vdm state vs", w, 4);
+      g5p_dump("draw", "fetch code", g->fetch.code_offset,
+               pvr_bo_suballoc_get_map_addr(g->fetch.pvr_bo), g->fetch.code_size);
+
+      /* 2. the varying format */
+      emit_ppp(csb, "ppp varying", g->static_vary->dev_addr.addr, g->static_vary_words, 4);
+
+      /* 3. the fetch data */
+      pvr_csb_pack (&w[0], VDMCTRL_VDM_STATE0, v0) {
+         v0.vs_data_addr_present = true;
+         v0.cam_size = cam;
+      }
+      pvr_csb_pack (&w[1], VDMCTRL_VDM_STATE2, v2) {
+         v2.vs_pds_data_base_addr = PVR_DEV_ADDR(fetch_data.data_offset);
+      }
+      emit_words(csb, "vdm state data", w, 2);
+      g5p_dump("draw", "fetch data", fetch_data.data_offset, fdata, fbytes / 4);
+   }
+
+   /* 4. the fragment pointers and sizes */
+   emit_ppp(csb, "ppp fragment", g->static_frag->dev_addr.addr, g->static_frag_words, 6);
+   g5p_dump("draw", "fs launch data", g->fs_launch.data_offset, pvr_bo_suballoc_get_map_addr(g->fs_launch.pvr_bo), 4);
+   g5p_dump("draw", "fs launch code", g->fs_launch.code_offset,
+            (const uint32_t *)pvr_bo_suballoc_get_map_addr(g->fs_launch.pvr_bo) + 8, g->fs_launch.code_size);
+   g5p_dump("draw", "uniform code", dp->halt.code_offset,
+            (const uint32_t *)pvr_bo_suballoc_get_map_addr(dp->halt.pvr_bo) + 4, 1);
+   if (g->varying.pvr_bo) {
+      const uint32_t *m = pvr_bo_suballoc_get_map_addr(g->varying.pvr_bo);
+      g5p_dump("draw", "varying data", g->varying.data_offset, m, g->varying.data_size);
+      g5p_dump("draw", "varying code", g->varying.code_offset, m + g->varying.data_size, g->varying.code_size);
+   } else {
+      g5p_dump("draw", "varying code", dp->halt.code_offset,
+               (const uint32_t *)pvr_bo_suballoc_get_map_addr(dp->halt.pvr_bo) + 4, 1);
+   }
+
+   /* 5-10. the per-draw blocks */
+   static const char *const names[] = { "ppp outsel", "ppp isp", "ppp clip viewport", "ppp wclamp ctrl",
+                                        "ppp dbsc", "ppp stream out" };
+   for (unsigned i = 0; i < nb; i++)
+      emit_ppp(csb, names[i], ppp_va + 4 * blocks[i][0], &ppp[blocks[i][0]], blocks[i][1]);
+   g5p_dump("draw", "stream out data", dp->halt.data_offset, pvr_bo_suballoc_get_map_addr(dp->halt.pvr_bo), 5);
+
+   /* 11. the index list: count, instances - 1, first vertex, split */
+   {
+      unsigned n = 0;
+      pvr_csb_pack (&w[n++], VDMCTRL_INDEX_LIST0, l0) {
+         l0.index_count_present = true;
+         l0.index_instance_count_present = true;
+         l0.index_offset_present = true;
+         l0.split_count_present = true;
+         l0.index_size = ROGUE_VDMCTRL_INDEX_SIZE_B32;
+         l0.primitive_topology = hw_topology;
+      }
+      w[n++] = draw->count;
+      w[n++] = draw->instances - 1;
+      w[n++] = draw->first;
+      w[n++] = split;
+      emit_words(csb, "index list", w, n);
+   }
+
+   pvr_csb_clear_relocation_mark(csb);
+   return csb->status;
+}
+
+/* vkCmdDrawIndexed: refused by name (rung A draws non-indexed) */
+VkResult
+PVR_PER_ARCH(g5p_cmd_draw_indexed)(struct pvr_cmd_buffer *cmd_buffer)
+{
+   return G5P_REFUSE(cmd_buffer, "an indexed draw (rung A draws non-indexed)");
+}
