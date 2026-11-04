@@ -723,12 +723,29 @@ static VkResult g5p_ws_rt_dataset_create(struct pvr_winsys *ws, const struct pvr
    return VK_SUCCESS;
 }
 
+/* Destroy is a VM edit too (g5p_destroy_render_target): another job of the context can still be queued,
+ * even if this target's last use has completed. Call without ws->lock; waits acquire it to snapshot fences. */
+static int g5p_ws_rt_destroy_idle(struct g5p_ws *ws, struct g5p_ws_rt *rt)
+{
+   int r;
+   unsigned waits = 0;
+   G5P_WS_VM_RETRY(ws, r, waits, g5p_drm_render_target_destroy(&ws->drm, rt->handle));
+   if (r)
+      fprintf(stderr, "apple_g5p render: DESTROY_RENDER_TARGET %u (%ux%u, context %u): %s after %u waits; "
+              "target remains live until context teardown\n", rt->handle, rt->width, rt->height,
+              rt->context, strerror(-r), waits);
+   else if (waits && getenv("PVR_G5P_WS_LOG"))
+      fprintf(stderr, "apple_g5p render: DESTROY_RENDER_TARGET %u waited for the context to idle (%u waits): destroyed\n",
+              rt->handle, waits);
+   return r;
+}
+
 static void g5p_ws_rt_dataset_destroy(struct pvr_winsys_rt_dataset *d)
 {
    struct g5p_ws_rt *rt = container_of(d, struct g5p_ws_rt, base);
    struct g5p_ws *ws = to_ws(d->ws);
    if (rt->handle)
-      g5p_drm_render_target_destroy(&ws->drm, rt->handle);
+      g5p_ws_rt_destroy_idle(ws, rt);
    vk_free(d->ws->alloc, rt);
 }
 
@@ -852,7 +869,12 @@ static VkResult g5p_ws_render_submit(const struct pvr_winsys_render_ctx *ctx,
       return g5p_ws_refuse(VK_ERROR_INITIALIZATION_FAILED, "CREATE_CONTEXT (render): %s", strerror(-r));
    }
    if (rt->handle && rt->context != c->context) {
-      g5p_drm_render_target_destroy(&ws->drm, rt->handle);
+      simple_mtx_unlock(&ws->lock);
+      r = g5p_ws_rt_destroy_idle(ws, rt);
+      if (r)
+         return g5p_ws_refuse(VK_ERROR_DEVICE_LOST,
+                              "DESTROY_RENDER_TARGET %u before context reassignment: %s", rt->handle, strerror(-r));
+      simple_mtx_lock(&ws->lock);
       rt->handle = 0;
    }
    if (!rt->handle) {
