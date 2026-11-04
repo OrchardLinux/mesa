@@ -682,8 +682,8 @@ pvr_g5p_compile_vs_xfb(const VkPipelineShaderStageCreateInfo *stage_info, struct
  * last-read source groups of every fragment program. Its uploads are the
  * image state and the sampler at that binding (out->uploads).
  */
-bool
-pvr_g5p_compile_load(struct pco_g5p_program *out)
+static bool
+g5p_compile_load_type(struct pco_g5p_program *out, unsigned raw)
 {
    static util_once_flag once = UTIL_ONCE_FLAG_INIT;
    util_call_once(&once, g5p_init_options);
@@ -692,17 +692,17 @@ pvr_g5p_compile_load(struct pco_g5p_program *out)
 
    nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT, &g5p_options, "g5p-load");
    nir_variable *prev = nir_variable_create(b.shader, nir_var_uniform,
-                                            glsl_sampler_type(GLSL_SAMPLER_DIM_2D, false, false, GLSL_TYPE_FLOAT),
+                                            glsl_sampler_type(GLSL_SAMPLER_DIM_2D, false, false, raw == 1 ? GLSL_TYPE_UINT : raw == 2 ? GLSL_TYPE_INT : GLSL_TYPE_FLOAT),
                                             "prev");
    prev->data.descriptor_set = 0;
    prev->data.binding = 0;
-   nir_variable *color = nir_variable_create(b.shader, nir_var_shader_out, glsl_vec4_type(), "color");
+   nir_variable *color = nir_variable_create(b.shader, nir_var_shader_out, raw == 1 ? glsl_uvec4_type() : raw == 2 ? glsl_ivec4_type() : glsl_vec4_type(), "color");
    color->data.location = FRAG_RESULT_DATA0;
    /* texelFetch (Mesa's form of a load): with the last-read group bits it reads every channel (the LOAD probe's
     * one-channel result was the default group rule, not the read op) */
    nir_def *xy = nir_f2i32(&b, nir_trim_vector(&b, nir_load_frag_coord(&b), 2));
    nir_def *texel = nir_txf(&b, xy, .texture_deref = nir_build_deref_var(&b, prev), .lod = nir_imm_int(&b, 0),
-                            .dim = GLSL_SAMPLER_DIM_2D, .dest_type = nir_type_float32);
+                            .dim = GLSL_SAMPLER_DIM_2D, .dest_type = raw == 1 ? nir_type_uint32 : raw == 2 ? nir_type_int32 : nir_type_float32);
    nir_store_var(&b, color, texel, 0xf);
 
    bool sample_mask = false; /* the load program reads no sample mask */
@@ -712,6 +712,7 @@ pvr_g5p_compile_load(struct pco_g5p_program *out)
     * output component 0 (B G R A = 0 0 R 0). */
    struct pco_g5p_fs_key key = PCO_G5P_FS_KEY_DEFAULT;
    key.last_read_groups = true;
+   key.color_output = raw == 1 ? PCO_G5P_COLOR_UINT32 : raw == 2 ? PCO_G5P_COLOR_SINT32 : PCO_G5P_COLOR_F16;
    bool ok = nir && pco_g5p_compile_general_link(nir, true, NULL, &key, NULL, out);
    if (!nir)
       snprintf(out->refusal, sizeof(out->refusal), "the load program's NIR");
@@ -721,8 +722,8 @@ pvr_g5p_compile_load(struct pco_g5p_program *out)
 }
 
 /* The clear quad's stages (pvr_g5p.h) */
-nir_shader *
-pvr_g5p_clear_nir(bool vertex)
+static nir_shader *
+g5p_clear_nir_type(bool vertex, unsigned raw)
 {
    static util_once_flag once = UTIL_ONCE_FLAG_INIT;
    util_call_once(&once, g5p_init_options);
@@ -737,7 +738,7 @@ pvr_g5p_clear_nir(bool vertex)
       out->data.location = VARYING_SLOT_POS;
       nir_store_var(&b, out, nir_load_var(&b, pos), 0xf);
    } else {
-      nir_variable *color = nir_variable_create(b.shader, nir_var_shader_out, glsl_vec4_type(), "color");
+      nir_variable *color = nir_variable_create(b.shader, nir_var_shader_out, raw == 1 ? glsl_uvec4_type() : raw == 2 ? glsl_ivec4_type() : glsl_vec4_type(), "color");
       color->data.location = FRAG_RESULT_DATA0;
       nir_store_var(&b, color, nir_load_push_constant(&b, 4, 32, nir_imm_int(&b, 0), .base = 0, .range = 16), 0xf);
       b.shader->num_uniforms = 16;
@@ -750,4 +751,28 @@ pvr_g5p_clear_nir_free(nir_shader *nir)
 {
    ralloc_free(nir);
    glsl_type_singleton_decref();
+}
+
+bool
+pvr_g5p_compile_load(struct pco_g5p_program *out)
+{
+   return g5p_compile_load_type(out, 0);
+}
+
+bool
+pvr_g5p_compile_load_raw(struct pco_g5p_program *out, bool is_signed)
+{
+   return g5p_compile_load_type(out, is_signed ? 2 : 1);
+}
+
+nir_shader *
+pvr_g5p_clear_nir(bool vertex)
+{
+   return g5p_clear_nir_type(vertex, 0);
+}
+
+nir_shader *
+pvr_g5p_clear_nir_raw(bool vertex, bool is_signed)
+{
+   return g5p_clear_nir_type(vertex, is_signed ? 2 : 1);
 }

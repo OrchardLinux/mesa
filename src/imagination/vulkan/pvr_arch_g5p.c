@@ -37,6 +37,7 @@
 #include "pvr_csb.h"
 #include "pvr_device.h"
 #include "pvr_g5p.h"
+#include "pvr_g5p_dgl.h"
 #include "pvr_g5p_ds.h"
 #include "pvr_g5p_formats.h"
 #include "pvr_g5p_msaa.h"
@@ -208,13 +209,21 @@ g5p_upload_kick(struct pvr_device *device, const struct pvr_suballoc_bo *usc, ui
 }
 
 static void
-g5p_free_programs(struct pvr_g5p_programs *p)
+g5p_free_programs(struct pvr_device *device, struct pvr_g5p_programs *p)
 {
    for (unsigned i = 0; i < PVR_G5P_MRT_VARIANTS; i++) {
       pvr_bo_suballoc_free(p->eot_usc[i]);
       pvr_bo_suballoc_free(p->clear_usc[i]);
       pvr_bo_suballoc_free(p->clear_kick[i].pvr_bo);
    }
+   for (unsigned i = 0; i < 2; i++) {
+      if (p->raw_load[i]) {
+         g5p_free_programs(device, p->raw_load[i]);
+         vk_free(&device->vk.alloc, p->raw_load[i]);
+      }
+   }
+   pvr_bo_suballoc_free(p->raw_clear_usc);
+   pvr_bo_suballoc_free(p->raw_clear_kick.pvr_bo);
    pvr_bo_suballoc_free(p->halt.pvr_bo);
    pvr_bo_suballoc_free(p->clear_dma.pvr_bo);
    pvr_bo_suballoc_free(p->eot.pvr_bo);
@@ -235,12 +244,12 @@ g5p_free_programs(struct pvr_g5p_programs *p)
  * the backend refuses is not an error here: a LOAD render is refused by
  * name then. */
 static VkResult
-g5p_upload_load(struct pvr_device *device, struct pvr_g5p_programs *p)
+g5p_upload_load(struct pvr_device *device, struct pvr_g5p_programs *p, unsigned raw)
 {
    struct pco_g5p_program prog;
    VkResult result = VK_SUCCESS;
 
-   if (!pvr_g5p_compile_load(&prog)) {
+   if (!(raw ? pvr_g5p_compile_load_raw(&prog, raw == 2) : pvr_g5p_compile_load(&prog))) {
       snprintf(p->load_refusal, sizeof(p->load_refusal), "%s", prog.refusal);
       free(prog.code);
       return VK_SUCCESS;
@@ -300,6 +309,46 @@ g5p_upload_zeroed(struct pvr_device *device, uint32_t size, struct pvr_suballoc_
 /* The programs of pvr_g5p_programs, uploaded into the device's PDS and USC
  * heaps (64-byte aligned USC code, as the end-of-tile program's branch to the
  * next 64-byte boundary assumes). */
+/* Called only for an integer pass; qualification uses FORMATS=probe. */
+static VkResult
+g5p_raw_programs_unlocked(struct pvr_device *device, unsigned raw)
+{
+   struct pvr_g5p_programs *p = &device->g5p->programs;
+   VkResult result;
+   if (!p->raw_clear_usc) {
+      uint8_t code[6 * G5P_USC_MAX];
+      size_t size = pvr_g5p_dgl_clear(code, sizeof(code));
+      if (!size)
+         return vk_error(device, VK_ERROR_INITIALIZATION_FAILED);
+      result = pvr_gpu_upload_usc(device, code, size, 64, &p->raw_clear_usc);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+   if (!p->raw_clear_kick.pvr_bo) {
+      result = g5p_upload_kick(device, p->raw_clear_usc, 1, &p->raw_clear_kick);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+   if (!p->raw_load[raw - 1]) {
+      p->raw_load[raw - 1] = vk_zalloc(&device->vk.alloc, sizeof(*p), 8, VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
+      if (!p->raw_load[raw - 1])
+         return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+      result = g5p_upload_load(device, p->raw_load[raw - 1], raw);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+   return VK_SUCCESS;
+}
+
+static VkResult
+g5p_raw_programs(struct pvr_device *device, unsigned raw)
+{
+   simple_mtx_lock(&device->g5p->clear_lock);
+   VkResult result = g5p_raw_programs_unlocked(device, raw);
+   simple_mtx_unlock(&device->g5p->clear_lock);
+   return result;
+}
+
 static VkResult
 g5p_upload_programs(struct pvr_device *device, struct pvr_g5p_programs *p)
 {
@@ -375,7 +424,7 @@ g5p_upload_programs(struct pvr_device *device, struct pvr_g5p_programs *p)
    if (result == VK_SUCCESS)
       result = g5p_upload_zeroed(device, G5P_DBIAS_POOL_BYTES, &p->dbias_pool);
    if (result == VK_SUCCESS)
-      result = g5p_upload_load(device, p);
+      result = g5p_upload_load(device, p, 0);
    return result;
 }
 
@@ -414,7 +463,7 @@ PVR_PER_ARCH(g5p_device_finish)(struct pvr_device *device)
       device->vk.dispatch_table.DestroyPipelineLayout(vk_dev, device->g5p->clear_layout, NULL);
    simple_mtx_destroy(&device->g5p->clear_lock);
 
-   g5p_free_programs(&device->g5p->programs);
+   g5p_free_programs(device, &device->g5p->programs);
    util_dynarray_fini(&device->g9p_vmas.vmas);
    simple_mtx_destroy(&device->g9p_vmas.lock);
    vk_free(&device->vk.alloc, device->g5p);
@@ -462,9 +511,11 @@ g5p_pbe_encode(uint64_t q[3], uint32_t key, bool srgb, uint64_t va, uint32_t wid
  */
 static VkResult
 g5p_load_background(struct pvr_cmd_buffer *cmd_buffer, const uint64_t state[4], uint32_t width, uint32_t height,
-                    uint64_t bgnd[4])
+                    uint64_t bgnd[4], unsigned raw)
 {
    const struct pvr_g5p_programs *p = &cmd_buffer->device->g5p->programs;
+   if (raw)
+      p = p->raw_load[raw - 1];
    const VkSamplerCreateInfo sci = {
       .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
       .magFilter = VK_FILTER_NEAREST,
@@ -580,6 +631,18 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
 
    /* targets: PBE words and clear colours */
    uint64_t pbe[4][3];
+   unsigned raw = 0;
+   const VkFormat first_format = info->attachments[hw_render->eot_surfaces[0].attachment_idx]->vk.format;
+   if (first_format == VK_FORMAT_R32G32B32A32_UINT) raw = 1;
+   if (first_format == VK_FORMAT_R32G32B32A32_SINT) raw = 2;
+   if (raw) {
+      if (n != 1 || g->samples != 1)
+         return G5P_REFUSE(cmd_buffer, "RGBA32 integer pass requires one single-sample target");
+      VkResult result = g5p_raw_programs(device, raw);
+      if (result != VK_SUCCESS)
+         return result;
+      g->raw32 = true;
+   }
    float clear[4][4] = { { 0 } };
    /* a loaded target: its texture state (q0, q1, q2, 0), the load program's image upload */
    uint64_t load_state[4] = { 0 };
@@ -646,9 +709,10 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
           hw_render->color_init[i].index < info->clear_value_count)
          memcpy(clear[t], info->clear_values[hw_render->color_init[i].index].color.float32, sizeof(clear[t]));
    }
-   if (load && !p->load_usc)
+   const struct pvr_g5p_programs *load_program = raw ? p->raw_load[raw - 1] : p;
+   if (load && !load_program->load_usc)
       return G5P_REFUSE(cmd_buffer, "LOAD of a colour attachment%s: the load program: %s",
-                        partial ? " (a partial render area)" : "", p->load_refusal);
+                        partial ? " (a partial render area)" : "", load_program->load_refusal);
    if (load && g->samples == 4)
       return G5P_REFUSE(cmd_buffer, "LOAD of a 4x colour attachment%s (the load program runs per pixel)",
                         partial ? " (a partial render area)" : "");
@@ -690,12 +754,12 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
    /* PDS_BGRND0..3: the clear kick, the clear DMA, its data; sizes */
    uint64_t bgnd[4] = { 0 };
    if (load) {
-      result = g5p_load_background(cmd_buffer, load_state, g->width, g->height, bgnd);
+      result = g5p_load_background(cmd_buffer, load_state, g->width, g->height, bgnd, raw);
       if (result != VK_SUCCESS)
          return result;
    } else {
       pvr_csb_pack (&bgnd[0], CR_PDS_BGRND0_BASE, b0) {
-         b0.shader_addr = PVR_DEV_ADDR(g->samples == 4 ? p->clear_kick_ms.data_offset
+         b0.shader_addr = PVR_DEV_ADDR(raw ? p->raw_clear_kick.data_offset : g->samples == 4 ? p->clear_kick_ms.data_offset
                                                      : p->clear_kick[v].data_offset);
          b0.texunicode_addr = PVR_DEV_ADDR(p->clear_dma.code_offset);
       }
@@ -794,7 +858,7 @@ PVR_PER_ARCH(g5p_frag_stream)(const struct pvr_device *device, const struct pvr_
       e->dbias_va = job->depth_bias_table_addr.addr;
       e->dbias_count = MIN2(g->dbias_count, DRM_G5P_RENDER_MAX_TABLE_ENTRIES);
    }
-   e->pixel_output_width = g5p_mrt_pixel_width(g->targets);
+   e->pixel_output_width = g->raw32 ? 4 : g5p_mrt_pixel_width(g->targets);
 
    pass.ta_program_va = device->heaps.pds_heap->base_addr.addr + p->ta_kick.data_offset;
    pass.ta_program_size = 0x40;

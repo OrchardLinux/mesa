@@ -83,6 +83,10 @@ struct pvr_g5p_programs {
       unsigned dwords, common;
    } load_upload[3];
    char load_refusal[128];
+   /* Lazy integer variants: float device allocation order remains identical. */
+   struct pvr_g5p_programs *raw_load[2];
+   struct pvr_suballoc_bo *raw_clear_usc;
+   struct pvr_pds_upload raw_clear_kick;
 };
 
 /* G5P's per-device state (pvr_device::g5p), allocated by g5p_device_init() */
@@ -110,6 +114,7 @@ struct pvr_g5p_job {
    uint32_t vdm_bytes;          /* through STREAM_TERMINATE */
    uint32_t width, height;
    unsigned targets;            /* colour targets, 1, 2 or 4 */
+   bool raw32;                  /* one RGBA32 integer target, four tile words */
    uint32_t dbias_count;        /* entries of upstream's depth-bias table, 0 without one */
    uint32_t scissor_count;      /* entries of upstream's scissor table, 0 without one */
    uint32_t samples;            /* 1 or 4 (hw_render->sample_count) */
@@ -279,6 +284,7 @@ bool pvr_g5p_compile_stage(const VkPipelineShaderStageCreateInfo *stage_info, bo
  * texture() of the attachment, bound as set 0 binding 0, at the fragment's
  * pixel centre. false with out->refusal set. */
 bool pvr_g5p_compile_load(struct pco_g5p_program *out);
+bool pvr_g5p_compile_load_raw(struct pco_g5p_program *out, bool is_signed);
 /* The clear quad's stages, built with nir_builder (pvr_g5p_nir.c): the
  * vertex stage passes its vec4 position at location 0 through, the
  * fragment stage writes the push constant's colour (bytes 0..15) to colour
@@ -287,6 +293,7 @@ bool pvr_g5p_compile_load(struct pco_g5p_program *out);
  * one. */
 struct nir_shader;
 struct nir_shader *pvr_g5p_clear_nir(bool vertex);
+struct nir_shader *pvr_g5p_clear_nir_raw(bool vertex, bool is_signed);
 void pvr_g5p_clear_nir_free(struct nir_shader *nir);
 /* A vertex stage whose SPIR-V declares ExecutionMode Xfb */
 bool pvr_g5p_stage_has_xfb(const VkPipelineShaderStageCreateInfo *stage_info);
