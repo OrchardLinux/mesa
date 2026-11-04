@@ -107,9 +107,11 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
    unsigned bind_dwords, ctrl0, nc = 0;
    VkResult result;
 
-   if (indirect_va || base_group[0] || base_group[1] || base_group[2])
-      return vk_errorf(cmd_buffer, VK_ERROR_FEATURE_NOT_PRESENT, "G5P: indirect/base dispatch not implemented yet");
-   if (!group_count[0] || !group_count[1] || !group_count[2])
+   if (base_group[0] || base_group[1] || base_group[2])
+      return vk_errorf(cmd_buffer, VK_ERROR_FEATURE_NOT_PRESENT, "G5P: base dispatch not implemented yet");
+   if (indirect_va && ((indirect_va & 3) || indirect_va >> 40))
+      return vk_error(cmd_buffer, VK_ERROR_FEATURE_NOT_PRESENT);
+   if (!indirect_va && (!group_count[0] || !group_count[1] || !group_count[2]))
       return VK_SUCCESS;
    if (!threads || threads > 512 || group_count[0] > 65536 || group_count[1] > 65536 || group_count[2] > 65536)
       return vk_error(cmd_buffer, VK_ERROR_FEATURE_NOT_PRESENT);
@@ -219,7 +221,15 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
 
       pvr_csb_set_relocation_mark(csb);
       emit_record(csb, &bind_rec);
-      emit_record(csb, &kernel_rec);
+      if (indirect_va) {
+         const struct g5p_cdm_indirect_record rec = g5p_cdm_indirect(
+            kernel_rec.w[0], kernel.data_offset, kernel.code_offset,
+            indirect_va, threads, 0);
+         uint32_t *w = pvr_arch_csb_alloc_dwords(csb, 6);
+         if (w) memcpy(w, rec.w, sizeof(rec.w));
+      } else {
+         emit_record(csb, &kernel_rec);
+      }
       pvr_csb_clear_relocation_mark(csb);
    }
 

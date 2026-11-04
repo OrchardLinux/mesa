@@ -25,4 +25,16 @@ static inline struct g5p_cdm_record g5p_cdm_task(uint32_t flags, uint32_t data, 
 {
    return (struct g5p_cdm_record){ .w = {flags,data | kind,code,0,0,0,8u << 27} };
 }
+/* KERNEL0 indirect-present, KERNEL1/2, KERNEL6/7, KERNEL8.
+ * The hardware reads three workgroup counts from the GPU address. */
+struct g5p_cdm_indirect_record { uint32_t w[6]; };
+static inline struct g5p_cdm_indirect_record
+g5p_cdm_indirect(uint32_t sizes, uint32_t data, uint32_t code,
+                  uint64_t address, unsigned threads, unsigned common)
+{
+   return (struct g5p_cdm_indirect_record){ .w = {
+      sizes | common << 18 | (1u << 29), data, code,
+      (uint32_t)(address >> 32), (uint32_t)address, (threads - 1) << 18,
+   } };
+}
 #endif
