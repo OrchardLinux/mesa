@@ -59,8 +59,11 @@ pvr_g5p_dgl_clear(uint8_t *output, size_t capacity)
 {
    uint8_t code[6 * G5P_USC_MAX];
    size_t size = 0;
-   for (unsigned c = 0; c < 4; c++) {
-      unsigned n = g5p_usc_mov_shared(code + size, 2 * c, c, 0);
+   /* Apple A9 raw uint/int output: descending output writes from common2..5.
+    * The ordinary compiler also places shared-move values at dword2 or above.
+    * The caller must DMA the four raw clear dwords at common2 and allocate six. */
+   for (int c = 3; c >= 0; c--) {
+      unsigned n = g5p_usc_mov_shared(code + size, 2 * c, c + 2, 0);
       if (!n)
          return 0;
       size += n;

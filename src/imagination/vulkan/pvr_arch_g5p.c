@@ -732,7 +732,7 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
    struct pvr_pds_upload clear_data, eot_data;
    {
       const uint32_t data[4] = { (uint32_t)floats->dev_addr.addr, (uint32_t)(floats->dev_addr.addr >> 32),
-                                 g5p_doutd_control(G5P_MRT_CLEAR_DWORDS * n), 0 };
+                                 raw ? g5p_doutd_control_at(2, 4, true) : g5p_doutd_control(G5P_MRT_CLEAR_DWORDS * n), 0 };
       result = pvr_arch_cmd_buffer_upload_pds(cmd_buffer, data, ARRAY_SIZE(data), 16, NULL, 0, 0, 16,
                                               &clear_data);
       if (result != VK_SUCCESS)
@@ -768,7 +768,7 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
       }
       pvr_csb_pack (&bgnd[3], CR_PDS_BGRND3_SIZEINFO, b3) {
          b3.pds_uniformsize = DIV_ROUND_UP(4, ROGUE_CR_PDS_BGRND3_SIZEINFO_PDS_UNIFORMSIZE_UNIT_SIZE);
-         b3.usc_sharedsize = DIV_ROUND_UP(G5P_MRT_CLEAR_DWORDS * n,
+         b3.usc_sharedsize = DIV_ROUND_UP(raw ? 6 : G5P_MRT_CLEAR_DWORDS * n,
                                           ROGUE_CR_PDS_BGRND3_SIZEINFO_USC_SHAREDSIZE_UNIT_SIZE);
       }
    }
