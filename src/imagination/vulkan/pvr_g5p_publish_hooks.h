@@ -166,11 +166,15 @@
 #define PVR_G5P_HOOK_pub_pvr_physical_device_1275() \
    PVR_G5P_HOOK_msaa_limits(pdevice, &supported_properties) \
    /* G5P: no transform feedback is built yet (G5P refuses every XFB pipeline), \
-    * so none is advertised: Zink derives its GL/ES version from what is real */ \
+    * so none is advertised: Zink derives its GL/ES version from what is real. \
+    * Nor dynamic colour-write enables: G5P compiles the write mask into the \
+    * fragment program, and Zink makes them dynamic whenever they exist. */ \
    if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g5p)) { \
       supported_extensions.EXT_transform_feedback = false; \
       supported_features.transformFeedback = false; \
       supported_features.geometryStreams = false; \
+      supported_extensions.EXT_color_write_enable = false; \
+      supported_features.colorWriteEnable = false; \
    }
 
 #define PVR_G5P_HOOK_winsys(version, render_fd, display_fd, alloc, ws, result) \
