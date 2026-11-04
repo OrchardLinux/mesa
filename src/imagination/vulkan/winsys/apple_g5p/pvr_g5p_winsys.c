@@ -108,6 +108,7 @@ struct g5p_ws {
    uint32_t chunk_live[G5P_WS_MAX_CHUNKS]; /* slices referencing each chunk; lock held */
    uint64_t arena_reclaimed;
    uint64_t arena_submits;
+   uint64_t arena_stats_after; /* bounded idle snapshots as well as120-job reports */
    uint64_t data_live, data_peak;
    unsigned data_count;
    struct util_vma_heap slices;
@@ -132,6 +133,7 @@ struct g5p_ws_bo {
    uint8_t *cpu;
    uint64_t alloc_size;
    unsigned chunk; /* stable until this slice is destroyed */
+   bool dedicated_image; /* VkMemoryDedicatedAllocateInfo.image was supplied */
    bool data_only; /* large application VkDeviceMemory, not code/control streams */
    bool own; /* an own kernel BO (display buffer or import) */
    struct g5p_drm_bo kbo;
@@ -150,8 +152,8 @@ static void g5p_ws_own_list(struct g5p_ws *ws, struct g5p_ws_bo *b)
       ws->data_peak = MAX2(ws->data_peak, ws->data_live);
       ws->data_count++;
       if (ws->arena_log)
-         fprintf(stderr, "apple_g5p winsys: data allocation pid=%ld fd=%d handle=%u size_kib=%" PRIu64 " live_kib=%" PRIu64 " bos=%u\n",
-                 (long)getpid(), ws->drm.fd, b->kbo.handle, b->alloc_size >> 10, ws->data_live >> 10, ws->data_count);
+         fprintf(stderr, "apple_g5p winsys: data allocation pid=%ld fd=%d handle=%u size_kib=%" PRIu64 " live_kib=%" PRIu64 " bos=%u dedicated_image=%u\n",
+                 (long)getpid(), ws->drm.fd, b->kbo.handle, b->alloc_size >> 10, ws->data_live >> 10, ws->data_count, b->dedicated_image);
    }
    simple_mtx_unlock(&ws->lock);
 }
@@ -463,7 +465,7 @@ static struct g5p_ws_bo *g5p_ws_bo_new(struct g5p_ws *ws, uint64_t size)
 
 /* An own kernel BO in the dedicated window (a VM edit: the kernel refuses it
  * while a job of the context is queued or running). */
-static VkResult g5p_ws_own_create(struct g5p_ws *ws, uint64_t size, uint64_t alignment, bool data, struct g5p_ws_bo *b)
+static VkResult g5p_ws_own_create(struct g5p_ws *ws, uint64_t size, uint64_t alignment, unsigned data, struct g5p_ws_bo *b)
 {
    const uint64_t alloc = align64(size, G5P_WS_PAGE);
    simple_mtx_lock(&ws->lock);
@@ -490,7 +492,8 @@ static VkResult g5p_ws_own_create(struct g5p_ws *ws, uint64_t size, uint64_t ali
    b->va = va;
    b->cpu = b->kbo.map;
    b->alloc_size = alloc;
-   b->data_only = data;
+   b->data_only = data != 0;
+   b->dedicated_image = data == 2;
    g5p_ws_own_list(ws, b);
    return VK_SUCCESS;
 }
@@ -504,8 +507,8 @@ static VkResult g5p_ws_buffer_create(struct pvr_winsys *ws_, uint64_t size, uint
       return vk_error(NULL, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    VkResult r = VK_SUCCESS;
-   if (type == PVR_WINSYS_BO_TYPE_DISPLAY || type == PVR_G5P_BO_TYPE_DATA) {
-      r = g5p_ws_own_create(ws, size, alignment, type == PVR_G5P_BO_TYPE_DATA, b);
+   if (type == PVR_WINSYS_BO_TYPE_DISPLAY || type == PVR_G5P_BO_TYPE_DATA || type == PVR_G5P_BO_TYPE_IMAGE_DATA) {
+      r = g5p_ws_own_create(ws, size, alignment, type == PVR_G5P_BO_TYPE_IMAGE_DATA ? 2 : type == PVR_G5P_BO_TYPE_DATA, b);
    } else {
       const uint64_t alloc = align64(size, G5P_WS_PAGE), align = MAX2(alignment, G5P_WS_PAGE);
       simple_mtx_lock(&ws->lock);
@@ -1112,7 +1115,8 @@ static VkResult g5p_ws_render_submit(const struct pvr_winsys_render_ctx *ctx,
    g5p_ws_perf_account(&ws->perf, res, nres, nchunks, t0);
    if (ws->arena_log) {
       simple_mtx_lock(&ws->lock);
-      if (++ws->arena_submits % 120 == 0) {
+      if (++ws->arena_submits % 120 == 0 || t0 >= ws->arena_stats_after) {
+         ws->arena_stats_after = t0 + 5000000000ull;
          g5p_ws_arena_stats(ws, "submit");
          fprintf(stderr, "apple_g5p winsys: rt stats pid=%ld context=%u creates=%" PRIu64 " reuses=%" PRIu64 "\n",
                  (long)getpid(), c->context, c->rt_creates, c->rt_reuses);
@@ -1291,6 +1295,8 @@ static VkResult g5p_ws_arena_init(struct g5p_ws *ws)
       return g5p_ws_fail(VK_ERROR_INITIALIZATION_FAILED, "the arena's first chunk at %#" PRIx64 ": %s",
                        ws->arena_va, strerror(-r));
    g5p_ws_perf_init(&ws->perf, ws->arena_va, size, ws->arena_cpu);
+   if (ws->arena_log)
+      g5p_ws_arena_stats(ws, "init");
    /* above the code window: display BOs and imports are never programs */
    util_vma_heap_init(&ws->dedicated, ws->arena_va + ws->render.code_window, G5P_WS_DEDICATED_SIZE);
    ws->vma_heaps_ready = true;

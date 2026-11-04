@@ -117,7 +117,8 @@
    if (PVR_HAS_FEATURE(&(device)->pdevice->dev_info, apple_g5p) &&           \
        (type) == PVR_WINSYS_BO_TYPE_GPU &&                                  \
        pvr_g5p_memory_is_large((info)->allocationSize))                     \
-      (type) = PVR_G5P_BO_TYPE_DATA;
+      (type) = pvr_g5p_memory_is_dedicated_image(info)                      \
+                  ? PVR_G5P_BO_TYPE_IMAGE_DATA : PVR_G5P_BO_TYPE_DATA;
 
 #define PVR_G5P_HOOK_memory_dedicated(device, requirements)                 \
    if (PVR_HAS_FEATURE(&(device)->pdevice->dev_info, apple_g5p))             \

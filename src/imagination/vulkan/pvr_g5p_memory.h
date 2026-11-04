@@ -15,11 +15,21 @@
 /* A private winsys type, selected only by pvr_AllocateMemory's G5P hook.
  * G9P's GPU/DISPLAY enum and internal pvr_bo_alloc callers are unchanged. */
 #define PVR_G5P_BO_TYPE_DATA ((enum pvr_winsys_bo_type)2)
+#define PVR_G5P_BO_TYPE_IMAGE_DATA ((enum pvr_winsys_bo_type)3)
 
 static inline bool
 pvr_g5p_memory_is_large(uint64_t size)
 {
    return size >= PVR_G5P_DATA_THRESHOLD;
+}
+
+static inline bool
+pvr_g5p_memory_is_dedicated_image(const VkMemoryAllocateInfo *info)
+{
+   for (const VkBaseInStructure *ext = info->pNext; ext; ext = ext->pNext)
+      if (ext->sType == VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO)
+         return ((const VkMemoryDedicatedAllocateInfo *)ext)->image != VK_NULL_HANDLE;
+   return false;
 }
 
 static inline void
