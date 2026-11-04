@@ -51,6 +51,7 @@
 #include "pvr_g5p_upload.h"
 #include "pvr_g5p_ds.h"
 #include "pvr_g5p_msaa.h"
+#include "pvr_g5p_vertex.h"
 #include "pvr_pass.h"
 #include "pvr_pipeline.h"
 
@@ -194,20 +195,44 @@ fetch_ids(unsigned fetches)
    return fetches ? 8 * fetches : 2;
 }
 
+/* The base instance (Apple's g3b-basevertex: add32 t1, cN, t1 before the
+ * DDMADs and the DOUTWs; t1 is the 0-based instance): fetch 0's free dword,
+ * or after the index controls in a second unit without fetches */
 static unsigned
-fetch_data_bytes(unsigned fetches, unsigned id_mask)
+fetch_base_instance(unsigned fetches)
 {
-   return fetches ? 32 * fetches + (id_mask ? 16 : 0) : 16;
+   return fetches ? 7 : 4;
 }
 
 static unsigned
-fetch_program(uint32_t *dest, unsigned fetches, unsigned id_mask)
+fetch_data_bytes(unsigned fetches, unsigned id_mask, bool base_instance)
+{
+   return fetches ? 32 * fetches + (id_mask ? 16 : 0) : base_instance ? 32 : 16;
+}
+
+/* The program reads the instance: its index, or a per-instance fetch */
+static bool
+fetch_reads_instance(const struct pvr_g5p_pipeline *g)
+{
+   bool r = g->vs_id_mask & 2;
+   for (unsigned f = 0; f < g->fetch_count; f++)
+      r |= g->fetch_list[f].rate == PVR_G5P_FETCH_INSTANCE;
+   return r;
+}
+
+static unsigned
+fetch_program(uint32_t *dest, const struct pvr_g5p_fetch *list, unsigned fetches, unsigned id_mask,
+              bool base_instance)
 {
    pdsc_init();
    pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-vertex-fetch");
+   if (base_instance)
+      pdsc_add32(p, pdsc_ref_temp32(1), pdsc_ref_const32(fetch_base_instance(fetches)), pdsc_ref_temp32(1));
    for (unsigned f = 0; f < fetches; f++) {
       const unsigned c = f * 8;
-      pdsc_ddmad(p, pdsc_ref_const32(c + 6), pdsc_ref_temp32(0), pdsc_ref_const64(c), pdsc_ref_const64(c + 4));
+      /* a per-instance fetch multiplies by the instance (Apple's s1=t1) */
+      const unsigned t = list[f].rate == PVR_G5P_FETCH_INSTANCE;
+      pdsc_ddmad(p, pdsc_ref_const32(c + 6), pdsc_ref_temp32(t), pdsc_ref_const64(c), pdsc_ref_const64(c + 4));
    }
    unsigned k = 0;
    u_foreach_bit (i, id_mask)
@@ -293,101 +318,6 @@ usc_off(const struct pvr_device *device, const struct pvr_suballoc_bo *bo)
 
 /* ---- pipelines ---- */
 
-/* The vertex attribute formats rung A fetches: 32-bit floats, 1 to 4
- * components (one DDMAD of the format's dwords) */
-static unsigned
-attrib_dwords(VkFormat format)
-{
-   switch (format) {
-   case VK_FORMAT_R32_SFLOAT: return 1;
-   case VK_FORMAT_R32G32_SFLOAT: return 2;
-   case VK_FORMAT_R32G32B32_SFLOAT: return 3;
-   case VK_FORMAT_R32G32B32A32_SFLOAT: return 4;
-   default: return 0;
-   }
-}
-
-/* Vertex fetches (the ICD's vertex_input_ok() and fetch_per_binding()):
- * each binding whose attributes are consecutive whole vec4s is one DDMAD
- * into r4L.. of its first location; otherwise one DDMAD per attribute,
- * format-sized. Only attributes the vertex program reads are fetched. */
-static VkResult
-g5p_fetches(struct pvr_device *device, struct pvr_g5p_pipeline *g, const struct vk_vertex_input_state *vi,
-            bool dynamic_strides, uint32_t read)
-{
-   struct {
-      unsigned location, binding;
-      uint32_t offset;
-      VkFormat format;
-   } a[PVR_G5P_MAX_FETCH];
-   unsigned n = 0;
-
-   if (read & ~(vi ? vi->attributes_valid : 0))
-      return G5P_REFUSE(device, "the vertex shader reads location %u, which has no vertex attribute",
-                        u_bit_scan(&(uint32_t){ read & ~(vi ? vi->attributes_valid : 0) }));
-   if (!vi)
-      return VK_SUCCESS;
-   u_foreach_bit (loc, vi->attributes_valid) {
-      const struct vk_vertex_attribute_state *at = &vi->attributes[loc];
-      if (vi->bindings[at->binding].input_rate != VK_VERTEX_INPUT_RATE_VERTEX)
-         return G5P_REFUSE(device, "vertex attribute %u: per-instance input rate", loc);
-      if (!attrib_dwords(at->format))
-         return G5P_REFUSE(device, "vertex attribute %u: format %s (rung A fetches 32-bit floats)", loc,
-                           vk_Format_to_str(at->format));
-      if (!(read & BITFIELD_BIT(loc)))
-         continue; /* bound but not read: not fetched */
-      if (loc >= PVR_G5P_MAX_FETCH)
-         return G5P_REFUSE(device, "vertex attribute at location %u", loc);
-      a[n++] = (__typeof__(a[0])){ loc, at->binding, at->offset, at->format };
-   }
-
-   /* per binding, when every attribute is a vec4 and they are consecutive */
-   bool per_binding = true;
-   for (unsigned i = 0; i < n && per_binding; i++)
-      per_binding = a[i].format == VK_FORMAT_R32G32B32A32_SFLOAT;
-   for (unsigned i = 0; i < n && per_binding; i++) {
-      unsigned first = ~0u, cnt = 0;
-      uint32_t min_off = ~0u;
-      for (unsigned k = 0; k < n; k++) {
-         if (a[k].binding != a[i].binding)
-            continue;
-         first = MIN2(first, a[k].location);
-         min_off = MIN2(min_off, a[k].offset);
-         cnt++;
-      }
-      if (a[i].offset != min_off + 16 * (a[i].location - first) ||
-          (!dynamic_strides && vi->bindings[a[i].binding].stride < 16 * cnt))
-         per_binding = false;
-   }
-   g->fetch_count = 0;
-   if (per_binding) {
-      for (unsigned b = 0; b < MESA_VK_MAX_VERTEX_BINDINGS; b++) {
-         unsigned first = ~0u, cnt = 0;
-         uint32_t min_off = ~0u;
-         for (unsigned i = 0; i < n; i++) {
-            if (a[i].binding != b)
-               continue;
-            first = MIN2(first, a[i].location);
-            min_off = MIN2(min_off, a[i].offset);
-            cnt++;
-         }
-         if (cnt)
-            g->fetch_list[g->fetch_count++] =
-               (struct pvr_g5p_fetch){ .binding = b, .offset = min_off, .dwords = 4 * cnt, .ao = 4 * first };
-      }
-   } else {
-      for (unsigned i = 0; i < n; i++)
-         g->fetch_list[g->fetch_count++] = (struct pvr_g5p_fetch){
-            .binding = a[i].binding, .offset = a[i].offset, .dwords = attrib_dwords(a[i].format),
-            .ao = 4 * a[i].location };
-   }
-   for (unsigned i = 1; i < g->fetch_count; i++)
-      if (g->fetch_list[i].binding != g->fetch_list[0].binding)
-         return G5P_REFUSE(device, "vertex input from bindings %u and %u (rung A: one vertex buffer)",
-                           g->fetch_list[0].binding, g->fetch_list[i].binding);
-   return VK_SUCCESS;
-}
-
 /* What rung A draws: refused by name otherwise (the ICD's validate_state()
  * with rung A's limits) */
 static VkResult
@@ -427,9 +357,6 @@ g5p_check_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo *c
 
    if (s->shader_stages != (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT) || s->ts)
       return G5P_REFUSE(device, "shader stages %#x (a vertex and a fragment shader)", s->shader_stages);
-   if (s->ia && !BITSET_TEST(s->dynamic, MESA_VK_DYNAMIC_IA_PRIMITIVE_RESTART_ENABLE) &&
-       s->ia->primitive_restart_enable)
-      return G5P_REFUSE(device, "primitive restart");
    if (s->rs && (s->rs->depth_clamp_enable || s->rs->polygon_mode != VK_POLYGON_MODE_FILL))
       return G5P_REFUSE(device, "depth clamp or polygon mode %d", s->rs->polygon_mode);
    if (s->rs && (s->rs->line.mode != VK_LINE_RASTERIZATION_MODE_DEFAULT || s->rs->line.stipple.enable))
@@ -488,6 +415,7 @@ g5p_pipeline_free(struct pvr_device *device, struct pvr_g5p_pipeline *g)
    pvr_bo_suballoc_free(g->vs_usc);
    pvr_bo_suballoc_free(g->fs_usc);
    pvr_bo_suballoc_free(g->fetch.pvr_bo);
+   pvr_bo_suballoc_free(g->fetch_base.pvr_bo);
    pvr_bo_suballoc_free(g->fs_launch.pvr_bo);
    pvr_bo_suballoc_free(g->varying.pvr_bo);
    pvr_bo_suballoc_free(g->fs_loader.pvr_bo);
@@ -531,12 +459,10 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
    if (!vs_info || !fs_info)
       return G5P_REFUSE(device, "a pipeline without a vertex and a fragment shader");
 
-   /* format components per location: the VS sees (0,0,0,1) beyond them */
-   uint8_t components[PCO_G5P_MAX_ATTRIBS] = { 0 };
-   if (s->vi)
-      u_foreach_bit (loc, s->vi->attributes_valid)
-         if (loc < PCO_G5P_MAX_ATTRIBS)
-            components[loc] = attrib_dwords(s->vi->attributes[loc].format);
+   /* the vertex input layout: the fetches, and the registers the vertex program reads them from
+    * (pvr_g5p_vertex.h) */
+   struct pvr_g5p_vertex_layout vertex;
+   pvr_g5p_vertex_layout_init(&vertex, s->vi, BITSET_TEST(s->dynamic, MESA_VK_DYNAMIC_VI_BINDING_STRIDES));
 
    /* the fragment program first: the vertex program is compiled against the
     * varyings it reads (Apple's VertexProgramKey; Rogue's pco_rev_link_nir) */
@@ -545,7 +471,7 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
    struct pco_g5p_vs_link link = { .valid = true };
    for (unsigned i = 0; i < fs->num_varyings; i++)
       link.interp[fs->vary[i].location] = fs->vary[i].interp;
-   if (!pvr_g5p_compile_stage(vs_info, false, 1, components, NULL, &link, vs))
+   if (!pvr_g5p_compile_stage(vs_info, false, 1, &vertex, NULL, &link, vs))
       return G5P_REFUSE(device, "vertex shader: %s", vs->refusal);
    for (unsigned i = 0; i < fs->num_varyings; i++)
       if (!vs->vout_dword[fs->vary[i].location])
@@ -596,10 +522,8 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
    for (unsigned i = 0; i < fs->num_varyings; i++)
       g->fs_flat |= fs->vary[i].interp == PCO_G5P_INTERP_FLAT;
 
-   result = g5p_fetches(device, g, s->vi, BITSET_TEST(s->dynamic, MESA_VK_DYNAMIC_VI_BINDING_STRIDES),
-                        vs->input_mask);
-   if (result != VK_SUCCESS)
-      return result;
+   g->fetch_count = vertex.fetch_count;
+   memcpy(g->fetch_list, vertex.fetch_list, sizeof(g->fetch_list));
    if (!g->fetch_count && !(g->vs_id_mask & 1))
       return G5P_REFUSE(device, "a vertex shader without attributes or vertex index (no fetch-less PDS form)");
 
@@ -626,10 +550,16 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
 
    /* PDS: vertex fetch code */
    uint32_t code[96], data[2 * (1 + PCO_G5P_MAX_FS_VARYINGS) + 4];
-   unsigned n = fetch_program(code, g->fetch_count, g->vs_id_mask);
+   unsigned n = fetch_program(code, g->fetch_list, g->fetch_count, g->vs_id_mask, false);
    result = pvr_gpu_upload_pds(device, NULL, 0, 0, code, n, 16, 64, &g->fetch);
    if (result != VK_SUCCESS)
       return result;
+   if (fetch_reads_instance(g)) {
+      n = fetch_program(code, g->fetch_list, g->fetch_count, g->vs_id_mask, true);
+      result = pvr_gpu_upload_pds(device, NULL, 0, 0, code, n, 16, 64, &g->fetch_base);
+      if (result != VK_SUCCESS)
+         return result;
+   }
 
    /* PDS: the fragment launch, data {DOUTU} and its code at +0x20 */
    {
@@ -941,13 +871,12 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
       return G5P_REFUSE(cmd_buffer, "a draw without a G5P graphics pipeline");
    if (!draw->count || !draw->instances)
       return VK_SUCCESS;
-   if (draw->instances != 1 || draw->first_instance)
-      return G5P_REFUSE(cmd_buffer, "%u instances from %u (rung A draws one instance)", draw->instances,
-                        draw->first_instance);
    if (!g5p_topology(dyn->ia.primitive_topology, &hw_topology, &split, &lines))
       return G5P_REFUSE(cmd_buffer, "topology %d", dyn->ia.primitive_topology);
-   if (dyn->ia.primitive_restart_enable)
-      return G5P_REFUSE(cmd_buffer, "primitive restart");
+   /* the vertex input: instances, indices, the bound vertex buffers (pvr_arch_g5p_vertex.c) */
+   VkResult result = pvr_arch_g5p_vertex_draw_check(cmd_buffer, g, draw);
+   if (result != VK_SUCCESS)
+      return result;
    if (dyn->vp.viewport_count != 1 || dyn->vp.scissor_count != 1)
       return G5P_REFUSE(cmd_buffer, "%u viewports, %u scissors (one of each)", dyn->vp.viewport_count,
                         dyn->vp.scissor_count);
@@ -966,7 +895,7 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
    if (mrt != VK_SUCCESS)
       return mrt;
 
-   VkResult result = pvr_arch_cmd_buffer_start_sub_cmd(cmd_buffer, PVR_SUB_CMD_TYPE_GRAPHICS);
+   result = pvr_arch_cmd_buffer_start_sub_cmd(cmd_buffer, PVR_SUB_CMD_TYPE_GRAPHICS);
    if (result != VK_SUCCESS)
       return result;
 
@@ -1002,8 +931,13 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
    }
 
    /* 3. the vertex fetch data: bases, controls, strides, the DOUTU word */
-   uint32_t fdata[4 * 2 * PVR_G5P_MAX_FETCH + 4] = { 0 };
-   const unsigned fbytes = fetch_data_bytes(g->fetch_count, g->vs_id_mask);
+   uint32_t fdata[4 * 2 * PVR_G5P_MAX_FETCH + 8] = { 0 };
+   /* a first instance takes the program that adds it to t1 */
+   const bool base_instance = draw->first_instance && fetch_reads_instance(g);
+   const struct pvr_pds_upload *fetch_code = base_instance ? &g->fetch_base : &g->fetch;
+   const unsigned fbytes = fetch_data_bytes(g->fetch_count, g->vs_id_mask, base_instance);
+   if (base_instance)
+      fdata[fetch_base_instance(g->fetch_count)] = draw->first_instance;
    {
       const uint64_t doutu = doutu_src0(usc_off(device, g->vs_usc), g->vs_temps);
       fdata[fetch_doutu(g->fetch_count)] = (uint32_t)doutu;
@@ -1017,13 +951,17 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
          const struct pvr_vertex_binding *vb = &cs->vertex_bindings[fe->binding];
          if (!vb->buffer)
             return G5P_REFUSE(cmd_buffer, "no vertex buffer bound at binding %u", fe->binding);
-         const uint64_t base = vb->buffer->dev_addr.addr + vb->offset + fe->offset;
+         const uint32_t stride = dyn->vi_binding_strides[fe->binding];
+         /* divisor 0: every instance reads the first instance's element */
+         const bool divisor0 = fe->rate == PVR_G5P_FETCH_INSTANCE_DIVISOR0;
+         const uint64_t base = vb->buffer->dev_addr.addr + vb->offset + fe->offset +
+                               (divisor0 ? (uint64_t)draw->first_instance * stride : 0);
          const uint64_t ctl = ddmad_src3(fe->dwords, fe->ao, f == g->fetch_count - 1);
          fdata[8 * f] = (uint32_t)base;
          fdata[8 * f + 1] = (uint32_t)(base >> 32);
          fdata[8 * f + 4] = (uint32_t)ctl;
          fdata[8 * f + 5] = (uint32_t)(ctl >> 32);
-         fdata[8 * f + 6] = dyn->vi_binding_strides[fe->binding];
+         fdata[8 * f + 6] = divisor0 ? 0 : stride;
       }
    }
    struct pvr_pds_upload fetch_data;
@@ -1204,7 +1142,7 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
          v0.cam_size = cam;
       }
       pvr_csb_pack (&w[1], VDMCTRL_VDM_STATE3, v3) {
-         v3.vs_pds_code_base_addr = PVR_DEV_ADDR(g->fetch.code_offset);
+         v3.vs_pds_code_base_addr = PVR_DEV_ADDR(fetch_code->code_offset);
       }
       pvr_csb_pack (&w[2], VDMCTRL_VDM_STATE4, v4) {
          v4.vs_output_size = g->vs_outputs;
@@ -1219,8 +1157,8 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
       if (vector > 64)
          w[3] |= BITFIELD_BIT(30);
       emit_words(csb, "vdm state vs", w, 4);
-      g5p_dump("draw", "fetch code", g->fetch.code_offset,
-               pvr_bo_suballoc_get_map_addr(g->fetch.pvr_bo), g->fetch.code_size);
+      g5p_dump("draw", "fetch code", fetch_code->code_offset,
+               pvr_bo_suballoc_get_map_addr(fetch_code->pvr_bo), fetch_code->code_size);
 
       /* 2. the varying format */
       emit_ppp(csb, "ppp varying", g->static_vary->dev_addr.addr, g->static_vary_words, 4);
@@ -1271,21 +1209,13 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
       emit_ppp(csb, names[i], ppp_va + 4 * blocks[i][0], &ppp[blocks[i][0]], blocks[i][1]);
    g5p_dump("draw", "stream out data", dp->halt.data_offset, pvr_bo_suballoc_get_map_addr(dp->halt.pvr_bo), 5);
 
-   /* 11. the index list: count, instances - 1, first vertex, split */
+   /* 11. the index list: [the index buffer], count, instances - 1, first vertex or vertex offset, split
+    * (pvr_arch_g5p_vertex.c) */
    {
-      unsigned n = 0;
-      pvr_csb_pack (&w[n++], VDMCTRL_INDEX_LIST0, l0) {
-         l0.index_count_present = true;
-         l0.index_instance_count_present = true;
-         l0.index_offset_present = true;
-         l0.split_count_present = true;
-         l0.index_size = ROGUE_VDMCTRL_INDEX_SIZE_B32;
-         l0.primitive_topology = hw_topology;
-      }
-      w[n++] = draw->count;
-      w[n++] = draw->instances - 1;
-      w[n++] = draw->first;
-      w[n++] = split;
+      unsigned n;
+      result = pvr_arch_g5p_vertex_index_list(cmd_buffer, draw, hw_topology, split, w, &n);
+      if (result != VK_SUCCESS)
+         return result;
       emit_words(csb, "index list", w, n);
    }
 
@@ -1293,9 +1223,18 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
    return csb->status;
 }
 
-/* vkCmdDrawIndexed: refused by name (rung A draws non-indexed) */
+/* vkCmdDrawIndexed: the same draw with an index list (pvr_arch_g5p_vertex.c) */
 VkResult
-PVR_PER_ARCH(g5p_cmd_draw_indexed)(struct pvr_cmd_buffer *cmd_buffer)
+PVR_PER_ARCH(g5p_cmd_draw_indexed)(struct pvr_cmd_buffer *cmd_buffer, uint32_t index_count, uint32_t instances,
+                                   uint32_t first_index, int32_t vertex_offset, uint32_t first_instance)
 {
-   return G5P_REFUSE(cmd_buffer, "an indexed draw (rung A draws non-indexed)");
+   const struct pvr_g5p_draw draw = {
+      .count = index_count,
+      .instances = instances,
+      .first = first_index,
+      .first_instance = first_instance,
+      .indexed = true,
+      .vertex_offset = vertex_offset,
+   };
+   return pvr_arch_g5p_cmd_draw(cmd_buffer, &draw);
 }

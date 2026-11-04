@@ -30,6 +30,13 @@ enum g5p_binop {
 };
 enum g5p_minmax { G5P_UMIN, G5P_UMAX, G5P_IMIN, G5P_IMAX, G5P_MINMAX_COUNT };
 enum g5p_convert { G5P_F2I32, G5P_F2U32, G5P_I2F32, G5P_U2F32, G5P_F2I32_RTE, G5P_CONVERT_COUNT };
+/* The 8- and 16-bit sources of the convert to float (Apple's vertex format
+ * conversions): bit 0 signed, bit 1 normalized, bit 2 16-bit. */
+enum g5p_small_format {
+   G5P_SMALL_U8, G5P_SMALL_S8, G5P_SMALL_UN8, G5P_SMALL_SN8,
+   G5P_SMALL_U16, G5P_SMALL_S16, G5P_SMALL_UN16, G5P_SMALL_SN16,
+   G5P_SMALL_FORMAT_COUNT
+};
 enum g5p_unary { G5P_FLOOR, G5P_LOG2, G5P_EXP2, G5P_NOT, G5P_POPCOUNT, G5P_BITREVERSE, G5P_UNARY_COUNT };
 enum g5p_tex_dim { G5P_TEX_2D, G5P_TEX_2D_ARRAY, G5P_TEX_3D, G5P_TEX_CUBE, G5P_TEX_DIM_COUNT };
 /* ISA round 2 (isa-g5p.md "ISA round 2"): compare/write relations, SFU
@@ -76,6 +83,13 @@ unsigned g5p_usc_binary_literal(uint8_t *out, enum g5p_binop op, unsigned dst_ha
 unsigned g5p_usc_fma_literal(uint8_t *out, unsigned dst_half, uint32_t value, unsigned b_half,
                              unsigned c_half, unsigned bank, unsigned b_group, unsigned c_group,
                              unsigned header);
+/* Vertex integer forms with a literal A (Apple's vertex probes m_imin_lit,
+ * m_umax_lit, m_imax_neg, m_umin_big, m_isub_lit, m_isub_big, m_ineg):
+ * min/max(literal, B) and literal - B; 0 - B is ineg. */
+unsigned g5p_usc_minmax_literal(uint8_t *out, enum g5p_minmax op, unsigned dst_half, uint32_t value,
+                                unsigned b_half, unsigned bank, unsigned b_group, unsigned header);
+unsigned g5p_usc_isub_literal(uint8_t *out, unsigned dst_half, uint32_t value, unsigned b_half,
+                              unsigned bank, unsigned b_group, unsigned header);
 unsigned g5p_usc_shift(uint8_t *out, bool left, unsigned dst_half, unsigned value_half,
                        unsigned amount, bool immediate, unsigned bank, unsigned value_group,
                        unsigned amount_group, unsigned header);
@@ -188,6 +202,14 @@ unsigned g5p_usc_binary_literal2(uint8_t *out, enum g5p_binop op, unsigned dst_h
                                  unsigned b_half, unsigned bank, unsigned b_group, unsigned header,
                                  enum g5p_literal type, int long_form, unsigned source_extension,
                                  unsigned dst_control, bool negate_b);
+/* One 8- or 16-bit component of the half register src_half (2 * r + 1: the
+ * high 16 bits) to f32; high_byte: bits 15:8 of that half (8-bit formats). */
+unsigned g5p_usc_convert_small(uint8_t *out, enum g5p_small_format fmt, unsigned dst_half, unsigned src_half,
+                               bool high_byte, unsigned bank, unsigned src_group, unsigned header,
+                               unsigned source_extension);
+/* The f16 in half register src_half to f32: -0.0 + x with an f16 B source. */
+unsigned g5p_usc_half_to_float(uint8_t *out, unsigned dst_half, unsigned src_half, unsigned bank,
+                               unsigned src_group, unsigned header);
 unsigned g5p_usc_convert2(uint8_t *out, enum g5p_convert op, unsigned dst_half, unsigned src_half,
                           unsigned bank, unsigned src_group, unsigned header,
                           unsigned source_extension, unsigned dst_control);
@@ -210,6 +232,10 @@ unsigned g5p_usc_fma_shared_a(uint8_t *out, unsigned dst_half, unsigned a_dword,
 unsigned g5p_usc_alu_shared_pair(uint8_t *out, enum g5p_binop op, unsigned dst_half, unsigned a_dword,
                                  unsigned b_dword, unsigned bank, unsigned a_shared_group,
                                  unsigned b_shared_group);
+/* min/max(shared A, B) (Apple's m_imin_u, m_umax_u). */
+unsigned g5p_usc_minmax_shared(uint8_t *out, enum g5p_minmax op, unsigned dst_half, unsigned a_dword,
+                               unsigned b_half, unsigned bank, unsigned b_group, unsigned header,
+                               unsigned a_shared_group);
 /* Relations, selections, discard. */
 struct g5p_ctl {
    unsigned bank, header, source_extension, dst_control;

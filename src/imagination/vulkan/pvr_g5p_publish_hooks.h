@@ -7,7 +7,18 @@
 #include "vk_format.h"
 #include "winsys/apple_g5p/pvr_g5p_winsys.h"
 #include "pvr_g5p.h"
-
+#include "pvr_g5p_vertex.h"
+/* G5P fetches the vertex formats of pvr_g5p_vertex_format_info() (32-bit
+ * float and integer, 8/16-bit normalized and scaled, 16-bit float) with
+ * dword strides. Of those, it advertises the ones a whole number of dwords
+ * in size, whose tightly packed strides are dword multiples too (Zink passes
+ * GL's strides through), and no other, so that Zink converts the rest. */
+static inline bool
+pvr_g5p_vertex_buffer_format(VkFormat vk_format)
+{
+   return pvr_g5p_vertex_format_info(vk_format, &(struct pvr_g5p_vertex_format){ 0 }) &&
+          vk_format_get_blocksize(vk_format) % 4 == 0;
+}
 #define PVR_G5P_HOOK_pub_pvr_arch_cmd_buffer_1661() \
    if (PVR_HAS_FEATURE(dev_info, apple_g5p)) { \
       /* the background, end of tile and stream of a G5P render: pvr_arch_g5p_job_init() */ \
@@ -49,13 +60,15 @@
 
 #define PVR_G5P_HOOK_pub_pvr_arch_cmd_buffer_9338() \
    if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g5p)) { \
-      /* G5P: indexed draws are refused by name (pvr_arch_g5p_gfx.c) */ \
-      vk_command_buffer_set_error(&cmd_buffer->vk, \
-                                  pvr_arch_g5p_cmd_draw_indexed(cmd_buffer)); \
+      /* G5P: the draw with an index list (pvr_arch_g5p_vertex.c) */ \
+      result = pvr_arch_g5p_cmd_draw_indexed(cmd_buffer, indexCount, instanceCount, firstIndex, \
+                                             vertexOffset, firstInstance); \
+      if (result != VK_SUCCESS) \
+         vk_command_buffer_set_error(&cmd_buffer->vk, result); \
       goto end_cmd_draw_indexed; \
    }
 
-#define PVR_G5P_HOOK_pub_pvr_arch_cmd_buffer_10235() \
+#define PVR_G5P_HOOK_pub_pvr_arch_cmd_buffer_10237() \
    if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g5p)) { \
       /* G5P: clears and loads are background objects (pvr_arch_g5p_job_init()) */ \
    } else
@@ -145,13 +158,19 @@
       simple_mtx_unlock(&device->g9p_vmas.lock); \
    }
 
-#define PVR_G5P_HOOK_pub_pvr_formats_432() \
-   /* G5P fetches 32-bit float vertex attributes only so far: advertise no \
-    * other vertex format, so that Zink converts the rest itself */ \
-   if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g5p) && vk_format != VK_FORMAT_R32_SFLOAT && \
-       vk_format != VK_FORMAT_R32G32_SFLOAT && vk_format != VK_FORMAT_R32G32B32_SFLOAT && \
-       vk_format != VK_FORMAT_R32G32B32A32_SFLOAT) \
-      flags &= ~VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT;
+#define PVR_G5P_HOOK_pub_pvr_formats_437() \
+   /* the scaled formats have no entry of their own */ \
+   if (!pvr_format && PVR_HAS_FEATURE(&pdevice->dev_info, apple_g5p) && \
+       pvr_g5p_vertex_buffer_format(vk_format)) \
+      return VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT;
+
+#define PVR_G5P_HOOK_pub_pvr_formats_454() \
+   /* the vertex formats G5P fetches, and no other */ \
+   if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g5p)) { \
+      flags &= ~VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT; \
+      if (pvr_g5p_vertex_buffer_format(vk_format)) \
+         flags |= VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT; \
+   }
 
 #define PVR_G5P_HOOK_pub_pvr_image_347() \
    /* G5P: the A9's colour layouts (pvr_g5p_image.c) */ \

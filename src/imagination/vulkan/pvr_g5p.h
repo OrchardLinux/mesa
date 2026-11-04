@@ -110,10 +110,21 @@ struct vk_graphics_pipeline_state;
 /* The most vertex attributes and fetches of a G5P pipeline (PCO_G5P_MAX_ATTRIBS) */
 #define PVR_G5P_MAX_FETCH 16
 
+/* The index a vertex fetch's DDMAD multiplies the stride by: the vertex
+ * (t0), the instance (t1: per-instance rate, divisor 1; the base instance
+ * is added to t1 first), or none (divisor 0: the first instance's element,
+ * the draw folds it into the base and fetches with stride 0) */
+enum pvr_g5p_fetch_rate {
+   PVR_G5P_FETCH_VERTEX,
+   PVR_G5P_FETCH_INSTANCE,
+   PVR_G5P_FETCH_INSTANCE_DIVISOR0,
+};
+
 /* One vertex fetch: a DDMAD of `dwords` from binding `binding` at `offset`
- * into the unified store at dword `ao` (the A9 ICD's g5p_fetch) */
+ * into the unified store at dword `ao` (the A9 ICD's g5p_fetch), by `rate`
+ * (enum pvr_g5p_fetch_rate) */
 struct pvr_g5p_fetch {
-   uint8_t binding, dwords, ao;
+   uint8_t binding, dwords, ao, rate;
    uint32_t offset;
 };
 
@@ -139,6 +150,10 @@ struct pvr_g5p_pipeline {
     * {DOUTU}, DOUTU.end at +0x20: the PPP shader base), the coefficient
     * program (data, then its code; none without varyings) */
    struct pvr_pds_upload fetch, fs_launch, varying;
+   /* the vertex fetch code that adds the base instance to t1 first (Apple's
+    * g3b-basevertex), for draws with a first instance: only when the
+    * program reads the instance index or a fetch is per instance */
+   struct pvr_pds_upload fetch_base;
    /* static PPP blocks: the varying format (4 words) and the fragment
     * pointers and sizes (6 words) */
    struct pvr_suballoc_bo *static_vary, *static_frag;
@@ -175,15 +190,22 @@ struct pvr_g5p_pipeline {
    uint32_t samples;
 };
 
-/* A non-indexed draw (CmdDraw) */
+/* A draw (CmdDraw, CmdDrawIndexed): `first` is the first vertex, or the
+ * first index of an indexed draw, whose indices are offset by vertex_offset */
 struct pvr_g5p_draw {
    uint32_t count, instances, first, first_instance;
+   bool indexed;
+   int32_t vertex_offset;
 };
 
 /* SPIR-V of one stage -> the G5P backend's program (pvr_g5p_nir.c), for a
- * pipeline of `samples` rasterization samples. false with out->refusal set. */
+ * pipeline of `samples` rasterization samples. The vertex stage takes its
+ * vertex input layout (pvr_g5p_vertex.h; NULL for the fragment stage),
+ * which also gives the backend its attribute components. false with
+ * out->refusal set. */
+struct pvr_g5p_vertex_layout;
 bool pvr_g5p_compile_stage(const VkPipelineShaderStageCreateInfo *stage_info, bool half_output, uint32_t samples,
-                           const uint8_t *attrib_components, const struct pco_g5p_fs_key *key,
+                           struct pvr_g5p_vertex_layout *vertex, const struct pco_g5p_fs_key *key,
                            const struct pco_g5p_vs_link *link, struct pco_g5p_program *out);
 /* The background program of a loaded colour attachment (pvr_g5p_nir.c):
  * texture() of the attachment, bound as set 0 binding 0, at the fragment's
@@ -199,7 +221,9 @@ VkResult PVR_PER_ARCH(g5p_graphics_pipeline_compile)(struct pvr_device *device,
 void PVR_PER_ARCH(g5p_graphics_pipeline_destroy)(struct pvr_device *device,
                                                  struct pvr_graphics_pipeline *pipeline);
 VkResult PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_draw *draw);
-VkResult PVR_PER_ARCH(g5p_cmd_draw_indexed)(struct pvr_cmd_buffer *cmd_buffer);
+VkResult PVR_PER_ARCH(g5p_cmd_draw_indexed)(struct pvr_cmd_buffer *cmd_buffer, uint32_t index_count,
+                                            uint32_t instances, uint32_t first_index, int32_t vertex_offset,
+                                            uint32_t first_instance);
 
 #   define pvr_arch_g5p_graphics_pipeline_compile PVR_PER_ARCH(g5p_graphics_pipeline_compile)
 #   define pvr_arch_g5p_graphics_pipeline_destroy PVR_PER_ARCH(g5p_graphics_pipeline_destroy)

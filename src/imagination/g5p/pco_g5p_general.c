@@ -2787,6 +2787,13 @@ static void emit_isub(struct gctx *c, nir_alu_instr *a)
    define(c, &a->def, dst);
 }
 
+/* Shifts. A vertex program takes Apple's vertex form of the literal shifts
+ * (bank 1, header 0x11; our decode of Apple's compile of the vertex probes
+ * v_ishr2, v_ishr24, v_ushr2, v_ushr8, v_ushr24, v_shl8 in
+ * tools/mesa-a9-vtx-re/probes.metal, byte-equal to these encoders). The
+ * fragment form (bank 0, header 1) in a vertex program reads and writes
+ * other registers: x >> 2 then read again gave x on hardware (vertex-input's
+ * gl_VertexIndex rungs). Dynamic amounts have no vertex probe. */
 static void emit_shift(struct gctx *c, nir_alu_instr *a)
 {
    struct ref x = alu_src(c, a, 0), amt = alu_src(c, a, 1);
@@ -2794,19 +2801,22 @@ static void emit_shift(struct gctx *c, nir_alu_instr *a)
    unsigned xr = reg_of(c, x, nir_op_infos[a->op].name);
    if (is_const(c, amt)) {
       unsigned s = V(c, amt.def, amt.comp)->imm & 31;
+      const unsigned bank = c->vs ? 1 : 0, header = c->vs ? 0x11 : 1;
       bool d = dies(c, x);
       unsigned gx = vgrp(c, x);
       free_dying(c, &x, 1);
       unsigned dst = alloc_reg(c, d ? (int)xr : -1);
       if (a->op == nir_op_ishr)
-         put(c, raw, g5p_usc_binary_literal(raw, G5P_BIN_ISHR, 2 * dst, s, 2 * xr, 0, gx, 1, false, -1),
+         put(c, raw, g5p_usc_binary_literal(raw, G5P_BIN_ISHR, 2 * dst, s, 2 * xr, bank, gx, header, false, -1),
              "ishr literal");
       else
-         put(c, raw, g5p_usc_shift(raw, a->op == nir_op_ishl, 2 * dst, 2 * xr, s, true, 0, gx, 1, 1),
+         put(c, raw, g5p_usc_shift(raw, a->op == nir_op_ishl, 2 * dst, 2 * xr, s, true, bank, gx, 1, header),
              "immediate shift");
       define(c, &a->def, dst);
       return;
    }
+   if (c->vs)
+      refuse(c, "vertex %s with a dynamic amount (no vertex probe)", nir_op_infos[a->op].name);
    if (a->op == nir_op_ishr)
       refuse(c, "ishr with a dynamic amount (only the literal-amount form is witnessed)");
    /* The probes mask dynamic amounts to 31 before the shift. */
@@ -2871,6 +2881,7 @@ static void emit_unary_like(struct gctx *c, nir_alu_instr *a)
 
 static void vs_int(struct gctx *c, nir_alu_instr *a);
 static void vs_bitwise(struct gctx *c, nir_alu_instr *a);
+static void vs_minsub(struct gctx *c, nir_alu_instr *a);
 
 static void emit_alu(struct gctx *c, nir_alu_instr *a)
 {
@@ -2899,6 +2910,11 @@ static void emit_alu(struct gctx *c, nir_alu_instr *a)
    if (c->vs && (a->op == nir_op_iadd || a->op == nir_op_imul || a->op == nir_op_ishl ||
                  a->op == nir_op_inot)) {
       vs_int(c, a);
+      return;
+   }
+   if (c->vs && (a->op == nir_op_imin || a->op == nir_op_imax || a->op == nir_op_umin ||
+                 a->op == nir_op_umax || a->op == nir_op_isub || a->op == nir_op_ineg)) {
+      vs_minsub(c, a);
       return;
    }
    switch (a->op) {
@@ -3010,6 +3026,83 @@ static void vs_bitwise(struct gctx *c, nir_alu_instr *a)
    c->p->evidence |= PCO_G5P_EV_VS_ALU;
    define(c, &a->def, dst);
    return;
+}
+
+/* Vertex integer min/max, subtract and negate in Apple's vertex forms, our
+ * decode of the m_* probes in tools/mesa-a9-vtx-re/probes.metal (Apple's
+ * applegpu_g5p compile, byte-equal to these encoders): register pairs with
+ * bank 1, header 0x31 (m_imin_rr, m_isub_rr); a literal in A with header 0x11
+ * (m_imin_lit, m_imax_neg, m_isub_lit, m_isub_big; ineg is 0 - x, m_ineg);
+ * a common-store operand in A (m_imin_u; m_isub_u is u - x, m_isub_u2 x - u
+ * by routing 0x70). The fragment form (bank 0, header 1) in a vertex program
+ * reads other registers (the vertex shift, device run 1). x - k is an iadd of
+ * -k (Apple's v_iadd_lit form). */
+static void vs_minsub(struct gctx *c, nir_alu_instr *a)
+{
+   uint8_t raw[G5P_USC_MAX];
+   const bool neg = a->op == nir_op_ineg, sub = neg || a->op == nir_op_isub;
+   const enum g5p_minmax mop = a->op == nir_op_umin ? G5P_UMIN : a->op == nir_op_umax ? G5P_UMAX
+                              : a->op == nir_op_imin ? G5P_IMIN : G5P_IMAX;
+   const char *name = nir_op_infos[a->op].name;
+   c->p->evidence |= PCO_G5P_EV_VS_ALU;
+   if (neg) {
+      struct ref x = alu_src(c, a, 0);
+      unsigned xr = reg_of(c, x, name);
+      unsigned g = vgrp(c, x);
+      unsigned dst = vs_dst(c, &x, 1);
+      put(c, raw, g5p_usc_isub_literal(raw, 2 * dst, 0, 2 * xr, 1, g, 0x11), "ineg");
+      define(c, &a->def, dst);
+      return;
+   }
+   struct ref r[2] = {alu_src(c, a, 0), alu_src(c, a, 1)};
+   for (unsigned i = 0; i < 2; i++) {
+      if (!is_const(c, r[i]) || is_const(c, r[1 - i]))
+         continue;
+      uint32_t k = V(c, r[i].def, r[i].comp)->imm;
+      struct ref x = r[1 - i];
+      unsigned xr = reg_of(c, x, name);
+      unsigned g = vgrp(c, x);
+      unsigned dst = vs_dst(c, &x, 1);
+      unsigned n;
+      if (sub && i == 1)
+         n = g5p_usc_iadd_literal(raw, 2 * dst, -k, 2 * xr, 1, g);
+      else if (sub)
+         n = g5p_usc_isub_literal(raw, 2 * dst, k, 2 * xr, 1, g, 0x11);
+      else
+         n = g5p_usc_minmax_literal(raw, mop, 2 * dst, k, 2 * xr, 1, g, 0x11);
+      put(c, raw, n, sub && i == 1 ? "isub literal (iadd)" : sub ? "isub literal" : "min/max literal");
+      define(c, &a->def, dst);
+      return;
+   }
+   for (unsigned i = 0; i < 2; i++) {
+      if (vkind(c, r[i]) != VK_SHARED || vkind(c, r[1 - i]) != VK_REG)
+         continue;
+      unsigned sd = V(c, r[i].def, r[i].comp)->imm;
+      struct ref x = r[1 - i];
+      unsigned xr = reg_of(c, x, name);
+      unsigned g = vgrp(c, x);
+      unsigned dst = vs_dst(c, &x, 1);
+      unsigned n = sub ? g5p_usc_alu_shared(raw, G5P_BIN_ISUB, 2 * dst, sd, 2 * xr, 1, g, 0x11, 0, 0, false,
+                                            i ? 0x70 : -1, 1)
+                       : g5p_usc_minmax_shared(raw, mop, 2 * dst, sd, 2 * xr, 1, g, 0x11, 1);
+      put(c, raw, n, sub ? "shared isub" : "shared min/max");
+      define(c, &a->def, dst);
+      return;
+   }
+   unsigned reg[2] = {reg_of(c, r[0], name), reg_of(c, r[1], name)};
+   bool d0 = dies(c, r[0]), d1 = dies(c, r[1]);
+   /* min/max: a dying operand in B, as the other vertex pairs; a - b keeps its order */
+   unsigned ia = !sub && d0 ? 1 : 0, ib = 1 - ia;
+   unsigned ga = vgrp(c, r[ia]), gb = vgrp(c, r[ib]);
+   free_dying(c, r, 2);
+   unsigned dst = alloc_reg(c, d0 ? (int)reg[0] : d1 ? (int)reg[1] : -1);
+   struct g5p_alu f = G5P_ALU(2 * dst);
+   f.bank = 1;
+   f.header = 0x31;
+   f.a = gsrc(reg[ia], (struct ref){0}, ga);
+   f.b = gsrc(reg[ib], (struct ref){0}, gb);
+   put(c, raw, sub ? g5p_usc_binary(raw, G5P_BIN_ISUB, &f) : g5p_usc_minmax(raw, mop, &f), name);
+   define(c, &a->def, dst);
 }
 
 static void vs_int(struct gctx *c, nir_alu_instr *a)
@@ -3676,8 +3769,60 @@ static void emit_tex(struct gctx *c, nir_tex_instr *t)
 }
 
 /* ---- stage setup and output ---- */
+struct vs_convert {
+   struct val *v;
+   unsigned reg, fmt, byte;
+};
+
+static int vs_convert_order(const void *x, const void *y)
+{
+   const struct vs_convert *a = x, *b = y;
+   if (a->reg != b->reg)
+      return a->reg < b->reg ? -1 : 1;
+   return a->byte < b->byte ? -1 : a->byte > b->byte;
+}
+
+/* The converted vertex inputs (PCO_G5P_VS_CONVERT_BASE), in Apple's form
+ * (our decode of the c_* and v_unorm4x8 vertex probes): one convert per
+ * component at the program's start, from the fetched dword's half (byte
+ * select within it), into a new register; the dword's last convert writes
+ * it in place. A half read again later takes class 9d, header 0x51 and
+ * group 0 (v_unorm4x8 reads each half twice); its last read group 1, header
+ * 0x11. An f16 source is read once (v_half2). */
+static void vs_converts(struct gctx *c, struct vs_convert *cv, unsigned n)
+{
+   uint8_t raw[G5P_USC_MAX];
+   qsort(cv, n, sizeof(*cv), vs_convert_order);
+   for (unsigned i = 0; i < n; i++) {
+      const unsigned half = 2 * cv[i].reg + (cv[i].byte >> 1);
+      bool last_half = true, last_reg = true;
+      for (unsigned k = i + 1; k < n; k++) {
+         last_half &= 2 * cv[k].reg + (cv[k].byte >> 1) != half;
+         last_reg &= cv[k].reg != cv[i].reg;
+      }
+      if (last_reg)
+         c->busy &= ~BITFIELD_BIT(cv[i].reg); /* the dword's last read: in place */
+      unsigned dst = alloc_reg(c, last_reg ? (int)cv[i].reg : -1);
+      unsigned m;
+      if (cv[i].fmt == PCO_G5P_VSF_F16) {
+         if (!last_half)
+            refuse(c, "an f16 vertex input half read twice (no probe)");
+         m = g5p_usc_half_to_float(raw, 2 * dst, half, 1, 1, 0x11);
+      } else {
+         m = g5p_usc_convert_small(raw, cv[i].fmt, 2 * dst, half, cv[i].byte & 1, 1, last_half,
+                                   last_half ? 0x11 : 0x51, last_half ? 0 : 4);
+      }
+      put(c, raw, m, "vertex input convert");
+      hold(c, cv[i].v, dst);
+   }
+   c->p->evidence |= PCO_G5P_EV_VS_ALU;
+}
+
 static void setup_inputs(struct gctx *c)
 {
+   struct vs_convert cv[4 * PCO_G5P_MAX_ATTRIBS];
+   unsigned ncv = 0;
+   uint32_t raw_regs = 0;
    foreach_instr_all(ins, c) {
       if (ins->type != nir_instr_type_intrinsic)
          continue;
@@ -3706,11 +3851,30 @@ static void setup_inputs(struct gctx *c)
             continue;
          }
          v->state = VAL_REG;
+         const unsigned base = nir_intrinsic_base(in);
+         if (base >= PCO_G5P_VS_CONVERT_BASE) {
+            const unsigned fmt = (base - PCO_G5P_VS_CONVERT_BASE) / 4, byte = (base - PCO_G5P_VS_CONVERT_BASE) % 4;
+            if (fmt >= PCO_G5P_VSF_COUNT || in->def.num_components != 1 ||
+                (fmt >= PCO_G5P_VSF_U16 && (byte & 1)))
+               refuse(c, "vertex input location %u: converted load %#x", l, base);
+            raw_regs |= BITFIELD_BIT(4 * l + comp);
+            if (v->uses) {
+               if (ncv == ARRAY_SIZE(cv))
+                  refuse(c, "more than %u converted vertex input components", (unsigned)ARRAY_SIZE(cv));
+               cv[ncv++] = (struct vs_convert){v, 4 * l + comp, fmt, byte};
+            }
+            continue;
+         }
          v->input = true;
          if (v->uses)
             hold(c, v, 4 * l + comp);
       }
    }
+   /* the fetched dwords of converted inputs: in the unified store (not
+    * written), busy until their converts */
+   c->busy |= raw_regs;
+   if (raw_regs)
+      c->max_dword = MAX2(c->max_dword, util_last_bit(raw_regs));
    /* Vertex and instance index: DOUTW of the PDS input temp pair into the
     * dwords after the last fetched attribute (Apple: r0 / r1 without
     * attributes), vertex index first. */
@@ -3741,6 +3905,12 @@ static void setup_inputs(struct gctx *c)
       c->p->id_reg[i] = next++;
       c->p->evidence |= PCO_G5P_EV_VS_IDS;
    }
+   if (ncv)
+      vs_converts(c, cv, ncv);
+   /* a converted dword none of whose components is read */
+   for (unsigned i = 0; i < ncv; i++)
+      raw_regs &= ~BITFIELD_BIT(cv[i].reg);
+   c->busy &= ~raw_regs;
 }
 
 static bool is_varying_load(nir_intrinsic_instr *in)

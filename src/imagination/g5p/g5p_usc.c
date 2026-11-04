@@ -302,6 +302,39 @@ unsigned g5p_usc_fma_literal(uint8_t *out, unsigned dst_half, uint32_t value, un
    return finish(out, raw, n);
 }
 
+/* Apple's vertex m_imin_lit 991100030f812001ba217c00 (min(x, 7)), m_imax_neg
+ * (long literal -3), m_umin_big (0x12345): the literal prefix, then the
+ * min/max code, 0x21, 0x7c. */
+unsigned g5p_usc_minmax_literal(uint8_t *out, enum g5p_minmax op, unsigned dst_half, uint32_t value,
+                                unsigned b_half, unsigned bank, unsigned b_group, unsigned header)
+{
+   CHECK(op < G5P_MINMAX_COUNT, "unsupported integer min/max");
+   uint8_t raw[G5P_USC_MAX];
+   unsigned n = literal_prefix(raw, 0x99, dst_half, bank, value, b_half, b_group, header, -1);
+   if (!n)
+      return 0;
+   raw[n++] = minmax_code[op];
+   raw[n++] = 0x21;
+   raw[n++] = 0x7c;
+   raw[n++] = 0;
+   return finish(out, raw, n);
+}
+
+/* literal - B: Apple's vertex m_isub_lit 9911000349812201a504 (100 - x),
+ * m_ineg 9911000301812001a504 (0 - x), m_isub_big (0x12345 - x, long form,
+ * last byte 0). */
+unsigned g5p_usc_isub_literal(uint8_t *out, unsigned dst_half, uint32_t value, unsigned b_half,
+                              unsigned bank, unsigned b_group, unsigned header)
+{
+   uint8_t raw[G5P_USC_MAX];
+   unsigned n = literal_prefix(raw, 0x99, dst_half, bank, value, b_half, b_group, header, -1);
+   if (!n)
+      return 0;
+   raw[n++] = binop_code[G5P_BIN_ISUB];
+   raw[n++] = value > 0xffff ? 0 : 4;
+   return finish(out, raw, n);
+}
+
 unsigned g5p_usc_shift(uint8_t *out, bool left, unsigned dst_half, unsigned value_half,
                        unsigned amount, bool immediate, unsigned bank, unsigned value_group,
                        unsigned amount_group, unsigned header)
@@ -360,6 +393,50 @@ unsigned g5p_usc_convert2(uint8_t *out, enum g5p_convert op, unsigned dst_half, 
    raw[8] = convert_code[op];
    raw[9] = 4;
    return finish(out, raw, 10);
+}
+
+/* Apple's vertex format conversions (our decode of the c_* and v_*norm*
+ * vertex probes): the convert's tag is (format << 1) | 1, its source a half
+ * register, and its last byte 0x0c, 0x4c for the half's high byte
+ * (c_un8_b3 9911060305832001684c: un8, r0's high half, high byte). A source
+ * read again takes class 9d, header bit 6 (v_unorm4x8). */
+unsigned g5p_usc_convert_small(uint8_t *out, enum g5p_small_format fmt, unsigned dst_half, unsigned src_half,
+                               bool high_byte, unsigned bank, unsigned src_group, unsigned header,
+                               unsigned source_extension)
+{
+   CHECK(fmt < G5P_SMALL_FORMAT_COUNT, "unsupported small conversion format");
+   CHECK(!high_byte || fmt < G5P_SMALL_U16, "a 16-bit source has no high byte");
+   CHECK(source_extension == 0 || source_extension == 4, "unmeasured conversion class");
+   uint8_t raw[G5P_USC_MAX];
+   CHECK(header_ok(header), g5p_usc_error);
+   raw[0] = 0x99 | source_extension;
+   raw[1] = header;
+   if (!destination(raw + 2, dst_half, bank))
+      return 0;
+   raw[4] = (fmt << 1) | 1;
+   SEL(s, src_half, src_group, 1);
+   raw[5] = s;
+   raw[6] = 0x20;
+   raw[7] = 1;
+   raw[8] = 0x68;
+   raw[9] = high_byte ? 0x4c : 0x0c;
+   return finish(out, raw, 10);
+}
+
+/* Apple's c_f16_h0/h1, v_half2: 991106030181a001440d7000, the f16 literal
+ * fadd (A = -0.0) with byte 9 bit 2 set, its B read as f16 from the half. */
+unsigned g5p_usc_half_to_float(uint8_t *out, unsigned dst_half, unsigned src_half, unsigned bank,
+                               unsigned src_group, unsigned header)
+{
+   uint8_t raw[G5P_USC_MAX];
+   unsigned n = literal_prefix(raw, 0x99, dst_half, bank, 0x8000, src_half, src_group, header, 0);
+   if (!n)
+      return 0;
+   raw[n++] = binop_code[G5P_BIN_FADD];
+   raw[n++] = 0x0d;
+   raw[n++] = 0x70;
+   raw[n++] = 0;
+   return finish(out, raw, n);
 }
 
 unsigned g5p_usc_unary(uint8_t *out, enum g5p_unary op, unsigned dst_half, unsigned src_half,
@@ -649,10 +726,13 @@ unsigned g5p_usc_alu_shared(uint8_t *out, enum g5p_binop op, unsigned dst_half, 
                             unsigned source_extension, unsigned dst_control, bool negate_b,
                             int route, unsigned a_shared_group)
 {
-   /* Integer add/multiply: vertex v_iadd_k / v_imul_k, no routing parcel. */
+   /* Integer add/multiply: vertex v_iadd_k / v_imul_k, no routing parcel.
+    * Subtract: m_isub_u (shared - B, no parcel) and m_isub_u2 (B - shared,
+    * routing 0x70). */
    bool integer = op == G5P_BIN_IADD || op == G5P_BIN_IMUL;
    CHECK(((op == G5P_BIN_FADD || op == G5P_BIN_FMUL) && (route < 0 || route == 0x70)) ||
-         (integer && route < 0 && !negate_b),
+         (integer && route < 0 && !negate_b) ||
+         (op == G5P_BIN_ISUB && (route < 0 || route == 0x70) && !negate_b),
          "unmeasured shared binary operation/routing");
    CHECK(half_register(b_half, "b_half requires a measured 32-bit aligned half index"), g5p_usc_error);
    CHECK(b_group <= 1, "b_group must be an integer in [0,1]");
@@ -667,6 +747,29 @@ unsigned g5p_usc_alu_shared(uint8_t *out, enum g5p_binop op, unsigned dst_half, 
    raw[8] = binop_code[op];
    raw[9] = negate_b ? 0x40 : 0;
    return finish(out, raw, add_route(raw, 9, route));
+}
+
+/* Apple's vertex m_imin_u 9911000389810041ba210800: the shared head of
+ * g5p_usc_alu_shared, then the register form's min/max tail. */
+unsigned g5p_usc_minmax_shared(uint8_t *out, enum g5p_minmax op, unsigned dst_half, unsigned a_dword,
+                               unsigned b_half, unsigned bank, unsigned b_group, unsigned header,
+                               unsigned a_shared_group)
+{
+   CHECK(op < G5P_MINMAX_COUNT, "unsupported integer min/max");
+   CHECK(half_register(b_half, "b_half requires a measured 32-bit aligned half index"), g5p_usc_error);
+   CHECK(b_group <= 1, "b_group must be an integer in [0,1]");
+   uint8_t raw[G5P_USC_MAX], a[4];
+   if (!alu_header(raw, 0x99, dst_half, bank, header, 0, 0) || !shared_src(a, a_dword, a_shared_group))
+      return 0;
+   raw[4] = a[0];
+   raw[5] = (b_half << 1) | (b_group << 7) | 1;
+   raw[6] = a[2];
+   raw[7] = a[3];
+   raw[8] = minmax_code[op];
+   raw[9] = 0x21;
+   raw[10] = 8;
+   raw[11] = 0;
+   return finish(out, raw, 12);
 }
 
 unsigned g5p_usc_fma_shared_ac(uint8_t *out, unsigned dst_half, unsigned a_dword, unsigned b_half,
