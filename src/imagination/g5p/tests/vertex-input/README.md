@@ -45,6 +45,7 @@ another physical device.
 | `inst-first` `inst-first-indexed` | the instanced quad from `firstInstance` 2 (2 instances) and 1 (3 instances, indexed, vertex offset 4): `gl_InstanceIndex` includes the first instance |
 | `inst-rate` | a per-instance colour and offset (divisor 1), 4 instances from `firstInstance` 1: instance i reads element 1 + i |
 | `inst-divisor0` | the offset per instance, the colour in a binding of divisor 0, from `firstInstance` 2: every instance has element 2's colour (skipped without the zero divisor) |
+| `inst-div3` `inst-div-mixed` | 8 instances (offset divisor 1), the colour's red/green and blue/alpha from bindings of divisors 3 and 3 (`firstInstance` 0) and 2 and 5 (`firstInstance` 3): instance i reads element first + i / d |
 | `restart-16` `restart-32` `restart-8` | 8 quads as one indexed triangle strip whose quads are cut apart by primitive restart (`0xffff`, `0xffffffff`, `0xff`; the 8-bit one skipped without the extension) |
 
 The `fmt-*` rungs draw colour × scale + bias (push constants) and compare with the format's conversion on the CPU; each
@@ -52,4 +53,4 @@ value is chosen a quarter step away from 8-bit rounding (Vulkan lets a colour ro
 8-bit targets through f16 rounded toward zero), the format's edges first. A format the device doesn't give
 `VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT` skips its rung.
 
-Reference run on lavapipe (llvmpipe, LLVM 22.1.8): `VERTEX-INPUT RESULT PASS 41 of 41`.
+Reference run on lavapipe (llvmpipe, LLVM 22.1.8): `VERTEX-INPUT RESULT PASS 43 of 43`.

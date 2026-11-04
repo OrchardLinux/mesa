@@ -17,7 +17,7 @@ for s in color.vert:COLOR_VERT:vert instance.vert:INSTANCE_VERT:vert vertex_inde
          int_umin.vert:INTOP_VERT,OP_UMIN:vert int_umax.vert:INTOP_VERT,OP_UMAX:vert \
          int_isub.vert:INTOP_VERT,OP_ISUB:vert int_ineg.vert:INTOP_VERT,OP_INEG:vert \
          fmt.vert:FMT_VERT:vert fmt_int.vert:FMT_INT_VERT:vert \
-         inst_attr.vert:INST_ATTR_VERT:vert; do
+         inst_attr.vert:INST_ATTR_VERT:vert inst_div.vert:INST_DIV_VERT:vert; do
     name=${s%%:*} rest=${s#*:}
     def=${rest%%:*} stage=${rest#*:}
     var=$(echo "$name" | tr . _)

@@ -205,10 +205,54 @@ fetch_base_instance(unsigned fetches)
    return fetches ? 7 : 4;
 }
 
+/* The distinct divisors > 1 of the fetches, div[k] (at most
+ * PVR_G5P_MAX_DIVISORS, the layout's rule); slot[f]: fetch f's k */
 static unsigned
-fetch_data_bytes(unsigned fetches, unsigned id_mask, bool base_instance)
+fetch_divisors(const struct pvr_g5p_pipeline *g, uint32_t *div, unsigned *slot)
 {
-   return fetches ? 32 * fetches + (id_mask ? 16 : 0) : base_instance ? 32 : 16;
+   unsigned n = 0;
+   for (unsigned f = 0; f < g->fetch_count; f++) {
+      if (g->fetch_list[f].rate != PVR_G5P_FETCH_INSTANCE_DIVISOR)
+         continue;
+      unsigned k = 0;
+      while (k < n && div[k] != g->fetch_list[f].divisor)
+         k++;
+      if (k == n)
+         div[n++] = g->fetch_list[f].divisor;
+      slot[f] = k;
+   }
+   return n;
+}
+
+/* The divisors' multipliers: a unit after the index controls */
+static unsigned
+fetch_multipliers(unsigned fetches, unsigned id_mask)
+{
+   return 8 * fetches + (id_mask ? 4 : 0);
+}
+
+/* i / d = (i * m) >> (31 + s) for every 31-bit i, s = ceil(log2(d)) (upstream
+ * Rogue's pvr_pds_vertex_shader() divide) */
+static unsigned
+divisor_shift(uint32_t d)
+{
+   return util_last_bit(d - 1);
+}
+
+static uint32_t
+divisor_multiplier(uint32_t d)
+{
+   return (uint32_t)(((UINT64_C(1) << (31 + divisor_shift(d))) + d - 1) / d);
+}
+
+static unsigned
+fetch_data_bytes(const struct pvr_g5p_pipeline *g, bool base_instance)
+{
+   uint32_t div[PVR_G5P_MAX_DIVISORS];
+   unsigned slot[PVR_G5P_MAX_FETCH];
+   const unsigned fetches = g->fetch_count;
+   return fetches ? 32 * fetches + (g->vs_id_mask ? 16 : 0) + (fetch_divisors(g, div, slot) ? 16 : 0)
+                  : base_instance ? 32 : 16;
 }
 
 /* The program reads the instance: its index, or a per-instance fetch */
@@ -217,22 +261,50 @@ fetch_reads_instance(const struct pvr_g5p_pipeline *g)
 {
    bool r = g->vs_id_mask & 2;
    for (unsigned f = 0; f < g->fetch_count; f++)
-      r |= g->fetch_list[f].rate == PVR_G5P_FETCH_INSTANCE;
+      r |= g->fetch_list[f].rate == PVR_G5P_FETCH_INSTANCE || g->fetch_list[f].rate == PVR_G5P_FETCH_INSTANCE_DIVISOR;
    return r;
 }
 
 static unsigned
-fetch_program(uint32_t *dest, const struct pvr_g5p_fetch *list, unsigned fetches, unsigned id_mask,
-              bool base_instance)
+fetch_program(uint32_t *dest, const struct pvr_g5p_pipeline *g, bool base_instance)
 {
+   const struct pvr_g5p_fetch *list = g->fetch_list;
+   const unsigned fetches = g->fetch_count, id_mask = g->vs_id_mask;
+   uint32_t div[PVR_G5P_MAX_DIVISORS];
+   unsigned slot[PVR_G5P_MAX_FETCH];
+   const unsigned ndiv = fetch_divisors(g, div, slot);
    pdsc_init();
    pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-vertex-fetch");
+   /* divisor k: t(2 + 2k) = t1 / d, then plus the base instance; t1 is
+    * still the 0-based instance here. Apple's forms (our decode of
+    * AGX::PDSEncoderGen1<>::EncodeVertexPDSProgram's step-rate path, which
+    * divides into t2): a power of two is one shr32 by log2(d); another d is
+    * limm t2 = 0, limm t3 = 0, mad t2:t3 = c(m) * t1 + t2:t3, one shr64 of
+    * the pair by 31 + s; the base is add32 t2, c(base), t2. pdsc temp64
+    * refs take the pair's first 32-bit temp. */
+   for (unsigned k = 0; k < ndiv; k++) {
+      const unsigned t = 2 + 2 * k;
+      if (util_is_power_of_two_nonzero(div[k])) {
+         pdsc_shr32(p, pdsc_ref_temp32(t), pdsc_ref_temp32(1), util_logbase2(div[k]));
+      } else {
+         const pdsc_ref pair = pdsc_ref_temp64(t);
+         pdsc_limm(p, pdsc_ref_temp32(t), pdsc_ref_imm(0));
+         pdsc_limm(p, pdsc_ref_temp32(t + 1), pdsc_ref_imm(0));
+         pdsc_mad(p, pair, pdsc_ref_const32(fetch_multipliers(fetches, id_mask) + k), pdsc_ref_temp32(1), pair);
+         pdsc_shr64(p, pair, pair, 31 + divisor_shift(div[k]));
+      }
+      if (base_instance)
+         pdsc_add32(p, pdsc_ref_temp32(t), pdsc_ref_const32(fetch_base_instance(fetches)), pdsc_ref_temp32(t));
+   }
    if (base_instance)
       pdsc_add32(p, pdsc_ref_temp32(1), pdsc_ref_const32(fetch_base_instance(fetches)), pdsc_ref_temp32(1));
    for (unsigned f = 0; f < fetches; f++) {
       const unsigned c = f * 8;
-      /* a per-instance fetch multiplies by the instance (Apple's s1=t1) */
-      const unsigned t = list[f].rate == PVR_G5P_FETCH_INSTANCE;
+      /* a per-instance fetch multiplies by the instance (Apple's s1=t1), a
+       * divided one by its divisor's pair */
+      const unsigned t = list[f].rate == PVR_G5P_FETCH_INSTANCE           ? 1
+                         : list[f].rate == PVR_G5P_FETCH_INSTANCE_DIVISOR ? 2 + 2 * slot[f]
+                                                                          : 0;
       pdsc_ddmad(p, pdsc_ref_const32(c + 6), pdsc_ref_temp32(t), pdsc_ref_const64(c), pdsc_ref_const64(c + 4));
    }
    unsigned k = 0;
@@ -566,12 +638,12 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
 
    /* PDS: vertex fetch code */
    uint32_t code[96], data[2 * (1 + PCO_G5P_MAX_FS_VARYINGS) + 4];
-   unsigned n = fetch_program(code, g->fetch_list, g->fetch_count, g->vs_id_mask, false);
+   unsigned n = fetch_program(code, g, false);
    result = pvr_gpu_upload_pds(device, NULL, 0, 0, code, n, 16, 64, &g->fetch);
    if (result != VK_SUCCESS)
       return result;
    if (fetch_reads_instance(g)) {
-      n = fetch_program(code, g->fetch_list, g->fetch_count, g->vs_id_mask, true);
+      n = fetch_program(code, g, true);
       result = pvr_gpu_upload_pds(device, NULL, 0, 0, code, n, 16, 64, &g->fetch_base);
       if (result != VK_SUCCESS)
          return result;
@@ -1049,9 +1121,16 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
    /* a first instance takes the program that adds it to t1 */
    const bool base_instance = draw->first_instance && fetch_reads_instance(g);
    const struct pvr_pds_upload *fetch_code = base_instance ? &g->fetch_base : &g->fetch;
-   const unsigned fbytes = fetch_data_bytes(g->fetch_count, g->vs_id_mask, base_instance);
+   const unsigned fbytes = fetch_data_bytes(g, base_instance);
    if (base_instance)
       fdata[fetch_base_instance(g->fetch_count)] = draw->first_instance;
+   {
+      uint32_t div[PVR_G5P_MAX_DIVISORS];
+      unsigned slot[PVR_G5P_MAX_FETCH];
+      const unsigned ndiv = fetch_divisors(g, div, slot);
+      for (unsigned k = 0; k < ndiv; k++)
+         fdata[fetch_multipliers(g->fetch_count, g->vs_id_mask) + k] = divisor_multiplier(div[k]);
+   }
    {
       const uint64_t doutu = doutu_src0(usc_off(device, g->vs_usc), g->vs_temps);
       fdata[fetch_doutu(g->fetch_count)] = (uint32_t)doutu;
@@ -1273,6 +1352,14 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
       const uint32_t state5 = G5P_VS_STATE5;
       ROGUE_VDMCTRL_VDM_STATE5_unpack(&state5, &v5);
       v5.vs_pds_data_size = fbytes / 16;
+      /* the fetch program's temps: t0:t1 and one pair per divisor; Apple's
+       * VertexProgramVariantPDSState sizes them 2 * ceil(temps / 4)
+       * (vertex-temps.md), which G5P_VS_STATE5's 2 covers up to t3 */
+      {
+         uint32_t div[PVR_G5P_MAX_DIVISORS];
+         unsigned slot[PVR_G5P_MAX_FETCH];
+         v5.vs_pds_temp_size = 2 * DIV_ROUND_UP(2 + 2 * fetch_divisors(g, div, slot), 4);
+      }
       v5.vs_usc_unified_size = g->vs_unified;
       ROGUE_VDMCTRL_VDM_STATE5_pack(&w[3], &v5);
       /* a vertex above 64 output dwords: bit 30 (no csbgen field; AGXMetalA9) */
