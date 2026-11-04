@@ -20,7 +20,8 @@
 #include "util/log.h"
 
 #include "pvr_common.h"
-#include "pvr_g5p_tex.h"
+#include "pvr_g5p_tex.h" /* pvr_macros.h: PVR_PER_ARCH, before pvr_g5p_ds.h */
+#include "pvr_g5p_ds.h"
 #include "pvr_g5p_tex_encode.h"
 #include "pvr_image.h"
 
@@ -66,7 +67,7 @@ g5p_view_state(const struct pvr_image_view *iview, uint64_t q[3])
    const struct pvr_g5p_tex_format *f = g5p_tex_format(iview->vk.format);
 
    if (vk_format_is_depth_or_stencil(iview->vk.format))
-      return "depth/stencil view (sampled from its ZLS planes: not built here)";
+      return pvr_arch_g5p_ds_view_state(iview, q); /* its ZLS plane in place (pvr_arch_g5p_ds.c) */
    if (!f)
       return "format without a texture key";
 
