@@ -552,6 +552,9 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
     * the kernel takes its entries from ISP_DBIAS_BASE */
    if (sub_cmd->depth_bias_bo)
       g->dbias_count = sub_cmd->depth_bias_bo->size / sizeof(struct pvr_depth_bias_state);
+   /* the draws' ISP scissor entries (pvr_arch_g5p_gfx.c): upstream's per-render table, ISP_SCISSOR_BASE */
+   if (sub_cmd->scissor_bo)
+      g->scissor_count = sub_cmd->scissor_bo->size / sizeof(struct pvr_scissor_words);
 
    /* the control stream: one block, through STREAM_TERMINATE */
    struct pvr_csb *csb = &sub_cmd->control_stream;
@@ -602,22 +605,37 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
          g->height = iview->vk.extent.height;
       }
    }
-   bool load = false;
+   /* A render area smaller than the attachment: every tile runs the
+    * background and is stored, so the tiles outside the area must load what
+    * they hold (the A9 ICD's rule: the LOAD background whatever the load op;
+    * the draws are clipped to the area, pvr_arch_g5p_gfx.c). A CLEAR there
+    * would need a clear of the area alone. Several targets in a partial area
+    * are refused before (pvr_arch_g5p_mrt_pass_check()). */
+   const VkRect2D *area = &info->render_area;
+   const bool partial = area->offset.x || area->offset.y || area->extent.width != g->width ||
+                        area->extent.height != g->height;
+   bool load = partial;
    for (unsigned i = 0; i < hw_render->color_init_count; i++) {
       const unsigned t = i; /* color_init follows the EOT surfaces' order */
+      if (partial && hw_render->color_init[i].op == VK_ATTACHMENT_LOAD_OP_CLEAR)
+         return G5P_REFUSE(cmd_buffer, "a CLEAR of colour attachment %u in a partial render area (%d,%d %ux%u of "
+                           "%ux%u): no clear of the area alone", t, area->offset.x, area->offset.y,
+                           area->extent.width, area->extent.height, g->width, g->height);
       if (hw_render->color_init[i].op == VK_ATTACHMENT_LOAD_OP_LOAD) {
          if (n != 1 || t)
             return G5P_REFUSE(cmd_buffer, "LOAD of colour attachment %u of %u (one target is built)", t, n);
-         if (!p->load_usc)
-            return G5P_REFUSE(cmd_buffer, "LOAD of a colour attachment: the load program: %s", p->load_refusal);
-         if (g->samples == 4)
-            return G5P_REFUSE(cmd_buffer, "LOAD of a 4x colour attachment (the load program runs per pixel)");
          load = true;
       }
       if (t < n && hw_render->color_init[i].op == VK_ATTACHMENT_LOAD_OP_CLEAR &&
           hw_render->color_init[i].index < info->clear_value_count)
          memcpy(clear[t], info->clear_values[hw_render->color_init[i].index].color.float32, sizeof(clear[t]));
    }
+   if (load && !p->load_usc)
+      return G5P_REFUSE(cmd_buffer, "LOAD of a colour attachment%s: the load program: %s",
+                        partial ? " (a partial render area)" : "", p->load_refusal);
+   if (load && g->samples == 4)
+      return G5P_REFUSE(cmd_buffer, "LOAD of a 4x colour attachment%s (the load program runs per pixel)",
+                        partial ? " (a partial render area)" : "");
    g->targets = n;
 
    /* per render: the clear floats and the PBE block, then their DOUTD data */
@@ -748,6 +766,11 @@ PVR_PER_ARCH(g5p_frag_stream)(const struct pvr_device *device, const struct pvr_
    e->zls_address_mask = zls.address_mask;
    e->bgobj_depth = zls.bgobj_depth;
    e->bgobj_vals = zls.bgobj_vals;
+   /* the draws' scissor entries, when a draw is clipped: upstream's per-render table */
+   if (g->scissor_count && job->scissor_table_addr.addr) {
+      e->scissor_va = job->scissor_table_addr.addr;
+      e->scissor_count = MIN2(g->scissor_count, DRM_G5P_RENDER_MAX_TABLE_ENTRIES);
+   }
    /* the draws' depth-bias entries: upstream's per-render table */
    if (g->dbias_count && job->depth_bias_table_addr.addr) {
       e->dbias_va = job->depth_bias_table_addr.addr;

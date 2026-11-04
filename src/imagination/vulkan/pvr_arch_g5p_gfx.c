@@ -12,7 +12,8 @@
  *
  * Rung A of step 7 (docs: orchard-mesa-pr-plan.md "Step 7 design"): one
  * linear colour target, no depth/stencil, one vertex buffer, non-indexed
- * single-instance draws, the scissor at the whole attachment; blending as
+ * single-instance draws, scissors and partial render areas as the ICD clips
+ * them (region clip, ISP scissor table); blending as
  * the G5P backend compiles it (pvr_g5p_blend.h); the fragment program's
  * texture, sampler, image-size and blend-constant uploads (no push
  * constants or buffers yet). Everything else is refused by name.
@@ -817,7 +818,55 @@ PVR_PER_ARCH(g5p_graphics_pipeline_compile)(struct pvr_device *device,
    return VK_SUCCESS;
 }
 
+/* vkCmdClearAttachments (the hook in rogue/pvr_blit.c): Rogue's clear
+ * programs and words do not run on the A9, and G5P has no clear of
+ * rectangles (a clear quad, the A9 ICD's clear_quads()) yet. Refused by
+ * name, so no Rogue word reaches a G5P control stream. */
+VkResult
+PVR_PER_ARCH(g5p_clear_attachments)(struct pvr_cmd_buffer *cmd_buffer, uint32_t attachment_count,
+                                    const VkClearAttachment *attachments, uint32_t rect_count,
+                                    const VkClearRect *rects)
+{
+   if (!attachment_count || !rect_count)
+      return VK_SUCCESS;
+   const VkRect2D *r = &rects[0].rect;
+   return G5P_REFUSE(cmd_buffer, "vkCmdClearAttachments of %u attachment(s) (aspects %#x), %u rectangle(s), the "
+                     "first %d,%d %ux%u (no clear quad yet)", attachment_count, attachments[0].aspectMask,
+                     rect_count, r->offset.x, r->offset.y, r->extent.width, r->extent.height);
+}
+
 /* ---- draws ---- */
+
+/* The draw's ISP scissor entry: the clip [x0, x1) x [y0, y1) as IPF words
+ * (the A9 ICD's scissor_index(), upstream's form: max exclusive), appended to
+ * the command buffer's table, which upstream uploads per render as
+ * ISP_SCISSOR_BASE (the pass's scissor_va); the previous draw's entry when
+ * the clip did not change */
+static VkResult
+g5p_scissor_index(struct pvr_cmd_buffer *cmd_buffer, int32_t x0, int32_t y0, int32_t x1, int32_t y1,
+                  uint32_t *index)
+{
+   struct pvr_scissor_words s;
+   pvr_csb_pack (&s.w0, IPF_SCISSOR_WORD_0, w0) {
+      w0.scw0_xmin = x0;
+      w0.scw0_xmax = x1;
+   }
+   pvr_csb_pack (&s.w1, IPF_SCISSOR_WORD_1, w1) {
+      w1.scw1_ymin = y0;
+      w1.scw1_ymax = y1;
+   }
+   const unsigned n = util_dynarray_num_elements(&cmd_buffer->scissor_array, struct pvr_scissor_words);
+   if (n && !memcmp(util_dynarray_top_ptr(&cmd_buffer->scissor_array, struct pvr_scissor_words), &s, sizeof(s))) {
+      *index = n - 1;
+      return VK_SUCCESS;
+   }
+   struct pvr_scissor_words *slot = util_dynarray_grow(&cmd_buffer->scissor_array, struct pvr_scissor_words, 1);
+   if (!slot)
+      return vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+   *slot = s;
+   *index = n;
+   return VK_SUCCESS;
+}
 
 /* Apple's PrimitiveTypeToVDMCTRLType and the captured split counts (170
  * list, 510 strip) */
@@ -1084,19 +1133,28 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
    if (result != VK_SUCCESS)
       return result;
 
-   /* the clip: the scissor within the render area; a fully clipped draw
-    * emits nothing. Rung A draws at the whole attachment only (the ISP
-    * scissor table is not part of its pass yet). */
+   /* the clip: the scissor within the render area and the attachment; a
+    * fully clipped draw emits nothing. A clip smaller than the attachment is
+    * the A9 ICD's (g5p_job_draw()): the TA region clip in whole tiles, and
+    * the ISP scissor table entry the pixels are cut to. The tiles outside a
+    * partial render area keep the LOAD background (pvr_arch_g5p.c), so they
+    * are stored back unchanged. */
    const uint32_t width = info->rstate->width, height = info->rstate->height;
    const VkRect2D *ra = &info->render_area, *sc = discard ? ra : &dyn->vp.scissors[0];
-   const int32_t x0 = MAX2(sc->offset.x, ra->offset.x), y0 = MAX2(sc->offset.y, ra->offset.y);
-   const int32_t x1 = MIN2((int64_t)sc->offset.x + sc->extent.width, (int64_t)ra->offset.x + ra->extent.width);
-   const int32_t y1 = MIN2((int64_t)sc->offset.y + sc->extent.height, (int64_t)ra->offset.y + ra->extent.height);
+   const int32_t x0 = MAX3(sc->offset.x, ra->offset.x, 0), y0 = MAX3(sc->offset.y, ra->offset.y, 0);
+   const int32_t x1 = MIN3((int64_t)sc->offset.x + sc->extent.width, (int64_t)ra->offset.x + ra->extent.width,
+                           (int64_t)width);
+   const int32_t y1 = MIN3((int64_t)sc->offset.y + sc->extent.height, (int64_t)ra->offset.y + ra->extent.height,
+                           (int64_t)height);
    if (x1 <= x0 || y1 <= y0)
       return VK_SUCCESS;
-   if (x0 || y0 || x1 != (int32_t)width || y1 != (int32_t)height)
-      return G5P_REFUSE(cmd_buffer, "a scissor or render area of %d,%d..%d,%d in %ux%u (rung A: the whole attachment)",
-                        x0, y0, x1, y1, width, height);
+   const bool scissor = x0 || y0 || x1 != (int32_t)width || y1 != (int32_t)height;
+   uint32_t scissor_index = 0;
+   if (scissor) {
+      result = g5p_scissor_index(cmd_buffer, x0, y0, x1, y1, &scissor_index);
+      if (result != VK_SUCCESS)
+         return result;
+   }
 
    /* flat varyings take vertex 0; a fan's first vertex is the hardware's vertex 1 */
    if (dyn->ia.primitive_topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN && g->fs_flat)
@@ -1202,6 +1260,7 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
           * (pvr_g5p_msaa.h: 15, or 7 at 4x) */
          ctl.upass = isp.upass ? pvr_g5p_msaa_upass(g->samples) : 0;
          ctl.bpres = true;
+         ctl.scenable = scissor;
          ctl.tagwritedisable = isp.tag_write_disable;
       }
       pvr_csb_pack (&w[2], TA_STATE_ISPA, fa) {
@@ -1225,7 +1284,7 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
       w[5] = 0;
       /* with a depth/stencil attachment: its tests, Apple's face form */
       if (ds_aspects)
-         pvr_arch_g5p_ds_isp(dyn, ds_aspects, g->samples, lines, pass, false, dbias, false, &w[1]);
+         pvr_arch_g5p_ds_isp(dyn, ds_aspects, g->samples, lines, pass, scissor, dbias, false, &w[1]);
       PPP_BLOCK(w, 6);
    }
    /* 7. region clip (32-pixel tiles) and the viewport */
@@ -1270,14 +1329,14 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
       }
       PPP_BLOCK(w, 3);
    }
-   /* 9. depth bias and scissor indices: the draw's depth-bias entry, no scissor table */
+   /* 9. depth bias and scissor indices: the draw's entries of the render's tables */
    {
       pvr_csb_pack (&w[0], TA_STATE_HEADER, h) {
          h.pres_ispctl_dbsc = true;
       }
       pvr_csb_pack (&w[1], TA_STATE_ISPDBSC, dbsc) {
          dbsc.dbindex = dbias_index;
-         dbsc.scindex = 0;
+         dbsc.scindex = scissor_index;
       }
       PPP_BLOCK(w, 2);
    }

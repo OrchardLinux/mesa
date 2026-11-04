@@ -2590,7 +2590,7 @@ void pvr_rogue_CmdClearAttachments(VkCommandBuffer commandBuffer,
          pvr_cmd_buffer_set_error_unwarned(cmd_buffer, result);
       return;
    }
-
+   PVR_G5P_HOOK(clear_attachments, cmd_buffer, attachmentCount, pAttachments, rectCount, pRects)
    /* TODO: There are some optimizations that can be made here:
     *  - For a full screen clear, update the clear values for the corresponding
     *    attachment index.
