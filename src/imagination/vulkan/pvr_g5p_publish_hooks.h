@@ -179,6 +179,14 @@ pvr_g5p_vertex_buffer_format(VkFormat vk_format)
          flags |= VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT; \
    }
 
+#define PVR_G5P_HOOK_pub_pvr_formats_519() \
+   /* no texel buffers on G5P: the backend refuses buffer textures \
+    * (tex_shape_refusal()), so neither uniform nor storage texel buffers \
+    * (nor the storage bits derived from them below) are claimed */ \
+   if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g5p)) \
+      flags &= ~(VK_FORMAT_FEATURE_2_UNIFORM_TEXEL_BUFFER_BIT | VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_BIT | \
+                 VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_ATOMIC_BIT);
+
 #define PVR_G5P_HOOK_pub_pvr_image_347() \
    /* G5P: the A9's colour layouts (pvr_g5p_image.c) */ \
    if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p)) \
