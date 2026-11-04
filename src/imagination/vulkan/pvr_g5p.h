@@ -187,6 +187,9 @@ struct pvr_g5p_pipeline {
    /* the fragment program discards (punch-through, no triangle merging);
     * it reads a flat varying */
    bool fs_discard, fs_flat;
+   /* a point pipeline: the vertex program writes the point size after the
+    * position (pco_g5p_vs_link::point_size) */
+   bool vs_point_size;
    /* the fragment program's tile read (pco_g5p_program::blend_mode: 0 none)
     * and colour write mask, for the ISP pass type (pvr_g5p_blend.h) */
    unsigned fs_blend_mode;
