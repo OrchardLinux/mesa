@@ -520,7 +520,7 @@ pvr_get_buffer_format_features2(struct pvr_physical_device *pdevice,
    default:
       break;
    }
-
+   PVR_G5P_HOOK(pub_pvr_formats_519)
    if (flags & VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_BIT) {
       flags |= VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |
                VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
