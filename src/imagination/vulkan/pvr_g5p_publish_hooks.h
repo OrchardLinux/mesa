@@ -52,23 +52,29 @@ pvr_g5p_vertex_buffer_format(VkFormat vk_format)
          .first_instance = firstInstance, \
       }; \
  \
-      result = pvr_arch_g5p_cmd_draw(cmd_buffer, &g5p_draw); \
+      /* pushed descriptors (Zink's uniform buffers) are instantiated as on \
+       * Rogue's draw path before the draw reads them */ \
+      result = pvr_flush_push_descriptors(cmd_buffer, &cmd_buffer->state.gfx_desc_state); \
+      if (result == VK_SUCCESS) \
+         result = pvr_arch_g5p_cmd_draw(cmd_buffer, &g5p_draw); \
       if (result != VK_SUCCESS) \
          vk_command_buffer_set_error(&cmd_buffer->vk, result); \
       goto end_cmd_draw; \
    }
 
-#define PVR_G5P_HOOK_pub_pvr_arch_cmd_buffer_9338() \
+#define PVR_G5P_HOOK_pub_pvr_arch_cmd_buffer_9342() \
    if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g5p)) { \
       /* G5P: the draw with an index list (pvr_arch_g5p_vertex.c) */ \
-      result = pvr_arch_g5p_cmd_draw_indexed(cmd_buffer, indexCount, instanceCount, firstIndex, \
-                                             vertexOffset, firstInstance); \
+      result = pvr_flush_push_descriptors(cmd_buffer, &cmd_buffer->state.gfx_desc_state); \
+      if (result == VK_SUCCESS) \
+         result = pvr_arch_g5p_cmd_draw_indexed(cmd_buffer, indexCount, instanceCount, firstIndex, \
+                                                vertexOffset, firstInstance); \
       if (result != VK_SUCCESS) \
          vk_command_buffer_set_error(&cmd_buffer->vk, result); \
       goto end_cmd_draw_indexed; \
    }
 
-#define PVR_G5P_HOOK_pub_pvr_arch_cmd_buffer_10237() \
+#define PVR_G5P_HOOK_pub_pvr_arch_cmd_buffer_10243() \
    if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g5p)) { \
       /* G5P: clears and loads are background objects (pvr_arch_g5p_job_init()) */ \
    } else

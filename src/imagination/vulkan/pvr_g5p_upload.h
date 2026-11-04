@@ -73,12 +73,15 @@ void PVR_PER_ARCH(g5p_vs_uploads_destroy)(struct pvr_device *device, struct pvr_
 /* A draw: the sources of every upload, the loader's data, and the
  * PDS_STATE_UPDATE words that run it. Before the draw's words are written
  * (it uploads into the command buffer). */
+VkResult PVR_PER_ARCH(g5p_upload_buffer)(struct pvr_cmd_buffer *cmd_buffer, unsigned set, unsigned binding,
+                                         uint64_t *addr, uint64_t *size);
 VkResult PVR_PER_ARCH(g5p_vs_uploads_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_stage_uploads *up,
                                            struct pvr_g5p_vs_upload_draw *out);
 
 #   define pvr_arch_g5p_vs_uploads_create PVR_PER_ARCH(g5p_vs_uploads_create)
 #   define pvr_arch_g5p_vs_uploads_destroy PVR_PER_ARCH(g5p_vs_uploads_destroy)
 #   define pvr_arch_g5p_vs_uploads_draw PVR_PER_ARCH(g5p_vs_uploads_draw)
+#   define pvr_arch_g5p_upload_buffer PVR_PER_ARCH(g5p_upload_buffer)
 
 #endif /* PVR_PER_ARCH */
 

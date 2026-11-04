@@ -9655,7 +9655,7 @@ void PVR_PER_ARCH(CmdDrawIndexed)(VkCommandBuffer commandBuffer,
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
 
    PVR_TRACE_BEGIN_DRAW(cmd_buffer, PVR_DRAW_INDEXED);
-   PVR_G5P_HOOK(pub_pvr_arch_cmd_buffer_9338)
+   PVR_G5P_HOOK(pub_pvr_arch_cmd_buffer_9342)
    if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g9p)) {
       if (!state->gfx_pipeline)
          return;
@@ -10553,7 +10553,7 @@ void PVR_PER_ARCH(CmdNextSubpass2)(VkCommandBuffer commandBuffer,
 
    hw_subpass = &next_hw_render->subpasses[next_map->subpass];
    hw_subpass_load_op = hw_subpass->load_op;
-   PVR_G5P_HOOK(pub_pvr_arch_cmd_buffer_10237)
+   PVR_G5P_HOOK(pub_pvr_arch_cmd_buffer_10243)
    if (hw_subpass_load_op &&
        !PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g9p)) {
       result = pvr_cs_write_load_op(cmd_buffer,
