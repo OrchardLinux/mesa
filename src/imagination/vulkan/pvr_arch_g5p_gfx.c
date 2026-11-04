@@ -531,6 +531,10 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
     * varyings it reads (Apple's VertexProgramKey; Rogue's pco_rev_link_nir) */
    if (!pvr_g5p_compile_stage(fs_info, true, g->samples, NULL, &key, NULL, fs))
       return G5P_REFUSE(device, "fragment shader: %s", fs->refusal);
+   /* several targets fed from varyings write wrong channels on the A9 (mrt4-vary, 2026-11-04); the
+    * backend fix removes this refusal once that rung passes */
+   if (key.color_targets > 1 && fs->num_varyings)
+      return G5P_REFUSE(device, "MRT with varying-fed outputs (pending backend fix)");
    struct pco_g5p_vs_link link = { .valid = true };
    for (unsigned i = 0; i < fs->num_varyings; i++)
       link.interp[fs->vary[i].location] = fs->vary[i].interp;
