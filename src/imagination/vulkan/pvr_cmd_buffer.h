@@ -468,6 +468,20 @@ struct pvr_cmd_buffer_xfb_state {
    struct pvr_query_pool *pool;
 };
 
+#ifdef PVR_G9P_ES3
+/*
+ * -Dimagination-g9p-es3, G9P transform feedback (pvr_arch_g9p_es3_gfx.h):
+ * capturing, the bytes written to each buffer since its binding offset, the
+ * current draw's record bases and its parameters' address
+ */
+struct pvr_g9p_es3_xfb_state {
+   bool active;
+   uint64_t written[PVR_XFB_MAX_BUFFERS];
+   uint64_t base[PVR_XFB_MAX_BUFFERS];
+   uint64_t params_addr;
+};
+#endif
+
 struct pvr_cmd_buffer_state {
    /* Pipeline binding. */
    const struct pvr_graphics_pipeline *gfx_pipeline;
@@ -537,6 +551,9 @@ struct pvr_cmd_buffer_state {
 
    const struct pvr_query_pool *query_pool;
    struct pvr_cmd_buffer_xfb_state xfb_state;
+#ifdef PVR_G9P_ES3
+   struct pvr_g9p_es3_xfb_state g9p_es3_xfb;
+#endif
 
    /* Query pool pointers indexed by query type */
    const struct pvr_query_pool *query_pools[PVR_QUERY_POOL_INDEX_COUNT];

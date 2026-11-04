@@ -527,3 +527,166 @@ es3_clear_attachments(struct pvr_cmd_buffer *cmd_buffer, uint32_t attachment_cou
                     &(const struct pvr_g9p_draw){ .count = 6 * rect_count, .instances = 1 },
                     VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
 }
+
+/* --- Transform feedback ---------------------------------------------------- */
+
+/*
+ * The vertex shader stores its captured outputs itself (g9p_compile.c
+ * lower_xfb(), our A9 driver's method), so what is left here is where each
+ * draw's records go and how many fit. As on the A9: non-indexed list
+ * draws, stream 0, whole primitives only, the buffer with the least room
+ * decides. Where our A9 driver resolves the counters when the command
+ * buffer executes (its queue runs on the CPU between jobs), this one
+ * resolves them while recording: Begin reads a counter buffer through the
+ * CPU mapping and End writes it, which is right when command buffers
+ * execute in the order they are recorded, as Zink's do. Queries and
+ * vkCmdDrawIndirectByteCountEXT are not built.
+ */
+
+static unsigned
+es3_xfb_vertices_per_primitive(VkPrimitiveTopology t)
+{
+   switch (t) {
+   case VK_PRIMITIVE_TOPOLOGY_POINT_LIST:
+      return 1;
+   case VK_PRIMITIVE_TOPOLOGY_LINE_LIST:
+      return 2;
+   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST:
+      return 3;
+   default:
+      return 0;
+   }
+}
+
+static void
+es3_pipeline_state(struct pvr_g9p_graphics_state *state, const struct g9p_shader *vs)
+{
+   state->es3_xfb_buffers = vs->xfb_buffers;
+   memcpy(state->es3_xfb_stride, vs->xfb_stride, sizeof(state->es3_xfb_stride));
+}
+
+/*
+ * Before a draw's vertex uniforms: its capture parameters and record
+ * bases, and the bytes the capture adds to each buffer
+ */
+static VkResult
+es3_xfb_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state *state,
+             const struct pvr_g9p_draw *draw, VkPrimitiveTopology topology)
+{
+   const struct pvr_cmd_buffer_xfb_state *xs = &cmd_buffer->state.xfb_state;
+   struct pvr_g9p_es3_xfb_state *x = &cmd_buffer->state.g9p_es3_xfb;
+   const unsigned vpp = es3_xfb_vertices_per_primitive(topology);
+   uint32_t params[4] = { 0 };
+   struct pvr_suballoc_bo *bo;
+   uint64_t records = 0;
+   VkResult result;
+
+   if (!state->es3_xfb_buffers)
+      return VK_SUCCESS;
+   if (x->active) {
+      uint64_t fit = UINT64_MAX;
+
+      if (draw->indexed || !vpp)
+         return vk_errorf(cmd_buffer, VK_ERROR_FEATURE_NOT_PRESENT,
+                          "G9P: transform feedback of an indexed draw or of topology %u "
+                          "(non-indexed lists only)",
+                          topology);
+      if (draw->count % vpp && MAX2(draw->instances, 1) > 1)
+         return vk_errorf(cmd_buffer, VK_ERROR_FEATURE_NOT_PRESENT,
+                          "G9P: transform feedback of instances with an incomplete primitive");
+      params[G9P_XFB_PARAM_VERTICES] = draw->count - draw->count % vpp;
+      u_foreach_bit (b, state->es3_xfb_buffers) {
+         const struct pvr_xfb_binding *bind = &xs->bindings[b];
+         const uint64_t stride = state->es3_xfb_stride[b];
+         const uint64_t room = bind->buffer_size > x->written[b]
+                                  ? (bind->buffer_size - x->written[b]) / stride
+                                  : 0;
+
+         if (!bind->buffer_size)
+            return vk_errorf(cmd_buffer, VK_ERROR_FEATURE_NOT_PRESENT,
+                             "G9P: transform feedback buffer %u not bound", b);
+         fit = MIN2(fit, room / vpp * vpp);
+      }
+      records = MIN2((uint64_t)params[G9P_XFB_PARAM_VERTICES] * MAX2(draw->instances, 1), fit);
+   }
+   params[G9P_XFB_PARAM_LIMIT] = records;
+   params[G9P_XFB_PARAM_FIRST] = draw->offset;
+   result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, params, sizeof(params), &bo);
+   if (result != VK_SUCCESS)
+      return result;
+   x->params_addr = bo->dev_addr.addr;
+   u_foreach_bit (b, state->es3_xfb_buffers) {
+      x->base[b] = xs->bindings[b].buffer_addr.addr + x->written[b];
+      x->written[b] += records * state->es3_xfb_stride[b];
+   }
+   return VK_SUCCESS;
+}
+
+/* buffer_addrs() of a G9P_XFB slot */
+static uint64_t
+es3_xfb_addr(const struct pvr_cmd_buffer *cmd_buffer, unsigned binding)
+{
+   const struct pvr_g9p_es3_xfb_state *x = &cmd_buffer->state.g9p_es3_xfb;
+
+   if (binding == G9P_XFB_PARAMS)
+      return x->params_addr;
+   return binding < PVR_XFB_MAX_BUFFERS ? x->base[binding] : 0;
+}
+
+/* A counter buffer's 32-bit byte count, through the CPU mapping */
+static uint32_t *
+es3_xfb_counter(struct pvr_cmd_buffer *cmd_buffer, VkBuffer handle, VkDeviceSize offset)
+{
+   VK_FROM_HANDLE(pvr_buffer, buffer, handle);
+
+   return (uint32_t *)PVR_PER_ARCH(g9p_cpu_addr)(cmd_buffer->device,
+                                                 buffer->dev_addr.addr + offset);
+}
+
+void
+PVR_PER_ARCH(g9p_es3_xfb_begin)(struct pvr_cmd_buffer *cmd_buffer, uint32_t first,
+                                uint32_t count, const VkBuffer *counters,
+                                const VkDeviceSize *offsets)
+{
+   struct pvr_g9p_es3_xfb_state *x = &cmd_buffer->state.g9p_es3_xfb;
+
+   x->active = true;
+   memset(x->written, 0, sizeof(x->written));
+   for (uint32_t j = 0; counters && j < count; j++) {
+      uint32_t *c;
+
+      if (first + j >= PVR_XFB_MAX_BUFFERS || counters[j] == VK_NULL_HANDLE)
+         continue;
+      c = es3_xfb_counter(cmd_buffer, counters[j], offsets ? offsets[j] : 0);
+      if (!c) {
+         vk_command_buffer_set_error(&cmd_buffer->vk,
+                                     vk_errorf(cmd_buffer, VK_ERROR_FEATURE_NOT_PRESENT,
+                                               "G9P: transform feedback counter not mapped"));
+         return;
+      }
+      x->written[first + j] = *c;
+   }
+}
+
+void
+PVR_PER_ARCH(g9p_es3_xfb_end)(struct pvr_cmd_buffer *cmd_buffer, uint32_t first, uint32_t count,
+                              const VkBuffer *counters, const VkDeviceSize *offsets)
+{
+   struct pvr_g9p_es3_xfb_state *x = &cmd_buffer->state.g9p_es3_xfb;
+
+   x->active = false;
+   for (uint32_t j = 0; counters && j < count; j++) {
+      uint32_t *c;
+
+      if (first + j >= PVR_XFB_MAX_BUFFERS || counters[j] == VK_NULL_HANDLE)
+         continue;
+      c = es3_xfb_counter(cmd_buffer, counters[j], offsets ? offsets[j] : 0);
+      if (!c) {
+         vk_command_buffer_set_error(&cmd_buffer->vk,
+                                     vk_errorf(cmd_buffer, VK_ERROR_FEATURE_NOT_PRESENT,
+                                               "G9P: transform feedback counter not mapped"));
+         return;
+      }
+      *c = x->written[first + j];
+   }
+}

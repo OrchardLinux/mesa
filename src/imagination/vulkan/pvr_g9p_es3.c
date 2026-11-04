@@ -41,13 +41,19 @@ pvr_g9p_es3_limits(struct vk_device_extension_table *ext, struct vk_features *fe
    features->sampleRateShading = false;
    features->alphaToOne = false;
 
-   /* Transform feedback: the stream-out program is a HALT, nothing is stored */
-   ext->EXT_transform_feedback = false;
-   features->transformFeedback = false;
+   /*
+    * Transform feedback: the vertex shader stores the records of
+    * non-indexed list draws, stream 0, up to four buffers
+    * (pvr_arch_g9p_es3_gfx.h); no queries, no draws from a counter
+    */
+   ext->EXT_transform_feedback = true;
+   features->transformFeedback = true;
    features->geometryStreams = false;
-   props->maxTransformFeedbackStreams = 0;
-   props->maxTransformFeedbackBuffers = 0;
+   props->maxTransformFeedbackStreams = 1;
+   props->maxTransformFeedbackBuffers = 4;
    props->transformFeedbackQueries = false;
+   props->transformFeedbackStreamsLinesTriangles = false;
+   props->transformFeedbackRasterizationStreamSelect = false;
    props->transformFeedbackDraw = false;
 }
 

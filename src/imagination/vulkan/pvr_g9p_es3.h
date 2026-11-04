@@ -37,6 +37,23 @@ void pvr_g9p_es3_limits(struct vk_device_extension_table *ext, struct vk_feature
 /* The sample counts a G9P attachment image may have */
 VkSampleCountFlags pvr_g9p_es3_sample_counts(void);
 
+#ifdef PVR_PER_ARCH
+struct pvr_cmd_buffer;
+
+/*
+ * Transform feedback on G9P (pvr_arch_g9p_es3_gfx.h): vkCmdBegin/End-
+ * TransformFeedbackEXT, from upstream's entry points
+ */
+void PVR_PER_ARCH(g9p_es3_xfb_begin)(struct pvr_cmd_buffer *cmd_buffer, uint32_t first,
+                                     uint32_t count, const VkBuffer *counters,
+                                     const VkDeviceSize *offsets);
+void PVR_PER_ARCH(g9p_es3_xfb_end)(struct pvr_cmd_buffer *cmd_buffer, uint32_t first,
+                                   uint32_t count, const VkBuffer *counters,
+                                   const VkDeviceSize *offsets);
+#   define pvr_arch_g9p_es3_xfb_begin PVR_PER_ARCH(g9p_es3_xfb_begin)
+#   define pvr_arch_g9p_es3_xfb_end PVR_PER_ARCH(g9p_es3_xfb_end)
+#endif
+
 #endif /* PVR_G9P_ES3 */
 
 #endif /* PVR_G9P_ES3_H */

@@ -7,6 +7,8 @@
 #ifdef PVR_G9P_ES3
 
 #include "g9p_es3_isa.h"
+#include "pvr_buffer.h"
+#include "pvr_g9p_es3.h"
 
 struct g9p_draw_programs;
 /* -Dimagination-g9p-es3, at the end of this file (pvr_arch_g9p_es3_gfx.h) */
@@ -25,6 +27,11 @@ static VkResult es3_clear_attachments(struct pvr_cmd_buffer *cmd_buffer,
                                       uint32_t attachment_count,
                                       const VkClearAttachment *attachments, uint32_t rect_count,
                                       const VkClearRect *rects, bool *handled);
+static void es3_pipeline_state(struct pvr_g9p_graphics_state *state, const struct g9p_shader *vs);
+static VkResult es3_xfb_draw(struct pvr_cmd_buffer *cmd_buffer,
+                             const struct pvr_g9p_graphics_state *state,
+                             const struct pvr_g9p_draw *draw, VkPrimitiveTopology topology);
+static uint64_t es3_xfb_addr(const struct pvr_cmd_buffer *cmd_buffer, unsigned binding);
 
 /* pvr_arch_g9p_gfx.c, after main line 288: the option-on insertion. */
 #define PVR_G9P_ES3_HOOK_arch_g9p_gfx_288() \
@@ -44,6 +51,21 @@ static VkResult es3_clear_attachments(struct pvr_cmd_buffer *cmd_buffer,
    result = es3_check_targets(device, vk_state, &fs); \
    if (result != VK_SUCCESS) \
    goto out;
+
+/* pvr_arch_g9p_gfx.c, after main line 562: the option-on insertion. */
+#define PVR_G9P_ES3_HOOK_arch_g9p_gfx_562() \
+   es3_pipeline_state(state, &vs);
+
+/* pvr_arch_g9p_gfx.c, after main line 817: the option-on insertion. */
+#define PVR_G9P_ES3_HOOK_arch_g9p_gfx_817() \
+   } else if (set == G9P_XFB) { \
+   addrs[k] = es3_xfb_addr(cmd_buffer, binding);
+
+/* pvr_arch_g9p_gfx.c, after main line 1012: the option-on insertion. */
+#define PVR_G9P_ES3_HOOK_arch_g9p_gfx_1012() \
+   result = es3_xfb_draw(cmd_buffer, state, draw, dyn->ia.primitive_topology); \
+   if (result != VK_SUCCESS) \
+   return result;
 
 /* pvr_arch_g9p_gfx.c, after main line 1267: the option-on insertion. */
 #define PVR_G9P_ES3_HOOK_arch_g9p_gfx_1267() \

@@ -58,6 +58,21 @@
  * dynamic state)
  */
 #define G9P_VERTEX_STRIDES (~3u)
+#ifdef PVR_G9P_ES3
+/*
+ * -Dimagination-g9p-es3: the set of the transform feedback slots. Bindings
+ * 0-3: the draw's record base in XFB buffer b; binding 4: the draw's
+ * capture parameters, three dwords (G9P_XFB_PARAM_*)
+ */
+#define G9P_XFB (~5u)
+#define G9P_XFB_PARAMS 4
+/* records per instance (the draw's vertex count in whole primitives) */
+#define G9P_XFB_PARAM_VERTICES 0
+/* records to store, all instances (0: transform feedback is not active) */
+#define G9P_XFB_PARAM_LIMIT 1
+/* the draw's first vertex (the vertex index's value for record 0) */
+#define G9P_XFB_PARAM_FIRST 2
+#endif
 /*
  * gl_FragCoord comes in a varying (window x, y, z, 1/w) the vertex shader
  * writes after its own (g9p_frag_coord_slot()), iterated without
@@ -135,6 +150,11 @@ struct g9p_shader {
     * FRAG_RESULT_DATAn + 1), each in output halves 4t..4t+3
     */
    unsigned num_targets;
+#endif
+#ifdef PVR_G9P_ES3
+   /* Vertex: the transform feedback buffers stored to, and their strides in bytes */
+   unsigned xfb_buffers;
+   unsigned xfb_stride[4];
 #endif
 };
 

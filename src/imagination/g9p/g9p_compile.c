@@ -28,6 +28,9 @@
 #include <vulkan/vulkan_core.h>
 
 #include "compiler/nir/nir_builder.h"
+#ifdef PVR_G9P_ES3
+#include "compiler/nir/nir_xfb_info.h"
+#endif
 #include "compiler/nir/nir_builtin_builder.h"
 #include "compiler/nir/nir_format_convert.h"
 #include "util/format/u_format.h"
@@ -2515,15 +2518,124 @@ lower_attrib_format(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return true;
 }
 
+#ifdef PVR_G9P_ES3
+/*
+ * -Dimagination-g9p-es3: transform feedback in the vertex shader, as our A9
+ * driver does it (hardware-proven there: two buffers, 3000 vertices captured
+ * once, xfb.md) and as nir_lower_xfb_to_stores() lays the records out: each
+ * captured output component is stored at
+ *
+ *    base[b] + record * stride[b] + offset,
+ *    record = instance * vertices + (vertex index - first vertex)
+ *
+ * by the G9P 32-bit store (g9p_mem_at() U32). On the A9 only the 4-byte
+ * store form lands in a vertex task; its 16-byte form is a no-op there
+ * (xfb.md, device run 2b), so every component is stored on its own. The
+ * stores run only for record < limit: the recorder sets the limit to the
+ * whole primitives that fit in every buffer, 0 when capture is not active.
+ * The outputs stay (capture and rasterization in one draw).
+ */
+static nir_def *
+xfb_param(nir_builder *b, unsigned dword)
+{
+   nir_def *index = nir_vulkan_resource_index(b, 2, 32, nir_imm_int(b, 0), .desc_set = G9P_XFB,
+                                              .binding = G9P_XFB_PARAMS,
+                                              .desc_type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
+
+   return nir_load_ubo(b, 1, 32, index, nir_imm_int(b, 4 * dword), .align_mul = 4,
+                       .range = ~0);
+}
+
+static bool
+lower_xfb_store(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   struct g9p_shader *out = data;
+   nir_io_xfb xfb;
+   nir_def *record, *limit;
+   bool any = false;
+
+   if (intr->intrinsic != nir_intrinsic_store_output)
+      return false;
+   xfb = nir_intrinsic_io_xfb(intr);
+   for (unsigned i = 0; i < 4; i++)
+      any |= xfb.out[i].num_components != 0;
+   if (!any)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   record = nir_iadd(b, nir_imul(b, nir_load_instance_id(b), xfb_param(b, G9P_XFB_PARAM_VERTICES)),
+                     nir_isub(b, nir_load_vertex_id(b), xfb_param(b, G9P_XFB_PARAM_FIRST)));
+   limit = xfb_param(b, G9P_XFB_PARAM_LIMIT);
+   nir_push_if(b, nir_ult(b, record, limit));
+   for (unsigned i = 0; i < 4; i++) {
+      const unsigned n = xfb.out[i].num_components;
+      const unsigned buffer = xfb.out[i].buffer;
+      const unsigned stride = b->shader->info.xfb_stride[buffer] * 4;
+      nir_def *index;
+
+      if (!n)
+         continue;
+      index = nir_vulkan_resource_index(b, 2, 32, nir_imm_int(b, 0), .desc_set = G9P_XFB,
+                                        .binding = buffer,
+                                        .desc_type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+      out->xfb_buffers |= BITFIELD_BIT(buffer);
+      out->xfb_stride[buffer] = stride;
+      for (unsigned c = 0; c < n; c++) {
+         /* start_component i is absolute; the source starts at the intrinsic's component */
+         nir_def *v = nir_channel(b, intr->src[0].ssa, i + c - nir_intrinsic_component(intr));
+         nir_def *offset = nir_iadd_imm(b, nir_imul_imm(b, record, stride),
+                                        4 * (xfb.out[i].offset + c));
+
+         nir_store_ssbo(b, v, index, offset, .write_mask = 1, .align_mul = 4);
+      }
+   }
+   nir_pop_if(b, NULL);
+   return true;
+}
+
+/*
+ * A vertex shader that captures outputs: false for what the store path
+ * cannot take (16-bit data, streams other than 0)
+ */
+static bool
+lower_xfb(nir_shader *nir, struct g9p_shader *out)
+{
+   if (!nir->xfb_info || !nir->xfb_info->buffers_written)
+      return true;
+   if (nir->xfb_info->streams_written > 1) {
+      fprintf(stderr, "g9p: transform feedback streams other than 0 not supported\n");
+      return false;
+   }
+   for (unsigned i = 0; i < nir->xfb_info->output_count; i++) {
+      if (nir->xfb_info->outputs[i].data_is_16bit) {
+         fprintf(stderr, "g9p: 16-bit transform feedback data not supported\n");
+         return false;
+      }
+   }
+   NIR_PASS(_, nir, nir_io_add_intrinsic_xfb_info);
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_xfb_store, nir_metadata_none, out);
+   return true;
+}
+#endif
+
 bool
 g9p_compile_vertex(nir_shader *nir, const struct g9p_vertex_attrib *attribs,
                    int frag_coord_slot, struct g9p_shader *out, void *mem_ctx)
 {
+#ifdef PVR_G9P_ES3
+   /* vk_spirv_to_nir() gathers it; a shader built otherwise may not have it */
+   if (nir->info.has_transform_feedback_varyings && !nir->xfb_info)
+      nir_shader_gather_xfb_info(nir);
+#endif
    memset(out, 0, sizeof(*out));
    lower_front(nir);
    if (frag_coord_slot >= 0)
       add_frag_coord_output(nir, frag_coord_slot);
    lower_io(nir);
+#ifdef PVR_G9P_ES3
+   if (!lower_xfb(nir, out))
+      return false;
+#endif
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_attrib_format,
             nir_metadata_control_flow, (void *)attribs);
    return compile_back(nir, out, MESA_SHADER_VERTEX, attribs, 0, mem_ctx);

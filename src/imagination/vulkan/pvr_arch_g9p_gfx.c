@@ -554,12 +554,12 @@ PVR_PER_ARCH(g9p_graphics_pipeline_compile)(struct pvr_device *device,
    result = pvr_gpu_upload_usc(device, fs.code, fs.code_size, 64, &state->fs_bo);
    if (result != VK_SUCCESS)
       goto out;
-
    state->num_varyings = vs.num_varyings;
    state->vs_outputs = vs.num_outputs;
    state->uses_discard = fs.uses_discard;
    state->uses_fbfetch = fs.uses_fbfetch;
    state->vs_regs = vs.num_regs;
+   PVR_G9P_ES3_HOOK(arch_g9p_gfx_562)
    state->num_buffers = vs.num_buffers;
    for (unsigned i = 0; i < vs.num_buffers; i++) {
       state->buffers[i].set = vs.buffers[i].set;
@@ -806,7 +806,6 @@ buffer_addrs(struct pvr_cmd_buffer *cmd_buffer, unsigned n, const unsigned (*set
 
          if (pc->dirty || !pc->dev_addr.addr) {
             struct pvr_suballoc_bo *pbo;
-
             result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, pc->data,
                                                         MAX2(pc->bytes_updated, 4), &pbo);
             if (result != VK_SUCCESS)
@@ -815,6 +814,7 @@ buffer_addrs(struct pvr_cmd_buffer *cmd_buffer, unsigned n, const unsigned (*set
             pc->dirty = false;
          }
          addrs[k] = pc->dev_addr.addr;
+   PVR_G9P_ES3_HOOK(arch_g9p_gfx_817)
       } else if (set == G9P_VIEWPORT) {
          /* scale/offset x, y, z of viewport 0 (gl_FragCoord's varying) */
          const struct vk_dynamic_graphics_state *dyn = &cmd_buffer->vk.dynamic_graphics_state;
@@ -1002,7 +1002,6 @@ PVR_PER_ARCH(g9p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer,
    if (cs->push_consts[PVR_STAGE_ALLOCATION_VERTEX_GEOMETRY].dirty) {
       struct pvr_push_constants *pc = &cs->push_consts[PVR_STAGE_ALLOCATION_VERTEX_GEOMETRY];
       struct pvr_suballoc_bo *bo;
-
       result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, pc->data,
                                                   MAX2(pc->bytes_updated, 4), &bo);
       if (result != VK_SUCCESS)
@@ -1010,6 +1009,7 @@ PVR_PER_ARCH(g9p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer,
       pc->dev_addr = bo->dev_addr;
       pc->dirty = false;
    }
+   PVR_G9P_ES3_HOOK(arch_g9p_gfx_1012)
    result = upload_vs_uniforms(cmd_buffer, state, &dma);
    if (result != VK_SUCCESS)
       return result;
