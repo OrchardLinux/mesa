@@ -150,4 +150,15 @@
                   ? pvr_image_view_from_handle((image_info)->imageView)     \
                   : NULL);
 
+/* pvr_image.c, pvr_image_init(): linear rows are 64-byte aligned on the
+ * A9, the ICD's G5P_LINEAR_STRIDE_ALIGN (the image state's stride field is
+ * in 16-byte units; every linear row the A9 has rendered or sampled was a
+ * multiple of 64 bytes): the alignment in pixels of this format.
+ */
+#define PVR_G5P_HOOK_stride_align(device, create_info, align)                \
+   if (PVR_HAS_FEATURE(&(device)->pdevice->dev_info, apple_g5p)) {           \
+      const unsigned cpp_ = vk_format_get_blocksize((create_info)->format); \
+      align = cpp_ && 64 % cpp_ == 0 ? 64 / cpp_ : 64;                      \
+   }
+
 #endif /* PVR_G5P_HOOKS_H */
