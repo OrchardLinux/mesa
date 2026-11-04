@@ -11,7 +11,7 @@ out=${1:-.}
 mkdir -p "$out"
 gen="$out/tex-blend-spirv.h"
 : >"$gen.tmp"
-for s in pass.vert:PASS_VERT:vert uv.vert:UV_VERT:vert tex.frag:TEX_FRAG:frag solid.frag:SOLID_FRAG:frag; do
+for s in pass.vert:PASS_VERT:vert uv.vert:UV_VERT:vert tex.frag:TEX_FRAG:frag texlod.frag:TEXLOD_FRAG:frag texarr.frag:TEXARR_FRAG:frag texcube.frag:TEXCUBE_FRAG:frag texarr0.frag:TEXARR0_FRAG:frag texcubex.frag:TEXCUBEX_FRAG:frag texlod0.frag:TEXLOD0_FRAG:frag solid.frag:SOLID_FRAG:frag; do
     name=${s%%:*} rest=${s#*:}
     def=${rest%%:*} stage=${rest#*:}
     var=$(echo "$name" | tr . _)

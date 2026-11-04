@@ -13,7 +13,15 @@
  *                 ONE_MINUS_SRC_ALPHA (a compositor's window draw)
  *   blend-*       the constant colour SRC over the left half of the target
  *                 with one blend setting each; the right half stays CLEAR
- * Textures are linear and written by the host (no transfer path needed).
+ * Textures are linear and written by the host (no transfer path needed),
+ * except in the optimal rungs, whose textures are uploaded from a buffer
+ * with vkCmdCopyBufferToImage (in a submission of its own):
+ *   tex-optimal   an 8x8 optimal texture, nearest
+ *   tex-mip0      level 0 of a 16x16 five-level chain (magnified: LOD < 0)
+ *   tex-mip2      level 2 of the same chain, textureLod 2
+ *   tex-array     layer 2 of an 8x8 three-layer 2D array
+ *   tex-cube      the -Z face of a 4x4 cube (face 5), s = 1 - u, t = 1 - v
+ * Every level, layer and face has texels of its own, so a wrong offset fails.
  * Sampling is exact. Blended pixels may differ from the CPU's rounding by
  * 1 per channel (the blend arithmetic's precision is the hardware's).
  *
@@ -45,6 +53,10 @@ static const float SRC[4] = { 0.5f, 0.3f, 0.1f, 0.6f };
 static const float CONSTANTS[4] = { 0.25f, 0.5f, 0.75f, 0.4f };
 
 enum tex_kind { TEX_NONE, TEX_OPAQUE, TEX_PREMULT };
+/* the optimal rungs' textures (uploaded by a copy) */
+enum tex_type { T_LINEAR, T_OPT, T_MIP0, T_MIP2, T_ARRAY, T_CUBE,
+                /* diagnostics: subresource 0 through the same paths, and a host-written array */
+                T_ARRAY0, T_CUBEX, T_LOD0, T_HOSTARR };
 
 struct rung {
    const char *name;
@@ -55,6 +67,7 @@ struct rung {
    VkBlendFactor src_rgb, dst_rgb, src_a, dst_a;
    VkBlendOp op_rgb, op_a;
    bool constants;    /* dynamic blend constants CONSTANTS */
+   enum tex_type type;
 };
 
 #define F(x) VK_BLEND_FACTOR_##x
@@ -84,6 +97,15 @@ static const struct rung rungs[] = {
      OP(ADD), OP(ADD) },
    { "blend-sa-omsa-10", TEX_NONE, 0, 0, false, true, F(SRC_ALPHA), F(ONE_MINUS_SRC_ALPHA), F(ONE), F(ZERO),
      OP(ADD), OP(ADD) },
+   { "tex-optimal", TEX_OPAQUE, 8, 8, .type = T_OPT },
+   { "tex-mip0", TEX_OPAQUE, 16, 16, .type = T_MIP0 },
+   { "tex-mip2", TEX_OPAQUE, 16, 16, .type = T_MIP2 },
+   { "tex-array", TEX_OPAQUE, 8, 8, .type = T_ARRAY },
+   { "tex-cube", TEX_OPAQUE, 4, 4, .type = T_CUBE },
+   { "diag-array-l0", TEX_OPAQUE, 8, 8, .type = T_ARRAY0 },
+   { "diag-cube-px", TEX_OPAQUE, 4, 4, .type = T_CUBEX },
+   { "diag-lod0", TEX_OPAQUE, 16, 16, .type = T_LOD0 },
+   { "diag-host-array", TEX_OPAQUE, 8, 8, .type = T_HOSTARR },
 };
 
 static VkPhysicalDevice pd;
@@ -91,6 +113,7 @@ static VkDevice dev;
 static VkQueue queue;
 static uint32_t queue_family;
 static bool verify = true;
+static const char *dump_dir; /* --dump DIR: DIR/<rung>.bgra, the target's 64x64 BGRA8 rows */
 
 #define CHECK(x)                                                                                        \
    do {                                                                                                 \
@@ -127,6 +150,30 @@ texel(const struct rung *r, unsigned i, unsigned j, uint8_t out[4])
       out[2] = (i * 7 + j * 13) * 9 % 256;
       out[3] = 255 - 16 * (i + j);
    }
+}
+
+/* A texel of level or layer l of an optimal rung's texture, RGBA */
+static void
+texel_l(unsigned i, unsigned j, unsigned l, uint8_t out[4])
+{
+   out[0] = (uint8_t)(11 + 37 * i + 61 * l);
+   out[1] = (uint8_t)(7 + 53 * j + 29 * l);
+   out[2] = (uint8_t)((i * 7 + j * 13 + l * 97) * 9);
+   out[3] = (uint8_t)(255 - ((i + j + l) * 5 & 127));
+}
+
+static unsigned
+levels_of(const struct rung *r)
+{
+   return r->type == T_MIP0 || r->type == T_MIP2 || r->type == T_LOD0 ? 5 : 1;
+}
+
+static unsigned
+layers_of(const struct rung *r)
+{
+   return r->type == T_ARRAY || r->type == T_ARRAY0 || r->type == T_HOSTARR ? 3
+          : r->type == T_CUBE || r->type == T_CUBEX                       ? 6
+                                                                          : 1;
 }
 
 static double
@@ -242,7 +289,8 @@ static void
 free_image(struct img *im)
 {
    vkDestroyImageView(dev, im->view, NULL);
-   vkUnmapMemory(dev, im->mem);
+   if (im->map)
+      vkUnmapMemory(dev, im->mem);
    vkDestroyImage(dev, im->image, NULL);
    vkFreeMemory(dev, im->mem, NULL);
 }
@@ -257,6 +305,130 @@ flush(VkDeviceMemory mem, bool invalidate)
       CHECK(vkInvalidateMappedMemoryRanges(dev, 1, &range));
    else
       CHECK(vkFlushMappedMemoryRanges(dev, 1, &range));
+   return 0;
+}
+
+/* An optimal texture for r, filled from a buffer by vkCmdCopyBufferToImage
+ * in a submission of its own (left in TRANSFER_DST_OPTIMAL)
+ */
+static int
+upload_optimal(const struct rung *r, struct img *im)
+{
+   const unsigned levels = levels_of(r), layers = layers_of(r);
+   const VkImageCreateInfo ici = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+      .flags = layers_of(r) == 6 ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0, .imageType = VK_IMAGE_TYPE_2D,
+      .format = VK_FORMAT_R8G8B8A8_UNORM, .extent = { r->tw, r->th, 1 }, .mipLevels = levels,
+      .arrayLayers = layers, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+      .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+      .initialLayout = r->type == T_HOSTARR ? VK_IMAGE_LAYOUT_PREINITIALIZED : VK_IMAGE_LAYOUT_UNDEFINED };
+   VkMemoryRequirements req;
+
+   memset(im, 0, sizeof(*im));
+   CHECK(vkCreateImage(dev, &ici, NULL, &im->image));
+   vkGetImageMemoryRequirements(dev, im->image, &req);
+   if (host_memory(&req, &im->mem))
+      return 1;
+   CHECK(vkBindImageMemory(dev, im->image, im->mem, 0));
+   const VkImageViewType vt = layers_of(r) == 6 ? VK_IMAGE_VIEW_TYPE_CUBE
+                              : layers_of(r) > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY
+                                                 : VK_IMAGE_VIEW_TYPE_2D;
+   const VkImageViewCreateInfo vci = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = im->image,
+                                       .viewType = vt, .format = ici.format,
+                                       .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, levels, 0, layers } };
+   CHECK(vkCreateImageView(dev, &vci, NULL, &im->view));
+
+   if (r->type == T_HOSTARR) {
+      /* diagnostic: the A9's layout written by the host (layers 64-byte rounded, twiddled with y in bit 0),
+       * not through the transfer path; only meaningful on the A9 */
+      uint8_t *map;
+      CHECK(vkMapMemory(dev, im->mem, 0, VK_WHOLE_SIZE, 0, (void **)&map));
+      for (unsigned l = 0; l < layers; l++) {
+         for (unsigned j = 0; j < r->th; j++) {
+            for (unsigned i = 0; i < r->tw; i++) {
+               unsigned m = 0;
+               for (unsigned b = 0; (1u << b) < r->tw; b++)
+                  m |= ((j >> b) & 1) << (2 * b) | ((i >> b) & 1) << (2 * b + 1);
+               texel_l(i, j, l, map + (size_t)l * ((4 * r->tw * r->th + 63) & ~63u) + 4 * m);
+            }
+         }
+      }
+      if (flush(im->mem, false))
+         return 1;
+      vkUnmapMemory(dev, im->mem);
+      return 0;
+   }
+
+   /* the staging buffer: every level, then every layer of it, tightly packed */
+   VkDeviceSize size = 0;
+   for (unsigned m = 0; m < levels; m++)
+      size += (VkDeviceSize)4 * (r->tw >> m) * (r->th >> m) * layers;
+   const VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size,
+                                    .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT };
+   VkBuffer buf;
+   VkDeviceMemory bmem;
+   VkMemoryRequirements breq;
+   uint8_t *map;
+   CHECK(vkCreateBuffer(dev, &bci, NULL, &buf));
+   vkGetBufferMemoryRequirements(dev, buf, &breq);
+   if (host_memory(&breq, &bmem))
+      return 1;
+   CHECK(vkBindBufferMemory(dev, buf, bmem, 0));
+   CHECK(vkMapMemory(dev, bmem, 0, VK_WHOLE_SIZE, 0, (void **)&map));
+   VkBufferImageCopy regions[5];
+   VkDeviceSize off = 0;
+   for (unsigned m = 0; m < levels; m++) {
+      const unsigned w = r->tw >> m, h = r->th >> m;
+
+      regions[m] = (VkBufferImageCopy){ .bufferOffset = off,
+                                        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, m, 0, layers },
+                                        .imageExtent = { w, h, 1 } };
+      for (unsigned l = 0; l < layers; l++) {
+         for (unsigned j = 0; j < h; j++) {
+            for (unsigned i = 0; i < w; i++)
+               texel_l(i, j, levels > 1 ? m : l, map + off + 4 * (j * w + i));
+         }
+         off += (VkDeviceSize)4 * w * h;
+      }
+   }
+   if (flush(bmem, false))
+      return 1;
+
+   const VkCommandPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+                                         .queueFamilyIndex = queue_family };
+   VkCommandPool pool;
+   CHECK(vkCreateCommandPool(dev, &pci, NULL, &pool));
+   const VkCommandBufferAllocateInfo cai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                                             .commandPool = pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                                             .commandBufferCount = 1 };
+   VkCommandBuffer cmd;
+   CHECK(vkAllocateCommandBuffers(dev, &cai, &cmd));
+   const VkCommandBufferBeginInfo cbi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+   CHECK(vkBeginCommandBuffer(cmd, &cbi));
+   const VkImageMemoryBarrier imb = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                                      .srcAccessMask = 0, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                                      .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                                      .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = im->image,
+                                      .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, levels, 0, layers } };
+   vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0,
+                        NULL, 1, &imb);
+   vkCmdCopyBufferToImage(cmd, buf, im->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, levels, regions);
+   CHECK(vkEndCommandBuffer(cmd));
+   const VkFenceCreateInfo fnci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+   VkFence fence;
+   CHECK(vkCreateFence(dev, &fnci, NULL, &fence));
+   const VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1,
+                             .pCommandBuffers = &cmd };
+   CHECK(vkQueueSubmit(queue, 1, &si, fence));
+   CHECK(vkWaitForFences(dev, 1, &fence, VK_TRUE, 5000000000ull));
+   vkDestroyFence(dev, fence, NULL);
+   vkFreeCommandBuffers(dev, pool, 1, &cmd);
+   vkDestroyCommandPool(dev, pool, NULL);
+   vkUnmapMemory(dev, bmem);
+   vkDestroyBuffer(dev, buf, NULL);
+   vkFreeMemory(dev, bmem, NULL);
    return 0;
 }
 
@@ -282,22 +454,27 @@ run(const struct rung *r)
       const VkComponentMapping bgra = { VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_R,
                                         VK_COMPONENT_SWIZZLE_A };
 
-      if (make_image(&tex, VK_FORMAT_R8G8B8A8_UNORM, r->tw, r->th, VK_IMAGE_USAGE_SAMPLED_BIT,
-                     VK_IMAGE_LAYOUT_PREINITIALIZED, r->swizzle ? &bgra : NULL))
-         return 1;
-      for (unsigned j = 0; j < r->th; j++) {
-         for (unsigned i = 0; i < r->tw; i++)
-            texel(r, i, j, tex.map + tex.layout.offset + j * tex.layout.rowPitch + 4 * i);
+      if (r->type != T_LINEAR) {
+         if (upload_optimal(r, &tex))
+            return 1;
+      } else {
+         if (make_image(&tex, VK_FORMAT_R8G8B8A8_UNORM, r->tw, r->th, VK_IMAGE_USAGE_SAMPLED_BIT,
+                        VK_IMAGE_LAYOUT_PREINITIALIZED, r->swizzle ? &bgra : NULL))
+            return 1;
+         for (unsigned j = 0; j < r->th; j++) {
+            for (unsigned i = 0; i < r->tw; i++)
+               texel(r, i, j, tex.map + tex.layout.offset + j * tex.layout.rowPitch + 4 * i);
+         }
+         if (flush(tex.mem, false))
+            return 1;
       }
-      if (flush(tex.mem, false))
-         return 1;
       const VkSamplerCreateInfo sci = { .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
                                         .magFilter = VK_FILTER_NEAREST, .minFilter = VK_FILTER_NEAREST,
                                         .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
                                         .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
                                         .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
                                         .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-                                        .maxLod = 0.25f };
+                                        .maxLod = levels_of(r) > 1 ? VK_LOD_CLAMP_NONE : 0.25f };
       CHECK(vkCreateSampler(dev, &sci, NULL, &sampler));
       const VkDescriptorSetLayoutBinding b = { .binding = 0,
                                                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
@@ -367,8 +544,31 @@ run(const struct rung *r)
    smi.codeSize = textured ? sizeof(spv_uv_vert) : sizeof(spv_pass_vert);
    smi.pCode = textured ? spv_uv_vert : spv_pass_vert;
    CHECK(vkCreateShaderModule(dev, &smi, NULL, &vsm));
-   smi.codeSize = textured ? sizeof(spv_tex_frag) : sizeof(spv_solid_frag);
-   smi.pCode = textured ? spv_tex_frag : spv_solid_frag;
+   if (!textured) {
+      smi.codeSize = sizeof(spv_solid_frag);
+      smi.pCode = spv_solid_frag;
+   } else if (r->type == T_MIP2) {
+      smi.codeSize = sizeof(spv_texlod_frag);
+      smi.pCode = spv_texlod_frag;
+   } else if (r->type == T_ARRAY || r->type == T_HOSTARR) {
+      smi.codeSize = sizeof(spv_texarr_frag);
+      smi.pCode = spv_texarr_frag;
+   } else if (r->type == T_ARRAY0) {
+      smi.codeSize = sizeof(spv_texarr0_frag);
+      smi.pCode = spv_texarr0_frag;
+   } else if (r->type == T_CUBEX) {
+      smi.codeSize = sizeof(spv_texcubex_frag);
+      smi.pCode = spv_texcubex_frag;
+   } else if (r->type == T_LOD0) {
+      smi.codeSize = sizeof(spv_texlod0_frag);
+      smi.pCode = spv_texlod0_frag;
+   } else if (r->type == T_CUBE) {
+      smi.codeSize = sizeof(spv_texcube_frag);
+      smi.pCode = spv_texcube_frag;
+   } else {
+      smi.codeSize = sizeof(spv_tex_frag);
+      smi.pCode = spv_tex_frag;
+   }
    CHECK(vkCreateShaderModule(dev, &smi, NULL, &fsm));
    const VkPipelineLayoutCreateInfo lci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
                                             .setLayoutCount = textured ? 1 : 0, .pSetLayouts = &dsl };
@@ -432,16 +632,19 @@ run(const struct rung *r)
    const VkCommandBufferBeginInfo cbi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
    CHECK(vkBeginCommandBuffer(cmd, &cbi));
    if (textured) {
-      const VkImageMemoryBarrier imb = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-                                         .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
-                                         .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-                                         .oldLayout = VK_IMAGE_LAYOUT_PREINITIALIZED,
-                                         .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-                                         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                                         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = tex.image,
-                                         .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
-      vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0,
-                           NULL, 1, &imb);
+      /* host-written linear textures, or optimal ones after their copy's submission */
+      const bool opt = r->type != T_LINEAR;
+      const VkImageMemoryBarrier imb = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+         .srcAccessMask = opt && r->type != T_HOSTARR ? VK_ACCESS_TRANSFER_WRITE_BIT : VK_ACCESS_HOST_WRITE_BIT,
+         .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+         .oldLayout = opt && r->type != T_HOSTARR ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+                                                  : VK_IMAGE_LAYOUT_PREINITIALIZED,
+         .newLayout = VK_IMAGE_LAYOUT_GENERAL, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = tex.image,
+         .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, levels_of(r), 0, layers_of(r) } };
+      vkCmdPipelineBarrier(cmd, opt && r->type != T_HOSTARR ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_HOST_BIT,
+                           VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &imb);
    }
    const VkClearValue cv = { .color.float32 = { CLEAR[0], CLEAR[1], CLEAR[2], CLEAR[3] } };
    const VkRenderPassBeginInfo rbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = rp,
@@ -492,7 +695,21 @@ run(const struct rung *r)
             uint8_t t[4];
             const unsigned i = (unsigned)(((x + 0.5) / W) * r->tw), j = (unsigned)(((y + 0.5) / H) * r->th);
 
-            texel(r, i, j, t);
+            if (r->type == T_LINEAR) {
+               texel(r, i, j, t);
+            } else {
+               const double u = (x + 0.5) / W, v = (y + 0.5) / H;
+               unsigned n = r->tw, l = 0;
+
+               if (r->type == T_MIP2)
+                  n = r->tw >> 2, l = 2;
+               else if (r->type == T_ARRAY || r->type == T_HOSTARR)
+                  l = 2;
+               if (r->type == T_CUBE || r->type == T_CUBEX)
+                  texel_l((unsigned)((1 - u) * n), (unsigned)((1 - v) * n), r->type == T_CUBE ? 5 : 0, t);
+               else
+                  texel_l((unsigned)(u * n), (unsigned)(v * n), l, t);
+            }
             if (r->swizzle) {
                const uint8_t s0 = t[0];
                t[0] = t[2];
@@ -525,6 +742,15 @@ run(const struct rung *r)
             }
          }
       }
+   }
+   if (dump_dir) {
+      char path[512];
+      snprintf(path, sizeof(path), "%s/%s.bgra", dump_dir, r->name);
+      FILE *f = fopen(path, "wb");
+      for (unsigned y = 0; f && y < H; y++)
+         fwrite(target.map + target.layout.offset + y * target.layout.rowPitch, 4, W, f);
+      if (f)
+         fclose(f);
    }
    if (!verify)
       printf("TEX-BLEND %s PASS: submitted and retired (not compared)\n", r->name);
@@ -573,12 +799,14 @@ main(int argc, char **argv)
          return 0;
       } else if (!strcmp(argv[a], "--device") && a + 1 < argc) {
          device_index = (unsigned)atoi(argv[++a]);
+      } else if (!strcmp(argv[a], "--dump") && a + 1 < argc) {
+         dump_dir = argv[++a];
       } else if (!strcmp(argv[a], "--no-verify")) {
          verify = false;
       } else if (argv[a][0] != '-' && nsel < ARRAY_LEN(sel)) {
          sel[nsel++] = argv[a];
       } else {
-         fprintf(stderr, "usage: %s [--list] [--device N] [--no-verify] [RUNG...]\n", argv[0]);
+         fprintf(stderr, "usage: %s [--list] [--device N] [--no-verify] [--dump DIR] [RUNG...]\n", argv[0]);
          return 2;
       }
    }

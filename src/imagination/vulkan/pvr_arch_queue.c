@@ -67,7 +67,7 @@
 #include "vk_sync.h"
 #include "vk_sync_dummy.h"
 #include "vk_util.h"
-
+#include "pvr_g5p_publish_hooks.h"
 static inline enum pvr_winsys_ctx_priority
 pvr_winsys_from_vk_queue_priority(const VkQueueGlobalPriority priority)
 {
@@ -671,7 +671,7 @@ static VkResult pvr_process_transfer_cmds(struct pvr_device *device,
                            &sync);
    if (result != VK_SUCCESS)
       return result;
-
+   PVR_G5P_HOOK(pub_pvr_arch_queue_619)
    /* G9P: no GPU transfer path yet; done by the CPU */
    if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p))
       result = pvr_arch_g9p_transfer_submit(

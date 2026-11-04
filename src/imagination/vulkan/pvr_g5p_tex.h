@@ -32,6 +32,7 @@
 #include "pvr_macros.h"
 
 struct pvr_combined_image_sampler_descriptor;
+struct pvr_image;
 struct pvr_image_descriptor;
 struct pvr_image_view;
 struct pvr_sampler_descriptor;
@@ -60,5 +61,13 @@ void PVR_PER_ARCH(g5p_combine_sampler)(struct pvr_combined_image_sampler_descrip
 #   define pvr_arch_g5p_combine_sampler PVR_PER_ARCH(g5p_combine_sampler)
 
 #endif /* PVR_PER_ARCH */
+
+/* The A9's layout of a colour image (pvr_g5p_image.c), from pvr_image_init()
+ * after upstream's: twiddled for mips, cubes, sampled arrays and compressed
+ * formats, with a layer rounded to 64 bytes or to PVR_G5P_IMAGE_BIG_LAYER;
+ * linear 2D otherwise, rows of stride_align pixels.
+ */
+#define PVR_G5P_IMAGE_BIG_LAYER 16384u
+void pvr_g5p_image_layout(struct pvr_image *image, unsigned stride_align);
 
 #endif /* PVR_G5P_TEX_H */

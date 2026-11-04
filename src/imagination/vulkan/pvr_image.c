@@ -45,7 +45,7 @@
 #include "vk_object.h"
 #include "vk_util.h"
 #include "wsi_common.h"
-
+#include "pvr_g5p_publish_hooks.h"
 static void pvr_image_init_memlayout(const struct pvr_device *device,
                                      struct pvr_image *image)
 {
@@ -421,7 +421,7 @@ VkResult pvr_image_init(struct pvr_device *device,
       pbe_stride_align = MAX2(pbe_stride_align, 64 / vk_format_get_blocksize(image->vk.format));
    pvr_image_init_physical_extent(image, pCreateInfo, pbe_stride_align);
    pvr_image_setup_mip_levels(image);
-   PVR_G5P_HOOK(ds_image, device, image)
+   PVR_G5P_HOOK(pub_pvr_image_347)
    return VK_SUCCESS;
 }
 
