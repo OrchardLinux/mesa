@@ -222,8 +222,11 @@ g5p_free_programs(struct pvr_device *device, struct pvr_g5p_programs *p)
          vk_free(&device->vk.alloc, p->raw_load[i]);
       }
    }
-   pvr_bo_suballoc_free(p->raw_clear_usc);
-   pvr_bo_suballoc_free(p->raw_clear_kick.pvr_bo);
+   for (unsigned i = 0; i < 2; i++) {
+      pvr_bo_suballoc_free(p->raw_clear_usc[i]);
+      pvr_bo_suballoc_free(p->raw_clear_kick[i].pvr_bo);
+   }
+   pvr_bo_suballoc_free(p->raw_eot_usc);
    pvr_bo_suballoc_free(p->halt.pvr_bo);
    pvr_bo_suballoc_free(p->clear_dma.pvr_bo);
    pvr_bo_suballoc_free(p->eot.pvr_bo);
@@ -311,25 +314,33 @@ g5p_upload_zeroed(struct pvr_device *device, uint32_t size, struct pvr_suballoc_
  * next 64-byte boundary assumes). */
 /* Called only for an integer pass; qualification uses FORMATS=probe. */
 static VkResult
-g5p_raw_programs_unlocked(struct pvr_device *device, unsigned raw)
+g5p_raw_programs_unlocked(struct pvr_device *device, unsigned raw, unsigned words)
 {
    struct pvr_g5p_programs *p = &device->g5p->programs;
    VkResult result;
-   if (!p->raw_clear_usc) {
+   const unsigned variant = words == 4;
+   if (!p->raw_clear_usc[variant]) {
       uint8_t code[6 * G5P_USC_MAX];
-      size_t size = pvr_g5p_dgl_clear(code, sizeof(code));
+      size_t size = pvr_g5p_dgl_clear_words(code, sizeof(code), words);
       if (!size)
          return vk_error(device, VK_ERROR_INITIALIZATION_FAILED);
-      result = pvr_gpu_upload_usc(device, code, size, 64, &p->raw_clear_usc);
+      result = pvr_gpu_upload_usc(device, code, size, 64, &p->raw_clear_usc[variant]);
       if (result != VK_SUCCESS)
          return result;
    }
-   if (!p->raw_clear_kick.pvr_bo) {
-      result = g5p_upload_kick(device, p->raw_clear_usc, 1, &p->raw_clear_kick);
+   if (!p->raw_clear_kick[variant].pvr_bo) {
+      result = g5p_upload_kick(device, p->raw_clear_usc[variant], 1, &p->raw_clear_kick[variant]);
       if (result != VK_SUCCESS)
          return result;
    }
-   if (!p->raw_load[raw - 1]) {
+   if (!p->raw_eot_usc) {
+      uint8_t code[G5P_MRT_EOT_USC_MAX];
+      const unsigned size = g5p_mrt_eot_usc_mode(code, 1, true);
+      result = pvr_gpu_upload_usc(device, code, size, 64, &p->raw_eot_usc);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+   if (raw <= 2 && !p->raw_load[raw - 1]) {
       p->raw_load[raw - 1] = vk_zalloc(&device->vk.alloc, sizeof(*p), 8, VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
       if (!p->raw_load[raw - 1])
          return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
@@ -341,10 +352,10 @@ g5p_raw_programs_unlocked(struct pvr_device *device, unsigned raw)
 }
 
 static VkResult
-g5p_raw_programs(struct pvr_device *device, unsigned raw)
+g5p_raw_programs(struct pvr_device *device, unsigned raw, unsigned words)
 {
    simple_mtx_lock(&device->g5p->clear_lock);
-   VkResult result = g5p_raw_programs_unlocked(device, raw);
+   VkResult result = g5p_raw_programs_unlocked(device, raw, words);
    simple_mtx_unlock(&device->g5p->clear_lock);
    return result;
 }
@@ -635,13 +646,17 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
    const VkFormat first_format = info->attachments[hw_render->eot_surfaces[0].attachment_idx]->vk.format;
    if (first_format == VK_FORMAT_R32G32B32A32_UINT) raw = 1;
    if (first_format == VK_FORMAT_R32G32B32A32_SINT) raw = 2;
+   if (first_format == VK_FORMAT_R32G32_UINT) raw = 3;
+   if (first_format == VK_FORMAT_R32G32_SINT) raw = 4;
+   if (first_format == VK_FORMAT_R16G16B16A16_UINT) raw = 5;
+   const unsigned raw_words = raw <= 2 ? 4 : 2;
    if (raw) {
       if (n != 1 || g->samples != 1)
-         return G5P_REFUSE(cmd_buffer, "RGBA32 integer pass requires one single-sample target");
-      VkResult result = g5p_raw_programs(device, raw);
+         return G5P_REFUSE(cmd_buffer, "integer pass requires one single-sample target");
+      VkResult result = g5p_raw_programs(device, raw, raw_words);
       if (result != VK_SUCCESS)
          return result;
-      g->raw32 = true;
+      g->raw_words = raw_words;
    }
    float clear[4][4] = { { 0 } };
    /* a loaded target: its texture state (q0, q1, q2, 0), the load program's image upload */
@@ -666,16 +681,25 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
       if ((level->pitch % 16 && !ms_store) || addr % 64)
          return G5P_REFUSE(cmd_buffer, "a colour target at %#" PRIx64 " with pitch %u (64-byte base, 16-byte rows)",
                            addr, level->pitch);
+      /* SINT32 and UINT32 share the same physical channel layout. Store
+       * signed bits with the unsigned PBE representation and raw EOT mode;
+       * do not perform a numeric conversion. LOAD/sampling below retains
+       * the original signed image key. Blending is rejected for integers.
+       */
+      const uint32_t store_key = raw ? key & ~(0x80u << 5) : key;
       if (ms_store) {
          pvr_g5p_msaa_pbe_store(pbe[t], key, addr, iview->vk.extent.width, iview->vk.extent.height,
                                 vk_format_is_srgb(iview->vk.format));
       } else {
-         g5p_pbe_encode(pbe[t], key, srgb, addr, iview->vk.extent.width, iview->vk.extent.height, level->pitch);
+         g5p_pbe_encode(pbe[t], store_key, srgb, addr, iview->vk.extent.width, iview->vk.extent.height, level->pitch);
          if (g->samples == 4) {
             pvr_g5p_msaa_pbe_resolve(pbe[t]);
             g->msaa_resolve = true;
          }
       }
+      if (raw && getenv("PVR_G5P_DGL_LOG"))
+         fprintf(stderr, "DGL-PBE words=%u source=uint-raw key=%08x store_key=%08x state=%016" PRIx64 ",%016" PRIx64 ",%016" PRIx64 "\n",
+                 raw_words, key, store_key, pbe[t][0], pbe[t][1], pbe[t][2]);
       if (!t)
          pvr_g5p_tex_linear(load_state, key, srgb, addr, iview->vk.extent.width, iview->vk.extent.height,
                             level->pitch);
@@ -709,7 +733,9 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
           hw_render->color_init[i].index < info->clear_value_count)
          memcpy(clear[t], info->clear_values[hw_render->color_init[i].index].color.float32, sizeof(clear[t]));
    }
-   const struct pvr_g5p_programs *load_program = raw ? p->raw_load[raw - 1] : p;
+   if (load && raw > 2)
+      return G5P_REFUSE(cmd_buffer, "integer boundary qualification supports CLEAR only");
+   const struct pvr_g5p_programs *load_program = raw && raw <= 2 ? p->raw_load[raw - 1] : p;
    if (load && !load_program->load_usc)
       return G5P_REFUSE(cmd_buffer, "LOAD of a colour attachment%s: the load program: %s",
                         partial ? " (a partial render area)" : "", load_program->load_refusal);
@@ -719,6 +745,11 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
    g->targets = n;
 
    /* per render: the clear floats and the PBE block, then their DOUTD data */
+   if (raw) {
+      uint32_t value[4]; memcpy(value, clear[0], sizeof(value));
+      pvr_g5p_dgl_clear_pack(value, value, raw == 5);
+      memcpy(clear[0], value, sizeof(value));
+   }
    struct pvr_suballoc_bo *floats, *block;
    uint32_t pbe_words[G5P_MRT_PBE_STRIDE * G5P_MRT_MAX];
    const unsigned pbe_dwords = g5p_mrt_pbe_block(pbe_words, n, (const uint64_t(*)[3])pbe);
@@ -732,7 +763,7 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
    struct pvr_pds_upload clear_data, eot_data;
    {
       const uint32_t data[4] = { (uint32_t)floats->dev_addr.addr, (uint32_t)(floats->dev_addr.addr >> 32),
-                                 raw ? g5p_doutd_control_at(2, 4, true) : g5p_doutd_control(G5P_MRT_CLEAR_DWORDS * n), 0 };
+                                 raw ? g5p_doutd_control_at(0, raw_words, true) : g5p_doutd_control(G5P_MRT_CLEAR_DWORDS * n), 0 };
       result = pvr_arch_cmd_buffer_upload_pds(cmd_buffer, data, ARRAY_SIZE(data), 16, NULL, 0, 0, 16,
                                               &clear_data);
       if (result != VK_SUCCESS)
@@ -740,7 +771,7 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
    }
    {
       /* a 4x store's end of tile emits per sample (pvr_g5p_msaa_eot_usc()); a resolve keeps the 1x one */
-      const struct pvr_suballoc_bo *eot_usc = g->samples == 4 && !g->msaa_resolve ? p->eot_usc_ms : p->eot_usc[v];
+      const struct pvr_suballoc_bo *eot_usc = raw ? p->raw_eot_usc : g->samples == 4 && !g->msaa_resolve ? p->eot_usc_ms : p->eot_usc[v];
       const uint64_t doutu = g5p_doutu_src0(g5p_usc_off(device, eot_usc), G5P_TEMPS);
       const uint32_t data[8] = { (uint32_t)block->dev_addr.addr, (uint32_t)(block->dev_addr.addr >> 32),
                                  g5p_doutd_control(pbe_dwords), 0, (uint32_t)doutu, (uint32_t)(doutu >> 32),
@@ -759,7 +790,7 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
          return result;
    } else {
       pvr_csb_pack (&bgnd[0], CR_PDS_BGRND0_BASE, b0) {
-         b0.shader_addr = PVR_DEV_ADDR(raw ? p->raw_clear_kick.data_offset : g->samples == 4 ? p->clear_kick_ms.data_offset
+         b0.shader_addr = PVR_DEV_ADDR(raw ? p->raw_clear_kick[raw_words == 4].data_offset : g->samples == 4 ? p->clear_kick_ms.data_offset
                                                      : p->clear_kick[v].data_offset);
          b0.texunicode_addr = PVR_DEV_ADDR(p->clear_dma.code_offset);
       }
@@ -768,7 +799,7 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
       }
       pvr_csb_pack (&bgnd[3], CR_PDS_BGRND3_SIZEINFO, b3) {
          b3.pds_uniformsize = DIV_ROUND_UP(4, ROGUE_CR_PDS_BGRND3_SIZEINFO_PDS_UNIFORMSIZE_UNIT_SIZE);
-         b3.usc_sharedsize = DIV_ROUND_UP(raw ? 6 : G5P_MRT_CLEAR_DWORDS * n,
+         b3.usc_sharedsize = DIV_ROUND_UP(raw ? raw_words : G5P_MRT_CLEAR_DWORDS * n,
                                           ROGUE_CR_PDS_BGRND3_SIZEINFO_USC_SHAREDSIZE_UNIT_SIZE);
       }
    }
@@ -858,7 +889,7 @@ PVR_PER_ARCH(g5p_frag_stream)(const struct pvr_device *device, const struct pvr_
       e->dbias_va = job->depth_bias_table_addr.addr;
       e->dbias_count = MIN2(g->dbias_count, DRM_G5P_RENDER_MAX_TABLE_ENTRIES);
    }
-   e->pixel_output_width = g->raw32 ? 4 : g5p_mrt_pixel_width(g->targets);
+   e->pixel_output_width = g->raw_words ? g->raw_words : g5p_mrt_pixel_width(g->targets);
 
    pass.ta_program_va = device->heaps.pds_heap->base_addr.addr + p->ta_kick.data_offset;
    pass.ta_program_size = 0x40;

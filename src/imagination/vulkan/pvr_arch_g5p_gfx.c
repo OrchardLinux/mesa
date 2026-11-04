@@ -542,6 +542,8 @@ g5p_check_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo *c
    const char *why = pvr_arch_g5p_blend_fs_key(s, colors, key);
    if (why)
       return G5P_REFUSE(device, "colour blend state: %s", why);
+   if (vk_format_is_int(cf) && cf != VK_FORMAT_R32G32B32A32_UINT && cf != VK_FORMAT_R32G32B32A32_SINT)
+      return G5P_REFUSE(device, "integer boundary qualification supports CLEAR only");
    if (cf == VK_FORMAT_R32G32B32A32_UINT)
       key->color_output = PCO_G5P_COLOR_UINT32;
    if (cf == VK_FORMAT_R32G32B32A32_SINT)

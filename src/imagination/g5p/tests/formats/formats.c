@@ -593,8 +593,8 @@ submit(VkCommandBuffer cmd)
 
 /* ---- rungs ---- */
 
-enum kind { K_SAMPLE, K_FILTER, K_MIP, K_FETCH, K_RENDER, K_BLEND, K_BLIT, K_LAYOUT };
-static const char kind_prefix[] = { 's', 'f', 'm', 'x', 'r', 'b', 'k', 'l' };
+enum kind { K_SAMPLE, K_FILTER, K_MIP, K_FETCH, K_RENDER, K_BLEND, K_BLIT, K_LAYOUT, K_CLEAR };
+static const char kind_prefix[] = { 's', 'f', 'm', 'x', 'r', 'b', 'k', 'l', 'c' };
 
 struct layout_case {
    const char *name;
@@ -644,7 +644,7 @@ feature_of(enum kind k)
    switch (k) {
    case K_SAMPLE: case K_MIP: case K_FETCH: case K_LAYOUT: return VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
    case K_FILTER: return VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
-   case K_RENDER: return VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
+   case K_CLEAR: case K_RENDER: return VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
    case K_BLIT: return VK_FORMAT_FEATURE_BLIT_SRC_BIT;
    default: return VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT;
    }
@@ -693,6 +693,10 @@ build_rungs(void)
             add(f, K_FETCH, 0);
          if (f->vk == VK_FORMAT_R32G32B32A32_UINT || f->vk == VK_FORMAT_R32G32B32A32_SINT)
             add(f, K_RENDER, 0);
+         if (f->vk == VK_FORMAT_R32G32B32A32_UINT || f->vk == VK_FORMAT_R32G32B32A32_SINT ||
+             f->vk == VK_FORMAT_R32G32_UINT || f->vk == VK_FORMAT_R32G32_SINT ||
+             f->vk == VK_FORMAT_R16G16B16A16_UINT)
+            add(f, K_CLEAR, 0);
          continue;
       }
       add(f, K_SAMPLE, 0);
@@ -1685,6 +1689,61 @@ run_render(const struct rung *r)
    return ret;
 }
 
+/* c-<integer format>: clear-only width boundary, independent of FS outputs.
+ * Four patterns exercise every bit position, signed extrema, and uint16
+ * saturation. CPU transfer/readback is shared with the proven format suite.
+ */
+static int
+run_integer_clear(const struct rung *r)
+{
+   const uint32_t values[][4] = {
+      {0, 17, 0x10001u, 0x76543210u},
+      {0x80000001u, 0x7fffffffu, 0x12345678u, 0xffffffffu},
+      {0x0000ffffu, 0x00010000u, 0xffff0000u, 0x80000000u},
+      {0x55555555u, 0xaaaaaaaau, 0x01234567u, 0x89abcdefu},
+   };
+   int failed = 0;
+   for (unsigned k = 0; k < ARRAY_LEN(values); k++) {
+      const struct fmt *f = r->f;
+      struct img target;
+      struct buf rb;
+      VkRenderPass rp;
+      VkFramebuffer fb;
+      VkCommandBuffer cmd;
+      if (make_image(&target, f->vk, W, H, 1,
+                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT) ||
+          make_pass(f->vk, target.view, VK_ATTACHMENT_LOAD_OP_CLEAR, &rp, &fb) || begin(&cmd))
+         return 1;
+      uint8_t want[16] = {0};
+      for (unsigned c = 0; c < 4; c++) {
+         const struct ch *ch = &f->c[c];
+         uint32_t v = values[k][c];
+         if (ch->bits == 16 && v > 65535) v = 65535;
+         if (ch->bits) put_bits(want, ch->off, ch->bits, v);
+      }
+      VkClearValue cv;
+      memcpy(cv.color.uint32, values[k], sizeof(values[k]));
+      const VkRenderPassBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+         .renderPass = rp, .framebuffer = fb, .renderArea = {{0,0},{W,H}},
+         .clearValueCount = 1, .pClearValues = &cv };
+      vkCmdBeginRenderPass(cmd, &bi, VK_SUBPASS_CONTENTS_INLINE);
+      vkCmdEndRenderPass(cmd);
+      if (submit(cmd) || read_target(target.image, f->vk, f->cpp, &rb)) return 1;
+      struct result res = {0};
+      for (unsigned y = 0; verify && y < H; y++)
+         for (unsigned x = 0; x < W; x++)
+            note(&res, x, y, rb.map + ((size_t)y*W+x)*f->cpp, want, f->cpp);
+      printf("INTEGER-CLEAR format=%s pattern=%u words=%u clear=%08x,%08x,%08x,%08x\n",
+             f->name, k, f->cpp/4, values[k][0], values[k][1], values[k][2], values[k][3]);
+      failed |= report(r, &res);
+      free_buffer(&rb);
+      vkDestroyFramebuffer(dev, fb, NULL);
+      vkDestroyRenderPass(dev, rp, NULL);
+      free_image(&target);
+   }
+   return failed;
+}
+
 /* ---- blit rungs ---- */
 
 static uint16_t
@@ -1905,7 +1964,7 @@ main(int argc, char **argv)
       }
       cur = r->name;
       ran++;
-      if (!(r->kind == K_RENDER || r->kind == K_BLEND ? run_render(r)
+      if (!(r->kind == K_CLEAR ? run_integer_clear(r) : r->kind == K_RENDER || r->kind == K_BLEND ? run_render(r)
             : r->kind == K_BLIT                    ? run_blit(r)
             : r->kind == K_LAYOUT                  ? run_layout(r)
                                                    : run_texture(r)))

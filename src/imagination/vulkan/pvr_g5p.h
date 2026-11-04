@@ -85,8 +85,9 @@ struct pvr_g5p_programs {
    char load_refusal[128];
    /* Lazy integer variants: float device allocation order remains identical. */
    struct pvr_g5p_programs *raw_load[2];
-   struct pvr_suballoc_bo *raw_clear_usc;
-   struct pvr_pds_upload raw_clear_kick;
+   struct pvr_suballoc_bo *raw_clear_usc[2];
+   struct pvr_suballoc_bo *raw_eot_usc;
+   struct pvr_pds_upload raw_clear_kick[2];
 };
 
 /* G5P's per-device state (pvr_device::g5p), allocated by g5p_device_init() */
@@ -114,7 +115,7 @@ struct pvr_g5p_job {
    uint32_t vdm_bytes;          /* through STREAM_TERMINATE */
    uint32_t width, height;
    unsigned targets;            /* colour targets, 1, 2 or 4 */
-   bool raw32;                  /* one RGBA32 integer target, four tile words */
+   unsigned raw_words;          /* integer tile storage: two or four words */
    uint32_t dbias_count;        /* entries of upstream's depth-bias table, 0 without one */
    uint32_t scissor_count;      /* entries of upstream's scissor table, 0 without one */
    uint32_t samples;            /* 1 or 4 (hw_render->sample_count) */

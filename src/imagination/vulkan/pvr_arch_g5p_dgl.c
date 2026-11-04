@@ -54,24 +54,48 @@ pvr_g5p_dgl_output(uint8_t *output, size_t capacity,
    return size;
 }
 
+/* Background objects have a distinct ABI from ordinary fragment uniforms:
+ * their DOUTD supplies common0 onward. Apple A9 builtin compiler witnesses
+ * use descending common3..0 for RGBA32 and common1..0 for RG32.
+ */
 size_t
-pvr_g5p_dgl_clear(uint8_t *output, size_t capacity)
+pvr_g5p_dgl_clear_words(uint8_t *output, size_t capacity, unsigned words)
 {
    uint8_t code[6 * G5P_USC_MAX];
    size_t size = 0;
-   /* Apple A9 raw uint/int output: descending output writes from common2..5.
-    * The ordinary compiler also places shared-move values at dword2 or above.
-    * The caller must DMA the four raw clear dwords at common2 and allocate six. */
-   for (int c = 3; c >= 0; c--) {
-      unsigned n = g5p_usc_mov_shared(code + size, 2 * c, c + 2, 0);
-      if (!n)
-         return 0;
-      size += n;
-   }
-   size += g5p_usc_emit_mrt(code + size, 4, 0);
+   if (words != 2 && words != 4)
+      return 0;
+   for (int c = words - 1; c >= 0; c--)
+      size += g5p_usc_mov_shared(code + size, 2 * c, c, 0);
+   size += g5p_usc_emit_mrt(code + size, words, 0);
    size += g5p_usc_special(code + size, true);
    if (!output || capacity < size)
       return 0;
    memcpy(output, code, size);
    return size;
+}
+
+size_t
+pvr_g5p_dgl_clear(uint8_t *output, size_t capacity)
+{
+   return pvr_g5p_dgl_clear_words(output, capacity, 4);
+}
+
+/* Vulkan integer clear conversion can be done before the background DMA.
+ * RGBA16UI clamps each u32 channel to UINT16_MAX, then packs two per word;
+ * it never passes through a floating-point or half-float conversion.
+ */
+void
+pvr_g5p_dgl_clear_pack(uint32_t output[4], const uint32_t input[4], bool uint16)
+{
+   uint32_t value[4];
+   for (unsigned c = 0; c < 4; c++)
+      value[c] = uint16 && input[c] > 65535 ? 65535 : input[c];
+   if (uint16) {
+      output[0] = value[0] | value[1] << 16;
+      output[1] = value[2] | value[3] << 16;
+      output[2] = output[3] = 0;
+   } else {
+      memcpy(output, value, sizeof(value));
+   }
 }

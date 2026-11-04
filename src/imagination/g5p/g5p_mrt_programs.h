@@ -105,7 +105,7 @@ static inline unsigned g5p_mrt_clear_usc(uint8_t *out, unsigned n)
 
 /* The end-of-tile program. Returns its size: 66 for one or two targets, 130
  * for four. */
-static inline unsigned g5p_mrt_eot_usc(uint8_t *out, unsigned n)
+static inline unsigned g5p_mrt_eot_usc_mode(uint8_t *out, unsigned n, bool integer)
 {
    unsigned o = 0;
    for (unsigned k = 0; k < n; k++) {
@@ -118,7 +118,7 @@ static inline unsigned g5p_mrt_eot_usc(uint8_t *out, unsigned n)
    for (unsigned k = 0; k < n; k++) {
       bool last = k + 1 == n;
       uint8_t t = n - 1 - k;
-      const uint8_t ins[8] = {0x1c, 0x05, (uint8_t)(2 * t), last ? 0x51 : 0x71, (uint8_t)(2 * k), 0x08,
+      const uint8_t ins[8] = {0x1c, (uint8_t)(0x05 | (integer ? 0x10 : 0)), (uint8_t)(2 * t), last ? 0x51 : 0x71, (uint8_t)(2 * k), 0x08,
                               0x4c, 0x04};
       memcpy(out + o, ins, last ? 6 : 8);
       o += last ? 6 : 8;
@@ -135,4 +135,13 @@ static inline unsigned g5p_mrt_eot_usc(uint8_t *out, unsigned n)
    return o + 2;
 }
 
+/* Integer source mode (bit 4) comes from the A9 builtin EOT compiler for
+ * unsigned integer attachments. Signed 32-bit stores use the identical
+ * unsigned physical layout to preserve their two's-complement bit patterns.
+ * The original float entry point and all of its bytes remain unchanged.
+ */
+static inline unsigned g5p_mrt_eot_usc(uint8_t *out, unsigned n)
+{
+   return g5p_mrt_eot_usc_mode(out, n, false);
+}
 #endif
