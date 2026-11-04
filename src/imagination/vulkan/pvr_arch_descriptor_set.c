@@ -141,7 +141,7 @@ write_image_sampler(const struct pvr_descriptor_set *set,
          }
       }
    }
-
+   PVR_G5P_HOOK(image_sampler, set, image_info, &image_sampler_desc)
    memcpy(desc_mapping, &image_sampler_desc, sizeof(image_sampler_desc));
 }
 
