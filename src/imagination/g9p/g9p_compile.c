@@ -28,6 +28,7 @@
 #include <vulkan/vulkan_core.h>
 
 #include "compiler/nir/nir_builder.h"
+#include "compiler/nir/nir_schedule.h"
 #include "compiler/nir/nir_builtin_builder.h"
 #include "compiler/nir/nir_format_convert.h"
 #include "util/format/u_format.h"
@@ -2561,7 +2562,8 @@ lower_front(nir_shader *nir)
    NIR_PASS(_, nir, nir_lower_var_copies);
    NIR_PASS(_, nir, nir_split_struct_vars, nir_var_function_temp);
    /* local arrays indexed dynamically: if-ladders, then SSA */
-   NIR_PASS(_, nir, nir_lower_indirect_derefs_to_if_else_trees, nir_var_function_temp, UINT32_MAX);
+   NIR_PASS(_, nir, nir_lower_indirect_derefs_to_if_else_trees,
+            nir_var_function_temp | nir_var_shader_in | nir_var_shader_out, UINT32_MAX);
    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
    NIR_PASS(_, nir, nir_lower_system_values);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo | nir_var_mem_ubo,
@@ -2642,6 +2644,36 @@ rematerialize_loads(nir_shader *nir, bool every_use)
    return nir_progress(progress, impl, nir_metadata_control_flow);
 }
 
+/*
+ * A fragment shader reads its buffers from the common store, as uniform
+ * operands with a fixed index: a load at a computed offset becomes a chain of
+ * selects over the offsets it can have (GL's uniform arrays indexed in a loop)
+ */
+static bool
+lower_dynamic_ubo_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   nir_def *value;
+   unsigned n;
+
+   if (intr->intrinsic != nir_intrinsic_load_ubo || nir_src_is_const(intr->src[1]) ||
+       intr->def.num_components != 1 || intr->def.bit_size != 32)
+      return false;
+   n = MIN2(nir_intrinsic_range(intr) / 4, G9P_FS_BUF_DWORDS);
+   b->cursor = nir_before_instr(&intr->instr);
+   value = nir_imm_int(b, 0);
+   for (unsigned k = 0; k < n; k++) {
+      const unsigned at = nir_intrinsic_range_base(intr) + 4 * k;
+      nir_def *load = nir_load_ubo(b, 1, 32, intr->src[0].ssa, nir_imm_int(b, at),
+                                   .align_mul = 4, .align_offset = 0,
+                                   .range_base = nir_intrinsic_range_base(intr),
+                                   .range = nir_intrinsic_range(intr));
+
+      value = nir_bcsel(b, nir_ieq_imm(b, intr->src[1].ssa, at), load, value);
+   }
+   nir_def_replace(&intr->def, value);
+   return true;
+}
+
 /* Optimization, out of SSA, then code for @ctx->stage */
 static bool
 compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
@@ -2673,6 +2705,11 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
             NULL, NULL);
    NIR_PASS(_, nir, nir_opt_algebraic_late);
    optimize(nir);
+   if (stage == MESA_SHADER_FRAGMENT) {
+      NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_dynamic_ubo_instr,
+               nir_metadata_control_flow, NULL);
+      optimize(nir);
+   }
    NIR_PASS(_, nir, nir_lower_bool_to_int32);
    NIR_PASS(_, nir, nir_opt_copy_prop);
    NIR_PASS(_, nir, nir_opt_dce);
@@ -2683,6 +2720,12 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
             nir_move_comparisons | nir_move_copies | nir_move_load_ubo |
             nir_move_load_input);
    NIR_PASS(_, nir, nir_convert_from_ssa, true, false);
+   /* a shader that ran out of registers: order by register pressure */
+   if (repeat_loads) {
+      const nir_schedule_options sched = { .threshold = 16, .fallback = true };
+
+      nir_schedule(nir, &sched);
+   }
    NIR_PASS(_, nir, nir_trivialize_registers);
    copy_branch_compare_operands(nir);
 
@@ -3251,5 +3294,8 @@ g9p_compile_fragment(nir_shader *nir, unsigned frag_coord_slot,
       NIR_PASS(_, nir, discards_to_select, out->native_blend);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_fb_fetch_instr, nir_metadata_control_flow,
             NULL);
-   return compile_back(nir, out, MESA_SHADER_FRAGMENT, NULL, frag_coord_slot, false, mem_ctx);
+   nir_shader *copy = nir_shader_clone(mem_ctx, nir);
+
+   return compile_back(nir, out, MESA_SHADER_FRAGMENT, NULL, frag_coord_slot, false, mem_ctx) ||
+          compile_back(copy, out, MESA_SHADER_FRAGMENT, NULL, frag_coord_slot, true, mem_ctx);
 }
