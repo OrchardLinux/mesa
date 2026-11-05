@@ -217,9 +217,11 @@ VkResult
 PVR_PER_ARCH(g5p_cmd_draw_indirect)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_buffer *buffer,
                                     VkDeviceSize offset, uint32_t count, uint32_t stride, bool indexed)
 {
-   const char *probe = getenv("PVR_G5P_INDIRECT");
-   if (!probe || strcmp(probe, "probe"))
-      return G5P_REFUSE(cmd_buffer, "indirect graphics draw awaits native A9 qualification (PVR_G5P_INDIRECT=probe)");
+   /* The base-zero A9 native packet is hardware-qualified. Keep a diagnostic
+    * opt-out without changing the unqualified firstInstance/XFB scope. */
+   const char *mode = getenv("PVR_G5P_INDIRECT");
+   if (mode && !strcmp(mode, "0"))
+      return G5P_REFUSE(cmd_buffer, "indirect graphics draw disabled by PVR_G5P_INDIRECT=0");
    if (!count)
       return VK_SUCCESS;
    const unsigned size = indexed ? sizeof(VkDrawIndexedIndirectCommand) : sizeof(VkDrawIndirectCommand);

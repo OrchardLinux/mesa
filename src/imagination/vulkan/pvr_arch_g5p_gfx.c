@@ -1416,7 +1416,7 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
    /* transform feedback: while capturing, the pipeline's capturing variant
     * (pvr_g5p_xfb.h); a pipeline that captures nothing draws as it is */
    const bool xfb = g->xfb && pvr_arch_g5p_xfb_capturing(cmd_buffer);
-   if (xfb && draw->indirect_addr)
+   if (draw->indirect_addr && pvr_arch_g5p_xfb_capturing(cmd_buffer))
       return G5P_REFUSE(cmd_buffer, "indirect graphics transform-feedback accounting is not implemented");
    if (xfb) {
       VkResult xr = pvr_arch_g5p_xfb_draw_check(cmd_buffer, dyn->ia.primitive_topology);
