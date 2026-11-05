@@ -105,6 +105,7 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
    const unsigned n = state->num_buffers;
    const uint32_t threads =
       state->local_size[0] * state->local_size[1] * state->local_size[2];
+   const uint32_t hw_threads = g5p_cdm_workgroup_threads(threads);
    const uint32_t count = threads | threads << 16;
    struct pvr_suballoc_bo *uniforms_bo;
    uint32_t uniforms[2 * G9P_MAX_BUFFERS + 4] = { 0 };
@@ -261,14 +262,14 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
          G9P_CDM_KERNEL_REGS(state->num_regs) | G9P_CDM_ANY_CLUSTER | G9P_CDM_FENCE |
             G9P_CDM_DATA_BLOCKS(kernel_dwords / 4),
          kernel.data_offset, kernel.code_offset, group_count[0], group_count[1],
-         group_count[2], threads, DIV_ROUND_UP(state->a9_local_dwords, 16));
+         group_count[2], hw_threads, DIV_ROUND_UP(state->a9_local_dwords, 16));
 
       pvr_csb_set_relocation_mark(csb);
       emit_record(csb, &bind_rec);
       if (indirect_va) {
          const struct g5p_cdm_indirect_record rec = g5p_cdm_indirect(
             kernel_rec.w[0], kernel.data_offset, kernel.code_offset,
-            indirect_va, threads, 0);
+            indirect_va, hw_threads, 0);
          uint32_t *w = pvr_arch_csb_alloc_dwords(csb, 6);
          if (w) memcpy(w, rec.w, sizeof(rec.w));
       } else {

@@ -6,6 +6,12 @@
 #include <stdint.h>
 #include <stdbool.h>
 struct g5p_cdm_record { uint32_t w[7]; };
+/* Rogue allocates whole 32-instance tasks for multi-task workgroups.
+ * The shader's logical local size and entry mask remain unpadded. */
+static inline unsigned g5p_cdm_workgroup_threads(unsigned logical)
+{
+   return logical > 32 ? (logical + 31) & ~31u : logical;
+}
 static inline uint32_t g5p_cdm_sizes(unsigned common, unsigned regs,
                                     unsigned data_blocks, bool fence)
 {
