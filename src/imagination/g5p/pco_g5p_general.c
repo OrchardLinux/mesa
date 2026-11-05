@@ -207,10 +207,11 @@ struct gctx {
    bool *sat_folded; /* per def: fsat folded into its producer */
    bool *saturate;   /* per def: producer emitted with saturate */
    int *rh_half;     /* per def: emitted with result_half into this output half */
-   uint64_t busy, reserved;
-   unsigned max_bank0;
-   bool tex_bank0; /* only the ordinary texture instruction uses this bank */
+   uint64_t busy, reserved; /* vertex: bit VS_BANK0 + i is bank 0 r<i> */
+   bool tex_bank0; /* explicit legacy texture route, separate from mixed-bank retry */
    unsigned max_dword, max_written;
+   unsigned max_bank0; /* vertex: bank-0 registers used (the DOUTU temps) */
+   bool alloc_out;     /* vertex bank-0 retry: the value being emitted is a vertex output (bank 1) */
    int now;
    int one_reg;
    /* fragment output: one entry per output half, 4 halves per colour target
@@ -232,6 +233,7 @@ struct gctx {
    const struct pco_g5p_vs_link *link;
    unsigned psize_dword; /* a point pipeline's point size: the last output dword */
    bool eager_vout; /* VS temps retry: each output written as soon as its value is final */
+   bool vs_bank0;   /* VS pressure retry: temps in bank 0, outputs in bank 1 (vs-two-bank-allocator.md) */
    nir_intrinsic_instr *vend_store; /* eager: the output component written by the final vend */
    unsigned vend_comp;
    /* common store */
@@ -370,6 +372,18 @@ static void vs_bank1_only(struct gctx *c, const char *what, int r0, int r1, int 
 }
 
 /* ---- registers (dwords) ---- */
+/* A vertex bank-0 register: the first free one, else -1. */
+static int alloc_bank0(struct gctx *c)
+{
+   for (unsigned r = VS_BANK0; r < VS_BANK0 + NUM_DWORDS; r++)
+      if (!((c->busy | c->reserved) & BITFIELD64_BIT(r))) {
+         c->busy |= BITFIELD64_BIT(r);
+         c->max_bank0 = MAX2(c->max_bank0, r - VS_BANK0 + 1);
+         return r;
+      }
+   return -1;
+}
+
 static unsigned alloc_run(struct gctx *c, unsigned n, const char *why)
 {
    if (c->vs && c->tex_bank0) {
@@ -383,6 +397,15 @@ static unsigned alloc_run(struct gctx *c, unsigned n, const char *why)
       }
       refuse(c, "vertex texture bank0 register pressure: %s needs %u dwords", why, n);
    }
+   /* The vertex bank-0 retry places registers as Apple's vertex programs do:
+    * temps in bank 0, the values of vertex outputs in bank 1 (every one of
+    * Apple's outputs reads bank 1). Runs (address pairs, loads) stay in
+    * bank 1. */
+   if (n == 1 && c->vs && c->vs_bank0 && !c->alloc_out) {
+      int r = alloc_bank0(c);
+      if (r >= 0)
+         return r;
+   }
    for (unsigned r = 0; r + n <= NUM_DWORDS; r++) {
       uint64_t mask = BITFIELD64_RANGE(r, n);
       if (!((c->busy | c->reserved) & mask)) {
@@ -392,8 +415,15 @@ static unsigned alloc_run(struct gctx *c, unsigned n, const char *why)
          return r;
       }
    }
+   if (n == 1 && c->vs && c->vs_bank0) {
+      int r = alloc_bank0(c);
+      if (r >= 0)
+         return r;
+      refuse(c, "register pressure: %s needs %u dword(s), %u of %u in use in each vertex bank", why, n, NUM_DWORDS,
+             NUM_DWORDS);
+   }
    refuse(c, "register pressure: %s needs %u dword(s), %u of %u in use", why, n,
-          util_bitcount64(c->busy | c->reserved), NUM_DWORDS);
+          util_bitcount64((c->busy | c->reserved) & BITFIELD64_MASK(NUM_DWORDS)), NUM_DWORDS);
 }
 
 /* The flown VS temps (g5p_gfx.h G5P_VS_TEMPS_FLOWN). A VS whose inputs
@@ -406,13 +436,17 @@ static unsigned alloc_reg(struct gctx *c, int prefer)
 {
    /* A dying input above them is not reused in place while a lower register
     * is free. Every VS within the flown temps uses no register this high. */
-   if (c->vs && prefer >= (int)VS_BANK0 && !c->tex_bank0)
-      prefer = -1; /* normal ALU outputs retain the qualified bank1 allocation */
-   if (c->vs && prefer >= VS_WRITE_REGS && prefer < (int)VS_BANK0 && (~(c->busy | c->reserved) & BITFIELD64_MASK(prefer)))
+   if (c->vs && prefer >= (int)VS_BANK0 && !c->tex_bank0 && !c->vs_bank0)
+      prefer = -1; /* preserve the ordinary bank1 route */
+   /* A vertex output's value is not computed in place over a bank-0 operand. */
+   if (c->alloc_out && prefer >= (int)VS_BANK0)
+      prefer = -1;
+   if (c->vs && prefer >= VS_WRITE_REGS && prefer < (int)VS_BANK0 &&
+       (~(c->busy | c->reserved) & BITFIELD64_MASK(prefer)))
       prefer = -1;
    if (prefer >= 0 && !((c->busy | c->reserved) & BITFIELD64_BIT(prefer))) {
       c->busy |= BITFIELD64_BIT(prefer);
-      if (c->vs && prefer >= (int)VS_BANK0) {
+      if (prefer >= (int)VS_BANK0) {
          c->max_bank0 = MAX2(c->max_bank0, (unsigned)prefer - VS_BANK0 + 1);
          return prefer;
       }
@@ -3315,7 +3349,33 @@ static void vs_int(struct gctx *c, nir_alu_instr *a);
 static void vs_bitwise(struct gctx *c, nir_alu_instr *a);
 static void vs_minsub(struct gctx *c, nir_alu_instr *a);
 
+/* A value a vertex output stores, directly or through a mov/vec. */
+static bool vs_feeds_output(nir_def *d)
+{
+   nir_foreach_use(u, d) {
+      nir_instr *i = nir_src_use_instr(u);
+      if (i->type == nir_instr_type_intrinsic &&
+          nir_instr_as_intrinsic(i)->intrinsic == nir_intrinsic_store_output)
+         return true;
+      if (i->type == nir_instr_type_alu) {
+         nir_alu_instr *m = nir_instr_as_alu(i);
+         if (nir_op_is_vec_or_mov(m->op) && vs_feeds_output(&m->def))
+            return true;
+      }
+   }
+   return false;
+}
+
+static void emit_alu_body(struct gctx *c, nir_alu_instr *a);
+
 static void emit_alu(struct gctx *c, nir_alu_instr *a)
+{
+   c->alloc_out = c->vs && c->vs_bank0 && vs_feeds_output(&a->def);
+   emit_alu_body(c, a);
+   c->alloc_out = false;
+}
+
+static void emit_alu_body(struct gctx *c, nir_alu_instr *a)
 {
    if (alias_op(c, a))
       return;
@@ -4514,6 +4574,7 @@ static int vs_convert_order(const void *x, const void *y)
 static void vs_converts(struct gctx *c, struct vs_convert *cv, unsigned n)
 {
    uint8_t raw[G5P_USC_MAX];
+   c->alloc_out = true; /* converted attributes stay in bank 1, where they are fetched */
    qsort(cv, n, sizeof(*cv), vs_convert_order);
    for (unsigned i = 0; i < n; i++) {
       const unsigned half = 2 * cv[i].reg + (cv[i].byte >> 1);
@@ -4537,6 +4598,7 @@ static void vs_converts(struct gctx *c, struct vs_convert *cv, unsigned n)
       put(c, raw, m, "vertex input convert");
       hold(c, cv[i].v, dst);
    }
+   c->alloc_out = false;
    c->p->evidence |= PCO_G5P_EV_VS_ALU;
 }
 
@@ -5010,6 +5072,28 @@ static int vout_order(const void *pa, const void *pb, void *data)
    return (int)c->vout[*a].slot - (int)c->vout[*b].slot;
 }
 
+/* A vertex output's register, in bank 1 (every output of Apple's reads bank
+ * 1): a constant or uniform held in bank 0 is written again into bank 1. */
+static unsigned vs_out_reg(struct gctx *c, struct ref r)
+{
+   c->alloc_out = true;
+   unsigned reg = reg_of(c, r, "vertex output");
+   struct val *v = V(c, r.def, r.comp);
+   if (!vbank(c, reg) && (v->state == VAL_CONST || v->state == VAL_SHARED)) {
+      uint8_t raw[G5P_USC_MAX];
+      unsigned b1 = alloc_reg(c, -1);
+      if (v->state == VAL_CONST)
+         put(c, raw, g5p_usc_immediate(raw, H(c, b1), v->imm, vbank(c, b1), -1), "movi (output)");
+      else
+         put(c, raw, g5p_usc_mov_shared(raw, H(c, b1), v->imm, vbank(c, b1)), "mov.shared (output)");
+      c->scratch |= BITFIELD64_BIT(b1);
+      reg = b1;
+   }
+   c->alloc_out = false;
+   vs_bank1_only(c, "vertex output", reg, -1, -1, -1);
+   return reg;
+}
+
 static void vs_output(struct gctx *c)
 {
    uint8_t raw[G5P_USC_MAX];
@@ -5020,7 +5104,7 @@ static void vs_output(struct gctx *c)
       if (c->vout[i].at >= 0)
          continue; /* written eagerly */
       order[n] = i;
-      reg[i] = reg_of(c, c->vout[i].r, "vertex output");
+      reg[i] = vs_out_reg(c, c->vout[i].r);
       n++;
    }
    if (!n)
@@ -5046,7 +5130,7 @@ static void eager_outputs(struct gctx *c, int idx)
    uint8_t raw[G5P_USC_MAX];
    for (unsigned i = 0; i < c->nvout; i++)
       if (c->vout[i].at == idx) {
-         unsigned r = reg_of(c, c->vout[i].r, "vertex output");
+         unsigned r = c->vs_bank0 ? vs_out_reg(c, c->vout[i].r) : reg_of(c, c->vout[i].r, "vertex output");
          put(c, raw, g5p_usc_vout(raw, H(c, r), c->vout[i].slot, vbank(c, r), false), "vertex output");
       }
 }
@@ -6152,12 +6236,16 @@ static bool codegen(struct gctx *c)
    out->size = c->size;
    if (c->cf)
       c->max_dword = MAX2(c->max_dword, c->st + 1);
-   out->temps = MAX3(8, align(c->max_dword, 4), align(c->max_bank0, 4));
+   out->temps = c->vs && c->vs_bank0 ? MAX2(8, align(c->max_dword, 4)) :
+                MAX3(8, align(c->max_dword, 4), align(c->max_bank0, 4));
    if (c->nhomes) {
       out->temps = MAX2(out->temps, align(32 + c->nhomes, 4));
       out->evidence |= PCO_G5P_EV_HIGH_REGS;
    }
-   out->written_temps = c->vs ? MAX3(8, align(c->max_written, 4), align(c->max_bank0, 4)) : out->temps;
+   out->written_temps = c->vs ? (c->vs_bank0 ? MAX2(8, align(c->max_written, 4)) :
+                                  MAX3(8, align(c->max_written, 4), align(c->max_bank0, 4))) : out->temps;
+   /* Mixed-bank programs declare bank0 separately; legacy texture launches retain their proven accounting. */
+   out->bank0_temps = c->vs && c->vs_bank0 && c->max_bank0 ? align(c->max_bank0, 8) : 0;
    out->common_dwords = c->common_next;
    if (!c->vs)
       out->varyings = out->num_varyings;
@@ -6193,8 +6281,8 @@ static void codegen_reset(struct gctx *c)
    c->p = keep.p;
    c->one_reg = c->zero_reg = c->ione_reg = c->fragcoord = -1;
    c->size = 0;
-   c->busy = c->reserved = c->max_dword = c->max_written = 0;
-   c->max_bank0 = 0;
+   c->busy = c->reserved = 0;
+   c->max_dword = c->max_written = c->max_bank0 = 0;
    c->tex_bank0 = false;
    c->ntex = c->nranges = c->nssbo = c->common_next = 0;
    c->nvout = c->ndiscards = 0;
@@ -6282,6 +6370,11 @@ bool pco_g5p_compile_general_link(nir_shader *nir, bool half_output, const uint8
    c->nir = nir;
    c->p = out;
    c->vs = nir->info.stage == MESA_SHADER_VERTEX;
+   /* Offline test only: the bank-0 placement from the first attempt, so the
+    * mixed-bank forms of every emitter appear in ordinary programs
+    * (bank-check.py and tuple-check.py over the compiled corpus). */
+   if (c->vs && getenv("PVR_G5P_VS_BANK0_FIRST") && strcmp(getenv("PVR_G5P_VS_BANK0_FIRST"), "0"))
+      c->vs_bank0 = true;
    c->half_output = half_output;
    c->attrib_components = attrib_components;
    c->key = key ? key : &default_key;
@@ -6397,6 +6490,16 @@ bool pco_g5p_compile_general_link(nir_shader *nir, bool half_output, const uint8
       } else if (first_ok) {
          free(first.code);
       }
+   }
+   /* Vertex, still out of registers: bank 0 holds what bank 1 cannot, as in
+    * Apple's vertex programs (v_press_vec4: bank 1 to r15, bank 0 to r22).
+    * Every program that fits bank 1 keeps its bytes. Plain, then with the
+    * eager outputs (fewer values live in bank 1 at the end). */
+   for (unsigned eager = 0; c->vs && !ok && eager < 2 && strstr(out->refusal, "register pressure"); eager++) {
+      codegen_reset(c);
+      c->vs_bank0 = true;
+      c->eager_vout = eager;
+      ok = two_pass(c);
    }
    /* Still out of registers: one more home above r31 per attempt. */
    while (!ok && !c->vs && strstr(out->refusal, "register pressure") && c->nhomes < G5P_MAX_HOMES) {

@@ -197,6 +197,7 @@ struct pco_g5p_program {
    unsigned varyings;                              /* vec4 varying items */
    unsigned temps;                                 /* registers used (DOUTU temps) */
    unsigned written_temps;                         /* VS: registers written, inputs excluded */
+   unsigned bank0_temps;                           /* VS: bank-0 temps, rounded to 8 as Apple's (0 = none) */
    unsigned common_dwords;                         /* common store used (FS; VS round 19) */
    unsigned num_uploads;
    struct pco_g5p_upload uploads[PCO_G5P_MAX_UPLOADS];

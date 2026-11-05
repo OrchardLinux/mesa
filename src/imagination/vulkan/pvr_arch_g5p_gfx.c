@@ -686,9 +686,15 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
 
    /* DOUTU temps (the ICD's vs_temps()): every register within the flown
     * envelope, else only the written ones (the inputs are in the unified store) */
-   g->vs_temps = vs->temps <= PCO_G5P_VS_TEMPS_FLOWN ? vs->temps : vs->written_temps;
-   if (g->vs_temps > 32)
-      return G5P_REFUSE(device, "vertex shader needs %u temps (> 32, the register file)", g->vs_temps);
+   const unsigned bank1_temps = vs->temps <= PCO_G5P_VS_TEMPS_FLOWN ? vs->temps : vs->written_temps;
+   if (bank1_temps > 32)
+      return G5P_REFUSE(device, "vertex shader needs %u temps (> 32, the register file)", bank1_temps);
+   /* A program with bank-0 temps declares them as Apple's do (vertex metadata
+    * +140 = the DOUTU temps; docs/gpu/vs-two-bank-allocator.md); the unified
+    * store keeps its bank-1 size. Without bank 0 every word is unchanged. */
+   if (vs->bank0_temps > 32)
+      return G5P_REFUSE(device, "vertex shader needs %u bank-0 temps (> 32)", vs->bank0_temps);
+   g->vs_temps = MAX2(bank1_temps, vs->bank0_temps);
    g->vs_written_temps = vs->written_temps;
    g->fs_temps = fs->temps;
    g->vs_outputs = vs->outputs;
@@ -724,8 +730,8 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
    u_foreach_bit (i, g->vs_id_mask)
       inputs = MAX2(inputs, g->vs_id_reg[i] + 1u);
    g->vs_unified = 4 * DIV_ROUND_UP(inputs, 8);
-   if (g->vs_temps > 8 || inputs > 8)
-      g->vs_unified = MAX2(g->vs_unified, 2 * DIV_ROUND_UP(MAX2(g->vs_temps, inputs + 2), 4));
+   if (bank1_temps > 8 || inputs > 8)
+      g->vs_unified = MAX2(g->vs_unified, 2 * DIV_ROUND_UP(MAX2(bank1_temps, inputs + 2), 4));
 
    /* USC programs */
    g->vs_usc_size = vs->size;
