@@ -129,6 +129,9 @@ struct g9p_shader {
 
    /* Fragment: reads gl_FragCoord (the frag_coord_slot varying) */
    bool uses_frag_coord;
+   /* Fragment: reads gl_PointCoord (this varying, filled by the DOUTI's pointsprite bit) */
+   bool uses_point_coord;
+   unsigned point_coord_slot;
    /* Fragment: may discard (punch-through pass type) */
    bool uses_discard;
    bool uses_fbfetch;
@@ -169,11 +172,12 @@ bool g9p_lower_cubes_seamful(nir_shader *nir);
  * Vertex shader: @attribs by attribute location (VERT_ATTRIB_GENERIC0 +
  * n); the vertex index arrives in r0. Vertex buffer b's address is loaded
  * into the common store as buffer (G9P_VERTEX_BUFFERS, b). It writes
- * gl_FragCoord's varying at @frag_coord_slot, or not with -1.
+ * gl_FragCoord's varying at @frag_coord_slot, or not with -1, and with
+ * @point_coord reserves the next one for gl_PointCoord.
  */
 bool g9p_compile_vertex(nir_shader *nir, const struct g9p_vertex_attrib *attribs,
-                        int frag_coord_slot, struct g9p_shader *out, bool point_size,
-                        void *mem_ctx);
+                        int frag_coord_slot, bool point_coord, struct g9p_shader *out,
+                        bool point_size, void *mem_ctx);
 
 /*
  * Fragment shader: @blend, if not NULL, is done in the shader (Apple's way:

@@ -427,14 +427,15 @@ blend_options(const struct vk_graphics_pipeline_state *vk_state, nir_lower_blend
 static VkResult
 compile_stage(struct pvr_device *device, nir_shader *nir,
               const VkPipelineShaderStageCreateInfo *stage,
-              const struct g9p_vertex_attrib *attribs, int frag_coord_slot,
+              const struct g9p_vertex_attrib *attribs, int frag_coord_slot, bool point_coord,
               const nir_lower_blend_options *blend, struct g9p_shader *out, bool point_size,
               void *mem_ctx)
 {
    bool ok;
 
    if (stage->stage == VK_SHADER_STAGE_VERTEX_BIT)
-      ok = g9p_compile_vertex(nir, attribs, frag_coord_slot, out, point_size, mem_ctx);
+      ok = g9p_compile_vertex(nir, attribs, frag_coord_slot, point_coord, out, point_size,
+                              mem_ctx);
    else
       ok = g9p_compile_fragment(nir, frag_coord_slot, blend, out, mem_ctx);
    if (!ok)
@@ -466,7 +467,8 @@ upload_varyings(struct pvr_device *device, struct pvr_g9p_graphics_state *state,
       const bool persp = v >= fs->num_varyings || fs->varying_perspective[v];
       const unsigned loc = 2 + 8 * v;
 
-      data[2 + 2 * v] = 0x03000000 | (3u << 2 | persp) << 16 | loc << 8 | loc;
+      data[2 + 2 * v] = 0x03000000 | (3u << 2 | persp) << 16 | loc << 8 | loc |
+                        (fs->uses_point_coord && v == fs->point_coord_slot ? BITFIELD_BIT(23) : 0);
       data[3 + 2 * v] = (persp ? BITFIELD_BIT(22) : 0) | (2 * v) << 23 |
                         (v + 1 == n ? BITFIELD_BIT(31) : 0);
    }
@@ -565,11 +567,12 @@ g9p_compile_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo 
                                nir_instr_as_tex(instr)->sampler_dim == GLSL_SAMPLER_DIM_CUBE;
       }
       slot = g9p_frag_coord_slot(vs_nir);
-      result = compile_stage(device, fs_nir, fs_info, NULL, slot,
+      result = compile_stage(device, fs_nir, fs_info, NULL, slot, false,
                              blend_options(vk_state, &blend) ? &blend : NULL, &fs, false, mem_ctx);
       if (result == VK_SUCCESS)
          result = compile_stage(device, vs_nir, vs_info, attribs,
-                                fs.uses_frag_coord ? (int)slot : -1, NULL, &vs, point_size, mem_ctx);
+                                fs.uses_frag_coord ? (int)slot : -1, fs.uses_point_coord, NULL, &vs,
+                                point_size, mem_ctx);
    }
    if (result != VK_SUCCESS)
       goto out;
@@ -681,8 +684,13 @@ PVR_PER_ARCH(g9p_graphics_pipeline_compile)(struct pvr_device *device,
    state->seamful = calloc(1, sizeof(*state->seamful));
    if (!state->seamful)
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
-   return g9p_compile_state(device, create_info, pipeline, vk_state, state->seamful, true,
-                            &has_cube);
+   /* too much for the backend: the draws filter across faces, as seamless ones do */
+   if (g9p_compile_state(device, create_info, pipeline, vk_state, state->seamful, true,
+                         &has_cube) != VK_SUCCESS) {
+      free(state->seamful);
+      state->seamful = NULL;
+   }
+   return VK_SUCCESS;
 }
 
 static void

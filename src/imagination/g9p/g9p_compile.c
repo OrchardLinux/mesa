@@ -1408,6 +1408,36 @@ emit_frag_coord(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
    return true;
 }
 
+/*
+ * gl_PointCoord: the varying after gl_FragCoord's, which the DOUTI's pointsprite
+ * bit fills with the sprite's coordinates (Rogue's fragment coefficient program)
+ */
+static bool
+emit_point_coord(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
+{
+   const unsigned n = ctx->frag_coord_slot + 1;
+
+   for (unsigned c = 0; c < 2; c++) {
+      int r;
+
+      if (!ctx->last_use[key(&intr->def, c)])
+         continue;
+      r = alloc_reg(ctx);
+      if (r < 0)
+         return false;
+      g9p_iterate(ctx->c, r, 4 * n + c, 1, false);
+      ctx->reg[key(&intr->def, c)] = r;
+   }
+   g9p_wait(ctx->c);
+   ctx->out->num_varyings = MAX2(ctx->out->num_varyings, n + 1);
+   ctx->out->varying_perspective[n - 1] = false;
+   ctx->out->varying_perspective[n] = false;
+   ctx->out->uses_frag_coord = true;
+   ctx->out->uses_point_coord = true;
+   ctx->out->point_coord_slot = n;
+   return true;
+}
+
 /* An output component: kept in its register until the end */
 static bool
 emit_output(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
@@ -2096,8 +2126,11 @@ emit_intrinsic(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
       const bool y = intr->intrinsic == nir_intrinsic_ddy ||
                      intr->intrinsic == nir_intrinsic_ddy_fine ||
                      intr->intrinsic == nir_intrinsic_ddy_coarse;
-      int r = low_reg(ctx, src_reg(ctx, nir_get_scalar(intr->src[0].ssa, 0))), dst;
+      int r = src_reg(ctx, nir_get_scalar(intr->src[0].ssa, 0)), dst;
 
+      /* the operand's register field stops at r31 */
+      if (r >= 32)
+         r = low_reg(ctx, r);
       if (r < 0)
          return false;
       release(ctx, &intr->instr);
@@ -2157,6 +2190,8 @@ emit_intrinsic(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
       return emit_varying_load(ctx, intr, true);
    case nir_intrinsic_load_frag_coord:
       return emit_frag_coord(ctx, intr);
+   case nir_intrinsic_load_point_coord:
+      return emit_point_coord(ctx, intr);
    case nir_intrinsic_demote:
    case nir_intrinsic_terminate:
       /*
@@ -2699,6 +2734,13 @@ g9p_buffer_slot(struct g9p_shader *out, unsigned set, unsigned binding)
 
 
 
+/* every phi: a vector phi would become a vector NIR register (dEQP random.all_features) */
+static uint8_t
+phis_scalar(const nir_instr *instr, const void *data)
+{
+   return 1;
+}
+
 static void
 optimize(nir_shader *nir)
 {
@@ -2708,7 +2750,7 @@ optimize(nir_shader *nir)
       progress = false;
       NIR_PASS(progress, nir, nir_lower_vars_to_ssa);
       NIR_PASS(progress, nir, nir_lower_alu_to_scalar, NULL, NULL);
-      NIR_PASS(progress, nir, nir_lower_phis_to_scalar, NULL, NULL);
+      NIR_PASS(progress, nir, nir_lower_phis_to_scalar, phis_scalar, NULL);
       NIR_PASS(progress, nir, nir_opt_copy_prop);
       NIR_PASS(progress, nir, nir_opt_dce);
       NIR_PASS(progress, nir, nir_opt_cse);
@@ -2857,6 +2899,7 @@ rematerialize_loads(nir_shader *nir, bool every_use)
              intr->intrinsic != nir_intrinsic_load_push_constant &&
              intr->intrinsic != nir_intrinsic_load_interpolated_input &&
              intr->intrinsic != nir_intrinsic_load_frag_coord &&
+             intr->intrinsic != nir_intrinsic_load_point_coord &&
              !(intr->intrinsic == nir_intrinsic_load_input &&
                (nir->info.stage == MESA_SHADER_FRAGMENT || every_use)))
             continue;
@@ -3062,7 +3105,7 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
       optimize(nir);
    }
    /* registers hold one component: vec4 phis of loops and ifs too */
-   NIR_PASS(_, nir, nir_lower_phis_to_scalar, NULL, NULL);
+   NIR_PASS(_, nir, nir_lower_phis_to_scalar, phis_scalar, NULL);
    NIR_PASS(_, nir, nir_lower_bool_to_int32);
    NIR_PASS(_, nir, nir_opt_copy_prop);
    NIR_PASS(_, nir, nir_opt_dce);
@@ -3229,7 +3272,7 @@ g9p_compile_compute(nir_shader *nir, struct g9p_shader *out, void *mem_ctx)
  * and the viewport (G9P_VIEWPORT buffer), written to varying @slot
  */
 static void
-add_frag_coord_output(nir_shader *nir, unsigned slot)
+add_frag_coord_output(nir_shader *nir, unsigned slot, bool point_coord)
 {
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
    nir_variable *pos = nir_find_variable_with_location(nir, nir_var_shader_out,
@@ -3260,6 +3303,15 @@ add_frag_coord_output(nir_shader *nir, unsigned slot)
                           nir_ffma(&b, nir_fmul(&b, nir_channel(&b, p, 2), inv_w), vp[4], vp[5]),
                           inv_w),
                  0xf);
+   /* the varying gl_PointCoord takes (emit_point_coord()): any value */
+   if (point_coord) {
+      nir_variable *pc = nir_variable_create(nir, nir_var_shader_out, glsl_vec4_type(),
+                                             "g9p_point_coord");
+
+      pc->data.location = VARYING_SLOT_VAR0 + slot + 1;
+      pc->data.interpolation = INTERP_MODE_NOPERSPECTIVE;
+      nir_store_var(&b, pc, nir_imm_vec4(&b, 0, 0, 0, 0), 0xf);
+   }
 }
 
 unsigned
@@ -3363,12 +3415,13 @@ lower_attrib_format(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 
 bool
 g9p_compile_vertex(nir_shader *nir, const struct g9p_vertex_attrib *attribs,
-                   int frag_coord_slot, struct g9p_shader *out, bool point_size, void *mem_ctx)
+                   int frag_coord_slot, bool point_coord, struct g9p_shader *out,
+                   bool point_size, void *mem_ctx)
 {
    memset(out, 0, sizeof(*out));
    lower_front(nir);
    if (frag_coord_slot >= 0)
-      add_frag_coord_output(nir, frag_coord_slot);
+      add_frag_coord_output(nir, frag_coord_slot, point_coord);
    lower_io(nir);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_attrib_format,
             nir_metadata_control_flow, (void *)attribs);
