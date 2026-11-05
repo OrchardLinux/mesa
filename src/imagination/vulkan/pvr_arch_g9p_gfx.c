@@ -384,7 +384,17 @@ blend_options(const struct vk_graphics_pipeline_state *vk_state, nir_lower_blend
    opts->logicop_func = vk_logic_op_to_pipe(cb->logic_op);
    opts->rt[0].format = vk_format_to_pipe_format(vk_state->rp->color_attachment_formats[0]);
    opts->rt[0].colormask = rt->write_mask;
-   if (rt->blend_enable && !cb->logic_op_enable) {
+   if (!(rt->write_mask & 0xf)) {
+      /*
+       * No colour written: the attachment's own value through the shader. With
+       * a colour mask of 0 nir_lower_blend leaves no read of the tile, and the
+       * draw would run opaque, over what is there (dEQP fragment_ops).
+       */
+      opts->rt[0].colormask = 0xf;
+      opts->rt[0].rgb.func = opts->rt[0].alpha.func = PIPE_BLEND_ADD;
+      opts->rt[0].rgb.src_factor = opts->rt[0].alpha.src_factor = PIPE_BLENDFACTOR_ZERO;
+      opts->rt[0].rgb.dst_factor = opts->rt[0].alpha.dst_factor = PIPE_BLENDFACTOR_ONE;
+   } else if (rt->blend_enable && !cb->logic_op_enable) {
       opts->rt[0].rgb.func = vk_blend_op_to_pipe(rt->color_blend_op);
       opts->rt[0].rgb.src_factor = vk_blend_factor_to_pipe(rt->src_color_blend_factor);
       opts->rt[0].rgb.dst_factor = vk_blend_factor_to_pipe(rt->dst_color_blend_factor);
