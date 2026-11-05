@@ -163,6 +163,7 @@ if with_imagination_g5p
     'pvr_g5p_formats.c',
     'pvr_g5p_image.c',
     'pvr_g5p_nir.c',
+    'pvr_g5p_swgs.c',
     'pvr_g5p_xfb_query.c',
     'pvr_g5p_ds.c',
     'pvr_g5p_msaa.c',
@@ -174,7 +175,8 @@ if with_imagination_g5p
   pvr_includes += inc_powervr_g5p
   # pvr_arch_g5p.c builds its PDS programs with pdsc (the A9 ICD's way)
   pvr_includes += inc_powervr_pdsc
-  pvr_deps += idep_powervr_g5p
+  pvr_deps += [idep_powervr_g5p, idep_libpoly,
+               declare_dependency(link_with : libpoly_nir)]
 endif
 
 rogue_files = files(
