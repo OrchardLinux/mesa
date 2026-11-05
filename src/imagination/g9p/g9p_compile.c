@@ -876,6 +876,16 @@ emit_alu(struct g9p_ctx *ctx, nir_alu_instr *alu)
       return ok;
    }
    default:
+      /*
+       * Before the release: a copy must not land on the other source, whose
+       * register the release may free
+       */
+      if (alu->op == nir_op_ishl || alu->op == nir_op_ushr || alu->op == nir_op_u2f32 ||
+          alu->op == nir_op_i2f32 || alu->op == nir_op_f2u32 || alu->op == nir_op_f2i32) {
+         r[0] = one_src(ctx, r[0]);
+         if (r[0] < 0)
+            return false;
+      }
       release(ctx, &alu->instr);
       dst = alloc_reg(ctx);
       if (dst < 0)
