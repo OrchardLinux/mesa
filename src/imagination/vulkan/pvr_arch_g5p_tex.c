@@ -121,7 +121,13 @@ PVR_PER_ARCH(g5p_pack_image_view)(const struct pvr_image_view *iview, struct pvr
    static_assert(sizeof(desc->words) + sizeof(desc->meta) == 32, "G5P image state is 32 bytes");
    memset(desc, 0, sizeof(*desc));
    if (why) {
-      if (pvr_image_view_get_image(iview)->vk.usage & VK_IMAGE_USAGE_SAMPLED_BIT)
+      /* A view with both depth and stencil aspects is an attachment view, never sampled: a sampled descriptor
+       * takes one of the two aspects (VUID-VkDescriptorImageInfo-imageView-01976), whose own view has its
+       * state. No warning for it: Zink's depth/stencil surfaces are such views of sampled-usage images, and
+       * the warning, last in many logs that end in an unrelated crash, read as that crash's cause. */
+      const VkImageAspectFlags ds = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+      if ((iview->vk.aspects & ds) != ds &&
+          (pvr_image_view_get_image(iview)->vk.usage & VK_IMAGE_USAGE_SAMPLED_BIT))
          mesa_logw("G5P: no texture state for a %s view of %s: %s",
                    vk_ImageViewType_to_str(iview->vk.view_type), vk_Format_to_str(iview->vk.format), why);
       return why;
