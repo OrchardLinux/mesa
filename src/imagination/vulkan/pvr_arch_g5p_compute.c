@@ -62,6 +62,7 @@ PVR_PER_ARCH(g5p_compute_pipeline_compile)(
    }
    state->num_regs = shader.num_regs;
    state->a9_local_dwords = shader.a9_local_dwords;
+   state->a9_has_barriers = shader.a9_has_barriers;
    state->uses_workgroup_id = shader.uses_workgroup_id;
    memcpy(state->local_size, shader.local_size, sizeof(state->local_size));
 
@@ -103,7 +104,7 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
    uint32_t uniforms[2 * G9P_MAX_BUFFERS + 1] = { 0 };
    uint32_t bind_data[4 * (G9P_MAX_BUFFERS + 1) + 4] = { 0 };
    uint32_t bind_code[G9P_MAX_BUFFERS + 2];
-   uint32_t kernel_data[G9P_KERNEL_DATA_DWORDS] = { 0 }, kernel_code[8];
+   uint32_t kernel_data[12] = { 0 }, kernel_code[8];
    struct pvr_pds_upload bind, kernel;
    unsigned bind_dwords, ctrl0, nc = 0;
    VkResult result;
@@ -199,8 +200,20 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
    kernel_code[6] = g9p_pds_halt();
    kernel_code[7] = g9p_pds_halt();
 
+   unsigned kernel_dwords = G9P_KERNEL_DATA_DWORDS;
+   if (state->a9_has_barriers) {
+      /* IF1 zeros TG2/3 before the ID write. DATA q4 is the zero pair. */
+      kernel_dwords = 12;
+      kernel_data[6] = BITFIELD_BIT(28) | 2u << 13 | 2;
+      kernel_code[0] = g9p_pds_bra_not_if1(5);
+      kernel_code[1] = g9p_pds_dout(G9P_DOUTW, 4, G9P_PDS_DATA, 6, 0);
+      kernel_code[2] = g9p_pds_dout(G9P_DOUTW, 0, G9P_PDS_TEMPS, 4, G9P_PDS_END);
+      kernel_code[3] = kernel_code[4] = g9p_pds_halt();
+      kernel_code[5] = g9p_pds_dout(G9P_DOUTW, 0, G9P_PDS_TEMPS, 2, 0);
+      kernel_code[6] = g9p_pds_dout(G9P_DOUTU, 0, G9P_PDS_DATA, 0, G9P_PDS_END | G9P_PDS_CC);
+   }
    result = pvr_arch_cmd_buffer_upload_pds(cmd_buffer, kernel_data,
-                                           ARRAY_SIZE(kernel_data),
+                                           kernel_dwords,
                                            ROGUE_CDMCTRL_KERNEL1_DATA_ADDR_ALIGNMENT,
                                            kernel_code, ARRAY_SIZE(kernel_code),
                                            ROGUE_CDMCTRL_KERNEL2_CODE_ADDR_ALIGNMENT,
@@ -216,7 +229,7 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
                           bind.code_offset);
       const struct g5p_cdm_record kernel_rec = g5p_cdm_kernel(
          G9P_CDM_KERNEL_REGS(state->num_regs) | G9P_CDM_ANY_CLUSTER | G9P_CDM_FENCE |
-            G9P_CDM_DATA_BLOCKS(G9P_KERNEL_DATA_DWORDS / 4),
+            G9P_CDM_DATA_BLOCKS(kernel_dwords / 4),
          kernel.data_offset, kernel.code_offset, group_count[0], group_count[1],
          group_count[2], threads, MAX2(DIV_ROUND_UP(4 * (2 * n + 1), 64),
                          DIV_ROUND_UP(state->a9_local_dwords, 16)));

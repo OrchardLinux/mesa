@@ -140,7 +140,7 @@ struct g9p_ctx {
    struct g9p_vs_store vs_stores[4 * 64];
    unsigned num_vs_high;
    unsigned num_vs_stores;
-   unsigned num_keys;
+   unsigned num_keys; G9P_A9_CTX_FIELDS
    struct g9p_code *c;
    struct g9p_shader *out;
    mesa_shader_stage stage;
@@ -3719,7 +3719,7 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
       }
    }
 
-   ctx->ip = 0;
+   ctx->ip = 0; G9P_A9_GENERATE_INIT;
    ctx->num_frag_samples = 0;
    if (!emit_cf_list(ctx, &impl->body))
       return false;

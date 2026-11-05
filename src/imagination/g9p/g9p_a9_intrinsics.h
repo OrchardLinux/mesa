@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 #ifdef PVR_APPLE_G5P
+#include "../g5p/g5p_barrier.h"
 /* Static threadgroup operands: A9 host-compiler forms (compute.md §4).
  * Reserve TG0/1 for IDs and TG2/3 for the future software-barrier counters.
  * CDM allocation covers system words plus the native shared block. */
@@ -45,15 +46,47 @@ static bool a9_shared(struct g9p_ctx *ctx, nir_intrinsic_instr *in)
    if (load) ctx->reg[key(&in->def, 0)] = reg;
    return true;
 }
+/* Keep the election's local-index source live for every task barrier. */
+static void a9_generate_init(struct g9p_ctx *ctx, nir_function_impl *impl)
+{
+   ctx->a9_barriers_remaining = 0;
+   if (!ctx->out->a9) return;
+   unsigned n = ctx->out->local_size[0] * ctx->out->local_size[1] * ctx->out->local_size[2];
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic) continue;
+         nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+         if (in->intrinsic == nir_intrinsic_barrier &&
+             nir_intrinsic_execution_scope(in) == SCOPE_WORKGROUP)
+            ctx->a9_barriers_remaining++;
+      }
+   }
+   ctx->out->a9_has_barriers = n > 32 && ctx->a9_barriers_remaining;
+   if (ctx->out->a9_has_barriers) ctx->busy |= ctx->pinned |= BITFIELD64_BIT(0);
+}
 static bool a9_barrier(struct g9p_ctx *ctx, nir_intrinsic_instr *in)
 {
    if (!ctx->out->a9) return false;
    unsigned n = ctx->out->local_size[0] * ctx->out->local_size[1] * ctx->out->local_size[2];
+   unsigned scope = nir_intrinsic_execution_scope(in);
    if ((nir_intrinsic_memory_modes(in) & ~nir_var_mem_shared) ||
-       ((nir_intrinsic_execution_scope(in) != SCOPE_NONE &&
-         nir_intrinsic_execution_scope(in) != SCOPE_INVOCATION) && n != 1)) {
-      fprintf(stderr, "g5p: inter-invocation barrier not implemented; no wait-as-barrier fallback\n");
+       (scope != SCOPE_NONE && scope != SCOPE_INVOCATION && scope != SCOPE_WORKGROUP)) {
+      fprintf(stderr, "g5p: device/image memory barrier not implemented\n");
       return false;
+   }
+   if (scope == SCOPE_WORKGROUP) {
+      unsigned N = ctx->a9_barriers_remaining--;
+      if (!N || N > 31) return false;
+      if (n > 32) {
+         int r = alloc_temp(ctx), t = alloc_temp(ctx);
+         if (r < 0 || t < 0) return false;
+         /* Local size is fixed per pipeline: specialize Apple's target uniform. */
+         g9p_mov_imm(ctx->c, t, DIV_ROUND_UP(n, 32) - 1);
+         g5p_shared_barrier(ctx->c, r, 2 * t, 2, ctx->st, N);
+         release(ctx, &in->instr);
+         return true;
+      }
+      /* Apple's <=32 compiler form; cross-lane hardware qualification pending. */
    }
    g9p_wait(ctx->c);
    return true;
