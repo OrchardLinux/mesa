@@ -57,6 +57,8 @@ static void a9_generate_init(struct g9p_ctx *ctx, nir_function_impl *impl)
       nir_foreach_instr(instr, block) {
          if (instr->type != nir_instr_type_intrinsic) continue;
          nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+         if (in->intrinsic == nir_intrinsic_ssbo_atomic_swap)
+            ctx->busy |= ctx->pinned |= BITFIELD64_BIT(0);
          if (in->intrinsic == nir_intrinsic_barrier &&
              nir_intrinsic_execution_scope(in) == SCOPE_WORKGROUP)
             ctx->a9_barriers_remaining++;
@@ -115,7 +117,7 @@ static bool a9_ssbo_atomic(struct g9p_ctx *ctx, nir_intrinsic_instr *in)
    int off=src_reg(ctx,nir_get_scalar(in->src[1].ssa,0));
    int val=src_reg(ctx,nir_get_scalar(in->src[2].ssa,0));
    int zero=const_reg(ctx,0), pair=alloc_pair(ctx), dst=alloc_reg(ctx);
-   if (slot<0 || off<0 || val<0 || zero<0 || pair<0 || dst<0) return false;
+   if (slot<0 || off<0 || val<0 || zero<0 || pair<0 || dst<0 || pair>30 || dst>31) return false;
    ctx->temps |= BITFIELD64_RANGE(pair,2);
    g9p_addr(ctx->c,pair,2*slot,off,0,false);
    g5p_device_atomic(ctx->c,group,op,pair,dst,zero,val);
@@ -123,7 +125,28 @@ static bool a9_ssbo_atomic(struct g9p_ctx *ctx, nir_intrinsic_instr *in)
    ctx->reg[key(&in->def,0)]=dst;
    return true;
 }
+static bool a9_ssbo_cas(struct g9p_ctx *ctx, nir_intrinsic_instr *in)
+{
+   if (!ctx->out->a9 || ctx->stage != MESA_SHADER_COMPUTE ||
+       in->def.bit_size != 32 || in->def.num_components != 1 ||
+       nir_intrinsic_atomic_op(in) != nir_atomic_op_cmpxchg ||
+       nir_intrinsic_offset_shift(in) != 0) return false;
+   int slot=buffer_slot(ctx,in->src[0]);
+   int off=src_reg(ctx,nir_get_scalar(in->src[1].ssa,0));
+   int cmp=src_reg(ctx,nir_get_scalar(in->src[2].ssa,0));
+   int val=src_reg(ctx,nir_get_scalar(in->src[3].ssa,0));
+   int pair=alloc_pair(ctx), i=alloc_temp(ctx), dst=alloc_reg(ctx);
+   if (slot<0 || off<0 || cmp<0 || val<0 || pair<0 || i<0 || dst<0 || pair>30 || dst>31 || i>31)
+      return false;
+   ctx->temps |= BITFIELD64_RANGE(pair,2);
+   g9p_addr(ctx->c,pair,2*slot,off,0,false);
+   g5p_device_cas(ctx->c,pair,dst,cmp,val,i,ctx->st);
+   release(ctx,&in->instr);
+   ctx->reg[key(&in->def,0)]=dst;
+   return true;
+}
 #define G9P_A9_INTRINSICS \
+   case nir_intrinsic_ssbo_atomic_swap: return a9_ssbo_cas(ctx, intr); \
    case nir_intrinsic_ssbo_atomic: return a9_ssbo_atomic(ctx, intr); \
    case nir_intrinsic_load_shared: case nir_intrinsic_store_shared: return a9_shared(ctx, intr); \
    case nir_intrinsic_barrier: return a9_barrier(ctx, intr);
