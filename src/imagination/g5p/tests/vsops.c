@@ -44,6 +44,18 @@ int main(void)
    /* v_bnot: the vertex u32 binary literal (and 1), bank 1, header 0x11, the form the boolean not's XOR takes */
    n = g5p_usc_binary_literal2(b, G5P_BIN_AND, 8, 1, 8, 1, 1, 0x11, G5P_LIT_U32, -1, 0, 0, false);
    check("v_bnot_and", b, n, "9911080303912001c8017000");
+   /* v_iand_lit, v_iand_big, v_ior_big, v_ixor_big, v_ixor_big_rr: the u32 binary literal, bank 1, header 0x11;
+    * x ^ 0x3f800000 is the boolean not of a materialized 1.0/0.0 */
+   n = g5p_usc_binary_literal2(b, G5P_BIN_AND, 8, 0x7f, 8, 1, 1, 0x11, G5P_LIT_U32, -1, 0, 0, false);
+   check("v_iand_lit", b, n, "991108037f912201c8017000");
+   n = g5p_usc_binary_literal2(b, G5P_BIN_AND, 8, 0x12345678, 8, 1, 1, 0x11, G5P_LIT_U32, -1, 0, 0, false);
+   check("v_iand_big", b, n, "99310803719173213413c8017000");
+   n = g5p_usc_binary_literal2(b, G5P_BIN_OR, 8, 0x40000000, 8, 1, 1, 0x11, G5P_LIT_U32, -1, 0, 0, false);
+   check("v_ior_big", b, n, "99110803019121010041ce017000");
+   n = g5p_usc_binary_literal2(b, G5P_BIN_XOR, 8, 0x3f800000, 8, 1, 1, 0x11, G5P_LIT_U32, -1, 0, 0, false);
+   check("v_ixor_big (boolean not)", b, n, "9911080301912181803fc6017000");
+   n = g5p_usc_binary_literal2(b, G5P_BIN_XOR, 14, 0x3f800000, 8, 1, 0, 0x11, G5P_LIT_U32, -1, 0, 0, false);
+   check("v_ixor_big_rr (boolean not, read again)", b, n, "99110e0301112181803fc6017000");
    printf("G5P VSOPS ENCODERS %s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
    return fails != 0;
 }

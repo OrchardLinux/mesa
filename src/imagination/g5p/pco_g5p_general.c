@@ -2383,11 +2383,14 @@ static void emit_bool_alu(struct gctx *c, nir_alu_instr *a)
    unsigned g = vgrp(c, x);
    free_dying(c, &x, 1);
    unsigned dst = alloc_reg(c, d ? (int)xr : -1);
-   /* vertex: the binary literal form of v_bnot (bank 1, header 0x11; 0x40 and extension 4 on a repeated read, as
-    * the vertex f16-literal ALU) */
-   put(c, raw, g5p_usc_binary_literal2(raw, G5P_BIN_XOR, 2 * dst, F32_ONE, 2 * xr, c->vs, g,
-                                       (c->vs ? 0x11 : 1) | (g ? 0 : 0x40), G5P_LIT_U32, -1, g ? 0 : 4, 0, false),
-       "boolean not");
+   /* vertex: Apple's v_ixor_big / v_ixor_big_rr (x ^ 0x3f800000): bank 1, header 0x11, the source group alone
+    * marks a repeated read (no extension) */
+   if (c->vs)
+      put(c, raw, g5p_usc_binary_literal2(raw, G5P_BIN_XOR, 2 * dst, F32_ONE, 2 * xr, 1, g, 0x11, G5P_LIT_U32, -1, 0,
+                                          0, false), "boolean not");
+   else
+      put(c, raw, g5p_usc_binary_literal2(raw, G5P_BIN_XOR, 2 * dst, F32_ONE, 2 * xr, 0, g, g ? 1 : 0x41, G5P_LIT_U32,
+                                          -1, g ? 0 : 4, 0, false), "boolean not");
    define(c, &a->def, dst);
 }
 
@@ -3073,12 +3076,29 @@ static void vs_bitwise(struct gctx *c, nir_alu_instr *a)
 {
    uint8_t raw[G5P_USC_MAX];
    struct ref r[2] = {alu_src(c, a, 0), alu_src(c, a, 1)};
-   /* v_iand, v_ior, v_ixor: the register-pair form of v_iadd_rr. A literal or
+   enum g5p_binop bop = a->op == nir_op_iand ? G5P_BIN_AND : a->op == nir_op_ior ? G5P_BIN_OR : G5P_BIN_XOR;
+   /* A 32-bit literal operand: Apple's v_iand_lit, v_iand_big, v_ior_big, v_ixor_big(_rr) (tools/g5p-1b-dgl/
+    * vs-canary/vsops2-probes.py): the u32 binary literal with bank 1, header 0x11, the register in B, its source
+    * group alone marking a repeated read; short or long by the value. */
+   for (unsigned i = 0; i < 2 && a->def.bit_size == 32; i++) {
+      if (!is_const(c, r[i]) || is_const(c, r[1 - i]) || vkind(c, r[1 - i]) != VK_REG)
+         continue;
+      uint32_t k = V(c, r[i].def, r[i].comp)->imm;
+      struct ref x = r[1 - i];
+      unsigned xr = reg_of(c, x, "vertex bitwise literal");
+      unsigned g = vgrp(c, x);
+      unsigned dst = vs_dst(c, &x, 1);
+      put(c, raw, g5p_usc_binary_literal2(raw, bop, 2 * dst, k, 2 * xr, 1, g, 0x11, G5P_LIT_U32, -1, 0, 0, false),
+          "vertex bitwise literal");
+      c->p->evidence |= PCO_G5P_EV_VS_ALU;
+      define(c, &a->def, dst);
+      return;
+   }
+   /* v_iand, v_ior, v_ixor: the register-pair form of v_iadd_rr. A
     * common-store operand has no probed vertex form. */
    if (vkind(c, r[0]) != VK_REG || vkind(c, r[1]) != VK_REG || is_const(c, r[0]) || is_const(c, r[1]))
-      refuse(c, "vertex %s with a literal or uniform operand (only the register-pair form is probed)",
-             nir_op_infos[a->op].name);
-   enum g5p_binop bop = a->op == nir_op_iand ? G5P_BIN_AND : a->op == nir_op_ior ? G5P_BIN_OR : G5P_BIN_XOR;
+      refuse(c, "vertex %s with a uniform operand or a 1-bit literal (the register-pair and 32-bit literal forms "
+             "are probed)", nir_op_infos[a->op].name);
    unsigned reg[2] = {reg_of(c, r[0], "vertex bitwise"), reg_of(c, r[1], "vertex bitwise")};
    bool d0 = dies(c, r[0]), d1 = dies(c, r[1]);
    unsigned ia = d0 ? 1 : 0, ib = d0 ? 0 : 1;
