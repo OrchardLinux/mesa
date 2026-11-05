@@ -1342,7 +1342,7 @@ static bool pvr_sub_cmd_gfx_requires_ds_subtile_alignment(
    uint32_t zls_tile_size_y;
 
    rogue_get_zls_tile_size_xy(dev_info, &zls_tile_size_x, &zls_tile_size_y);
-
+   PVR_G5P_HOOK(ds_subtile_alignment, dev_info)
    if (ds_plane->physical_extent.width >= zls_tile_size_x &&
        ds_plane->physical_extent.height >= zls_tile_size_y) {
       return false;

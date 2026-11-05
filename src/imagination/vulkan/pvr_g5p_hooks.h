@@ -156,6 +156,21 @@
          (s_load) = false;                                                                             \
    }
 
+/* pvr_arch_cmd_buffer.c, pvr_sub_cmd_gfx_requires_ds_subtile_alignment(): no
+ * copy-around of a depth/stencil attachment with a side under a ZLS tile.
+ * Rogue's ZLS stores whole tiles past such an image's extent, so upstream
+ * copies the attachment through a tile-rounded buffer with transfer jobs
+ * before and after the render. The A9's ZLS plane is already whole 32-pixel
+ * tiles in a power-of-two square (pvr_g5p_ds_layout()) and ZLS_PIXELS covers
+ * them (pvr_g5p_ds_zls()), so the render loads and stores it in place. The
+ * copy-around also ran through the CPU transfer path, which has no mapping
+ * of arena-backed images ("G5P transfer: no stable CPU mapping", then a lost
+ * device): every depth attachment with a side under the tile failed.
+ */
+#define PVR_G5P_HOOK_ds_subtile_alignment(dev_info)                           \
+   if (PVR_HAS_FEATURE(dev_info, apple_g5p))                                  \
+      return false;
+
 /* pvr_device.c, pvr_MapMemory2(): the CPU transfer path G5P shares with G9P
  * (pvr_arch_g9p_cpu_addr()) maps a bound BO and leaves it mapped. That is the
  * driver's mapping, not the application's, so a vkMapMemory of that memory
