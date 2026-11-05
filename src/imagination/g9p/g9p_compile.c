@@ -1762,6 +1762,66 @@ uses_layered_tex(nir_function_impl *impl)
 }
 
 /*
+ * A 2D array sample with explicit gradients (Apple's code for gradient2d():
+ * f718 W1 8100 | coord << 9 | sampler, 07e0 0080): the gradients in f32 r0-r3,
+ * x then y, s then t; the coordinates and the layer as an integer in r[coord]...
+ */
+static bool
+emit_tex_grad(struct g9p_ctx *ctx, nir_tex_instr *tex)
+{
+   const int ci = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   const int dxi = nir_tex_instr_src_index(tex, nir_tex_src_ddx);
+   const int dyi = nir_tex_instr_src_index(tex, nir_tex_src_ddy);
+   const int slot = texture_slot(ctx, tex);
+   int coord, dst, half;
+
+   if (ctx->stage != MESA_SHADER_FRAGMENT || ci < 0 || dxi < 0 || dyi < 0 || slot < 0 ||
+       !tex->is_array || tex->sampler_dim != GLSL_SAMPLER_DIM_2D || tex->is_shadow) {
+      fprintf(stderr, "g9p: only gradients of 2D arrays\n");
+      return false;
+   }
+   coord = alloc_range(ctx, 3);
+   half = const_reg(ctx, 0x3f000000);
+   if (coord < 0 || half < 0)
+      return false;
+   ctx->temps |= BITFIELD64_RANGE(coord, 3);
+   for (unsigned c = 0; c < 2; c++) {
+      const int dx = src_reg(ctx, nir_get_scalar(tex->src[dxi].src.ssa, c));
+      const int dy = src_reg(ctx, nir_get_scalar(tex->src[dyi].src.ssa, c));
+      const int r = src_reg(ctx, nir_get_scalar(tex->src[ci].src.ssa, c));
+
+      if (dx < 0 || dy < 0 || r < 0)
+         return false;
+      g9p_alu2(ctx->c, G9P_OR, c, dx, dx, false);
+      g9p_alu2(ctx->c, G9P_OR, 2 + c, dy, dy, false);
+      g9p_alu2(ctx->c, G9P_OR, coord + c, r, r, false);
+   }
+   {
+      const int r = src_reg(ctx, nir_get_scalar(tex->src[ci].src.ssa, 2));
+
+      if (r < 0)
+         return false;
+      g9p_alu2(ctx->c, G9P_FADD, coord + 2, r, half, false);
+      g9p_convert(ctx->c, coord + 2, coord + 2, G9P_F2U);
+   }
+   release(ctx, &tex->instr);
+   dst = alloc_range(ctx, 4);
+   if (dst < 0)
+      return false;
+   G9P_EMIT(ctx->c, 0xf71a, g9p_sample_w1(dst, tex_state_dword(ctx, slot)),
+            0x8100 | coord << 9 | tex_sampler_dword(ctx, slot), 0x07e0, 0x0080);
+   g9p_wait(ctx->c);
+   ctx->busy &= ~ctx->temps;
+   ctx->temps = 0;
+   for (unsigned c = 0; c < 4; c++) {
+      ctx->reg[key(&tex->def, c)] = dst + c;
+      if (c >= tex->def.num_components || !ctx->last_use[key(&tex->def, c)])
+         ctx->busy &= ~BITFIELD64_BIT(dst + c);
+   }
+   return true;
+}
+
+/*
  * A 2D array or cube sample, ported from the A9 (G5P) backend (OrchardLinux/mesa
  * PR #5, Berkay Kösebay; Apple's operand layout): the coordinates in r0-r2, where
  * the sample reads them (as g9p_sample_regs() reads r0-r1); an array's layer
@@ -1779,6 +1839,8 @@ emit_tex_layered(struct g9p_ctx *ctx, nir_tex_instr *tex)
    unsigned at;
    int dst, lod;
 
+   if (tex->op == nir_texop_txd)
+      return emit_tex_grad(ctx, tex);
    if (ctx->stage != MESA_SHADER_FRAGMENT || ci < 0 || slot < 0 || tex->is_shadow ||
        (cube && tex->is_array) ||
        (!cube && !is3d && tex->sampler_dim != GLSL_SAMPLER_DIM_2D) ||
@@ -2024,6 +2086,29 @@ emit_intrinsic(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
       /* resolved where they are used */
       return true;
 
+   case nir_intrinsic_ddx:
+   case nir_intrinsic_ddx_fine:
+   case nir_intrinsic_ddx_coarse:
+   case nir_intrinsic_ddy:
+   case nir_intrinsic_ddy_fine:
+   case nir_intrinsic_ddy_coarse: {
+      /* Apple's dfdx(), dfdy(): 0198 dst src 0144 0200, 0145 0400 */
+      const bool y = intr->intrinsic == nir_intrinsic_ddy ||
+                     intr->intrinsic == nir_intrinsic_ddy_fine ||
+                     intr->intrinsic == nir_intrinsic_ddy_coarse;
+      int r = low_reg(ctx, src_reg(ctx, nir_get_scalar(intr->src[0].ssa, 0))), dst;
+
+      if (r < 0)
+         return false;
+      release(ctx, &intr->instr);
+      dst = alloc_reg(ctx);
+      if (dst < 0)
+         return false;
+      G9P_EMIT(ctx->c, g9p_w0(ctx->c, 0x0198), g9p_dst(ctx->c, dst), 0x0100 | r << 2,
+               y ? 0x0145 : 0x0144, y ? 0x0400 : 0x0200);
+      ctx->reg[key(&intr->def, 0)] = dst;
+      return true;
+   }
    case nir_intrinsic_load_front_face: {
       /* Apple's read of the face register, then 0/~0 */
       int r, zero, dst, flag, slot;
@@ -2827,6 +2912,30 @@ lower_dynamic_ubo_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return true;
 }
 
+/* A cube direction's major axis and signs */
+struct cube_axes {
+   nir_def *is_z, *is_y, *px, *py, *pz;
+};
+
+/*
+ * GL's face coordinates sc, tc and major axis ma of (x, y, z) on the face @a
+ * chose; linear, so also of the direction's derivatives
+ */
+static void
+cube_select(nir_builder *b, const struct cube_axes *a, nir_def *x, nir_def *y, nir_def *z,
+            nir_def **sc, nir_def **tc, nir_def **ma)
+{
+   nir_def *sx = nir_bcsel(b, a->px, x, nir_fneg(b, x));
+   nir_def *sy = nir_bcsel(b, a->py, y, nir_fneg(b, y));
+   nir_def *sz = nir_bcsel(b, a->pz, z, nir_fneg(b, z));
+
+   *sc = nir_bcsel(b, a->is_z, nir_bcsel(b, a->pz, x, nir_fneg(b, x)),
+                   nir_bcsel(b, a->is_y, x, nir_bcsel(b, a->px, nir_fneg(b, z), z)));
+   *tc = nir_bcsel(b, a->is_z, nir_fneg(b, y),
+                   nir_bcsel(b, a->is_y, nir_bcsel(b, a->py, z, nir_fneg(b, z)), nir_fneg(b, y)));
+   *ma = nir_bcsel(b, a->is_z, sz, nir_bcsel(b, a->is_y, sy, sx));
+}
+
 /*
  * Seamful cube sampling for samplers with
  * VK_SAMPLER_CREATE_NON_SEAMLESS_CUBE_MAP_BIT_EXT: this hardware filters across
@@ -2845,20 +2954,60 @@ lower_cube_seamful(nir_builder *b, nir_tex_instr *tex, void *data)
    nir_def *c = tex->src[ci].src.ssa;
    nir_def *x = nir_channel(b, c, 0), *y = nir_channel(b, c, 1), *z = nir_channel(b, c, 2);
    nir_def *ax = nir_fabs(b, x), *ay = nir_fabs(b, y), *az = nir_fabs(b, z);
-   nir_def *is_z = nir_fge(b, az, nir_fmax(b, ax, ay));
-   nir_def *is_y = nir_fge(b, ay, ax);
-   nir_def *px = nir_fge_imm(b, x, 0), *py = nir_fge_imm(b, y, 0), *pz = nir_fge_imm(b, z, 0);
-   nir_def *sc = nir_bcsel(b, is_z, nir_bcsel(b, pz, x, nir_fneg(b, x)),
-                           nir_bcsel(b, is_y, x, nir_bcsel(b, px, nir_fneg(b, z), z)));
-   nir_def *tc = nir_bcsel(b, is_z, nir_fneg(b, y),
-                           nir_bcsel(b, is_y, nir_bcsel(b, py, z, nir_fneg(b, z)), nir_fneg(b, y)));
-   nir_def *ma = nir_bcsel(b, is_z, az, nir_bcsel(b, is_y, ay, ax));
-   nir_def *face = nir_bcsel(b, is_z, nir_bcsel(b, pz, nir_imm_float(b, 4), nir_imm_float(b, 5)),
-                             nir_bcsel(b, is_y, nir_bcsel(b, py, nir_imm_float(b, 2), nir_imm_float(b, 3)),
-                                       nir_bcsel(b, px, nir_imm_float(b, 0), nir_imm_float(b, 1))));
-   nir_def *half_rcp = nir_fmul_imm(b, nir_frcp(b, ma), 0.5);
+   struct cube_axes a = {
+      .is_z = nir_fge(b, az, nir_fmax(b, ax, ay)),
+      .is_y = nir_fge(b, ay, ax),
+      .px = nir_fge_imm(b, x, 0),
+      .py = nir_fge_imm(b, y, 0),
+      .pz = nir_fge_imm(b, z, 0),
+   };
+   nir_def *sc, *tc, *ma;
+   nir_def *face = nir_bcsel(b, a.is_z, nir_bcsel(b, a.pz, nir_imm_float(b, 4), nir_imm_float(b, 5)),
+                             nir_bcsel(b, a.is_y, nir_bcsel(b, a.py, nir_imm_float(b, 2), nir_imm_float(b, 3)),
+                                       nir_bcsel(b, a.px, nir_imm_float(b, 0), nir_imm_float(b, 1))));
 
-   nir_src_rewrite(&tex->src[ci].src,
+   cube_select(b, &a, x, y, z, &sc, &tc, &ma);
+
+   nir_def *rcp = nir_frcp(b, ma), *half_rcp = nir_fmul_imm(b, rcp, 0.5);
+
+   /*
+    * An implicit level as exact gradients of the face coordinates, from the
+    * direction's derivatives with this pixel's face: past a face's edge a helper
+    * pixel's face coordinates jump (dEQP mipmap.cube).
+    */
+   if (b->shader->info.stage == MESA_SHADER_FRAGMENT &&
+       (tex->op == nir_texop_tex || tex->op == nir_texop_txb)) {
+      nir_def *grad[2];
+      const int bi = nir_tex_instr_src_index(tex, nir_tex_src_bias);
+      /* a bias of b scales the gradients by 2^b */
+      nir_def *scale = bi >= 0 ? nir_fpow(b, nir_imm_float(b, 2.0), tex->src[bi].src.ssa) : NULL;
+
+      for (unsigned d = 0; d < 2; d++) {
+         nir_def *dsc, *dtc, *dma;
+         nir_def *dx = d ? nir_ddy(b, x) : nir_ddx(b, x);
+         nir_def *dy = d ? nir_ddy(b, y) : nir_ddx(b, y);
+         nir_def *dz = d ? nir_ddy(b, z) : nir_ddx(b, z);
+
+         cube_select(b, &a, dx, dy, dz, &dsc, &dtc, &dma);
+
+         /* d(sc / ma) = (dsc - (sc / ma) dma) / ma, halved for the face's 0..1 */
+         nir_def *s_ = nir_fmul(b, nir_fsub(b, dsc, nir_fmul(b, nir_fmul(b, sc, rcp), dma)), half_rcp);
+         nir_def *t_ = nir_fmul(b, nir_fsub(b, dtc, nir_fmul(b, nir_fmul(b, tc, rcp), dma)), half_rcp);
+
+         if (scale) {
+            s_ = nir_fmul(b, s_, scale);
+            t_ = nir_fmul(b, t_, scale);
+         }
+         grad[d] = nir_vec2(b, s_, t_);
+      }
+      if (bi >= 0)
+         nir_tex_instr_remove_src(tex, bi);
+      nir_tex_instr_add_src(tex, nir_tex_src_ddx, grad[0]);
+      nir_tex_instr_add_src(tex, nir_tex_src_ddy, grad[1]);
+      tex->op = nir_texop_txd;
+   }
+
+   nir_src_rewrite(&tex->src[nir_tex_instr_src_index(tex, nir_tex_src_coord)].src,
                    nir_vec3(b, nir_fadd_imm(b, nir_fmul(b, sc, half_rcp), 0.5),
                             nir_fadd_imm(b, nir_fmul(b, tc, half_rcp), 0.5), face));
    tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
