@@ -922,6 +922,17 @@ buffer_addrs(struct pvr_cmd_buffer *cmd_buffer, unsigned n, const unsigned (*set
          if (result != VK_SUCCESS)
             return result;
          addrs[k] = bbo->dev_addr.addr;
+      } else if (set == G9P_FRONT_FACE) {
+         const uint32_t cw = cmd_buffer->vk.dynamic_graphics_state.rs.front_face ==
+                                   VK_FRONT_FACE_CLOCKWISE
+                                ? ~0u
+                                : 0;
+         struct pvr_suballoc_bo *fbo;
+
+         result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, &cw, sizeof(cw), &fbo);
+         if (result != VK_SUCCESS)
+            return result;
+         addrs[k] = fbo->dev_addr.addr;
       } else if (set == G9P_VIEWPORT) {
          /* scale/offset x, y, z of viewport 0 (gl_FragCoord's varying) */
          const struct vk_dynamic_graphics_state *dyn = &cmd_buffer->vk.dynamic_graphics_state;
@@ -2265,6 +2276,7 @@ g9p_ds_stencil_offset(const struct pvr_image *img)
              ? (uint64_t)plane->physical_extent.width * plane->physical_extent.height * 4
              : 0;
 }
+
 
 /* The ZLS words of a render's depth/stencil attachment, or false for D32F alone */
 static bool

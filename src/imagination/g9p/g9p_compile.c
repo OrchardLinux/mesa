@@ -1333,14 +1333,37 @@ emit_varying_load(struct g9p_ctx *ctx, nir_intrinsic_instr *intr, bool persp)
               gl_varying_slot_name_for_stage(sem.location, MESA_SHADER_FRAGMENT));
       return false;
    }
+   ctx->out->num_varyings = MAX2(ctx->out->num_varyings, n + 1);
+   ctx->out->varying_perspective[n] = persp;
+   /* read only as a sample's coordinates: those are iterated straight to the sampler */
+   {
+      bool straight = !nir_def_is_unused(&intr->def);
+
+      nir_foreach_use_including_if(src, &intr->def) {
+         nir_alu_instr *alu;
+
+         if (nir_src_is_if(src) || nir_src_use_instr(src)->type != nir_instr_type_alu) {
+            straight = false;
+            break;
+         }
+         alu = nir_instr_as_alu(nir_src_use_instr(src));
+         if (!nir_op_is_vec(alu->op) || alu->def.num_components < 2 ||
+             !only_tex_uses(&alu->def) || varying_component(nir_get_scalar(&alu->def, 0)) < 0 ||
+             varying_component(nir_get_scalar(&alu->def, 1)) !=
+                varying_component(nir_get_scalar(&alu->def, 0)) + 1) {
+            straight = false;
+            break;
+         }
+      }
+      if (straight)
+         return true;
+   }
    r = alloc_reg(ctx);
    if (r < 0)
       return false;
    g9p_iterate(ctx->c, r, 4 * n + nir_intrinsic_component(intr), 1, persp);
    g9p_wait(ctx->c);
    ctx->reg[key(&intr->def, 0)] = r;
-   ctx->out->num_varyings = MAX2(ctx->out->num_varyings, n + 1);
-   ctx->out->varying_perspective[n] = persp;
    return true;
 }
 
@@ -1962,18 +1985,24 @@ emit_intrinsic(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
 
    case nir_intrinsic_load_front_face: {
       /* Apple's read of the face register, then 0/~0 */
-      int r, zero, dst;
+      int r, zero, dst, flag, slot;
 
       if (ctx->stage != MESA_SHADER_FRAGMENT)
          return false;
+      /* the register is the winding: the state says which one is front */
+      slot = g9p_buffer_slot(ctx->out, G9P_FRONT_FACE, 0);
       r = alloc_temp(ctx);
       zero = const_reg(ctx, 0);
+      flag = alloc_temp(ctx);
       dst = alloc_reg(ctx);
-      if (r < 0 || zero < 0 || dst < 0)
+      if (slot < 0 || r < 0 || zero < 0 || flag < 0 || dst < 0)
          return false;
+      ctx->out->buffers[slot].dwords = MAX2(ctx->out->buffers[slot].dwords, 1);
       G9P_EMIT(ctx->c, 0x0198, g9p_dst(ctx->c, r), 0x0131, 0x0110, 0x0154, 0x0038);
-      if (!emit_select_const(ctx, G9P_EQ, false, r, zero, 0, ~0u, dst))
+      if (!emit_select_const(ctx, G9P_EQ, false, r, zero, ~0u, 0, dst))
          return false;
+      g9p_mov_uniform(ctx->c, flag, g9p_fs_buf_base(ctx->tex_total) + G9P_FS_BUF_DWORDS * slot, zero);
+      g9p_alu2(ctx->c, G9P_XOR, dst, dst, flag, false);
       ctx->reg[key(&intr->def, 0)] = dst;
       release(ctx, &intr->instr);
       return true;
