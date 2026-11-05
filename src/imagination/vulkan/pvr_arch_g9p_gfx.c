@@ -479,15 +479,14 @@ upload_varyings(struct pvr_device *device, struct pvr_g9p_graphics_state *state,
                              &state->varyings);
 }
 
-VkResult
-PVR_PER_ARCH(g9p_graphics_pipeline_compile)(struct pvr_device *device,
-                                            const VkGraphicsPipelineCreateInfo *create_info,
-                                            struct pvr_graphics_pipeline *pipeline,
-                                            const struct vk_graphics_pipeline_state *vk_state)
+static VkResult
+g9p_compile_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo *create_info,
+                  struct pvr_graphics_pipeline *pipeline,
+                  const struct vk_graphics_pipeline_state *vk_state,
+                  struct pvr_g9p_graphics_state *state, bool seamful, bool *has_cube)
 {
    const bool point_size = vk_state->ia &&
                            vk_state->ia->primitive_topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
-   struct pvr_g9p_graphics_state *state = &pipeline->g9p;
    const VkPipelineShaderStageCreateInfo *vs_info = NULL, *fs_info = NULL;
    struct g9p_vertex_attrib attribs[G9P_MAX_ATTRIBS] = { 0 };
    void *mem_ctx = ralloc_context(NULL);
@@ -498,6 +497,7 @@ PVR_PER_ARCH(g9p_graphics_pipeline_compile)(struct pvr_device *device,
 
    memset(state, 0, sizeof(*state));
    state->id = p_atomic_inc_return(&next_id);
+   state->is_seamful = seamful;
    if (getenv("G9P_DEBUG"))
       fprintf(stderr, "g9p: pipeline %u\n", state->id);
    for (unsigned i = 0; i < create_info->stageCount; i++) {
@@ -549,6 +549,21 @@ PVR_PER_ARCH(g9p_graphics_pipeline_compile)(struct pvr_device *device,
          result = stage_nir(device, pipeline, fs_info, mem_ctx, &fs_nir);
       if (result != VK_SUCCESS)
          goto out;
+      if (seamful) {
+         g9p_lower_cubes_seamful(vs_nir);
+         g9p_lower_cubes_seamful(fs_nir);
+      } else {
+         nir_foreach_function_impl (impl, vs_nir)
+            nir_foreach_block (block, impl)
+               nir_foreach_instr (instr, block)
+                  *has_cube |= instr->type == nir_instr_type_tex &&
+                               nir_instr_as_tex(instr)->sampler_dim == GLSL_SAMPLER_DIM_CUBE;
+         nir_foreach_function_impl (impl, fs_nir)
+            nir_foreach_block (block, impl)
+               nir_foreach_instr (instr, block)
+                  *has_cube |= instr->type == nir_instr_type_tex &&
+                               nir_instr_as_tex(instr)->sampler_dim == GLSL_SAMPLER_DIM_CUBE;
+      }
       slot = g9p_frag_coord_slot(vs_nir);
       result = compile_stage(device, fs_nir, fs_info, NULL, slot,
                              blend_options(vk_state, &blend) ? &blend : NULL, &fs, false, mem_ctx);
@@ -650,11 +665,29 @@ out:
    return result;
 }
 
-void
-PVR_PER_ARCH(g9p_graphics_pipeline_destroy)(struct pvr_graphics_pipeline *pipeline)
+VkResult
+PVR_PER_ARCH(g9p_graphics_pipeline_compile)(struct pvr_device *device,
+                                            const VkGraphicsPipelineCreateInfo *create_info,
+                                            struct pvr_graphics_pipeline *pipeline,
+                                            const struct vk_graphics_pipeline_state *vk_state)
 {
    struct pvr_g9p_graphics_state *state = &pipeline->g9p;
+   bool has_cube = false;
+   VkResult result = g9p_compile_state(device, create_info, pipeline, vk_state, state, false,
+                                       &has_cube);
 
+   if (result != VK_SUCCESS || !has_cube)
+      return result;
+   state->seamful = calloc(1, sizeof(*state->seamful));
+   if (!state->seamful)
+      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+   return g9p_compile_state(device, create_info, pipeline, vk_state, state->seamful, true,
+                            &has_cube);
+}
+
+static void
+g9p_state_destroy(struct pvr_g9p_graphics_state *state)
+{
    if (state->varyings.pvr_bo)
       pvr_bo_suballoc_free(state->varyings.pvr_bo);
    if (state->fs_kick.pvr_bo)
@@ -663,6 +696,16 @@ PVR_PER_ARCH(g9p_graphics_pipeline_destroy)(struct pvr_graphics_pipeline *pipeli
       pvr_bo_suballoc_free(state->vs_kick.pvr_bo);
    pvr_bo_suballoc_free(state->fs_bo);
    pvr_bo_suballoc_free(state->vs_bo);
+}
+
+void
+PVR_PER_ARCH(g9p_graphics_pipeline_destroy)(struct pvr_graphics_pipeline *pipeline)
+{
+   if (pipeline->g9p.seamful) {
+      g9p_state_destroy(pipeline->g9p.seamful);
+      free(pipeline->g9p.seamful);
+   }
+   g9p_state_destroy(&pipeline->g9p);
 }
 
 /* --- Draws ---------------------------------------------------------------- */
@@ -712,6 +755,68 @@ static VkResult upload_buffer_addrs(struct pvr_cmd_buffer *cmd_buffer, unsigned 
 static VkResult buffer_addrs(struct pvr_cmd_buffer *cmd_buffer, unsigned n,
                              const unsigned (*sets)[2], enum pvr_stage_allocation stage,
                              uint64_t *addrs);
+
+/*
+ * The texture state of a cube view sampled as a 2D array per face
+ * (g9p_lower_cubes_seamful()): layout 3, six layers at bit 111
+ */
+static VkResult
+seamful_tex_state(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_descriptor_set *set,
+                  unsigned offset, uint64_t *addr)
+{
+   const uint32_t *d = (const uint32_t *)((const uint8_t *)set->mapping + offset);
+   uint32_t w[4] = { d[0], d[1], d[2], d[3] };
+   struct pvr_suballoc_bo *bo;
+   VkResult result;
+
+   if ((w[0] & 7) != 6)
+      return VK_SUCCESS;
+   w[0] = (w[0] & ~7u) | 3;
+   w[3] |= 5u << 15;
+   result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, w, sizeof(w), &bo);
+   if (result == VK_SUCCESS)
+      *addr = bo->dev_addr.addr;
+   return result;
+}
+
+/* Bit 63 of the sampler word, which the hardware ignores: g9p_pack_sampler() */
+#define G9P_SAMPLER_SEAMFUL BITFIELD64_BIT(63)
+
+static bool
+tex_wants_seamful(const struct pvr_descriptor_state *desc, unsigned set_idx, unsigned binding,
+                  unsigned index)
+{
+   const struct pvr_descriptor_set *set = desc->sets[set_idx];
+
+   if (!set || !set->mapping)
+      return false;
+
+   const struct pvr_descriptor_set_layout_binding *b = &set->layout->bindings[binding];
+   const uint8_t *d = (const uint8_t *)set->mapping + b->offset + index * b->stride;
+   uint64_t sampler;
+
+   memcpy(&sampler, d + sizeof(struct pvr_image_descriptor), sizeof(sampler));
+   return (*(const uint32_t *)d & 7) == 6 && (sampler & G9P_SAMPLER_SEAMFUL);
+}
+
+static bool
+draw_wants_seamful(const struct pvr_cmd_buffer *cmd_buffer,
+                   const struct pvr_g9p_graphics_state *state)
+{
+   const struct pvr_descriptor_state *desc = &cmd_buffer->state.gfx_desc_state;
+
+   for (unsigned t = 0; t < state->num_textures; t++) {
+      if (tex_wants_seamful(desc, state->textures[t].set, state->textures[t].binding,
+                            state->textures[t].index))
+         return true;
+   }
+   for (unsigned t = 0; t < state->vs_num_textures; t++) {
+      if (tex_wants_seamful(desc, state->vs_textures[t].set, state->vs_textures[t].binding,
+                            state->vs_textures[t].index))
+         return true;
+   }
+   return false;
+}
 
 /*
  * The fragment shader's common store, DMA'd per draw by the program
@@ -778,9 +883,21 @@ upload_textures(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics
             dump32("texture descriptor", addr, (const uint32_t *)((uint8_t *)set->mapping + offset),
                    (sizeof(struct pvr_image_descriptor) + 8) / 4);
       }
+      uint64_t state_addr = addr;
+
+      if (set && state->is_seamful && set->mapping) {
+         const struct pvr_descriptor_set_layout_binding *b =
+            &set->layout->bindings[state->textures[t].binding];
+         const VkResult r = seamful_tex_state(cmd_buffer, set,
+                                              b->offset + state->textures[t].index * b->stride,
+                                              &state_addr);
+
+         if (r != VK_SUCCESS)
+            return r;
+      }
       for (unsigned k = 0; k < 3; k++) {
-         src[n] = k == 0 ? addr : k == 1 ? p->zeros->dev_addr.addr
-                                         : addr + sizeof(struct pvr_image_descriptor);
+         src[n] = k == 0 ? state_addr : k == 1 ? p->zeros->dev_addr.addr
+                                               : addr + sizeof(struct pvr_image_descriptor);
          ctrl[n++] = doutd_ctrl(k == 2 ? g9p_tex_sampler(0, state->num_textures, t)
                                        : g9p_tex_state(0, t) + 4 * k,
                                 k == 2 ? 2 : 4, false);
@@ -1044,6 +1161,12 @@ upload_vs_uniforms(struct pvr_cmd_buffer *cmd_buffer,
                                state->vs_textures[t].index * b->stride;
 
             memcpy(&block[g9p_tex_state(G9P_VS_TEX_BASE, t)], d, 16);
+            /* a cube sampled as a 2D array (seamful_tex_state()) */
+            if (state->is_seamful && (block[g9p_tex_state(G9P_VS_TEX_BASE, t)] & 7) == 6) {
+               block[g9p_tex_state(G9P_VS_TEX_BASE, t)] =
+                  (block[g9p_tex_state(G9P_VS_TEX_BASE, t)] & ~7u) | 3;
+               block[g9p_tex_state(G9P_VS_TEX_BASE, t) + 3] |= 5u << 15;
+            }
             memcpy(&block[g9p_tex_sampler(G9P_VS_TEX_BASE, state->vs_num_textures, t)],
                    d + sizeof(struct pvr_image_descriptor), 8);
          }
@@ -1283,7 +1406,10 @@ PVR_PER_ARCH(g9p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer,
 {
    struct pvr_cmd_buffer_state *cs = &cmd_buffer->state;
    const struct pvr_graphics_pipeline *pipeline = cs->gfx_pipeline;
-   const struct pvr_g9p_graphics_state *state = &pipeline->g9p;
+   const struct pvr_g9p_graphics_state *state =
+      pipeline->g9p.seamful && draw_wants_seamful(cmd_buffer, &pipeline->g9p)
+         ? pipeline->g9p.seamful
+         : &pipeline->g9p;
    const struct vk_dynamic_graphics_state *dyn = &cmd_buffer->vk.dynamic_graphics_state;
    const struct pvr_render_pass_info *info = &cs->render_pass_info;
    const uint32_t width = info->render_area.offset.x + info->render_area.extent.width;
@@ -1996,6 +2122,8 @@ PVR_PER_ARCH(g9p_pack_sampler)(const VkSamplerCreateInfo *info)
    w |= (uint64_t)g9p_sampler_address(info->addressModeU) << 29;
    w |= (uint64_t)g9p_sampler_address(info->addressModeV) << 32;
    w |= (uint64_t)g9p_sampler_address(info->addressModeW) << 35;
+   if (info->flags & VK_SAMPLER_CREATE_NON_SEAMLESS_CUBE_MAP_BIT_EXT)
+      w |= G9P_SAMPLER_SEAMFUL;
    if (getenv("G9P_DEBUG"))
       fprintf(stderr, "g9p: sampler filter %u/%u mip %u lod %f..%f address %u/%u/%u: %016" PRIx64 "\n",
               info->magFilter, info->minFilter, info->mipmapMode, info->minLod, info->maxLod,

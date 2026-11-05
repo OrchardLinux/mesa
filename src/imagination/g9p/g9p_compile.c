@@ -1841,7 +1841,7 @@ emit_tex_vertex(struct g9p_ctx *ctx, nir_tex_instr *tex)
    int lod = -1, coord, dst;
    unsigned at;
 
-   if (ci < 0 || slot < 0 || tex->is_shadow || tex->is_array ||
+   if (ci < 0 || slot < 0 || tex->is_shadow || (tex->is_array && cube) ||
        (!cube && !is3d && tex->sampler_dim != GLSL_SAMPLER_DIM_2D) ||
        (tex->op != nir_texop_tex && tex->op != nir_texop_txl) ||
        nir_tex_instr_src_index(tex, nir_tex_src_offset) >= 0) {
@@ -1862,12 +1862,22 @@ emit_tex_vertex(struct g9p_ctx *ctx, nir_tex_instr *tex)
    if (coord < 0)
       return false;
    ctx->temps |= BITFIELD64_RANGE(coord, 4);
-   for (unsigned c = 0; c < (cube || is3d ? 3 : 2); c++) {
+   for (unsigned c = 0; c < (cube || is3d || tex->is_array ? 3 : 2); c++) {
       const int r = src_reg(ctx, nir_get_scalar(tex->src[ci].src.ssa, c));
 
       if (r < 0)
          return false;
-      g9p_alu2(ctx->c, G9P_OR, coord + c, r, r, false);
+      if (c == 2 && tex->is_array) {
+         /* the layer as an integer, uint(z + 0.5), as in fragment shaders */
+         const int half = const_reg(ctx, 0x3f000000);
+
+         if (half < 0)
+            return false;
+         g9p_alu2(ctx->c, G9P_FADD, coord + 2, r, half, false);
+         g9p_convert(ctx->c, coord + 2, coord + 2, G9P_F2U);
+      } else {
+         g9p_alu2(ctx->c, G9P_OR, coord + c, r, r, false);
+      }
    }
    /* The cube op reads r0-r2 (no other source in Apple's code), reserved in such a shader */
    if (cube) {
@@ -1892,6 +1902,9 @@ emit_tex_vertex(struct g9p_ctx *ctx, nir_tex_instr *tex)
       ctx->c->w[at + 2] |= 0x8000;
    } else if (is3d) {
       ctx->c->w[at] = (ctx->c->w[at] & ~0x0f00) | G9P_TEX_3D << 8;
+   } else if (tex->is_array) {
+      ctx->c->w[at] = (ctx->c->w[at] & ~0x0f00) | G9P_TEX_2D_ARRAY << 8;
+      ctx->c->w[at + 2] |= 0x8000;
    }
    g9p_wait(ctx->c);
    release(ctx, &tex->instr);
@@ -2812,6 +2825,55 @@ lower_dynamic_ubo_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    }
    nir_def_replace(&intr->def, value);
    return true;
+}
+
+/*
+ * Seamful cube sampling for samplers with
+ * VK_SAMPLER_CREATE_NON_SEAMLESS_CUBE_MAP_BIT_EXT: this hardware filters across
+ * faces with no mode to turn that off, so such a draw samples a 2D array per
+ * face instead (GL's cube map equations; the draw's texture state says 2D array).
+ */
+static bool
+lower_cube_seamful(nir_builder *b, nir_tex_instr *tex, void *data)
+{
+   const int ci = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+
+   if (tex->sampler_dim != GLSL_SAMPLER_DIM_CUBE || tex->is_array || tex->is_shadow || ci < 0)
+      return false;
+   b->cursor = nir_before_instr(&tex->instr);
+
+   nir_def *c = tex->src[ci].src.ssa;
+   nir_def *x = nir_channel(b, c, 0), *y = nir_channel(b, c, 1), *z = nir_channel(b, c, 2);
+   nir_def *ax = nir_fabs(b, x), *ay = nir_fabs(b, y), *az = nir_fabs(b, z);
+   nir_def *is_z = nir_fge(b, az, nir_fmax(b, ax, ay));
+   nir_def *is_y = nir_fge(b, ay, ax);
+   nir_def *px = nir_fge_imm(b, x, 0), *py = nir_fge_imm(b, y, 0), *pz = nir_fge_imm(b, z, 0);
+   nir_def *sc = nir_bcsel(b, is_z, nir_bcsel(b, pz, x, nir_fneg(b, x)),
+                           nir_bcsel(b, is_y, x, nir_bcsel(b, px, nir_fneg(b, z), z)));
+   nir_def *tc = nir_bcsel(b, is_z, nir_fneg(b, y),
+                           nir_bcsel(b, is_y, nir_bcsel(b, py, z, nir_fneg(b, z)), nir_fneg(b, y)));
+   nir_def *ma = nir_bcsel(b, is_z, az, nir_bcsel(b, is_y, ay, ax));
+   nir_def *face = nir_bcsel(b, is_z, nir_bcsel(b, pz, nir_imm_float(b, 4), nir_imm_float(b, 5)),
+                             nir_bcsel(b, is_y, nir_bcsel(b, py, nir_imm_float(b, 2), nir_imm_float(b, 3)),
+                                       nir_bcsel(b, px, nir_imm_float(b, 0), nir_imm_float(b, 1))));
+   nir_def *half_rcp = nir_fmul_imm(b, nir_frcp(b, ma), 0.5);
+
+   nir_src_rewrite(&tex->src[ci].src,
+                   nir_vec3(b, nir_fadd_imm(b, nir_fmul(b, sc, half_rcp), 0.5),
+                            nir_fadd_imm(b, nir_fmul(b, tc, half_rcp), 0.5), face));
+   tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
+   tex->is_array = true;
+   tex->coord_components = 3;
+   return true;
+}
+
+bool
+g9p_lower_cubes_seamful(nir_shader *nir)
+{
+   bool progress = false;
+
+   NIR_PASS(progress, nir, nir_shader_tex_pass, lower_cube_seamful, nir_metadata_control_flow, NULL);
+   return progress;
 }
 
 /* Optimization, out of SSA, then code for @ctx->stage */

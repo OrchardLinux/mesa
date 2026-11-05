@@ -133,6 +133,12 @@ struct pvr_g9p_compute_state {
 struct pvr_g9p_graphics_state {
    /* a number for debug output (G9P_DEBUG prints it before its shaders) */
    unsigned id;
+   /*
+    * With cube samples: the same pipeline sampling them as 2D arrays per face,
+    * for draws whose sampler asks for no filtering across faces
+    */
+   struct pvr_g9p_graphics_state *seamful;
+   bool is_seamful;
    struct pvr_suballoc_bo *vs_bo, *fs_bo;
    /* vertex kick (code and data), fragment kick bundle, DOUTI program */
    struct pvr_pds_upload vs_kick, fs_kick, varyings;
