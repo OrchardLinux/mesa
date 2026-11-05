@@ -61,6 +61,7 @@ PVR_PER_ARCH(g5p_compute_pipeline_compile)(
       state->buffers[i].binding = shader.buffers[i].binding;
    }
    state->num_regs = shader.num_regs;
+   pipeline->const_shared_regs_count = shader.a9_local_dwords;
    state->uses_workgroup_id = shader.uses_workgroup_id;
    memcpy(state->local_size, shader.local_size, sizeof(state->local_size));
 
@@ -217,7 +218,8 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
          G9P_CDM_KERNEL_REGS(state->num_regs) | G9P_CDM_ANY_CLUSTER | G9P_CDM_FENCE |
             G9P_CDM_DATA_BLOCKS(G9P_KERNEL_DATA_DWORDS / 4),
          kernel.data_offset, kernel.code_offset, group_count[0], group_count[1],
-         group_count[2], threads, DIV_ROUND_UP(4 * (2 * n + 1), 64));
+         group_count[2], threads, MAX2(DIV_ROUND_UP(4 * (2 * n + 1), 64),
+                         DIV_ROUND_UP(pipeline->const_shared_regs_count, 16)));
 
       pvr_csb_set_relocation_mark(csb);
       emit_record(csb, &bind_rec);

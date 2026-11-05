@@ -2,32 +2,47 @@
 #ifdef PVR_APPLE_G5P
 /* Static threadgroup operands: A9 host-compiler forms (compute.md §4).
  * Reserve TG0/1 for IDs and TG2/3 for the future software-barrier counters.
- * Current one-common-chunk path admits at most32 shared bytes. */
+ * CDM allocation covers system words plus the native shared block. */
+/* S and RI address forms from compute-isa-shared-atomic.md §1.3.
+ * RI reads a temporary half index for the last time (short parcel8800).
+ * The uint32->half conversion uses the helper's explicitly inferred1189 form. */
 static bool a9_shared(struct g9p_ctx *ctx, nir_intrinsic_instr *in)
 {
    bool load = in->intrinsic == nir_intrinsic_load_shared;
    nir_src offset = in->src[load ? 0 : 1];
    unsigned bits = load ? in->def.bit_size : nir_src_bit_size(in->src[0]);
    unsigned comps = load ? in->def.num_components : nir_src_num_components(in->src[0]);
-   if (!ctx->out->a9 || !nir_src_is_const(offset) || bits != 32 || comps != 1)
+   if (!ctx->out->a9 || bits != 32 || comps != 1 || (nir_intrinsic_base(in) & 3))
       return false;
-   unsigned byte = nir_src_as_uint(offset) + nir_intrinsic_base(in);
-   if ((byte & 3) || byte >= 32) return false;
-   unsigned word = 4 + byte / 4;
-   if (load) {
-      release(ctx, &in->instr);
-      int dst = alloc_reg(ctx);
-      if (dst < 0) return false;
-      g9p_tg_load(ctx->c, dst, word);
-      g9p_wait(ctx->c);
-      ctx->reg[key(&in->def, 0)] = dst;
+   unsigned word = 4 + nir_intrinsic_base(in) / 4;
+   bool constant = nir_src_is_const(offset);
+   int index = -1;
+   if (constant) {
+      unsigned byte = nir_src_as_uint(offset);
+      if (byte & 3) return false;
+      word += byte / 4;
    } else {
-      int src = src_reg(ctx, nir_get_scalar(in->src[0].ssa, 0));
-      if (src < 0) return false;
-      G9P_EMIT(ctx->c, 0x2314, 0x0180 | 2 * src, 0x8100 | word, 0x0200);
-      g9p_wait(ctx->c);
-      release(ctx, &in->instr);
+      int src = src_reg(ctx, nir_get_scalar(offset.ssa, 0));
+      int shift = const_reg(ctx, 2);
+      index = alloc_temp(ctx);
+      if (src < 0 || shift < 0 || index < 0) return false;
+      g9p_shift(ctx->c, index, src, shift, true);
+      G9P_EMIT(ctx->c, 0x1189, 0x0300 | 2 * index,
+               0x0101 | index << 10, 0x0120, 0x0fa1, 0x4000);
    }
+   int reg = load ? alloc_reg(ctx) : src_reg(ctx, nir_get_scalar(in->src[0].ssa, 0));
+   if (reg < 0 || word >= 65536) return false;
+   unsigned w1 = 0x0100 | (!load ? 0x80 : 0) | 2 * reg;
+   if (constant) {
+      G9P_EMIT(ctx->c, 0x2314, w1, 0x8100 | (word & 255), 0x0200 | (word >> 8));
+   } else {
+      w1 |= (2 * index) << 9;
+      if (word < 256) G9P_EMIT(ctx->c, 0x2314, w1, 0x8800 | word);
+      else G9P_EMIT(ctx->c, 0x2314, w1, 0x8900 | (word & 255), word >> 8);
+   }
+   g9p_wait(ctx->c);
+   release(ctx, &in->instr);
+   if (load) ctx->reg[key(&in->def, 0)] = reg;
    return true;
 }
 static bool a9_barrier(struct g9p_ctx *ctx, nir_intrinsic_instr *in)
