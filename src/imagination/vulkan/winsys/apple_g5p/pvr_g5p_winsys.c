@@ -365,7 +365,7 @@ static void g5p_ws_vma_unmap(struct pvr_winsys_vma *vma)
 /* ---- buffers ---- */
 
 /* One wait of a VM edit the kernel refused with EBUSY: every live render context's last job, the lock not held */
-static void g5p_ws_wait_jobs(struct g5p_ws *ws, int64_t deadline);
+static int g5p_ws_wait_jobs(struct g5p_ws *ws, int64_t deadline);
 
 /* A VM edit (own BO create, import, destroy) that the kernel refuses with EBUSY while a render job of this file
  * is queued (g5p_render_vm_idle(): "G5P VM_BIND busy=render-idle" in dmesg): wait for the jobs and try again, for
@@ -817,22 +817,31 @@ struct g5p_ws_render_ctx {
 };
 
 /* A private snapshot holds its fence alive while the winsys lock is dropped. */
-static void g5p_ws_wait_jobs(struct g5p_ws *ws, int64_t deadline)
+static int g5p_ws_wait_jobs(struct g5p_ws *ws, int64_t deadline)
 {
    uint32_t snapshot = 0;
+   int r = 0;
    simple_mtx_lock(&ws->lock);
-   if (ws->context && ws->context->last &&
-       !drmSyncobjCreate(ws->base.render_fd, 0, &snapshot) &&
-       drmSyncobjTransfer(ws->base.render_fd, snapshot, 0, ws->context->last, 0, 0)) {
-      drmSyncobjDestroy(ws->base.render_fd, snapshot);
-      snapshot = 0;
+   if (ws->context && ws->context->last) {
+      if (drmSyncobjCreate(ws->base.render_fd, 0, &snapshot))
+         r = -errno;
+      else if (drmSyncobjTransfer(ws->base.render_fd, snapshot, 0, ws->context->last, 0, 0))
+         r = -errno;
    }
    simple_mtx_unlock(&ws->lock);
    if (snapshot) {
-      drmSyncobjWait(ws->base.render_fd, &snapshot, 1, deadline, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL);
+      if (!r) {
+         do {
+            r = drmSyncobjWait(ws->base.render_fd, &snapshot, 1, deadline,
+                               DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL) ? -errno : 0;
+         } while (r == -EINTR && os_time_get_nano() < deadline);
+      }
       drmSyncobjDestroy(ws->base.render_fd, snapshot);
    }
+   /* A first-claim contention can leave the last fence already signalled.
+    * Yield even then rather than spinning on admission. */
    os_time_sleep(1000);
+   return r;
 }
 
 /* Called by both engine wrappers. No kernel allocation until the first submit. */
@@ -1255,10 +1264,47 @@ static VkResult g5p_ws_render_submit(const struct pvr_winsys_render_ctx *ctx,
    uint32_t sig = signal ? vk_sync_as_drm_syncobj(signal)->syncobj : local_signal;
    if (local_signal)
       syncs[n++] = (struct drm_g5p_sync){.handle = sig, .flags = DRM_G5P_SYNC_SIGNAL};
-   r = g5p_drm_submit_render_typed(&ws->drm, c->context, rt_handle, &pass, res, nres, syncs, n, &job_id);
-   if (!r && drmSyncobjTransfer(ws->base.render_fd, c->last, 0, sig, 0, 0)) r = -errno;
-   if (!r && frag && geom && drmSyncobjTransfer(ws->base.render_fd,
-       vk_sync_as_drm_syncobj(geom)->syncobj, 0, sig, 0, 0)) r = -errno;
+   const int64_t deadline = os_time_get_nano() + G5P_WS_BUSY_NS;
+   unsigned busy_retries = 0;
+   const char *operation = "SUBMIT_RENDER_TYPED";
+   bool accepted = false;
+   for (;;) {
+      r = g5p_drm_submit_render_typed(&ws->drm, c->context, rt_handle, &pass, res, nres, syncs, n, &job_id);
+      /* release9d rejects queued>=max_queued_jobs before acceptance. Retry
+       * only EBUSY: EINTR/EFAULT may follow acceptance and are never replayed.
+       * Another queue can publish a dependency while we wait on a retained
+       * snapshot of the last accepted fence, so do not hold the winsys lock. */
+      if (r != -EBUSY || busy_retries >= 2048 || os_time_get_nano() >= deadline)
+         break;
+      if (!busy_retries)
+         mesa_logw("apple_g5p render: backpressure context=%u rt=%u max_queued=%u; waiting before retry",
+                   c->context, rt_handle, ws->render.max_queued_jobs);
+      busy_retries++;
+      simple_mtx_unlock(&ws->lock);
+      r = g5p_ws_wait_jobs(ws, deadline);
+      simple_mtx_lock(&ws->lock);
+      if (r) {
+         operation = "backpressure fence wait";
+         break;
+      }
+      if (os_time_get_nano() >= deadline) {
+         r = -EBUSY;
+         break;
+      }
+   }
+   if (!r) {
+      accepted = true;
+      operation = "SYNCOBJ_TRANSFER last";
+      if (drmSyncobjTransfer(ws->base.render_fd, c->last, 0, sig, 0, 0)) r = -errno;
+   }
+   if (!r && frag && geom) {
+      operation = "SYNCOBJ_TRANSFER geometry";
+      if (drmSyncobjTransfer(ws->base.render_fd,
+          vk_sync_as_drm_syncobj(geom)->syncobj, 0, sig, 0, 0)) r = -errno;
+   }
+   if (busy_retries)
+      mesa_logw("apple_g5p render: backpressure context=%u retries=%u accepted=%u job=%" PRIu64 " result=%d",
+                c->context, busy_retries, accepted, job_id, r);
    if (local_signal) drmSyncobjDestroy(ws->base.render_fd, local_signal);
    simple_mtx_unlock(&ws->lock);
    g5p_ws_perf_account(&ws->perf, res, nres, nchunks, t0);
@@ -1273,8 +1319,9 @@ static VkResult g5p_ws_render_submit(const struct pvr_winsys_render_ctx *ctx,
       simple_mtx_unlock(&ws->lock);
    }
    if (r)
-      return g5p_ws_refuse(r == -ENOMEM ? VK_ERROR_OUT_OF_DEVICE_MEMORY : VK_ERROR_DEVICE_LOST,
-                           "SUBMIT_RENDER_TYPED/fence tracking: %s", strerror(-r));
+      return g5p_ws_refuse(r == -ENOMEM || r == -EBUSY ? VK_ERROR_OUT_OF_DEVICE_MEMORY : VK_ERROR_DEVICE_LOST,
+                           "%s: %s context=%u rt=%u accepted=%u job=%" PRIu64 " retries=%u",
+                           operation, strerror(-r), c->context, rt_handle, accepted, job_id, busy_retries);
 
    return VK_SUCCESS;
 }
