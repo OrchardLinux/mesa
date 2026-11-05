@@ -220,7 +220,8 @@ struct gctx {
    int8_t vary_idx[PCO_G5P_VARYING_SLOTS]; /* FS: VARn -> c->p->vary[], -1 when not read */
    bool lazy_iter; /* FS pressure retry: each varying is read where the program loads it */
    /* vertex output */
-   struct { unsigned slot; struct ref r; int at; } vout[72]; /* at: eager emission point, -1 = the end */
+   /* position, every VARn, point size; at: eager emission point, -1 = the end */
+   struct { unsigned slot; struct ref r; int at; } vout[4 + 4 * PCO_G5P_VARYING_SLOTS + 4];
    unsigned nvout;
    const struct pco_g5p_vs_link *link;
    unsigned psize_dword; /* a point pipeline's point size: the last output dword */
@@ -1185,8 +1186,11 @@ static void plan_vs_layout(struct gctx *c)
     * alpha for the size) */
    if (c->link && c->link->point_size)
       c->psize_dword = c->p->outputs++;
-   if (c->p->outputs > 255)
-      refuse(c, "%u output dwords", c->p->outputs);
+   /* The A9 TA vertex holds 128 dwords, the position included
+    * (varyings-capacity-1: 124 varying components exact, 128 wrong as a
+    * whole with no GPU event); refuse past it by name, never draw it. */
+   if (c->p->outputs > 128)
+      refuse(c, "%u output dwords (the A9 TA vertex holds 128)", c->p->outputs);
    if (!c->eager_vout)
       return;
    /* Eager outputs: the program-order last written component ends the task. */
@@ -1239,11 +1243,14 @@ static void plan_varyings(struct gctx *c)
       mask[n] |= BITFIELD_MASK(in->def.num_components) << nir_intrinsic_component(in);
    }
    if (util_bitcount(read) > PCO_G5P_MAX_FS_VARYINGS)
-      refuse(c, "%u varying locations read (Apple's A9 limit: 60 components, %u vec4)", util_bitcount(read),
+      refuse(c, "%u varying locations read (%u vec4: the reported 64 components)", util_bitcount(read),
              PCO_G5P_MAX_FS_VARYINGS);
    bool w = false;
    u_foreach_bit(n, read)
       w |= interp[n] == PCO_G5P_INTERP_SMOOTH;
+   /* the last location's last component must fit the u7 iterator slot */
+   if ((w ? 1 : 0) + 4 * util_bitcount(read) > 128)
+      refuse(c, "%u varying locations with W exceed the u7 iterator slot", util_bitcount(read));
    unsigned i = 0;
    u_foreach_bit(n, read) {
       c->p->vary[i] = (struct pco_g5p_varying){.location = n, .set = (w ? 1 : 0) + 4 * i, .interp = interp[n],
@@ -3420,7 +3427,13 @@ static void read_varying(struct gctx *c, nir_intrinsic_instr *in, struct drc *d)
       any |= V(c, &in->def, j)->uses > 0;
    if (!any)
       return;
-   if (v->interp == PCO_G5P_INTERP_FLAT) {
+   /* A flat set past the u8 C-term load (coefficient dword >= 256: the
+    * 16th location's last components) is iterated without perspective: the
+    * flat DOUTI shade model gives a constant plane (A = B = 0), so
+    * A*x + B*y + C is exactly C (varyings-capacity-1: c124f, 31 flat
+    * locations, exact on the A9). */
+   const bool flat_iterated = v->interp == PCO_G5P_INTERP_FLAT && 4 * (slot + n - 1) + 2 >= 256;
+   if (v->interp == PCO_G5P_INTERP_FLAT && !flat_iterated) {
       /* The C term of each component's coefficient set (Apple's `14 23`). */
       for (unsigned j = 0; j < n; j++) {
          struct val *val = V(c, &in->def, j);
@@ -3436,8 +3449,8 @@ static void read_varying(struct gctx *c, nir_intrinsic_instr *in, struct drc *d)
       c->p->evidence |= PCO_G5P_EV_ITERATOR;
       return;
    }
-   unsigned flags = (v->interp == PCO_G5P_INTERP_NOPERSPECTIVE ? G5P_ITER_LINEAR : 0) |
-                    (v->centroid ? G5P_ITER_CENTROID : 0);
+   unsigned flags = (v->interp == PCO_G5P_INTERP_NOPERSPECTIVE || flat_iterated ? G5P_ITER_LINEAR : 0) |
+                    (v->centroid && !flat_iterated ? G5P_ITER_CENTROID : 0);
    if (drc_take(c, d))
       flags |= G5P_ITER_DRC1;
    unsigned dst = alloc_run(c, n, "varying");
@@ -4097,7 +4110,14 @@ static unsigned varying_reads(struct gctx *c, nir_intrinsic_instr *in)
    unsigned n = 0;
    for (unsigned j = 0; j < in->def.num_components; j++)
       n += V(c, &in->def, j)->uses > 0;
-   return in == c->narrow_iter ? 1 : !n ? 0 : vary_of(c, in)->interp == PCO_G5P_INTERP_FLAT ? n : 1;
+   if (in == c->narrow_iter)
+      return 1;
+   if (!n)
+      return 0;
+   /* flat: one C-term load per used component, or one iterator past dword 255 (read_varying()) */
+   const bool loaded = vary_of(c, in)->interp == PCO_G5P_INTERP_FLAT &&
+                       4 * (varying_slot(c, in) + in->def.num_components - 1) + 2 < 256;
+   return loaded ? n : 1;
 }
 
 /* Fragment varyings (and gl_FragCoord.xy) read ahead of the body in program
