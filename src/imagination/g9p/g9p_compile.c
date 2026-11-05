@@ -1102,7 +1102,7 @@ emit_vec(struct g9p_ctx *ctx, nir_alu_instr *alu)
    release(ctx, &alu->instr);
    return true;
 }
-
+#include "g9p_a9_alu.h"
 static bool
 emit_alu(struct g9p_ctx *ctx, nir_alu_instr *alu)
 {
@@ -1120,7 +1120,7 @@ emit_alu(struct g9p_ctx *ctx, nir_alu_instr *alu)
    }
    for (unsigned i = 0; i < num_inputs; i++)
       s[i] = nir_get_scalar(alu->src[i].src.ssa, alu->src[i].swizzle[0]);
-
+   G9P_A9_ALU_LITERAL_FMA();
    /* compared where it is used (emit_branch_cmp()) */
    if (branch_compare(&alu->def))
       return true;
@@ -1181,7 +1181,7 @@ emit_alu(struct g9p_ctx *ctx, nir_alu_instr *alu)
          if (r[0] < 0)
             return false;
          release(ctx, &alu->instr);
-         dst = alloc_reg(ctx);
+         dst = G9P_A9_ALU_SINGLE_DEST();
          if (dst < 0)
             return false;
          g9p_add_imm(ctx->c, dst, r[0], imm);
@@ -1191,7 +1191,7 @@ emit_alu(struct g9p_ctx *ctx, nir_alu_instr *alu)
    }
    if (alu->op == nir_op_mov && is_const(s[0], &imm)) {
       release(ctx, &alu->instr);
-      dst = alloc_reg(ctx);
+      dst = G9P_A9_ALU_SINGLE_DEST();
       if (dst < 0)
          return false;
       g9p_mov_imm(ctx->c, dst, imm);
@@ -3433,7 +3433,7 @@ emit_branch_cmp(struct g9p_ctx *ctx, nir_if *nif, bool *sense)
    case nir_op_ieq32:  cond = G9P_EQ;  *sense = true;  break;
    default:            cond = G9P_EQ;  *sense = false; break; /* ine32 */
    }
-   a = src_reg(ctx, nir_get_scalar(cmp->src[0].src.ssa, cmp->src[0].swizzle[0]));
+   a = src_reg(ctx, nir_get_scalar(cmp->src[0].src.ssa, cmp->src[0].swizzle[0])); G9P_A9_BRANCH_IMMEDIATE();
    b = src_reg(ctx, nir_get_scalar(cmp->src[1].src.ssa, cmp->src[1].swizzle[0]));
    if (a < 0 || b < 0)
       return false;

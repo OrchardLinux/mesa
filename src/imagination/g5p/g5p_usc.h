@@ -269,6 +269,9 @@ struct g5p_lit3 {
    bool result_half;
 };
 unsigned g5p_usc_literal_ternary(uint8_t *out, const struct g5p_lit3 *t);
+/* FP32 FMA: full-width literal multiplicand and addend, no rounding between. */
+unsigned g5p_usc_fma_f32_literals(uint8_t *out, unsigned dst_half, unsigned b_half,
+                                   uint32_t multiplier, uint32_t addend, unsigned bank);
 unsigned g5p_usc_repeat_fma(uint8_t *out, unsigned dst_half, struct g5p_src a, struct g5p_src b,
                             struct g5p_ctl k);
 unsigned g5p_usc_predicated_sfu(uint8_t *out, unsigned dst_half, struct g5p_src s, unsigned bank,

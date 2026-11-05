@@ -1267,6 +1267,21 @@ unsigned g5p_usc_literal_ternary(uint8_t *out, const struct g5p_lit3 *t)
    return finish(out, raw, n);
 }
 
+/* Strict compute-speed fma4/fma4_fs witnesses. C bit9 remains unmapped;
+ * callers retain the register-source path for those constants. */
+unsigned g5p_usc_fma_f32_literals(uint8_t *out, unsigned dst_half, unsigned b_half,
+                                   uint32_t multiplier, uint32_t addend, unsigned bank)
+{
+   const struct g5p_lit3 t = {
+      .opcode = 0x4c, .dst_half = dst_half, .value = multiplier,
+      .b_half = b_half, .b_group = 0, .c_literal = true, .c_value = addend,
+      .k = {.bank = bank, .header = bank ? 0x11 : 1},
+      .operation_control = 0, .routing = 0x70, .long_form = 1, .c_long_form = 1,
+   };
+   CHECK(bank <= 1, "invalid FMA register bank");
+   return g5p_usc_literal_ternary(out, &t);
+}
+
 unsigned g5p_usc_repeat_fma(uint8_t *out, unsigned dst_half, struct g5p_src a, struct g5p_src b,
                             struct g5p_ctl k)
 {

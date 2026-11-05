@@ -2690,6 +2690,22 @@ static void emit_ffma(struct gctx *c, nir_alu_instr *a)
             x.neg = false;
          }
          uint16_t h;
+         if (!x.abs && !f16_exact(bits, &h) && is_const(c, r[2]) &&
+             (!getenv("PVR_G5P_FMA_LITERALS") || strcmp(getenv("PVR_G5P_FMA_LITERALS"), "0"))) {
+            uint32_t addend = V(c, r[2].def, r[2].comp)->imm;
+            if (!(addend & 0x200)) {
+               unsigned xr = reg_of(c, x, "full-f32 literal ffma");
+               bool dx = dies(c, x);
+               struct ref operands[3] = {lit, x, r[2]};
+               free_dying(c, operands, 3);
+               unsigned dst = alloc_reg(c, dx ? (int)xr : -1);
+               put(c, raw, g5p_usc_fma_f32_literals(raw, 2 * dst, 2 * xr, bits, addend, 0),
+                   "full-f32 literal ffma");
+               c->p->evidence |= PCO_G5P_EV_FS_ALU;
+               define(c, &a->def, dst);
+               return;
+            }
+         }
          if (x.abs || !f16_exact(bits, &h))
             continue;
          unsigned xr = reg_of(c, x, "ffma literal"), cr = reg_of(c, r[2], "ffma literal");
