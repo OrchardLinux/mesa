@@ -1573,8 +1573,9 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
    uint32_t fdata[4 * 2 * PVR_G5P_MAX_FETCH + 8] = { 0 };
    /* a first instance takes the program that adds it to t1 */
    const bool base_instance = draw->first_instance && fetch_reads_instance(g);
-   const struct pvr_pds_upload *fetch_code = draw->indirect_addr ? &g->fetch_indirect :
-                                                 base_instance ? &g->fetch_base : &g->fetch;
+   /* The A9 indirect variant reads ptemp1, but its initializer is not yet
+    * recovered/qualified. Keep base-zero indirect on the proven fetch. */
+   const struct pvr_pds_upload *fetch_code = base_instance ? &g->fetch_base : &g->fetch;
    const unsigned fbytes = fetch_data_bytes(g, base_instance);
    if (base_instance)
       fdata[fetch_base_instance(g->fetch_count)] = draw->first_instance;
@@ -1602,13 +1603,13 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
          /* divisor 0: every instance reads the first instance's element */
          const bool divisor0 = fe->rate == PVR_G5P_FETCH_INSTANCE_DIVISOR0;
          const uint64_t base = vb->buffer->dev_addr.addr + vb->offset + fe->offset +
-                               (divisor0 && !draw->indirect_addr ? (uint64_t)draw->first_instance * stride : 0);
+                               (divisor0 ? (uint64_t)draw->first_instance * stride : 0);
          const uint64_t ctl = ddmad_src3(fe->dwords, fe->ao, f == g->fetch_count - 1);
          fdata[8 * f] = (uint32_t)base;
          fdata[8 * f + 1] = (uint32_t)(base >> 32);
          fdata[8 * f + 4] = (uint32_t)ctl;
          fdata[8 * f + 5] = (uint32_t)(ctl >> 32);
-         fdata[8 * f + 6] = divisor0 && !draw->indirect_addr ? 0 : stride;
+         fdata[8 * f + 6] = divisor0 ? 0 : stride;
       }
    }
    struct pvr_pds_upload fetch_data;

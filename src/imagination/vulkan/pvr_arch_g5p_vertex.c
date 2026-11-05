@@ -227,10 +227,10 @@ PVR_PER_ARCH(g5p_cmd_draw_indirect)(struct pvr_cmd_buffer *cmd_buffer, struct pv
        (count > 1 && (stride < size || stride % 4 ||
                      (uint64_t)(count - 1) * stride > buffer->vk.size - offset - size)))
       return G5P_REFUSE(cmd_buffer, "indirect graphics argument range/alignment");
-   /* The native VDM supplies firstInstance in PDS persistent temporary 1.
-    * The indirect vertex-fetch variant applies it on the GPU. XFB's CPU
-    * resolve cannot account for unknown GPU counts and refuses.
-    */
+   /* A9's indirect fetch reads ptemp1, but INDEX_LIST alone does not
+    * initialize it (qualification failed). Until the producer is recovered,
+    * drawIndirectFirstInstance is false and valid arguments have base zero.
+    * XFB's CPU resolve cannot account for GPU counts and refuses. */
    for (unsigned i = 0; i < count; i++) {
       const struct pvr_g5p_draw draw = {
          .count = 1, .instances = 1, .indexed = indexed,
