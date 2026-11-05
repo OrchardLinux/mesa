@@ -259,6 +259,7 @@ struct gctx {
    unsigned ndecls;
    unsigned st;       /* mask-stack register (dword): the one after the program's own */
    int st_last;       /* count pass: index of the last stack operation */
+   bool reserve_st31; /* pressure retry: keep r31 free for the mask stack */
    /* per codegen pass */
    bool decl_held[G5P_MAX_DECLS];
    bool stack_used;   /* a stack operation was put: pushes read the register */
@@ -5561,6 +5562,8 @@ static bool codegen(struct gctx *c)
       plan_common(c);
       plan_fs_output(c);
       c->reserved = BITFIELD_RANGE(0, c->mrt.words); /* packed colour halves, o0..o(2N-1) */
+      if (c->cf && c->reserve_st31)
+         c->reserved |= BITFIELD_BIT(NUM_DWORDS - 1);
       c->max_dword = c->mrt.words;
       if (c->cf && !c->count_pass)
          c->reserved |= BITFIELD_BIT(c->st); /* the mask stack, above every register of the count pass */
@@ -5659,20 +5662,29 @@ static bool two_pass(struct gctx *c)
    if (!c->vs && !(c->key->last_read_groups || c->cf))
       return codegen(c);
    c->count_pass = true;
-   c->st = 0;
+   c->st = c->reserve_st31 ? NUM_DWORDS - 1 : 0;
    c->st_last = -1;
    if (!codegen(c))
       return false;
    if (c->cf) {
-      c->st = c->max_dword; /* the register after the program's own, as Apple's */
-      if (c->st >= NUM_DWORDS) {
+      /* The ordinary path keeps Apple's allocation: the stack is the first
+       * register after the program. If that first count used all 32 low
+       * registers, reserve r31 and count again. The second count then fails
+       * at the real pressure point, allowing the existing high-register-home
+       * retry to park a live value above r31 instead of discovering the full
+       * bank only after every value has been released at program end. */
+      if (!c->reserve_st31 && c->max_dword >= NUM_DWORDS) {
          free(c->p->code);
          c->p->code = NULL;
-         snprintf(c->p->refusal, sizeof(c->p->refusal),
-                  "fragment: register pressure: no register left for the mask stack (%u of %u in use)",
-                  c->max_dword, NUM_DWORDS);
-         return false;
+         codegen_reset(c);
+         c->reserve_st31 = true;
+         c->count_pass = true;
+         c->st = NUM_DWORDS - 1;
+         c->st_last = -1;
+         if (!codegen(c))
+            return false;
       }
+      c->st = c->reserve_st31 ? NUM_DWORDS - 1 : c->max_dword;
    }
    free(c->p->code);
    codegen_reset(c);
