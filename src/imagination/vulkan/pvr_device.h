@@ -101,6 +101,9 @@ struct pvr_device {
          /* load op: the old target sampled at the pixel position, and its kick */
          struct pvr_suballoc_bo *load_usc;
          struct pvr_pds_upload load_kick;
+         /* depth/stencil clear draws: the tile's colour unchanged, and its kick */
+         struct pvr_suballoc_bo *keep_usc;
+         struct pvr_pds_upload keep_kick;
          /* vkCmdClearAttachments: a vertex shader of (x, y) pairs and its kick */
          struct pvr_suballoc_bo *clear_vs_usc;
          struct pvr_pds_upload clear_vs_kick;

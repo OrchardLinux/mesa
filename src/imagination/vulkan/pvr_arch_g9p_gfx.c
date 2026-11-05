@@ -195,6 +195,16 @@ PVR_PER_ARCH(g9p_gfx_device_init)(struct pvr_device *device)
    if (result != VK_SUCCESS)
       goto out;
 
+   /* Depth/stencil clear draws: the tile's own colour back, the same as a colour mask of 0 */
+   c->n = 0;
+   c->fragment = true;
+   g9p_tile_read(c, 0);
+   g9p_wait(c);
+   g9p_end_fragment(c, true);
+   result = upload_usc(device, c, &p->keep_usc);
+   if (result != VK_SUCCESS)
+      goto out;
+
    /* Register 0x470's program: a jump to `015e a000` (as captured) */
    c->n = 0;
    {
@@ -267,6 +277,8 @@ PVR_PER_ARCH(g9p_gfx_device_init)(struct pvr_device *device)
 
    result = upload_kick(device, p->clear_usc, 8, 0, &p->clear_kick);
    if (result == VK_SUCCESS)
+      result = upload_kick(device, p->keep_usc, 8, 0, &p->keep_kick);
+   if (result == VK_SUCCESS)
       result = upload_kick(device, p->load_usc, 8, 0, &p->load_kick);
    if (result == VK_SUCCESS)
       result = upload_kick(device, p->vdm_end_usc, 8, 0, &p->vdm_end);
@@ -313,11 +325,14 @@ PVR_PER_ARCH(g9p_gfx_device_finish)(struct pvr_device *device)
       pvr_bo_suballoc_free(p->vdm_end.pvr_bo);
    if (p->clear_kick.pvr_bo)
       pvr_bo_suballoc_free(p->clear_kick.pvr_bo);
+   if (p->keep_kick.pvr_bo)
+      pvr_bo_suballoc_free(p->keep_kick.pvr_bo);
    pvr_bo_suballoc_free(p->vdm_end_usc);
    pvr_bo_suballoc_free(p->eot_usc);
    pvr_bo_suballoc_free(p->clear_usc);
    pvr_bo_suballoc_free(p->clear_vs_usc);
    pvr_bo_suballoc_free(p->load_usc);
+   pvr_bo_suballoc_free(p->keep_usc);
    pvr_bo_suballoc_free(p->load_kick.pvr_bo);
    pvr_bo_suballoc_free(p->clear_vs_kick.pvr_bo);
 }
@@ -1649,7 +1664,7 @@ g9p_ds_clear(struct pvr_cmd_buffer *cmd_buffer, const VkClearAttachment *att,
    const bool stencil = att->aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT;
    struct pvr_g9p_graphics_state state = {
       .vs_kick = p->clear_vs_kick,
-      .fs_kick = p->clear_kick,
+      .fs_kick = p->keep_kick,
       .vs_outputs = 4,
       .vs_regs = 8,
       .num_buffers = 1,
@@ -2460,7 +2475,7 @@ PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
     * << 15, `depth` capture 0x001f803f for 64x64; the store writes nothing
     * without it); iOS 10's 4 without depth
     */
-   put32(&s, job->has_depth_attachment
+   put32(&s, job->has_depth_attachment || job->has_stencil_attachment
                 ? (job->ds.physical_extent.width - 1) | (job->ds.physical_extent.height - 1) << 15
                 : 4);
    put32(&s, 0xf9);
