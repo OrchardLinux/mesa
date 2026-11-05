@@ -488,8 +488,9 @@ static inline void
 g9p_iterate(struct g9p_code *c, unsigned dst, unsigned first, unsigned comps,
             bool perspective)
 {
+   /* Apple's iterate before a wait: no third word, W1 without its continuation bit */
    G9P_EMIT(c, (comps & 3) << 11 | (perspective ? 0x0308 : 0x0108),
-            (perspective + first) << 9 | 0x0100 | 2 * dst, 0x0080);
+            (perspective + first) << 9 | 2 * dst);
 }
 
 /* A sample's W1: the f32 result's registers, the state's common-store dword / 2 at bit 9 */
