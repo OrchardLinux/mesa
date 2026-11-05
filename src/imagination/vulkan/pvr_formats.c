@@ -367,15 +367,19 @@ pvr_get_image_format_features2(struct pvr_physical_device *pdevice,
                     VK_FORMAT_FEATURE_2_BLIT_DST_BIT);
    }
    /*
-    * Depth/stencil: attachments only (`depth` capture; the hardware stores
-    * depth compressed, which is not decoded for sampling). 24-bit depth is
-    * not decoded: rendering with X8_D24 crashed the GFX firmware (glmark2).
+    * Depth/stencil: attachments (`depth` capture). The hardware stores depth
+    * compressed, which is not decoded for sampling, but GLES 2 has depth
+    * textures whatever the driver says (OES_depth_texture in Mesa is always on):
+    * offered as sampled so that they exist and can be rendered to. Sampling them
+    * does not give their values yet. 24-bit depth is not decoded: rendering
+    * with X8_D24 crashed the GFX firmware (glmark2).
     */
    if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g9p) &&
        vk_format_is_depth_or_stencil(vk_format)) {
       flags &= vk_format == VK_FORMAT_D16_UNORM || vk_format == VK_FORMAT_D32_SFLOAT ||
                      vk_format == VK_FORMAT_S8_UINT || vk_format == VK_FORMAT_D32_SFLOAT_S8_UINT
-                  ? VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT
+                  ? VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT |
+                       VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT
                   : 0;
    }
    /* G9P: colour images the driver copies can be copied from the host too */

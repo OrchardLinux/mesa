@@ -782,6 +782,59 @@ descriptor_buffer_addr(const struct pvr_descriptor_set *ds, unsigned binding)
 }
 
 /*
+ * Vertex fetch reads words from the buffer's address + index x stride + the
+ * attribute's offset, and only the offset's bytes are handled in the shader. A
+ * binding with an address or stride that is not a multiple of 4 draws from a
+ * copy with a stride that is: the stride reported for it here. Room for the
+ * widest attribute, which may reach past a small stride (GL's byte vec4 of
+ * stride 2).
+ */
+static uint32_t
+realigned_stride(uint32_t stride)
+{
+   return stride ? align(MAX2(stride, 16), 4) : 0;
+}
+
+static bool
+binding_needs_copy(const struct pvr_vertex_binding *vb, uint32_t stride)
+{
+   return vb->buffer && (((vb->buffer->dev_addr.addr + vb->offset) | stride) & 3);
+}
+
+static VkResult
+realign_vertex_binding(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_vertex_binding *vb,
+                       uint32_t stride, uint64_t *addr)
+{
+   const uint8_t *src =
+      (const uint8_t *)PVR_PER_ARCH(g9p_cpu_addr)(cmd_buffer->device,
+                                                  vb->buffer->dev_addr.addr + vb->offset);
+   const uint32_t new_stride = realigned_stride(stride);
+   const uint64_t size = vb->size == VK_WHOLE_SIZE ? vb->buffer->vk.size - vb->offset : vb->size;
+   const uint64_t count = stride ? size / stride + 1 : 1;
+   const uint64_t copy_size = MAX2(new_stride, 16) * count;
+   struct pvr_suballoc_bo *bo;
+   uint8_t *dst;
+   VkResult result;
+
+   if (!src)
+      return VK_SUCCESS; /* not mapped: as it is */
+   dst = calloc(1, copy_size);
+   if (!dst)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   for (uint64_t i = 0; i < count; i++) {
+      const uint64_t at = i * stride;
+
+      if (at < size)
+         memcpy(dst + i * new_stride, src + at, MIN2(MAX2(new_stride, 16), size - at));
+   }
+   result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, dst, copy_size, &bo);
+   free(dst);
+   if (result == VK_SUCCESS)
+      *addr = bo->dev_addr.addr;
+   return result;
+}
+
+/*
  * The addresses of a stage's buffers by common-store slot (vertex buffers
  * and strides, push constants, the viewport, descriptor set buffers)
  */
@@ -801,6 +854,13 @@ buffer_addrs(struct pvr_cmd_buffer *cmd_buffer, unsigned n, const unsigned (*set
 
          if (vb->buffer)
             addrs[k] = vb->buffer->dev_addr.addr + vb->offset;
+         if (binding_needs_copy(vb, cmd_buffer->vk.dynamic_graphics_state.vi_binding_strides[binding])) {
+            result = realign_vertex_binding(
+               cmd_buffer, vb, cmd_buffer->vk.dynamic_graphics_state.vi_binding_strides[binding],
+               &addrs[k]);
+            if (result != VK_SUCCESS)
+               return result;
+         }
          if (vb->buffer && dumping()) {
             const uint32_t *v = (const uint32_t *)PVR_PER_ARCH(g9p_cpu_addr)(cmd_buffer->device,
                                                                             addrs[k]);
@@ -810,6 +870,8 @@ buffer_addrs(struct pvr_cmd_buffer *cmd_buffer, unsigned n, const unsigned (*set
          }
       } else if (set == G9P_VERTEX_STRIDES) {
          addrs[k] = cmd_buffer->vk.dynamic_graphics_state.vi_binding_strides[binding];
+         if (binding_needs_copy(&cs->vertex_bindings[binding], addrs[k]))
+            addrs[k] = realigned_stride(addrs[k]);
       } else if (set == G9P_PUSH_CONSTANTS) {
          struct pvr_push_constants *pc = &cs->push_consts[stage];
 
@@ -977,6 +1039,32 @@ g9p_current_hw_render(const struct pvr_render_pass_info *info)
    return &setup->renders[setup->subpass_map[info->subpass_idx].render];
 }
 
+static bool
+g9p_is_line(VkPrimitiveTopology t)
+{
+   return t == VK_PRIMITIVE_TOPOLOGY_LINE_LIST || t == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
+}
+
+/* ISPA's object type (lines are not drawn as triangles) */
+static uint32_t
+g9p_isp_objtype(const struct vk_dynamic_graphics_state *dyn)
+{
+   return g9p_is_line(dyn->ia.primitive_topology) ? ROGUE_TA_OBJTYPE_LINE
+                                                  : ROGUE_TA_OBJTYPE_TRIANGLE;
+}
+
+/* ISPA's line width: 4.4 fixed point, less one; 15 for anything but lines */
+static uint32_t
+g9p_isp_line_width(const struct vk_dynamic_graphics_state *dyn)
+{
+   uint32_t w;
+
+   if (!g9p_is_line(dyn->ia.primitive_topology))
+      return 15;
+   w = util_unsigned_fixed(dyn->rs.line.width, 4);
+   return MIN2((!!w) * (w - 1), ROGUE_TA_STATE_ISPA_POINTLINEWIDTH_SIZE_MAX);
+}
+
 /*
  * A draw's ISP words with a stencil aspect: ISPCTL and the front and back
  * ISPA/ISPB (the A9 driver, Rogue's face setup in the
@@ -1001,14 +1089,14 @@ g9p_ds_isp_words(const struct pvr_cmd_buffer *cmd_buffer, unsigned pass, bool sc
    stencil = ds.stencil.test_enable;
    for (unsigned i = 0; i < 2; i++) {
       pvr_csb_pack (&a[i], TA_STATE_ISPA, x) {
-         x.objtype = ROGUE_TA_OBJTYPE_TRIANGLE;
+         x.objtype = g9p_isp_objtype(dyn);
          x.passtype = pass;
          x.dwritedisable = !ds.depth.write_enable;
          x.dfbztestenable = true;
          /* VkCompareOp and ROGUE_TA_CMPMODE share their numbering */
          x.dcmpmode = ds.depth.test_enable ? (uint32_t)ds.depth.compare_op
                                            : ROGUE_TA_CMPMODE_ALWAYS;
-         x.pointlinewidth = 15;
+         x.pointlinewidth = g9p_isp_line_width(dyn);
          x.sref = stencil ? face[i]->reference : 0;
       }
       pvr_csb_pack (&b[i], TA_STATE_ISPB, x) {
@@ -1306,15 +1394,18 @@ emit_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state
     * 0e000000 00120f00 0e000000). Without one: always, no write.
     */
    pass = state->uses_fbfetch ? 1u : state->uses_discard ? 4u : 0u;
+   const uint32_t obj = g9p_isp_objtype(&cmd_buffer->vk.dynamic_graphics_state) << 28 |
+                        g9p_isp_line_width(&cmd_buffer->vk.dynamic_graphics_state) << 8;
+
    if (dp->depth_test) {
-      const uint32_t a = 0x00100f00 | pass << 24 | (uint32_t)dp->depth_compare << 17 |
+      const uint32_t a = 0x00100000 | obj | pass << 24 | (uint32_t)dp->depth_compare << 17 |
                          (dp->depth_write ? 0 : BITFIELD_BIT(21));
 
       PPP_BLOCK(0x1f, 0x03c00000 | (dp->scissor >= 0 ? BITFIELD_BIT(16) : 0), a, 0x0e000000, a,
                 0x0e000000);
    } else {
       PPP_BLOCK(0x1f, 0x03c40000 | (dp->scissor >= 0 ? BITFIELD_BIT(16) : 0),
-                0x003e0f00 | pass << 24, 0x0e000000, 0x00100f00 | pass << 24, 0);
+                0x003e0000 | obj | pass << 24, 0x0e000000, 0x00100000 | obj | pass << 24, 0);
    }
    if (dp->isp_set)
       memcpy(&ppp[blocks[nb - 1][0] + 1], dp->isp, sizeof(dp->isp));
