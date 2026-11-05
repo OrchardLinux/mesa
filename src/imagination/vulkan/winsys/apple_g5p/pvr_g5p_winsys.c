@@ -185,6 +185,38 @@ pvr_g5p_winsys_msaa(struct pvr_winsys *ws)
 static inline struct g5p_ws_bo *to_bo(struct pvr_winsys_bo *bo) { return container_of(bo, struct g5p_ws_bo, base); }
 static inline struct g5p_ws_vma *to_vma(struct pvr_winsys_vma *v) { return container_of(v, struct g5p_ws_vma, base); }
 
+bool
+pvr_g5p_winsys_vma_cpu_addr(struct pvr_winsys_vma *vma,
+                            uint64_t addr,
+                            uint64_t size,
+                            uint8_t **ptr_out,
+                            uint64_t *available_out)
+{
+   struct g5p_ws_bo *bo;
+   uint64_t delta, offset, available;
+
+   if (!vma->bo || addr < vma->dev_addr.addr)
+      return false;
+
+   delta = addr - vma->dev_addr.addr;
+   if (delta > vma->mapped_size)
+      return false;
+
+   bo = to_bo(vma->bo);
+   if (!bo->cpu || vma->bo_offset > bo->alloc_size ||
+       delta > bo->alloc_size - vma->bo_offset)
+      return false;
+
+   offset = vma->bo_offset + delta;
+   available = MIN2(vma->mapped_size - delta, bo->alloc_size - offset);
+   if (size > available)
+      return false;
+
+   *ptr_out = bo->cpu + offset;
+   *available_out = available;
+   return true;
+}
+
 /* ---- device info: the runtime values as the services winsys derives them
  * from the device info (pvr_srv.c, Imagination Technologies); the G5P paths
  * of the driver do not rely on them ---- */

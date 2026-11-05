@@ -3,9 +3,10 @@
  * Apple's A9 GPU (G5P): the CPU copies that know the A9's layouts
  * (pvr_g5p_layout.h). Built only with -Dimagination-g5p-experimental=true.
  *
- * G5P runs its transfer sub-commands on the CPU with G9P's copies (the
- * G9P driver, pvr_arch_g9p_transfer.c): linear and 2D-twiddled surfaces, one
- * element at a time. A blit from a block-compressed image is not an element
+ * G5P runs its transfer sub-commands on the CPU through the winsys's permanent
+ * BO mappings. Application mappings may be placed or unmapped while an
+ * asynchronous queue submission is executing, so they are never used here.
+ * A blit from a block-compressed image is not an element
  * copy: upstream hands it over in texels on a surface of 4x4 blocks
  * (pvr_setup_transfer_surface() converts to blocks only for raw copies), and
  * each texel has to be decoded from its block (util's ETC2/EAC decoder, as our
@@ -34,9 +35,11 @@
 #include "pvr_g9p.h"
 #include "pvr_image.h"
 #include "pvr_job_transfer.h"
+#include "winsys/apple_g5p/pvr_g5p_winsys.h"
 
 struct g5p_surface {
    uint8_t *base;
+   uint64_t available;
    enum pipe_format format;
    unsigned bpp, stride, width, height;
    bool twiddled, blocks; /* blocks: a compressed surface addressed in texels */
@@ -45,7 +48,15 @@ struct g5p_surface {
 static bool
 g5p_surface_init(struct pvr_device *device, const struct pvr_transfer_cmd_surface *s, struct g5p_surface *out)
 {
-   out->base = PVR_PER_ARCH(g9p_cpu_addr)(device, s->dev_addr.addr);
+   out->base = NULL;
+   out->available = 0;
+   simple_mtx_lock(&device->g9p_vmas.lock);
+   util_dynarray_foreach (&device->g9p_vmas.vmas, struct pvr_winsys_vma *, v) {
+      if (pvr_g5p_winsys_vma_cpu_addr(*v, s->dev_addr.addr, 1,
+                                      &out->base, &out->available))
+         break;
+   }
+   simple_mtx_unlock(&device->g9p_vmas.lock);
    out->format = vk_format_to_pipe_format(s->vk_format);
    out->bpp = vk_format_get_blocksize(s->vk_format);
    out->stride = s->stride ? s->stride : s->width;
@@ -54,7 +65,7 @@ g5p_surface_init(struct pvr_device *device, const struct pvr_transfer_cmd_surfac
    out->twiddled = s->mem_layout == PVR_MEMLAYOUT_TWIDDLED;
    out->blocks = util_format_is_compressed(out->format);
    if (!out->base)
-      mesa_loge("G5P transfer: no CPU mapping for %#" PRIx64, s->dev_addr.addr);
+      mesa_loge("G5P transfer: no stable CPU mapping for %#" PRIx64, s->dev_addr.addr);
    return out->base != NULL;
 }
 
@@ -83,8 +94,21 @@ g5p_offset(const struct g5p_surface *s, unsigned x, unsigned y)
    return ((size_t)y * s->stride + x) * s->bpp;
 }
 
-static void
-g5p_fill(const struct pvr_transfer_cmd *cmd, const struct g5p_surface *dst)
+static uint8_t *
+g5p_element(struct g5p_surface *s, unsigned x, unsigned y)
+{
+   if (x >= s->width || y >= s->height)
+      return NULL;
+
+   const size_t offset = g5p_offset(s, x, y);
+
+   if (offset > s->available || s->bpp > s->available - offset)
+      return NULL;
+   return s->base + offset;
+}
+
+static bool
+g5p_fill(const struct pvr_transfer_cmd *cmd, struct g5p_surface *dst)
 {
    const VkRect2D *r = &cmd->scissor;
    uint8_t packed[16] = { 0 };
@@ -100,9 +124,15 @@ g5p_fill(const struct pvr_transfer_cmd *cmd, const struct g5p_surface *dst)
                                               cmd->clear_color[3].f },
                             1);
    for (unsigned y = 0; y < r->extent.height; y++) {
-      for (unsigned x = 0; x < r->extent.width; x++)
-         memcpy(dst->base + g5p_offset(dst, r->offset.x + x, r->offset.y + y), packed, dst->bpp);
+      for (unsigned x = 0; x < r->extent.width; x++) {
+         uint8_t *to = g5p_element(dst, r->offset.x + x, r->offset.y + y);
+
+         if (!to)
+            return false;
+         memcpy(to, packed, dst->bpp);
+      }
    }
+   return true;
 }
 
 /* The uncompressed format util's ETC2/EAC decoder (_mesa_unpack_etc2_format())
@@ -150,7 +180,7 @@ g5p_decode_block(enum pipe_format format, const uint8_t *p, unsigned bpp, float 
 
 /* Texel (x, y) of a compressed surface addressed in texels, as RGBA floats;
  * the last block decoded is kept */
-static void
+static bool
 g5p_block_texel(const struct g5p_surface *s, unsigned x, unsigned y, float out[4], const uint8_t **last,
                 float block[16][4])
 {
@@ -162,18 +192,21 @@ g5p_block_texel(const struct g5p_surface *s, unsigned x, unsigned y, float out[4
    b.height = DIV_ROUND_UP(s->height, bh);
    b.stride = DIV_ROUND_UP(s->stride, bw);
 
-   const uint8_t *p = s->base + g5p_offset(&b, x / bw, y / bh);
+   const uint8_t *p = g5p_element(&b, x / bw, y / bh);
 
    assert(bw == 4 && bh == 4);
+   if (!p)
+      return false;
    if (p != *last) {
       g5p_decode_block(s->format, p, s->bpp, block);
       *last = p;
    }
    memcpy(out, block[(y % bh) * bw + x % bw], 4 * sizeof(float));
+   return true;
 }
 
-static void
-g5p_copy(const struct pvr_rect_mapping *m, const struct g5p_surface *src, const struct g5p_surface *dst)
+static bool
+g5p_copy(const struct pvr_rect_mapping *m, struct g5p_surface *src, struct g5p_surface *dst)
 {
    const bool decode = src->blocks && !dst->blocks;
    const bool same = !decode && (src->format == dst->format ||
@@ -195,17 +228,26 @@ g5p_copy(const struct pvr_rect_mapping *m, const struct g5p_surface *src, const 
          if (m->flip_x)
             sx = sw - 1 - sx;
 
-         uint8_t *to = dst->base + g5p_offset(dst, m->dst_rect.offset.x + x, m->dst_rect.offset.y + y);
+         uint8_t *to = g5p_element(dst, m->dst_rect.offset.x + x, m->dst_rect.offset.y + y);
+
+         if (!to)
+            return false;
 
          if (decode) {
             float v[4];
 
-            g5p_block_texel(src, m->src_rect.offset.x + sx, m->src_rect.offset.y + sy, v, &last, block);
+            if (!g5p_block_texel(src, m->src_rect.offset.x + sx,
+                                 m->src_rect.offset.y + sy, v, &last, block))
+               return false;
             util_format_pack_rgba(dst->format, to, v, 1);
             continue;
          }
 
-         const uint8_t *from = src->base + g5p_offset(src, m->src_rect.offset.x + sx, m->src_rect.offset.y + sy);
+         const uint8_t *from = g5p_element(src, m->src_rect.offset.x + sx,
+                                          m->src_rect.offset.y + sy);
+
+         if (!from)
+            return false;
 
          if (same) {
             memcpy(to, from, dst->bpp);
@@ -222,67 +264,54 @@ g5p_copy(const struct pvr_rect_mapping *m, const struct g5p_surface *src, const 
          }
       }
    }
+   return true;
 }
 
-static void
+static bool
 g5p_run(struct pvr_device *device, const struct pvr_transfer_cmd *cmd)
 {
    struct g5p_surface dst;
 
    if (!g5p_surface_init(device, &cmd->dst, &dst))
-      return;
+      return false;
    if (cmd->flags & PVR_TRANSFER_CMD_FLAGS_FILL) {
-      g5p_fill(cmd, &dst);
-      return;
+      return g5p_fill(cmd, &dst);
    }
    for (unsigned i = 0; i < cmd->source_count; i++) {
       const struct pvr_transfer_cmd_source *source = &cmd->sources[i];
       struct g5p_surface src;
 
       if (!g5p_surface_init(device, &source->surface, &src))
-         continue;
+         return false;
       if (!source->mapping_count) {
          /* the whole destination scissor, 1:1 */
          const struct pvr_rect_mapping m = { .src_rect = cmd->scissor, .dst_rect = cmd->scissor };
 
-         g5p_copy(&m, &src, &dst);
+         if (!g5p_copy(&m, &src, &dst))
+            return false;
       }
       for (unsigned k = 0; k < source->mapping_count; k++)
-         g5p_copy(&source->mappings[k], &src, &dst);
+         if (!g5p_copy(&source->mappings[k], &src, &dst))
+            return false;
    }
-}
-
-/* Whether a command needs this file's copies: a compressed source into an uncompressed destination (a blit) */
-static bool
-g5p_own(const struct pvr_transfer_cmd *cmd)
-{
-   if (cmd->flags & PVR_TRANSFER_CMD_FLAGS_FILL)
-      return false;
-   for (unsigned i = 0; i < cmd->source_count; i++) {
-      if (vk_format_is_compressed(cmd->sources[i].surface.vk_format) && !vk_format_is_compressed(cmd->dst.vk_format))
-         return true;
-   }
-   return false;
+   return true;
 }
 
 VkResult
 PVR_PER_ARCH(g5p_transfer_submit)(struct pvr_device *device, struct pvr_sub_cmd_transfer *sub_cmd,
                                   struct vk_sync *wait_sync, struct vk_sync *signal_sync)
 {
-   bool own = false;
    VkResult result;
-
-   list_for_each_entry (struct pvr_transfer_cmd, cmd, sub_cmd->transfer_cmds, link)
-      own |= g5p_own(cmd);
-   if (!own)
-      return pvr_arch_g9p_transfer_submit(device, sub_cmd, wait_sync, signal_sync);
 
    if (wait_sync) {
       result = vk_sync_wait(&device->vk, wait_sync, 0, VK_SYNC_WAIT_COMPLETE, UINT64_MAX);
       if (result != VK_SUCCESS)
          return result;
    }
-   list_for_each_entry (struct pvr_transfer_cmd, cmd, sub_cmd->transfer_cmds, link)
-      g5p_run(device, cmd);
+   list_for_each_entry (struct pvr_transfer_cmd, cmd, sub_cmd->transfer_cmds, link) {
+      if (!g5p_run(device, cmd))
+         return vk_errorf(device, VK_ERROR_DEVICE_LOST,
+                          "G5P transfer surface exceeds its stable BO mapping");
+   }
    return vk_sync_signal(&device->vk, signal_sync, 0);
 }
