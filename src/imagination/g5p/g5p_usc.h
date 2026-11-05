@@ -388,6 +388,9 @@ struct g5p_blend_info {
 };
 unsigned g5p_blend_general(uint8_t *out, unsigned max, const struct g5p_blend_key *k, unsigned const_base,
                            struct g5p_blend_info *info, const char **err);
+/* Disabled channels retain the destination after the blend equation. */
+unsigned g5p_blend_masked(uint8_t *out, unsigned max, const struct g5p_blend_key *k, unsigned const_base,
+                        unsigned write_mask, struct g5p_blend_info *info, const char **err);
 
 /* ---- Vertex-stage memory stores and integer forms (xfb.md, XFB probes) ----
  * Byte templates from Apple's applegpu_g5p vertex functions (tools/

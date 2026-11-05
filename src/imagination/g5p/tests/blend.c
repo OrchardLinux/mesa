@@ -14,6 +14,7 @@ static struct g5p_blend_key current;
 static unsigned tested, evaluated, fallback;
 static double source[4], destination[4], constants[4];
 static unsigned max_bytes,max_half;
+static unsigned current_mask = 0xf;
 #ifdef G5P_BLEND_BASELINE
 extern unsigned g5p_blend_baseline(uint8_t *,unsigned,const struct g5p_blend_key *,unsigned,
                                  struct g5p_blend_info *,const char **);
@@ -33,6 +34,8 @@ static double factor_ref(unsigned f,unsigned l)
 static double clamp(double x){return fmin(1,fmax(0,x));}
 static double equation_ref(unsigned l)
 {
+   if (!(current_mask & (1u << l)))
+      return destination[l];
    unsigned op=l<3?current.op_rgb:current.op_a;
    if(op==3)return fmin(source[l],destination[l]);
    if(op==4)return fmax(source[l],destination[l]);
@@ -93,18 +96,23 @@ static void g5p_blend_test_program(const struct bctx *c,const struct g5p_blend_i
 }
 int main(int argc,char **argv)
 {
-   bool dump=argc==3&&!strcmp(argv[1],"--dump");
+   bool maskdump=argc==3&&!strcmp(argv[1],"--dump-masks");
+   bool dump=argc==3&&(!strcmp(argv[1],"--dump")||maskdump);
    FILE *file=dump?fopen(argv[2],"wb"):NULL;
    if(dump&&!file)return 2;
    unsigned stride=dump?137:1;
+   bool masks=maskdump||(argc==2&&!strcmp(argv[1],"--masks"));
+   for(unsigned mask=masks?0:15;mask<16;mask++) {
+   current_mask=mask;
    for(unsigned rgb=0;rgb<1125;rgb++)for(unsigned alpha=0;alpha<1125;alpha+=stride) {
       current=(struct g5p_blend_key){rgb%15,(rgb/15)%15,rgb/225,alpha%15,(alpha/15)%15,alpha/225};
       uint8_t code[512];struct g5p_blend_info info;const char *err;
-      unsigned n=g5p_blend_general(code,sizeof(code),&current,0,&info,&err);
+      unsigned n=g5p_blend_masked(code,sizeof(code),&current,0,current_mask,&info,&err);
       if(err) {
          fprintf(stderr,"BLEND BUILD FAIL key=%u,%u,%u,%u,%u,%u: %s\n",current.src_rgb,current.dst_rgb,current.op_rgb,current.src_a,current.dst_a,current.op_a,err);return 1;
       }
 #ifdef G5P_BLEND_BASELINE
+      if (current_mask==0xf) {
       uint8_t old[512];struct g5p_blend_info oi;const char *oe;
       unsigned on=g5p_blend_baseline(old,sizeof(old),&current,0,&oi,&oe);
       if(!oe) {
@@ -114,15 +122,18 @@ int main(int argc,char **argv)
          }
          old_identical++;
       }
+      }
 #endif
       if(n>max_bytes)max_bytes=n;
       if(info.max_half>max_half)max_half=info.max_half;
       if(file) {
+         if(maskdump)fprintf(file,"%u ",current_mask);
          fprintf(file,"%u %u %u %u %u %u %u %u ",current.src_rgb,current.dst_rgb,current.op_rgb,current.src_a,current.dst_a,current.op_a,info.zero_lanes,n);
          for(unsigned i=0;i<n;i++)fprintf(file,"%02x",code[i]);
          fputc('\n',file);
       }
       tested++;
+   }
    }
    if(file)fclose(file);
    printf("BLEND UNIT PASS keys=%u float_models=%u canonical=%u max_bytes=%u max_half=%u\n",tested,evaluated,fallback,max_bytes,max_half);

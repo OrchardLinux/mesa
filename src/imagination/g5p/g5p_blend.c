@@ -86,6 +86,7 @@ struct bctx {
    unsigned const_base;
    bool tile_alpha_only;
    bool general; /* canonical fallback; measured shapes keep their exact bytes */
+   bool masked;
    char err[160];
 };
 
@@ -380,7 +381,7 @@ static void reads(struct bctx *c, unsigned i, int v)
 }
 
 static unsigned blend_build(uint8_t *out, unsigned max, const struct g5p_blend_key *k, unsigned const_base,
-                            struct g5p_blend_info *info, const char **err, bool general)
+                            struct g5p_blend_info *info, const char **err, bool general, unsigned write_mask)
 {
    static _Thread_local struct bctx cx;
    struct bctx *c = &cx;
@@ -388,6 +389,7 @@ static unsigned blend_build(uint8_t *out, unsigned max, const struct g5p_blend_k
    memset(info, 0, sizeof(*info));
    c->const_base = const_base;
    c->general = general;
+   c->masked = write_mask != 0xf;
    for (unsigned l = 0; l < 4; l++)
       c->raw[l] = c->out[l] = -1;
    *err = NULL;
@@ -399,6 +401,16 @@ static unsigned blend_build(uint8_t *out, unsigned max, const struct g5p_blend_k
       fs[l] = l < 3 ? k->src_rgb : k->src_a;
       fd[l] = l < 3 ? k->dst_rgb : k->dst_a;
       op[l] = l < 3 ? k->op_rgb : k->op_a;
+      /* A colour mask acts after blending. Express each disabled channel as
+       * destination replacement; the other channels still read the original
+       * source/destination alpha through the canonical deferred assignments.
+       * This uses the qualified tile conversion and half ALU, without the
+       * still-uncharacterised class-0x88 packed merge controls. */
+      if (!(write_mask & (1u << l))) {
+         fs[l] = F_ZERO;
+         fd[l] = F_ONE;
+         op[l] = O_ADD;
+      }
       if (fs[l] > F_SAS || fd[l] > F_SAS || op[l] > O_MAX) {
          snprintf(c->err, sizeof(c->err), "blend factors %u/%u op %u: outside VkBlendFactor/VkBlendOp core",
                   fs[l], fd[l], op[l]);
@@ -648,7 +660,10 @@ static unsigned blend_build(uint8_t *out, unsigned max, const struct g5p_blend_k
          break;
       case B_COPY:
       case B_NEG:
-         PUT(g5p_usc_half_binary_literal(raw, e->half, 0, S[1], k, e->op == B_NEG, 0),
+         /* -0 + x also preserves the sign of a disabled -0 float channel. */
+         PUT(g5p_usc_half_binary_literal(raw, e->half,
+                                         c->masked && e->op == B_COPY ? 0x8000 : 0,
+                                         S[1], k, e->op == B_NEG, 0),
              e->op == B_NEG ? "negate" : "output copy");
          break;
       case B_ZERO:
@@ -708,11 +723,23 @@ static unsigned blend_build(uint8_t *out, unsigned max, const struct g5p_blend_k
 unsigned g5p_blend_general(uint8_t *out, unsigned max, const struct g5p_blend_key *k, unsigned const_base,
                            struct g5p_blend_info *info, const char **err)
 {
-   unsigned n = blend_build(out, max, k, const_base, info, err, false);
+   unsigned n = blend_build(out, max, k, const_base, info, err, false, 0xf);
    if (!*err)
       return n;
    /* Retain byte identity for every existing measured equation. Other core
     * equations use the same tile read/convert/native-f16 ALU/write protocol.
     */
-   return blend_build(out, max, k, const_base, info, err, true);
+   return blend_build(out, max, k, const_base, info, err, true, 0xf);
+}
+
+unsigned g5p_blend_masked(uint8_t *out, unsigned max, const struct g5p_blend_key *k, unsigned const_base,
+                        unsigned write_mask, struct g5p_blend_info *info, const char **err)
+{
+   if (write_mask & ~0xfu) {
+      *err = "blend: colour write mask outside RGBA";
+      return 0;
+   }
+   if (write_mask == 0xf)
+      return g5p_blend_general(out, max, k, const_base, info, err);
+   return blend_build(out, max, k, const_base, info, err, true, write_mask);
 }

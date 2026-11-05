@@ -160,6 +160,8 @@ static bool blend_is_proven(const struct pco_g5p_fs_key *k)
 
 static struct g5p_blend_key general_key(const struct pco_g5p_fs_key *k)
 {
+   if (!k->blend)
+      return (struct g5p_blend_key){1, 0, 0, 1, 0, 0};
    return (struct g5p_blend_key){k->src_rgb, k->dst_rgb, k->op_rgb, k->src_a, k->dst_a, k->op_a};
 }
 
@@ -4306,7 +4308,8 @@ static void fs_output(struct gctx *c)
       uint8_t buf[512];
       const char *err;
       struct g5p_blend_key bk = general_key(c->key);
-      unsigned n = g5p_blend_general(buf, sizeof(buf), &bk, G5P_BLEND_CONST_BASE, &c->binfo, &err);
+      unsigned n = g5p_blend_masked(buf, sizeof(buf), &bk, G5P_BLEND_CONST_BASE, c->key->write_mask,
+                                   &c->binfo, &err);
       if (err)
          refuse(c, "general blend epilogue: %s", err);
       if (n) {
@@ -4607,6 +4610,16 @@ enum { BF_ZERO = 0, BF_ONE = 1, BF_SRC_ALPHA = 6, BF_ONE_MINUS_SRC_ALPHA = 7 };
 
 static unsigned blend_mode(struct gctx *c, const struct pco_g5p_fs_key *k)
 {
+   if (k->write_mask && k->write_mask != 0xf) {
+      uint8_t buf[512];
+      const char *err;
+      struct g5p_blend_key bk = general_key(k);
+      g5p_blend_masked(buf, sizeof(buf), &bk, G5P_BLEND_CONST_BASE, k->write_mask,
+                       &c->binfo, &err);
+      if (err)
+         refuse(c, "partial colour mask epilogue: %s", err);
+      return BLEND_GENERAL;
+   }
    if (!k->blend)
       return BLEND_NONE;
    if (!k->op_rgb && !k->op_a) {
@@ -4644,6 +4657,7 @@ struct blend_rw {
    unsigned zero; /* BLEND_GENERAL: channels that blend to constant 0 */
    bool drop;
    bool partial;
+   bool clamp_source;
 };
 
 static bool rewrite_output(nir_builder *b, nir_intrinsic_instr *in, void *data)
@@ -4661,7 +4675,8 @@ static bool rewrite_output(nir_builder *b, nir_intrinsic_instr *in, void *data)
       return false;
    }
    b->cursor = nir_before_instr(&in->instr);
-   nir_def *v = nir_fsat(b, in->src[0].ssa);
+   /* A mask alone must not clamp enabled float-render-target channels. */
+   nir_def *v = w->clamp_source ? nir_fsat(b, in->src[0].ssa) : in->src[0].ssa;
    if (w->zero) {
       nir_def *ch[4];
       for (unsigned i = 0; i < 4; i++)
@@ -4681,14 +4696,11 @@ static void apply_fs_key(struct gctx *c, nir_shader *nir, const struct pco_g5p_f
 {
    /* k->srgb: Apple's program is the linear one (ds-isa-state.md §2.2); the
     * gamma is PBE q1 bit 45 (gles3-tex.md §1.2), not a program change. */
-   if (k->write_mask != 0xf && k->write_mask)
-      refuse(c, "partial colour write mask 0x%x: Apple's read-modify-write epilogue uses uncharacterized "
-                "class-0x88 merges (ds-isa-state.md §3.2)", k->write_mask);
    c->blend = blend_mode(c, k);
    if (c->blend == BLEND_NONE && k->write_mask)
       return;
    struct blend_rw w = {.mode = c->blend, .zero = c->blend == BLEND_GENERAL ? c->binfo.zero_lanes : 0,
-                        .drop = !k->write_mask};
+                        .drop = !k->write_mask, .clamp_source = k->blend};
    nir_shader_intrinsics_pass(nir, rewrite_output, nir_metadata_control_flow, &w);
    if (w.partial)
       refuse(c, "blending with a partially written colour output");
