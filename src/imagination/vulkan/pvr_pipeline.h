@@ -22,7 +22,7 @@
 #include "pvr_g9p_xfb_core.h"
 #include "pvr_pds.h"
 #include "util/shader_stats.h"
-
+#include "pvr_g5p_compute_state.h"
 struct pvr_suballoc_bo;
 
 struct pvr_pipeline_stage_state {
@@ -127,7 +127,7 @@ struct pvr_g9p_compute_state {
    } buffers[40]; /* G9P_MAX_BUFFERS */
    unsigned num_regs;
    bool uses_workgroup_id;
-   unsigned local_size[3];
+   unsigned local_size[3]; PVR_G5P_COMPUTE_STATE_FIELDS
    unsigned shared_size;
 };
 
