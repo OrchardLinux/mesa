@@ -19,7 +19,7 @@
  * Common-store buffer slots per shader; a vertex binding takes two (its
  * address and stride), and Zink gives each attribute its own binding
  */
-#define G9P_MAX_BUFFERS 16
+#define G9P_MAX_BUFFERS 36 /* 16 vertex bindings x address and stride, and more */
 #define G9P_MAX_ATTRIBS 16
 #define G9P_MAX_VARYINGS 16
 #define G9P_MAX_TEXTURES 16
@@ -31,7 +31,7 @@
  * first G9P_FS_BUF_DWORDS dwords at g9p_fs_buf_base() + G9P_FS_BUF_DWORDS k,
  * which the shader reads as uniform operands (as Apple's fragment code does).
  */
-#define G9P_VS_TEX_BASE 32
+#define G9P_VS_TEX_BASE (2 * G9P_MAX_BUFFERS)
 #define G9P_FS_BUF_DWORDS 128
 
 static inline unsigned

@@ -240,8 +240,8 @@ g9p_addr(struct g9p_code *c, unsigned dst, unsigned base_dword, unsigned idx,
          unsigned shift, bool kill)
 {
    G9P_EMIT(c, g9p_w0(c, 0x1189), g9p_dst(c, dst),
-            (kill ? 0x8000 : 0) | (1 | idx << 2) << 8 | 0x81 | 4 * base_dword,
-            0x4100, 0x01a1, 0x0600 | shift << 13);
+            (kill ? 0x8000 : 0) | (1 | idx << 2) << 8 | 0x81 | 4 * (base_dword & 31),
+            0x4100 | (base_dword >> 5) << 1, 0x01a1, 0x0600 | shift << 13);
 }
 
 /*
