@@ -460,12 +460,22 @@ g5p_check_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo *c
    if (s->rs && s->rs->polygon_mode != VK_POLYGON_MODE_FILL) {
       if (s->rs->polygon_mode != VK_POLYGON_MODE_LINE && s->rs->polygon_mode != VK_POLYGON_MODE_POINT)
          return G5P_REFUSE(device, "polygon mode %d", s->rs->polygon_mode);
-      if (s->rs->depth_bias.enable || BITSET_TEST(s->dynamic, MESA_VK_DYNAMIC_RS_DEPTH_BIAS_ENABLE))
+      /* an effective bias only (a non-zero factor): Zink enables depth bias in
+       * every pipeline and sets zero factors when GL polygon offset is off.
+       * Static factors are judged here, dynamic ones at the draw (g5p_cmd_draw). */
+      if (s->rs->depth_bias.enable && !BITSET_TEST(s->dynamic, MESA_VK_DYNAMIC_RS_DEPTH_BIAS_ENABLE) &&
+          !BITSET_TEST(s->dynamic, MESA_VK_DYNAMIC_RS_DEPTH_BIAS_FACTORS) &&
+          (s->rs->depth_bias.constant_factor != 0.0f || s->rs->depth_bias.slope_factor != 0.0f))
          return G5P_REFUSE(device, "polygon offset with line or point fill is not qualified");
       if (BITSET_TEST(s->dynamic, MESA_VK_DYNAMIC_RS_POLYGON_MODE))
          return G5P_REFUSE(device, "dynamic polygon mode");
    }
-   if (s->rs && (s->rs->line.mode != VK_LINE_RASTERIZATION_MODE_DEFAULT || s->rs->line.stipple.enable))
+   /* line/point fill (PVR_G5P_POLYGON_MODE=probe): Zink asks for Bresenham polygon edges (bresenhamLines is
+    * advertised, rectangularLines not); width-1 edges of the qualified shapes are the same pixels */
+   const bool fill_bresenham = s->rs && s->rs->polygon_mode != VK_POLYGON_MODE_FILL &&
+                               s->rs->line.mode == VK_LINE_RASTERIZATION_MODE_BRESENHAM;
+   if (s->rs && ((s->rs->line.mode != VK_LINE_RASTERIZATION_MODE_DEFAULT && !fill_bresenham) ||
+                 s->rs->line.stipple.enable))
       return G5P_REFUSE(device, "line rasterization mode %d, stipple %d", s->rs->line.mode,
                         s->rs->line.stipple.enable);
    /* 1 or 4 samples (pvr_g5p_msaa.c); sample shading, alpha to coverage and a partial sample mask need the
@@ -1507,6 +1517,10 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
     * result is known (g5p-punch-ds@8150a8195df); preserve all DS test/ops. */
    if ((ds_aspects & VK_IMAGE_ASPECT_DEPTH_BIT) && dyn->ds.depth.bounds_test.enable)
       return G5P_REFUSE(cmd_buffer, "a depth bounds test");
+   /* line/point fill with an effective polygon offset (non-zero factors on a depth attachment): not qualified */
+   if (dbias && g->polygon_mode != VK_POLYGON_MODE_FILL &&
+       (dyn->rs.depth_bias.constant_factor != 0.0f || dyn->rs.depth_bias.slope_factor != 0.0f))
+      return G5P_REFUSE(cmd_buffer, "polygon offset with line or point fill is not qualified");
    if (dbias) {
       result = pvr_arch_g5p_ds_bias(cmd_buffer, dyn, &dbias_index);
       if (result != VK_SUCCESS)
