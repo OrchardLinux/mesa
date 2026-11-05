@@ -131,8 +131,33 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
     * launch it: the sub-command's ordinary completion tail still establishes
     * command-buffer ordering and signals the submit fence. */
    if (state->a9_bodyless) {
+      /* Preserve the indirect command's device-side argument read in command
+       * order. The dimensions have no consumer, so DMA them to scratch common
+       * store without launching an empty USC task. The normal fenced pass tail
+       * waits for the DMA and retains all external synchronization. */
+      if (indirect_va) {
+         uint32_t data[4] = { indirect_va, indirect_va >> 32,
+                             BITFIELD_BIT(31) | BITFIELD_BIT(28) | 3, 0 };
+         uint32_t code[2] = {
+            g9p_pds_dout(G9P_DOUTD, 0, G9P_PDS_DATA, 2, G9P_PDS_END),
+            g9p_pds_halt(),
+         };
+         result = pvr_arch_cmd_buffer_upload_pds(
+            cmd_buffer, data, ARRAY_SIZE(data),
+            ROGUE_CDMCTRL_KERNEL1_DATA_ADDR_ALIGNMENT, code, ARRAY_SIZE(code),
+            ROGUE_CDMCTRL_KERNEL2_CODE_ADDR_ALIGNMENT,
+            ROGUE_CDMCTRL_KERNEL1_DATA_ADDR_ALIGNMENT, &bind);
+         if (result != VK_SUCCESS)
+            return result;
+         const struct g5p_cdm_record rec = g5p_cdm_dma_task(
+            G9P_CDM_DATA_BLOCKS(1), bind.data_offset, bind.code_offset, 1);
+         pvr_csb_set_relocation_mark(&sub_cmd->control_stream);
+         emit_record(&sub_cmd->control_stream, &rec);
+         pvr_csb_clear_relocation_mark(&sub_cmd->control_stream);
+      }
       if (getenv("PVR_G5P_WS_LOG"))
-         fprintf(stderr, "G5P-COMPUTE bodyless dispatch omitted; completion tail retained\n");
+         fprintf(stderr, "G5P-COMPUTE bodyless dispatch omitted; completion tail retained%s\n",
+                 indirect_va ? "; indirect argument DMA retained" : "");
       return VK_SUCCESS;
    }
 
