@@ -36,3 +36,12 @@ g5p_blend_test = executable(
   install : false,
 )
 test('g5p-blend-equations', g5p_blend_test, timeout : 120)
+
+g5p_vsops_test = executable(
+  'g5p-vsops-test',
+  files('tests/vsops.c', 'g5p_usc.c'),
+  include_directories : [inc_powervr_g5p],
+  dependencies : [dep_m],
+  install : false,
+)
+test('g5p-vsops-encodings', g5p_vsops_test, timeout : 60)

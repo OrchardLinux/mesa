@@ -578,8 +578,9 @@ static bool alu_supported(struct gctx *c, nir_alu_instr *a)
       return bits == 32;
    case nir_op_flog2: case nir_op_fexp2: /* vertex: v_log2, v_exp2 (bank 1, header 0x21) */
       return bits == 32;
-   case nir_op_f2i32: case nir_op_f2u32: case nir_op_bit_count:
-   case nir_op_bitfield_reverse:
+   case nir_op_f2i32: case nir_op_f2u32: /* vertex: v_f2i, v_f2u (convert, bank 1, header 0x11) */
+      return bits == 32;
+   case nir_op_bit_count: case nir_op_bitfield_reverse:
       return !c->vs && bits == 32;
    default:
       return (is_cmp(a->op) && bits == 1) ||
@@ -2902,8 +2903,16 @@ static void emit_unary_like(struct gctx *c, nir_alu_instr *a)
    /* Repeated reads: convert (B slot) ext 4 + header 0x40, unary (A) ext 4. */
    unsigned cx = g ? 0 : 4, ch = g ? 1 : 0x41;
    switch (a->op) {
-   case nir_op_f2i32: n = g5p_usc_convert2(raw, G5P_F2I32, 2 * dst, 2 * xr, 0, g, ch, cx, 0); break;
-   case nir_op_f2u32: n = g5p_usc_convert2(raw, G5P_F2U32, 2 * dst, 2 * xr, 0, g, ch, cx, 0); break;
+   /* vertex (v_f2i, v_f2u, v_f2i_rr: tools/g5p-1b-dgl/vs-canary/vsops2-probes.py): bank 1, header 0x11, the
+    * source group 1 on the last read, no extension, as v_base's u2f32 */
+   case nir_op_f2i32:
+      n = c->vs ? g5p_usc_convert(raw, G5P_F2I32, 2 * dst, 2 * xr, c->vs, g, 0x11)
+                : g5p_usc_convert2(raw, G5P_F2I32, 2 * dst, 2 * xr, 0, g, ch, cx, 0);
+      break;
+   case nir_op_f2u32:
+      n = c->vs ? g5p_usc_convert(raw, G5P_F2U32, 2 * dst, 2 * xr, c->vs, g, 0x11)
+                : g5p_usc_convert2(raw, G5P_F2U32, 2 * dst, 2 * xr, 0, g, ch, cx, 0);
+      break;
    case nir_op_i2f32: /* vertex (v_i2f): bank 1, header 0x10 (B) */
       n = g5p_usc_convert2(raw, G5P_I2F32, 2 * dst, 2 * xr, c->vs, g, ch | (c->vs ? 0x10 : 0), cx, 0);
       break;
