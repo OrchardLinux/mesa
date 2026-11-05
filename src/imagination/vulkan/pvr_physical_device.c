@@ -1292,7 +1292,7 @@ VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
       supported_properties.transformFeedbackDraw = false;
       supported_properties.transformFeedbackQueries = true;
       supported_extensions.EXT_color_write_enable = false;
-      supported_features.colorWriteEnable = false;
+      supported_features.colorWriteEnable = false; PVR_G5P_HOOK(release9_features, supported_features)
    }
 #endif
    /*

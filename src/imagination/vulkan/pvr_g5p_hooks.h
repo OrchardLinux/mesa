@@ -42,6 +42,10 @@
       pvr_arch_g5p_pack_image_view(                                         \
          iview, &(iview)->image_state[PVR_TEXTURE_STATE_SAMPLE]);
 
+/* Release integration of the vertex-store capability, preserving shared lines. */
+#define PVR_G5P_HOOK_release9_features(features) \
+   (features).vertexPipelineStoresAndAtomics = true;
+
 /* pvr_arch_sampler.c, pvr_CreateSampler(): the A9's sampler words, both
  * forms (pvr_arch_g5p_pack_sampler()).
  */
