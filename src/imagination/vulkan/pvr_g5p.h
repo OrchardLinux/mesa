@@ -167,13 +167,14 @@ struct pvr_g5p_upload {
  * draws, uploaded once, and what each draw's words derive from. The PDS
  * programs are pdsc's, the USC programs the G5P backend's.
  */
-/* PVR_G5P_POLYGON_MODE=probe: line and point polygon modes (plan row R8)
- * qualification; fillModeNonSolid stays false otherwise */
+/* Line and point polygon modes (plan row R8, hardware-proven: polygon-mode-1
+ * 13/13 on 2026-11-05) are on by default with fillModeNonSolid;
+ * PVR_G5P_POLYGON_MODE=0 turns them off (A/B, the old named refusal). */
 static inline bool
-pvr_g5p_polygon_mode_probe(void)
+pvr_g5p_polygon_mode_enabled(void)
 {
    const char *e = getenv("PVR_G5P_POLYGON_MODE");
-   return e && !strcmp(e, "probe");
+   return !(e && !strcmp(e, "0"));
 }
 
 struct pvr_g5p_pipeline {
@@ -215,7 +216,7 @@ struct pvr_g5p_pipeline {
    /* a point pipeline: the vertex program writes the point size after the
     * position (pco_g5p_vs_link::point_size) */
    bool vs_point_size;
-   /* polygon mode of a triangle pipeline (PVR_G5P_POLYGON_MODE=probe): the
+   /* polygon mode of a triangle pipeline (on by default; PVR_G5P_POLYGON_MODE=0 off): the
     * ISP object type, as AGXMetalA9 encodeISPPrimitiveType picks it from
     * its triangle fill mode (desktop-gl-polygon-mode.md) */
    VkPolygonMode polygon_mode;

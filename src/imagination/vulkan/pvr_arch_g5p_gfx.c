@@ -454,9 +454,9 @@ g5p_check_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo *c
    if (s->shader_stages != (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT) || s->ts)
       return G5P_REFUSE(device, "shader stages %#x (a vertex and a fragment shader)", s->shader_stages);
    if (s->rs && (s->rs->depth_clamp_enable ||
-                 (s->rs->polygon_mode != VK_POLYGON_MODE_FILL && !pvr_g5p_polygon_mode_probe())))
+                 (s->rs->polygon_mode != VK_POLYGON_MODE_FILL && !pvr_g5p_polygon_mode_enabled())))
       return G5P_REFUSE(device, "depth clamp or polygon mode %d", s->rs->polygon_mode);
-   /* line and point fill (PVR_G5P_POLYGON_MODE=probe): the qualified scope only */
+   /* line and point fill (default; PVR_G5P_POLYGON_MODE=0 off): the qualified scope only */
    if (s->rs && s->rs->polygon_mode != VK_POLYGON_MODE_FILL) {
       if (s->rs->polygon_mode != VK_POLYGON_MODE_LINE && s->rs->polygon_mode != VK_POLYGON_MODE_POINT)
          return G5P_REFUSE(device, "polygon mode %d", s->rs->polygon_mode);
@@ -470,7 +470,7 @@ g5p_check_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo *c
       if (BITSET_TEST(s->dynamic, MESA_VK_DYNAMIC_RS_POLYGON_MODE))
          return G5P_REFUSE(device, "dynamic polygon mode");
    }
-   /* line/point fill (PVR_G5P_POLYGON_MODE=probe): Zink asks for Bresenham polygon edges (bresenhamLines is
+   /* line/point fill: Zink asks for Bresenham polygon edges (bresenhamLines is
     * advertised, rectangularLines not); width-1 edges of the qualified shapes are the same pixels */
    const bool fill_bresenham = s->rs && s->rs->polygon_mode != VK_POLYGON_MODE_FILL &&
                                s->rs->line.mode == VK_LINE_RASTERIZATION_MODE_BRESENHAM;
