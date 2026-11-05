@@ -55,7 +55,7 @@ static void recipe(struct rbuf *b, enum g5p_recipe r, unsigned d, unsigned x, un
 {
    struct g5p_lit3 l;
    struct g5p_alu f;
-   if (r != G5P_RC_RSQ && d != x) {
+   if (r != G5P_RC_RSQ && !(r == G5P_RC_TRUNC && (flags & G5P_RC_VERTEX)) && d != x) {
       b->err = "recipe overwrites its input";
       return;
    }
@@ -67,7 +67,7 @@ static void recipe(struct rbuf *b, enum g5p_recipe r, unsigned d, unsigned x, un
    const unsigned bank = vs;
    /* sin and cos: v_sin, v_cos (bench-gaps.md), every temp in bank 1. */
    if (vs && r != G5P_RC_RCP && r != G5P_RC_RSQ && r != G5P_RC_MIN && r != G5P_RC_MAX && r != G5P_RC_SIN &&
-       r != G5P_RC_COS) {
+       r != G5P_RC_COS && r != G5P_RC_TRUNC) {
       b->err = "no measured vertex form";
       return;
    }
@@ -130,6 +130,19 @@ static void recipe(struct rbuf *b, enum g5p_recipe r, unsigned d, unsigned x, un
                                                true));
       break;
    case G5P_RC_TRUNC:
+      if (vs) {
+         /* v_trunc_rr (tools/g5p-1b-dgl/vs-canary/vsops2-probes.py): the fragment round trip in bank 1 with
+          * the header's bank bit per register operand, into the destination (d != x, d its own temporary);
+          * x is read again by the select (group 0), as Apple's form does whether or not x dies. */
+         R("round convert", g5p_usc_convert2(_r, G5P_F2I32, d, x, 1, 0, 0x51, 4, 0));
+         R("round back", g5p_usc_convert2(_r, G5P_I2F32, d, d, 1, 1, 0x11, 0, 0));
+         l = lit3(0x5c, d, 0x4b000000, x, 0, KV(1, 0x18, 0, 0), 0x40, 0x4000);
+         l.c_half = d;
+         l.c_group = 1;
+         R("round select", g5p_usc_literal_ternary(_r, &l));
+         break;
+      }
+      __attribute__((fallthrough));
    case G5P_RC_RINT: /* f_math_trunc_0 / f_math_rint_0: int round trip, |x| >= 2^23 keeps x */
       R("round convert", g5p_usc_convert2(_r, r == G5P_RC_TRUNC ? G5P_F2I32 : G5P_F2I32_RTE, t, x, 0, 0, 0x41, 4, 0));
       R("round back", g5p_usc_convert2(_r, G5P_I2F32, t, t, 0, 1, 1, 0, 0));

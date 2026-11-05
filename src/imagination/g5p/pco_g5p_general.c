@@ -519,7 +519,7 @@ static bool is_cmp(nir_op op)
 static bool vs_recipe(nir_op op)
 {
    return op == nir_op_frcp || op == nir_op_frsq || op == nir_op_fmin || op == nir_op_fmax || op == nir_op_fsin ||
-          op == nir_op_fcos;
+          op == nir_op_fcos || op == nir_op_ftrunc;
 }
 
 /* Ops with a measured complete Apple lowering (isa-g5p.md ISA round 2 §3). */
@@ -2176,6 +2176,15 @@ static void emit_recipe(struct gctx *c, nir_alu_instr *a)
    if (x.neg || x.abs)
       refuse(c, "%s of a negated/absolute operand (no modifier in the measured lowering)",
              nir_op_infos[a->op].name);
+   /* vertex trunc (v_trunc_rr): x kept, the destination is the round trip's temporary */
+   if (r == G5P_RC_TRUNC && c->vs) {
+      unsigned xr = reg_of(c, x, "trunc");
+      unsigned d = alloc_reg(c, -1);
+      put_recipe(c, r, d, xr, 0, 0, 0);
+      free_dying(c, &x, 1);
+      define(c, &a->def, d);
+      return;
+   }
    if (r == G5P_RC_RSQ) {
       unsigned xr = reg_of(c, x, "rsqrt");
       unsigned d = alloc_reg(c, -1); /* never the input: the -0 test writes first */

@@ -37,6 +37,15 @@ g5p_blend_test = executable(
 )
 test('g5p-blend-equations', g5p_blend_test, timeout : 120)
 
+g5p_vs_trunc_test = executable(
+  'g5p-vs-trunc-test',
+  files('tests/vs-trunc.c', 'g5p_usc.c', 'g5p_recipes.c'),
+  include_directories : [inc_powervr_g5p],
+  dependencies : [dep_m],
+  install : false,
+)
+test('g5p-vs-trunc', g5p_vs_trunc_test, timeout : 60)
+
 g5p_vsops_test = executable(
   'g5p-vsops-test',
   files('tests/vsops.c', 'g5p_usc.c'),
