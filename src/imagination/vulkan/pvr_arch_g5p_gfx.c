@@ -95,6 +95,25 @@ g5p_dump(const char *who, const char *what, uint64_t addr, const uint32_t *w, un
    fprintf(stderr, "\n");
 }
 
+/* USC programs have byte sizes and need not end on a dword boundary. */
+static void
+g5p_dump_code(const char *what, uint64_t addr, const void *code, unsigned size)
+{
+   if (!g5p_logging())
+      return;
+
+   const uint8_t *bytes = code;
+   fprintf(stderr, "g5p pipeline: %-16s @%#" PRIx64 ":", what, addr);
+   for (unsigned offset = 0; offset < size;) {
+      const unsigned count = MIN2(size - offset, sizeof(uint32_t));
+      uint32_t word = 0;
+      memcpy(&word, bytes + offset, count);
+      fprintf(stderr, " %08x", word);
+      offset += count;
+   }
+   fprintf(stderr, "\n");
+}
+
 /* A refusal, by name, on stderr too (vk_errorf() is silent in release builds) */
 #define G5P_REFUSE(obj, ...)                                                                                       \
    (fprintf(stderr, "G5P refuses: " __VA_ARGS__), fprintf(stderr, "\n"),                                          \
@@ -774,10 +793,8 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
               g->vs_usc_size, g->vs_temps, vs->temps, vs->written_temps, g->vs_outputs, g->vs_unified,
               g->vs_id_mask, g->fetch_count, g->fs_usc_size, g->fs_temps, fs->num_varyings, fs->w_set,
               g->fs_discard);
-      g5p_dump("pipeline", "vs usc", usc_off(device, g->vs_usc), (const uint32_t *)vs->code,
-               DIV_ROUND_UP(vs->size, 4));
-      g5p_dump("pipeline", "fs usc", usc_off(device, g->fs_usc), (const uint32_t *)fs->code,
-               DIV_ROUND_UP(fs->size, 4));
+      g5p_dump_code("vs usc", usc_off(device, g->vs_usc), vs->code, vs->size);
+      g5p_dump_code("fs usc", usc_off(device, g->fs_usc), fs->code, fs->size);
    }
    return VK_SUCCESS;
 }
