@@ -3486,6 +3486,18 @@ static void emit_intrinsic(struct gctx *c, nir_intrinsic_instr *in)
       return;
    }
    switch (in->intrinsic) {
+   case nir_intrinsic_load_vulkan_descriptor: {
+      unsigned set, binding;
+      /* Each accepted binding is uploaded from its own start. The offset
+       * channel is zero, as eval_offset() already assumes for constant
+       * loads. Dynamic SSBO store arithmetic must be able to read it too. */
+      if (in->def.num_components == 2 && block_binding(in->src[0].ssa, &set, &binding)) {
+         struct val *offset = V(c, &in->def, 1);
+         offset->state = VAL_CONST;
+         offset->imm = 0;
+      }
+      break;
+   }
    case nir_intrinsic_load_input: /* VS: values were bound in setup_inputs() */
    case nir_intrinsic_load_interpolated_input:
       /* FS: bound in hoist_iterators(), or read here on the pressure retry. */
