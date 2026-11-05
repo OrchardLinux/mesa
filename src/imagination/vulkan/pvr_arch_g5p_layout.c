@@ -206,8 +206,34 @@ g5p_block_texel(const struct g5p_surface *s, unsigned x, unsigned y, float out[4
 }
 
 static bool
-g5p_copy(const struct pvr_rect_mapping *m, struct g5p_surface *src, struct g5p_surface *dst)
+g5p_normalize_axis(int32_t *offset, uint32_t *extent, bool *flip)
 {
+   const int64_t signed_extent = (int32_t)*extent;
+   if (signed_extent < 0) {
+      const int64_t start = (int64_t)*offset + signed_extent;
+      if (start < 0 || start > INT32_MAX)
+         return false;
+      *offset = start;
+      *extent = -signed_extent;
+      *flip = !*flip;
+   }
+   return *offset >= 0;
+}
+
+static bool
+g5p_copy(const struct pvr_rect_mapping *mapping, struct g5p_surface *src, struct g5p_surface *dst)
+{
+   /* Rogue's blit builder keeps signed source deltas in VkExtent2D's
+    * unsigned fields, while destination reversal is usually in flip_x/y.
+    * CPU addressing needs increasing rectangles and the relative reversal
+    * of source and destination. Reversing both axes twice cancels out. */
+   struct pvr_rect_mapping normalized = *mapping;
+   if (!g5p_normalize_axis(&normalized.src_rect.offset.x, &normalized.src_rect.extent.width, &normalized.flip_x) ||
+       !g5p_normalize_axis(&normalized.src_rect.offset.y, &normalized.src_rect.extent.height, &normalized.flip_y) ||
+       !g5p_normalize_axis(&normalized.dst_rect.offset.x, &normalized.dst_rect.extent.width, &normalized.flip_x) ||
+       !g5p_normalize_axis(&normalized.dst_rect.offset.y, &normalized.dst_rect.extent.height, &normalized.flip_y))
+      return false;
+   const struct pvr_rect_mapping *m = &normalized;
    const bool decode = src->blocks && !dst->blocks;
    const bool same = !decode && (src->format == dst->format ||
                                  (src->bpp == dst->bpp && util_format_is_compressed(src->format)));
@@ -217,13 +243,16 @@ g5p_copy(const struct pvr_rect_mapping *m, struct g5p_surface *src, struct g5p_s
    const uint8_t *last = NULL;
    float block[16][4];
 
+   if (!dw || !dh || !sw || !sh)
+      return true;
+
    for (unsigned y = 0; y < dh; y++) {
-      unsigned sy = sh == dh ? y : y * sh / dh;
+      unsigned sy = sh == dh ? y : (uint64_t)y * sh / dh;
 
       if (m->flip_y)
          sy = sh - 1 - sy;
       for (unsigned x = 0; x < dw; x++) {
-         unsigned sx = sw == dw ? x : x * sw / dw;
+         unsigned sx = sw == dw ? x : (uint64_t)x * sw / dw;
 
          if (m->flip_x)
             sx = sw - 1 - sx;
