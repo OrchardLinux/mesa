@@ -51,6 +51,9 @@ enum bop {
    B_DOT2,   /* A * B - C * D */
    B_MINMAX, /* min/max(A, B); pair: the alpha form, FIXUP follows */
    B_FIXUP,  /* the pair's second instruction: A = MINMAX, B = MINMAX's A */
+   B_COPY,   /* 0 + B: defer output assignment until all source reads finish */
+   B_NEG,    /* 0 - B */
+   B_ZERO,   /* literal zero, without modifying the original source alpha */
 };
 
 #define MAXN 64
@@ -82,8 +85,13 @@ struct bctx {
    int out[4];         /* the node in half L at the emit */
    unsigned const_base;
    bool tile_alpha_only;
+   bool general; /* canonical fallback; measured shapes keep their exact bytes */
    char err[160];
 };
+
+#ifdef G5P_BLEND_TEST
+static void g5p_blend_test_program(const struct bctx *, const struct g5p_blend_info *);
+#endif
 
 #define ERR(c, ...) do { if (!(c)->err[0]) snprintf((c)->err, sizeof((c)->err), __VA_ARGS__); } while (0)
 #define FAIL(c, ...) do { ERR(c, __VA_ARGS__); return -1; } while (0)
@@ -202,6 +210,10 @@ static int final_of(struct bctx *c, int v, unsigned l)
 {
    if (v < 0)
       return -1;
+   if (c->general) {
+      c->out[l] = v;
+      return v;
+   }
    /* The destination as the output while a factor reads it too: Apple keeps
     * one tile_component in the output half (its source colour sits elsewhere,
     * dst_SourceAlphaSaturated); ours would read the tile twice. Unwitnessed. */
@@ -229,6 +241,40 @@ static int fin(struct bctx *c, enum bop op, int a, int b, int x, int d, bool neg
 static void channel(struct bctx *c, unsigned l, unsigned fs, unsigned fd, unsigned op)
 {
    int S = src(c, l);
+   if (c->general) {
+      int v;
+      if (op == O_MIN || op == O_MAX) {
+         int d = tile(c, l, false);
+         /* Preserve Apple's paired alpha min/max and SAS factor form. */
+         v = node(c, B_MINMAX, l == 3 ? d : S, l == 3 ? S : d,
+                  -1, -1, 0, false, op == O_MAX, l == 3, false);
+         if (l == 3)
+            v = node(c, B_FIXUP, v, d, -1, -1, 0, false, false, false, false);
+      } else {
+         struct fv sf = factor(c, fs, l), df = factor(c, fd, l);
+         struct fv s = product(c, S, sf, false);
+         struct fv d = df.kind == V_ZERO ? df : product(c, tile(c, l, false), df, true);
+         bool sz = s.kind == V_ZERO, dz = d.kind == V_ZERO;
+         if (sz && dz)
+            v = node(c, B_ZERO, -1, -1, -1, -1, 0, false, false, false, true);
+         else if (sz || dz) {
+            v = sz ? d.n : s.n;
+            if ((op == O_SUB && sz) || (op == O_RSUB && dz))
+               v = node(c, B_NEG, -1, v, -1, -1, 0, false, false, false, true);
+         } else {
+            /* Equal products still need distinct source slots. Keep the
+             * witnessed binary form instead of reading one half twice.
+             */
+            if (s.n == d.n)
+               d.n = node(c, B_COPY, -1, d.n, -1, -1, 0, false, false, false, false);
+            v = node(c, B_ADD, op == O_RSUB ? d.n : s.n,
+                     op == O_RSUB ? s.n : d.n, -1, -1, 0,
+                     op != O_ADD, false, false, false);
+         }
+      }
+      final_of(c, v, l);
+      return;
+   }
    if (op == O_MIN || op == O_MAX) { /* factors ignored */
       bool max = op == O_MAX;
       if (l == 3) {
@@ -333,14 +379,15 @@ static void reads(struct bctx *c, unsigned i, int v)
       c->n[v].last = i;
 }
 
-unsigned g5p_blend_general(uint8_t *out, unsigned max, const struct g5p_blend_key *k, unsigned const_base,
-                           struct g5p_blend_info *info, const char **err)
+static unsigned blend_build(uint8_t *out, unsigned max, const struct g5p_blend_key *k, unsigned const_base,
+                            struct g5p_blend_info *info, const char **err, bool general)
 {
    static _Thread_local struct bctx cx;
    struct bctx *c = &cx;
    memset(c, 0, sizeof(*c));
    memset(info, 0, sizeof(*info));
    c->const_base = const_base;
+   c->general = general;
    for (unsigned l = 0; l < 4; l++)
       c->raw[l] = c->out[l] = -1;
    *err = NULL;
@@ -358,7 +405,7 @@ unsigned g5p_blend_general(uint8_t *out, unsigned max, const struct g5p_blend_ke
          *err = c->err;
          return 0;
       }
-      if (op[l] <= O_RSUB && fs[l] == F_ZERO && fd[l] == F_ZERO) {
+      if (!general && op[l] <= O_RSUB && fs[l] == F_ZERO && fd[l] == F_ZERO) {
          info->zero_lanes |= 1u << l;
          fs[l] = F_ONE;
       }
@@ -372,12 +419,28 @@ unsigned g5p_blend_general(uint8_t *out, unsigned max, const struct g5p_blend_ke
       *err = "blend: alpha blends to 0 while the colour factors read the source alpha";
       return 0;
    }
-   if (info->zero_lanes == 0xf)
+   if (info->zero_lanes == 0xf) {
+#ifdef G5P_BLEND_TEST
+      g5p_blend_test_program(c, info);
+#endif
       return 0; /* no epilogue: the colour is constant 0 */
+   }
 
    /* 1. lower: colour channels, then alpha (its output overwrites the source alpha) */
    for (unsigned l = 0; l < 4; l++)
       channel(c, l, fs[l], fd[l], op[l]);
+   if (general && !c->err[0]) {
+      /* Every equation reads the original colour/alpha, including when the
+       * alpha equation is zero. Only now may the four output halves change.
+       */
+      for (unsigned l = 0; l < 4; l++) {
+         int v = node(c, B_COPY, -1, c->out[l], -1, -1, 0, false, false, false, false);
+         if (v < 0)
+            break;
+         c->n[v].final = l;
+         c->out[l] = v;
+      }
+   }
    for (unsigned l = 0; l < 4 && !c->err[0]; l++)
       if (c->out[l] < 0)
          snprintf(c->err, sizeof(c->err), "blend: channel %u has no output", l);
@@ -405,7 +468,7 @@ unsigned g5p_blend_general(uint8_t *out, unsigned max, const struct g5p_blend_ke
          for (unsigned s = 0; s < 4; s++)
             if (c->n[u].s[s] == (int)v && !carries(&c->n[u], s))
                all = false;
-      c->n[v].stepped = !all;
+      c->n[v].stepped = general || !all;
    }
    for (unsigned v = 0; v < c->nn; v++) {
       if (c->n[v].op == B_LERP && !unprocessed(c, c->n[v].s[0])) {
@@ -583,6 +646,14 @@ unsigned g5p_blend_general(uint8_t *out, unsigned max, const struct g5p_blend_ke
       case B_ONEM:
          PUT(g5p_usc_half_binary_literal(raw, e->half, 0x3c00, S[1], k, true, 0), "1 - x");
          break;
+      case B_COPY:
+      case B_NEG:
+         PUT(g5p_usc_half_binary_literal(raw, e->half, 0, S[1], k, e->op == B_NEG, 0),
+             e->op == B_NEG ? "negate" : "output copy");
+         break;
+      case B_ZERO:
+         PUT(g5p_usc_half_immediate(raw, e->half, 0), "zero");
+         break;
       case B_MOVC:
          PUT(g5p_usc_half_move_shared(raw, e->half, e->lane, 0, k), "blend constant move");
          break;
@@ -628,5 +699,20 @@ unsigned g5p_blend_general(uint8_t *out, unsigned max, const struct g5p_blend_ke
       }
    }
 #undef PUT
+#ifdef G5P_BLEND_TEST
+   g5p_blend_test_program(c, info);
+#endif
    return n;
+}
+
+unsigned g5p_blend_general(uint8_t *out, unsigned max, const struct g5p_blend_key *k, unsigned const_base,
+                           struct g5p_blend_info *info, const char **err)
+{
+   unsigned n = blend_build(out, max, k, const_base, info, err, false);
+   if (!*err)
+      return n;
+   /* Retain byte identity for every existing measured equation. Other core
+    * equations use the same tile read/convert/native-f16 ALU/write protocol.
+    */
+   return blend_build(out, max, k, const_base, info, err, true);
 }

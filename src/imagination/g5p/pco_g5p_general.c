@@ -99,13 +99,14 @@ enum { BLEND_NONE, BLEND_PREMULT, BLEND_STRAIGHT_OVER, BLEND_REPLACE, BLEND_GENE
  * replace keep their paths. By default only the settings of the device
  * blend ladder (linux-a9 blend-ladder.c, release7 2026-11-02: 45 rungs,
  * every pixel within 1 LSB) and of the bench ladder's three blend rungs
- * take it; the rest stay refused by name.
- * PVR_G5P_BLEND_GENERAL=1: every setting the generator builds;
+ * take their original byte-identical shape. All other core equations use
+ * the same tile protocol with canonical native-f16 ALU lowering.
+ * PVR_G5P_BLEND_GENERAL=1: explicitly enable (the default);
  * PVR_G5P_BLEND_GENERAL=0: none. */
 bool pco_g5p_blend_general(void)
 {
    const char *e = getenv("PVR_G5P_BLEND_GENERAL");
-   return e && !strcmp(e, "1");
+   return !e || strcmp(e, "0");
 }
 
 static bool blend_general_off(void)

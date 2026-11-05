@@ -27,3 +27,12 @@ idep_powervr_g5p = declare_dependency(
   link_with : libpowervr_g5p,
   include_directories : inc_powervr_g5p,
 )
+
+g5p_blend_test = executable(
+  'g5p-blend-test',
+  files('tests/blend.c', 'g5p_usc.c'),
+  include_directories : [inc_powervr_g5p],
+  dependencies : [dep_m],
+  install : false,
+)
+test('g5p-blend-equations', g5p_blend_test, timeout : 120)
