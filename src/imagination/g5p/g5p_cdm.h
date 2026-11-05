@@ -12,9 +12,9 @@ static inline uint32_t g5p_cdm_sizes(unsigned common, unsigned regs,
    return common << 18 | (2 * ((regs+7)/8)) << 12 |
           (regs ? 1u << 8 : 0) | (data_blocks-1) << 2 | (fence ? 3 : 0);
 }
-static inline struct g5p_cdm_record g5p_cdm_dma_task(uint32_t sizes, uint32_t data, uint32_t code)
+static inline struct g5p_cdm_record g5p_cdm_dma_task(uint32_t sizes, uint32_t data, uint32_t code, unsigned common)
 {
-   return (struct g5p_cdm_record){ .w = {sizes | (1u << 18),data | 2,code,0,0,0,8u << 27} };
+   return (struct g5p_cdm_record){ .w = {sizes | common << 18,data | 2,code,0,0,0,8u << 27} };
 }
 static inline struct g5p_cdm_record g5p_cdm_kernel(uint32_t sizes, uint32_t data, uint32_t code,
      unsigned x, unsigned y, unsigned z, unsigned threads, unsigned common)

@@ -226,13 +226,12 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
       struct pvr_csb *csb = &sub_cmd->control_stream;
       const struct g5p_cdm_record bind_rec =
          g5p_cdm_dma_task(G9P_CDM_DATA_BLOCKS(bind_dwords / 4), bind.data_offset,
-                          bind.code_offset);
+                          bind.code_offset, DIV_ROUND_UP(2 * n + 1, 16));
       const struct g5p_cdm_record kernel_rec = g5p_cdm_kernel(
          G9P_CDM_KERNEL_REGS(state->num_regs) | G9P_CDM_ANY_CLUSTER | G9P_CDM_FENCE |
             G9P_CDM_DATA_BLOCKS(kernel_dwords / 4),
          kernel.data_offset, kernel.code_offset, group_count[0], group_count[1],
-         group_count[2], threads, MAX2(DIV_ROUND_UP(4 * (2 * n + 1), 64),
-                         DIV_ROUND_UP(state->a9_local_dwords, 16)));
+         group_count[2], threads, DIV_ROUND_UP(state->a9_local_dwords, 16));
 
       pvr_csb_set_relocation_mark(csb);
       emit_record(csb, &bind_rec);
