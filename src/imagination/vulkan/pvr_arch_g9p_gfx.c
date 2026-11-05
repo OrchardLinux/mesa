@@ -998,6 +998,8 @@ struct g9p_draw_programs {
    float vp[6]; /* a0 m0 a1 m1 a2 m2 */
    /* PPP control's cull mode (Rogue's CULLMODE) */
    unsigned cull;
+   /* the draw's entry in the render's depth bias table, or -1 for none */
+   int dbias;
    /* the draw's entry in the render's scissor table, or -1 for none */
    int scissor;
    /*
@@ -1075,6 +1077,31 @@ g9p_isp_line_width(const struct vk_dynamic_graphics_state *dyn)
    return MIN2((!!w) * (w - 1), ROGUE_TA_STATE_ISPA_POINTLINEWIDTH_SIZE_MAX);
 }
 
+/* A depth bias table entry for the render, reusing the previous one when equal; its index */
+static int
+depth_bias_index(struct pvr_cmd_buffer *cmd_buffer, VkFormat format)
+{
+   const struct vk_dynamic_graphics_state *dyn = &cmd_buffer->vk.dynamic_graphics_state;
+   struct util_dynarray *a = &cmd_buffer->depth_bias_array;
+   float constant = dyn->rs.depth_bias.constant_factor;
+   struct pvr_depth_bias_state b;
+   unsigned n;
+
+   /* The hardware's equation is the float one: a unorm format's r made from it */
+   if (format == VK_FORMAT_D16_UNORM)
+      constant *= 512.0f;
+   b = (struct pvr_depth_bias_state){
+      .constant_factor = constant,
+      .slope_factor = dyn->rs.depth_bias.slope_factor,
+      .clamp = dyn->rs.depth_bias.clamp,
+   };
+   n = util_dynarray_num_elements(a, struct pvr_depth_bias_state);
+   if (n && !memcmp(util_dynarray_element(a, struct pvr_depth_bias_state, n - 1), &b, sizeof(b)))
+      return n - 1;
+   util_dynarray_append_typed(a, struct pvr_depth_bias_state, b);
+   return n;
+}
+
 /*
  * A draw's ISP words with a stencil aspect: ISPCTL and the front and back
  * ISPA/ISPB (the A9 driver, Rogue's face setup in the
@@ -1137,6 +1164,8 @@ g9p_ds_isp_words(const struct pvr_cmd_buffer *cmd_buffer, unsigned pass, bool sc
       c.bpres = stencil;
       c.two_sided = stencil;
       c.scenable = scissor;
+      c.dbenable = !no_colour && dyn->rs.depth_bias.enable &&
+                   g9p_isp_objtype(dyn) == ROGUE_TA_OBJTYPE_TRIANGLE;
    }
    w[1] = a[0], w[2] = b[0], w[3] = a[1], w[4] = b[1];
 }
@@ -1315,6 +1344,10 @@ PVR_PER_ARCH(g9p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer,
                              vk_format_has_depth(
                                 info->attachments[hw->ds_attach_idx]->vk.format);
 
+      dp.dbias = -1;
+      if (has_depth && dyn->rs.depth_bias.enable &&
+          g9p_isp_objtype(dyn) == ROGUE_TA_OBJTYPE_TRIANGLE)
+         dp.dbias = depth_bias_index(cmd_buffer, info->attachments[hw->ds_attach_idx]->vk.format);
       dp.depth_test = has_depth && dyn->ds.depth.test_enable;
       dp.depth_write = dp.depth_test && dyn->ds.depth.write_enable;
       dp.depth_compare = dyn->ds.depth.compare_op;
@@ -1411,10 +1444,12 @@ emit_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state
       const uint32_t a = 0x00100000 | obj | pass << 24 | (uint32_t)dp->depth_compare << 17 |
                          (dp->depth_write ? 0 : BITFIELD_BIT(21));
 
-      PPP_BLOCK(0x1f, 0x03c00000 | (dp->scissor >= 0 ? BITFIELD_BIT(16) : 0), a, 0x0e000000, a,
+      PPP_BLOCK(0x1f, 0x03c00000 | (dp->scissor >= 0 ? BITFIELD_BIT(16) : 0) |
+                         (dp->dbias >= 0 ? BITFIELD_BIT(17) : 0), a, 0x0e000000, a,
                 0x0e000000);
    } else {
-      PPP_BLOCK(0x1f, 0x03c40000 | (dp->scissor >= 0 ? BITFIELD_BIT(16) : 0),
+      PPP_BLOCK(0x1f, 0x03c40000 | (dp->scissor >= 0 ? BITFIELD_BIT(16) : 0) |
+                         (dp->dbias >= 0 ? BITFIELD_BIT(17) : 0),
                 0x003e0000 | obj | pass << 24, 0x0e000000, 0x00100000 | obj | pass << 24, 0);
    }
    if (dp->isp_set)
@@ -1440,7 +1475,8 @@ emit_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state
    /* 5: w clamp (1e-20) and PPP control */
    PPP_BLOCK(0x00210000, 0x1e3ce508, 0x4a0 | dp->cull);
    /* 6: depth bias / scissor index (ISPCTL bit 16 enables the scissor) */
-   PPP_BLOCK(0x20, dp->scissor >= 0 ? (uint32_t)dp->scissor : 0);
+   PPP_BLOCK(0x20, (dp->dbias >= 0 ? (uint32_t)dp->dbias << 16 : 0) |
+                      (dp->scissor >= 0 ? (uint32_t)dp->scissor : 0));
    /* 7: stream out (the data's address; HALT after it) */
    PPP_BLOCK(0x00c00000, 1, 0x4022, p->stream_out.data_offset);
 #undef PPP_BLOCK
@@ -1546,6 +1582,7 @@ g9p_ds_clear(struct pvr_cmd_buffer *cmd_buffer, const VkClearAttachment *att,
       /* z = the clear depth: the clear vertex shader's z is 0 */
       .vp = { w / 2, w / 2, h / 2, h / 2, att->clearValue.depthStencil.depth, 0 },
       .scissor = -1,
+      .dbias = -1,
       .isp_set = true,
    };
    struct pvr_suballoc_bo *verts_bo, *table_bo;
@@ -1645,6 +1682,7 @@ PVR_PER_ARCH(g9p_clear_attachments)(struct pvr_cmd_buffer *cmd_buffer, uint32_t 
       .dma = &dma, .tex = &colour_dma, .fs_common_dwords = 4,
       .vp = { w / 2, w / 2, h / 2, h / 2, 0, 1 },
       .scissor = -1,
+      .dbias = -1,
       /* always, nothing but colour written: not the application's depth and stencil state */
       .isp_set = true,
       .isp = { 0x03c40000, 0x003e0f00, 0x0e000000, 0x00100f00, 0 },
@@ -2202,9 +2240,8 @@ g9p_ds_zls(const struct pvr_render_job *job, uint64_t *zlsctl, uint64_t *stencil
          s.enable = true;
       }
    }
-   *bgobjdepth = f == VK_FORMAT_D16_UNORM
-                    ? (uint32_t)lroundf(CLAMP(job->ds_clear_value.depth, 0.0f, 1.0f) * 65535.0f)
-                    : fui(job->has_depth_attachment ? job->ds_clear_value.depth : 1.0f);
+   /* a float on every format: the ISP compares floats (D16 as 65535 failed every LESS) */
+   *bgobjdepth = fui(job->ds_clear_value.depth);
    pvr_csb_pack (bgobjvals, CR_ISP_BGOBJVALS, v) {
       v.enablebgtag = true;
       v.mask = true;
@@ -2256,7 +2293,7 @@ PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
     * which iPadOS's userspace passes as pixels (0x001f803f for 64x64).
     */
    put64(&s, job->scissor_table_addr.addr);
-   put64(&s, 0);
+   put64(&s, job->depth_bias_table_addr.addr);
    put64(&s, 0);
    uint64_t zlsctl = g9p_zlsctl(job), stencil_base = 0;
    uint32_t bgobjdepth = job->has_depth_attachment ? fui(job->ds_clear_value.depth) : 0x3f800000;

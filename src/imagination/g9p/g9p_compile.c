@@ -2474,6 +2474,12 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
    nir_function_impl *impl;
    unsigned st;
 
+   /* texture2DProj */
+   {
+      const nir_lower_tex_options tex = { .lower_txp = ~0u };
+
+      NIR_PASS(_, nir, nir_lower_tex, &tex);
+   }
    /* integer division through floats: no such instruction (GLSL ES 1.00 int and ivec /) */
    {
       const nir_lower_idiv_options idiv = { .allow_fp16 = false };
