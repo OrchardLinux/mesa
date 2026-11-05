@@ -4703,6 +4703,27 @@ static bool impl_has_side_effects(nir_function_impl *impl)
    return false;
 }
 
+/* Explicit depth export plus storage needs the complete A9 deferred-depth
+ * protocol, not just DEPTHF. Keep it refused when storage support is merged:
+ * Apple's 2908/2371/211d and early-test modes remain unqualified together. */
+static bool storage_with_depth(nir_shader *nir)
+{
+   bool storage = false, depth = false;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(ins, block) {
+            if (ins->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *in = nir_instr_as_intrinsic(ins);
+            storage |= nir_intrinsic_writes_external_memory(in);
+            depth |= in->intrinsic == nir_intrinsic_store_output &&
+                     nir_intrinsic_io_semantics(in).location == FRAG_RESULT_DEPTH;
+         }
+      }
+   }
+   return storage && depth;
+}
+
 static bool discards_to_select(nir_shader *nir)
 {
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
@@ -5489,6 +5510,8 @@ bool pco_g5p_compile_general_link(nir_shader *nir, bool half_output, const uint8
       refuse(c, "stage %u", nir->info.stage);
    if (!c->vs && !half_output)
       refuse(c, "only packed-f16 colour output (8-bit UNORM targets) is implemented");
+   if (!c->vs && c->key->depth_feedback && storage_with_depth(nir))
+      refuse(c, "fragment depth export with memory side effects is not qualified");
    if (!c->vs) {
       /* Colour targets: 0 means one. Several targets take no blend and only the full write mask. */
       enum g5p_mrt_refusal mr = g5p_mrt_out_plan_make(c->key->color_targets ? c->key->color_targets : 1, &c->mrt);
