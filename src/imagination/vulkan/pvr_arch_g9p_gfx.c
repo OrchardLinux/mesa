@@ -553,13 +553,23 @@ PVR_PER_ARCH(g9p_graphics_pipeline_compile)(struct pvr_device *device,
       state->fs_buffers[i].dwords = fs.buffers[i].dwords;
       if (fs.buffers[i].dwords)
          state->fs_common_dwords = MAX2(state->fs_common_dwords,
-                                        G9P_FS_BUF_BASE + G9P_FS_BUF_DWORDS * i +
+                                        g9p_fs_buf_base(fs.num_textures) + G9P_FS_BUF_DWORDS * i +
                                            fs.buffers[i].dwords);
    }
    state->num_textures = fs.num_textures;
    for (unsigned i = 0; i < fs.num_textures; i++) {
       state->textures[i].set = fs.textures[i].set;
       state->textures[i].binding = fs.textures[i].binding;
+      state->textures[i].index = fs.textures[i].index;
+   }
+   state->vs_num_textures = vs.num_textures;
+   state->vs_common_dwords = vs.num_textures
+                                ? g9p_tex_sampler(G9P_VS_TEX_BASE, vs.num_textures, vs.num_textures)
+                                : 2 * vs.num_buffers;
+   for (unsigned i = 0; i < vs.num_textures; i++) {
+      state->vs_textures[i].set = vs.textures[i].set;
+      state->vs_textures[i].binding = vs.textures[i].binding;
+      state->vs_textures[i].index = vs.textures[i].index;
    }
 
    result = pvr_gpu_upload_usc(device, vs.code, vs.code_size, 64, &state->vs_bo);
@@ -699,10 +709,10 @@ upload_textures(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics
 {
    const struct pvr_g9p_gfx_programs *p = &cmd_buffer->device->g9p.gfx;
    const struct pvr_descriptor_state *desc = &cmd_buffer->state.gfx_desc_state;
-   uint64_t src[G9P_MAX_BUFFERS + 3 * 4];
-   uint32_t ctrl[G9P_MAX_BUFFERS + 3 * 4];
-   uint32_t data[3 * (G9P_MAX_BUFFERS + 3 * 4) + 4] = { 0 };
-   uint32_t code[G9P_MAX_BUFFERS + 3 * 4 + 1];
+   uint64_t src[G9P_MAX_BUFFERS + 3 * G9P_MAX_TEXTURES];
+   uint32_t ctrl[G9P_MAX_BUFFERS + 3 * G9P_MAX_TEXTURES];
+   uint32_t data[3 * (G9P_MAX_BUFFERS + 3 * G9P_MAX_TEXTURES) + 4] = { 0 };
+   uint32_t code[G9P_MAX_BUFFERS + 3 * G9P_MAX_TEXTURES + 1];
    unsigned n = 0, nc = 0;
 
    if (state->fs_num_buffers) {
@@ -726,7 +736,7 @@ upload_textures(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics
          if (!state->fs_buffers[k].dwords || !addrs[k])
             continue;
          src[n] = addrs[k];
-         ctrl[n++] = doutd_ctrl(G9P_FS_BUF_BASE + G9P_FS_BUF_DWORDS * k,
+         ctrl[n++] = doutd_ctrl(g9p_fs_buf_base(state->num_textures) + G9P_FS_BUF_DWORDS * k,
                                 state->fs_buffers[k].dwords, false);
       }
    }
@@ -736,7 +746,9 @@ upload_textures(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics
       uint64_t addr = 0;
 
       if (set) {
-         const unsigned offset = set->layout->bindings[state->textures[t].binding].offset;
+         const struct pvr_descriptor_set_layout_binding *b =
+            &set->layout->bindings[state->textures[t].binding];
+         const unsigned offset = b->offset + state->textures[t].index * b->stride;
 
          addr = set->dev_addr.addr + offset;
          if (set->mapping)
@@ -746,8 +758,9 @@ upload_textures(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics
       for (unsigned k = 0; k < 3; k++) {
          src[n] = k == 0 ? addr : k == 1 ? p->zeros->dev_addr.addr
                                          : addr + sizeof(struct pvr_image_descriptor);
-         ctrl[n++] = doutd_ctrl(G9P_FS_TEX_BASE + G9P_TEX_STRIDE * t + 4 * k, k == 2 ? 2 : 4,
-                                false);
+         ctrl[n++] = doutd_ctrl(k == 2 ? g9p_tex_sampler(0, state->num_textures, t)
+                                       : g9p_tex_state(0, t) + 4 * k,
+                                k == 2 ? 2 : 4, false);
       }
    }
 
@@ -975,13 +988,46 @@ upload_vs_uniforms(struct pvr_cmd_buffer *cmd_buffer,
       sets[k][0] = state->buffers[k].set;
       sets[k][1] = state->buffers[k].binding;
    }
-   result = upload_buffer_addrs(cmd_buffer, state->num_buffers, sets,
-                                PVR_STAGE_ALLOCATION_VERTEX_GEOMETRY, &addr);
-   if (result != VK_SUCCESS)
-      return result;
+   if (state->vs_num_textures) {
+      /* the common store in one block: the addresses, then the textures' words */
+      const struct pvr_descriptor_state *desc = &cmd_buffer->state.gfx_desc_state;
+      uint32_t block[G9P_VS_TEX_BASE + 10 * G9P_MAX_TEXTURES] = { 0 };
+      uint64_t addrs[G9P_MAX_BUFFERS];
+      struct pvr_suballoc_bo *bo;
+
+      result = buffer_addrs(cmd_buffer, state->num_buffers, sets,
+                            PVR_STAGE_ALLOCATION_VERTEX_GEOMETRY, addrs);
+      if (result != VK_SUCCESS)
+         return result;
+      memcpy(block, addrs, 8 * state->num_buffers);
+      for (unsigned t = 0; t < state->vs_num_textures; t++) {
+         const struct pvr_descriptor_set *set = desc->sets[state->vs_textures[t].set];
+
+         if (set && set->mapping) {
+            const struct pvr_descriptor_set_layout_binding *b =
+               &set->layout->bindings[state->vs_textures[t].binding];
+            const uint8_t *d = (const uint8_t *)set->mapping + b->offset +
+                               state->vs_textures[t].index * b->stride;
+
+            memcpy(&block[g9p_tex_state(G9P_VS_TEX_BASE, t)], d, 16);
+            memcpy(&block[g9p_tex_sampler(G9P_VS_TEX_BASE, state->vs_num_textures, t)],
+                   d + sizeof(struct pvr_image_descriptor), 8);
+         }
+      }
+      result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, block,
+                                                  4 * state->vs_common_dwords, &bo);
+      if (result != VK_SUCCESS)
+         return result;
+      addr = bo->dev_addr.addr;
+   } else {
+      result = upload_buffer_addrs(cmd_buffer, state->num_buffers, sets,
+                                   PVR_STAGE_ALLOCATION_VERTEX_GEOMETRY, &addr);
+      if (result != VK_SUCCESS)
+         return result;
+   }
    data[0] = addr;
    data[1] = addr >> 32;
-   data[2] = doutd_ctrl(0, MAX2(2 * state->num_buffers, 2), true);
+   data[2] = doutd_ctrl(0, MAX2(state->vs_common_dwords, 2), true);
    data[3] = 0;
    return pvr_arch_cmd_buffer_upload_pds(cmd_buffer, data, ARRAY_SIZE(data), 16, NULL, 0,
                                          0, 64, dma);
@@ -1309,7 +1355,8 @@ PVR_PER_ARCH(g9p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer,
       if (result != VK_SUCCESS)
          return result;
       dp.tex = &tex;
-      dp.fs_common_dwords = MAX2(state->fs_common_dwords, G9P_TEX_STRIDE * state->num_textures);
+      dp.fs_common_dwords = MAX2(state->fs_common_dwords,
+                                 g9p_tex_sampler(0, state->num_textures, state->num_textures));
    }
    /* the viewport (a0 m0 a1 m1 a2 m2) */
    {
@@ -1515,7 +1562,7 @@ emit_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state
    pvr_csb_emit (csb, VDMCTRL_PDS_STATE0, s0) {
       s0.dm_target = ROGUE_VDMCTRL_DM_TARGET_VDM;
       s0.usc_target = ROGUE_VDMCTRL_USC_TARGET_ALL;
-      s0.usc_common_size = MAX2(DIV_ROUND_UP(8 * state->num_buffers, 16), 2);
+      s0.usc_common_size = MAX2(DIV_ROUND_UP(4 * state->vs_common_dwords, 16), 2);
       s0.pds_data_size = DIV_ROUND_UP(PVR_DW_TO_BYTES(dma->data_size),
                                       ROGUE_VDMCTRL_PDS_STATE0_PDS_DATA_SIZE_UNIT_SIZE);
    }
@@ -1575,6 +1622,7 @@ g9p_ds_clear(struct pvr_cmd_buffer *cmd_buffer, const VkClearAttachment *att,
       .vs_outputs = 4,
       .vs_regs = 8,
       .num_buffers = 1,
+      .vs_common_dwords = 2,
    };
    struct pvr_pds_upload dma;
    struct g9p_draw_programs dp = {
@@ -1676,6 +1724,7 @@ PVR_PER_ARCH(g9p_clear_attachments)(struct pvr_cmd_buffer *cmd_buffer, uint32_t 
       .vs_outputs = 4,
       .vs_regs = 8,
       .num_buffers = 1,
+      .vs_common_dwords = 2,
    };
    struct pvr_pds_upload dma, colour_dma;
    struct g9p_draw_programs dp = {

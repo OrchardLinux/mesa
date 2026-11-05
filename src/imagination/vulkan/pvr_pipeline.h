@@ -164,8 +164,13 @@ struct pvr_g9p_graphics_state {
    /* the fragment shader's combined image samplers, by common-store slot */
    unsigned num_textures;
    struct {
-      unsigned set, binding;
-   } textures[4];
+      unsigned set, binding, index;
+   } textures[16]; /* G9P_MAX_TEXTURES */
+   /* the vertex shader's, and the size of its common store in dwords */
+   unsigned vs_num_textures, vs_common_dwords;
+   struct {
+      unsigned set, binding, index;
+   } vs_textures[16]; /* G9P_MAX_TEXTURES */
 };
 
 struct pvr_compute_pipeline {

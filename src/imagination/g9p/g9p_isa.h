@@ -492,6 +492,13 @@ g9p_iterate(struct g9p_code *c, unsigned dst, unsigned first, unsigned comps,
             (perspective + first) << 9 | 0x0100 | 2 * dst, 0x0080);
 }
 
+/* A sample's W1: the f32 result's registers, the state's common-store dword / 2 at bit 9 */
+static inline uint16_t
+g9p_sample_w1(unsigned dst, unsigned state)
+{
+   return 0x0100 | 2 * dst | (state / 2) << 9;
+}
+
 /*
  * Texture sample, its coordinates straight from the varyings: an iterate of
  * @comps components from component @first whose result goes to the sampler
@@ -505,7 +512,7 @@ g9p_sample_varying(struct g9p_code *c, unsigned dst, unsigned first, unsigned co
                    unsigned state, unsigned sampler)
 {
    G9P_EMIT(c, (comps & 3) << 11 | 0x0308, (1 + first) << 9 | 0x0100, 0x8000);
-   G9P_EMIT(c, 0xf51a, 0x0100 | 2 * dst, 0x8100 | state << 8 | sampler, 0x0700, 0x0200);
+   G9P_EMIT(c, 0xf51a, g9p_sample_w1(dst, state), 0x8100 | sampler, 0x0700, 0x0200);
 }
 
 /*
@@ -516,7 +523,20 @@ g9p_sample_varying(struct g9p_code *c, unsigned dst, unsigned first, unsigned co
 static inline void
 g9p_sample_regs(struct g9p_code *c, unsigned dst, unsigned state, unsigned sampler)
 {
-   G9P_EMIT(c, 0xf51a, 0x0100 | 2 * dst, 0x8100 | state << 8 | sampler, 0x0700, 0x0200);
+   G9P_EMIT(c, 0xf51a, g9p_sample_w1(dst, state), 0x8100 | sampler, 0x0700, 0x0200);
+}
+
+/*
+ * Vertex shaders: coordinates in f32 r[@coord].., the level an f16 in r[@lod]'s
+ * low half (Apple's code for t.sample(s, uv, level(l)) in a vertex function,
+ * W2 bits 9-14 the coordinates' register)
+ */
+static inline void
+g9p_sample_vertex(struct g9p_code *c, unsigned dst, unsigned state, unsigned sampler,
+                  unsigned coord, unsigned lod)
+{
+   G9P_EMIT(c, 0xf51a, g9p_sample_w1(dst, state), 0x0100 | coord << 9 | sampler, 0x07c0 | lod,
+            0x8180, 0x0108, 0x0010);
 }
 
 /*
@@ -614,7 +634,8 @@ g9p_end_fragment(struct g9p_code *c, bool colour)
 static inline void
 g9p_cube_coords(struct g9p_code *c, unsigned dst_half, unsigned src_half)
 {
-   G9P_EMIT(c, 0x7d08, (uint16_t)(((src_half << 1) | 1) << 8 | dst_half), 0x8000);
+   G9P_EMIT(c, 0x7d08, (uint16_t)(((src_half << 1) | 1) << 8 | dst_half),
+            c->fragment ? 0x8000 : 0x8400);
 }
 
 #endif /* G9P_ISA_H */

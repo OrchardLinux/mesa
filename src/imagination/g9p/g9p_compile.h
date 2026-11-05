@@ -22,25 +22,35 @@
 #define G9P_MAX_BUFFERS 16
 #define G9P_MAX_ATTRIBS 16
 #define G9P_MAX_VARYINGS 16
-#define G9P_MAX_TEXTURES 4
+#define G9P_MAX_TEXTURES 16
 /*
- * Fragment common store per texture: its state (8 dwords) at dword 16t,
- * its sampler (2 dwords) at 16t + 8, as the draw's texture DMA places them
+ * Texture state in the common store (Apple's layout for n textures, metal-tt):
+ * texture t's state (8 dwords) at dword 8t, its sampler (2 dwords) at 8n + 2t,
+ * from dword 0 in fragment shaders and after the buffers' address slots in
+ * vertex shaders. In fragment shaders the buffers' contents follow: buffer k's
+ * first G9P_FS_BUF_DWORDS dwords at g9p_fs_buf_base() + G9P_FS_BUF_DWORDS k,
+ * which the shader reads as uniform operands (as Apple's fragment code does).
  */
-#define G9P_TEX_STRIDE 16
-/*
- * In fragment shaders the texture takes common-store dwords 0-9 (only state
- * at dword 0 samples correctly so far: RENDER.md "Textures in Mesa"). The
- * compiler accepts one texture per shader: a second one, at dword 16 by
- * G9P_TEX_STRIDE, would overlap the buffers, so the layout has to change
- * before it does. The buffers' contents follow from dword 16: buffer k's first
- * G9P_FS_BUF_DWORDS dwords at 16 + G9P_FS_BUF_DWORDS k, which the shader
- * reads as uniform operands (as Apple's fragment code does; memory loads
- * there do not work yet: ISA.md "Fragment uniforms")
- */
-#define G9P_FS_TEX_BASE 0
-#define G9P_FS_BUF_BASE 16
+#define G9P_VS_TEX_BASE 32
 #define G9P_FS_BUF_DWORDS 128
+
+static inline unsigned
+g9p_tex_state(unsigned base, unsigned t)
+{
+   return base + 8 * t;
+}
+
+static inline unsigned
+g9p_tex_sampler(unsigned base, unsigned n, unsigned t)
+{
+   return base + 8 * n + 2 * t;
+}
+
+static inline unsigned
+g9p_fs_buf_base(unsigned n)
+{
+   return n <= 1 ? 16 : (10 * n + 15) & ~15u;
+}
 
 /* The set of the push-constant slot (its address is loaded like a buffer's) */
 #define G9P_PUSH_CONSTANTS (~0u)
@@ -129,7 +139,7 @@ struct g9p_shader {
    /* Fragment: the combined image samplers sampled, by common-store slot */
    unsigned num_textures;
    struct {
-      unsigned set, binding;
+      unsigned set, binding, index;
    } textures[G9P_MAX_TEXTURES];
 };
 

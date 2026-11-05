@@ -144,6 +144,8 @@ struct g9p_ctx {
    uint64_t temps;  /* released after the current instruction */
    unsigned max_reg;
    unsigned st;     /* mask stack register */
+   unsigned tex_total;  /* textures the shader samples (count_textures()) */
+   int vertex_reg, instance_reg; /* vertex shaders: r0-r1, or copies of them */
    bool reserve_st_low; /* the mask stack is r15, reserved (compile_back()) */
    bool reserve_low;    /* r11-r14 for address work, after running out (compile_back()) */
    unsigned ip;
@@ -222,6 +224,21 @@ alloc_low_temp(struct g9p_ctx *ctx)
          ctx->busy |= BITFIELD64_BIT(r);
          ctx->temps |= BITFIELD64_BIT(r);
          ctx->max_reg = MAX2(ctx->max_reg, r);
+         return r;
+      }
+   }
+   dump_busy(ctx);
+   return -1;
+}
+
+/* @n consecutive registers below r16, for a vertex shader's sample */
+static int
+alloc_low_range(struct g9p_ctx *ctx, unsigned n)
+{
+   for (unsigned r = 0; r + n <= MIN2(16, G9P_NUM_REGS); r++) {
+      if (!(ctx->busy & BITFIELD64_RANGE(r, n))) {
+         ctx->busy |= BITFIELD64_RANGE(r, n);
+         ctx->max_reg = MAX2(ctx->max_reg, r + n - 1);
          return r;
       }
    }
@@ -1145,7 +1162,8 @@ emit_mem(struct g9p_ctx *ctx, nir_intrinsic_instr *intr, int slot, nir_scalar of
       data = alloc_reg(ctx);
       if (zero < 0 || data < 0)
          return false;
-      g9p_mov_uniform(ctx->c, data, G9P_FS_BUF_BASE + G9P_FS_BUF_DWORDS * slot + byte / 4, zero);
+      g9p_mov_uniform(ctx->c, data,
+                      g9p_fs_buf_base(ctx->tex_total) + G9P_FS_BUF_DWORDS * slot + byte / 4, zero);
       ctx->reg[key(&intr->def, 0)] = data;
       return true;
    }
@@ -1241,7 +1259,7 @@ emit_attrib_load(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
    if (zero < 0 || rs < 0 || t < 0)
       return false;
    g9p_addr(ctx->c, rs, 2 * stride_slot, zero, 0, false);
-   g9p_alu2(ctx->c, G9P_IMUL, t, a->per_instance ? 1 : 0, rs, false);
+   g9p_alu2(ctx->c, G9P_IMUL, t, a->per_instance ? ctx->instance_reg : ctx->vertex_reg, rs, false);
    ctx->busy &= ~BITFIELD64_RANGE(rs, 2);
    if (offset) {
       if (offset < 64) {
@@ -1438,31 +1456,91 @@ emit_fb_fetch(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
 }
 
 /* The texture slot of a combined image sampler deref, added if new */
+static bool
+texture_key(nir_tex_instr *tex, unsigned *set, unsigned *binding, unsigned *index)
+{
+   int i = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
+   nir_deref_instr *deref;
+   nir_variable *var;
+
+   if (i < 0)
+      return false;
+   deref = nir_src_as_deref(tex->src[i].src);
+   var = nir_deref_instr_get_variable(deref);
+   if (!var)
+      return false;
+   *set = var->data.descriptor_set;
+   *binding = var->data.binding;
+   *index = 0;
+   if (deref->deref_type == nir_deref_type_array) {
+      if (!nir_src_is_const(deref->arr.index))
+         return false;
+      *index = nir_src_as_uint(deref->arr.index);
+   }
+   return true;
+}
+
 static int
 texture_slot(struct g9p_ctx *ctx, nir_tex_instr *tex)
 {
-   int i = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
-   nir_variable *var;
-   unsigned k;
+   unsigned set, binding, index, k;
 
-   if (i < 0)
-      return -1;
-   var = nir_deref_instr_get_variable(nir_src_as_deref(tex->src[i].src));
-   if (!var)
+   if (!texture_key(tex, &set, &binding, &index))
       return -1;
    for (k = 0; k < ctx->out->num_textures; k++) {
-      if (ctx->out->textures[k].set == var->data.descriptor_set &&
-          ctx->out->textures[k].binding == var->data.binding)
+      if (ctx->out->textures[k].set == set && ctx->out->textures[k].binding == binding &&
+          ctx->out->textures[k].index == index)
          return k;
    }
-   if (k == 1) {
-      fprintf(stderr, "g9p: one texture per fragment shader so far\n");
+   if (k == G9P_MAX_TEXTURES) {
+      fprintf(stderr, "g9p: more than %u textures in a shader\n", G9P_MAX_TEXTURES);
       return -1;
    }
-   ctx->out->textures[k].set = var->data.descriptor_set;
-   ctx->out->textures[k].binding = var->data.binding;
+   ctx->out->textures[k].set = set;
+   ctx->out->textures[k].binding = binding;
+   ctx->out->textures[k].index = index;
    ctx->out->num_textures++;
    return k;
+}
+
+/* How many textures the shader samples: the layout of their common store */
+static unsigned
+count_textures(nir_function_impl *impl)
+{
+   struct { unsigned set, binding, index; } seen[G9P_MAX_TEXTURES];
+   unsigned n = 0;
+
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         unsigned set, binding, index, k;
+
+         if (instr->type != nir_instr_type_tex ||
+             !texture_key(nir_instr_as_tex(instr), &set, &binding, &index))
+            continue;
+         for (k = 0; k < n; k++) {
+            if (seen[k].set == set && seen[k].binding == binding && seen[k].index == index)
+               break;
+         }
+         if (k == n && n < G9P_MAX_TEXTURES) {
+            seen[n].set = set, seen[n].binding = binding, seen[n].index = index;
+            n++;
+         }
+      }
+   }
+   return n;
+}
+
+static unsigned
+tex_state_dword(const struct g9p_ctx *ctx, unsigned slot)
+{
+   return g9p_tex_state(ctx->stage == MESA_SHADER_VERTEX ? G9P_VS_TEX_BASE : 0, slot);
+}
+
+static unsigned
+tex_sampler_dword(const struct g9p_ctx *ctx, unsigned slot)
+{
+   return g9p_tex_sampler(ctx->stage == MESA_SHADER_VERTEX ? G9P_VS_TEX_BASE : 0,
+                          ctx->tex_total, slot);
 }
 
 /* The varying component an SSA scalar is a plain load of, or -1 */
@@ -1494,7 +1572,7 @@ static bool
 emit_txs(struct g9p_ctx *ctx, nir_tex_instr *tex)
 {
    const int slot = texture_slot(ctx, tex);
-   const unsigned u = G9P_FS_TEX_BASE + G9P_TEX_STRIDE * slot;
+   const unsigned u = tex_state_dword(ctx, MAX2(slot, 0));
    int w, h, d0, d1, t, zero;
 
    if (ctx->stage != MESA_SHADER_FRAGMENT || tex->sampler_dim != GLSL_SAMPLER_DIM_2D ||
@@ -1643,12 +1721,79 @@ emit_tex_layered(struct g9p_ctx *ctx, nir_tex_instr *tex)
    if (dst < 0)
       return false;
    at = ctx->c->n;
-   g9p_sample_regs(ctx->c, dst, G9P_FS_TEX_BASE + G9P_TEX_STRIDE * slot,
-                   G9P_FS_TEX_BASE + G9P_TEX_STRIDE * slot + 8);
+   g9p_sample_regs(ctx->c, dst, tex_state_dword(ctx, slot), tex_sampler_dword(ctx, slot));
    ctx->c->w[at] = (ctx->c->w[at] & ~0x0f00) |
                    (cube ? G9P_TEX_CUBE : G9P_TEX_2D_ARRAY) << 8;
    sample_lod(ctx, tex, at, lod);
    g9p_wait(ctx->c);
+   for (unsigned c = 0; c < 4; c++) {
+      ctx->reg[key(&tex->def, c)] = dst + c;
+      if (c >= tex->def.num_components || !ctx->last_use[key(&tex->def, c)])
+         ctx->busy &= ~BITFIELD64_BIT(dst + c);
+   }
+   return true;
+}
+
+/*
+ * A vertex shader's sample: explicit level (level 0 without one), the
+ * coordinates in registers of their own, as r0-r1 hold the vertex and instance
+ * index here.
+ */
+static bool
+emit_tex_vertex(struct g9p_ctx *ctx, nir_tex_instr *tex)
+{
+   const bool cube = tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE;
+   const int ci = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   const int slot = texture_slot(ctx, tex);
+   int lod = -1, coord, dst;
+   unsigned at;
+
+   if (ci < 0 || slot < 0 || tex->is_shadow || tex->is_array ||
+       (!cube && tex->sampler_dim != GLSL_SAMPLER_DIM_2D) ||
+       (tex->op != nir_texop_tex && tex->op != nir_texop_txl) ||
+       nir_tex_instr_src_index(tex, nir_tex_src_offset) >= 0) {
+      fprintf(stderr, "g9p: only 2D and cube samples with a level in vertex shaders\n");
+      return false;
+   }
+   if (tex->op == nir_texop_txl) {
+      lod = lod_source(ctx, tex);
+      if (lod < 0)
+         return false;
+   } else {
+      lod = const_reg(ctx, 0);
+      lod = lod < 0 ? lod : low_reg(ctx, lod);
+      if (lod < 0)
+         return false;
+   }
+   coord = alloc_low_range(ctx, 4);
+   if (coord < 0)
+      return false;
+   ctx->temps |= BITFIELD64_RANGE(coord, 4);
+   for (unsigned c = 0; c < (cube ? 3 : 2); c++) {
+      const int r = src_reg(ctx, nir_get_scalar(tex->src[ci].src.ssa, c));
+
+      if (r < 0)
+         return false;
+      g9p_alu2(ctx->c, G9P_OR, coord + c, r, r, false);
+   }
+   /* The cube op reads r0-r2 (no other source in Apple's code), reserved in such a shader */
+   if (cube) {
+      for (unsigned c = 0; c < 3; c++)
+         G9P_EMIT(ctx->c, 0x1199, 0x0100 | 2 * c, g9p_srcs(coord + c, coord + c, false), G9P_OR);
+      g9p_cube_coords(ctx->c, 2 * coord, 0);
+   }
+   dst = alloc_low_range(ctx, 4);
+   if (dst < 0)
+      return false;
+   at = ctx->c->n;
+   g9p_sample_vertex(ctx->c, dst, tex_state_dword(ctx, slot), tex_sampler_dword(ctx, slot), coord,
+                     lod);
+   if (cube) {
+      ctx->c->w[at] = (ctx->c->w[at] & ~0x0f00) | G9P_TEX_CUBE << 8;
+      ctx->c->w[at + 2] |= 0x8000;
+   }
+   g9p_wait(ctx->c);
+   release(ctx, &tex->instr);
    for (unsigned c = 0; c < 4; c++) {
       ctx->reg[key(&tex->def, c)] = dst + c;
       if (c >= tex->def.num_components || !ctx->last_use[key(&tex->def, c)])
@@ -1673,6 +1818,8 @@ emit_tex(struct g9p_ctx *ctx, nir_tex_instr *tex)
 
    if (tex->op == nir_texop_txs)
       return emit_txs(ctx, tex);
+   if (ctx->stage == MESA_SHADER_VERTEX)
+      return emit_tex_vertex(ctx, tex);
    if (tex->is_array || tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE)
       return emit_tex_layered(ctx, tex);
    if (ctx->stage != MESA_SHADER_FRAGMENT || tex->sampler_dim != GLSL_SAMPLER_DIM_2D ||
@@ -1689,8 +1836,8 @@ emit_tex(struct g9p_ctx *ctx, nir_tex_instr *tex)
       dst = alloc_range(ctx, 4);
       if (dst < 0)
          return false;
-      g9p_sample_varying(ctx->c, dst, first, 2, G9P_FS_TEX_BASE + G9P_TEX_STRIDE * slot,
-                         G9P_FS_TEX_BASE + G9P_TEX_STRIDE * slot + 8);
+      g9p_sample_varying(ctx->c, dst, first, 2, tex_state_dword(ctx, slot),
+                         tex_sampler_dword(ctx, slot));
       ctx->out->num_varyings = MAX2(ctx->out->num_varyings, first / 4 + 1);
    } else {
       const int lod = lod_source(ctx, tex);
@@ -1711,8 +1858,7 @@ emit_tex(struct g9p_ctx *ctx, nir_tex_instr *tex)
       {
          const unsigned at = ctx->c->n;
 
-         g9p_sample_regs(ctx->c, dst, G9P_FS_TEX_BASE + G9P_TEX_STRIDE * slot,
-                         G9P_FS_TEX_BASE + G9P_TEX_STRIDE * slot + 8);
+         g9p_sample_regs(ctx->c, dst, tex_state_dword(ctx, slot), tex_sampler_dword(ctx, slot));
          sample_lod(ctx, tex, at, lod);
       }
    }
@@ -2202,6 +2348,19 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
    /* 2D array and cube samples: their coordinates in r0-r3 (emit_tex_layered()) */
    if (ctx->stage == MESA_SHADER_FRAGMENT && uses_layered_tex(impl))
       ctx->busy |= BITFIELD64_RANGE(0, 4), ctx->pinned |= BITFIELD64_RANGE(0, 4);
+   /* a vertex shader's cube samples use r0-r3 too: the indices kept elsewhere */
+   ctx->vertex_reg = 0;
+   ctx->instance_reg = 1;
+   if (ctx->stage == MESA_SHADER_VERTEX && uses_layered_tex(impl)) {
+      ctx->busy |= BITFIELD64_RANGE(0, 4), ctx->pinned |= BITFIELD64_RANGE(0, 4);
+      ctx->vertex_reg = alloc_pair(ctx);
+      if (ctx->vertex_reg < 0)
+         return false;
+      ctx->instance_reg = ctx->vertex_reg + 1;
+      ctx->pinned |= BITFIELD64_RANGE(ctx->vertex_reg, 2);
+      g9p_alu2(ctx->c, G9P_OR, ctx->vertex_reg, 0, 0, false);
+      g9p_alu2(ctx->c, G9P_OR, ctx->instance_reg, 1, 1, false);
+   }
 
    /* compute: r0 holds the local index from the start when it is used */
    nir_foreach_block(block, impl) {
@@ -2531,6 +2690,7 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
    if (!impl)
       return false;
    nir_index_ssa_defs(impl);
+   ctx.tex_total = count_textures(impl);
    if (getenv("G9P_DEBUG"))
       nir_print_shader(nir, stderr);
 
