@@ -907,6 +907,9 @@ static void scan_cf(struct gctx *c, struct exec_list *list, struct unsupported *
             case nir_intrinsic_load_ubo:
                ok = true;
                break;
+            case nir_intrinsic_store_ssbo:
+               ok = in->src[0].ssa->bit_size==32 && in->num_components==1 && nir_intrinsic_write_mask(in)==1;
+               break;
             case nir_intrinsic_load_ssbo:
                ok = !c->vs;
                break;
@@ -1423,6 +1426,11 @@ static void liveness(struct gctx *c)
             mark(c, resolve_value(c, in->src[0].ssa, 0), idx);
             continue;
          }
+         if (in->intrinsic == nir_intrinsic_store_ssbo) {
+            mark(c,resolve_value(c,in->src[0].ssa,0),idx);
+            mark(c,resolve_value(c,in->src[2].ssa,0),idx);
+            continue;
+         }
          if (in->intrinsic == nir_intrinsic_store_reg) {
             mark(c, resolve_value(c, in->src[0].ssa, 0), idx);
             mark_decl(c, in->src[1].ssa, idx);
@@ -1729,8 +1737,9 @@ static void plan_common(struct gctx *c)
          struct range *r = range_for(c, PCO_G5P_UPLOAD_UBO, set, binding);
          r->lo = MIN2(r->lo, off);
          r->hi = MAX2(r->hi, off + 4 * in->def.num_components);
-      } else if (in->intrinsic == nir_intrinsic_load_ssbo) {
-         if (!block_binding(in->src[0].ssa, &set, &binding))
+      } else if (in->intrinsic == nir_intrinsic_load_ssbo || in->intrinsic == nir_intrinsic_store_ssbo) {
+         unsigned source=in->intrinsic==nir_intrinsic_store_ssbo ? 1 : 0;
+         if (!block_binding(in->src[source].ssa, &set, &binding))
             refuse(c, "load_ssbo: block index is not a constant descriptor binding");
          bool found = false;
          for (unsigned i = 0; i < c->nssbo; i++)
@@ -3442,6 +3451,33 @@ static void emit_deriv(struct gctx *c, nir_intrinsic_instr *in)
    define(c, &in->def, dst);
 }
 
+static void stage_ssbo_store(struct gctx *c,nir_intrinsic_instr *in)
+{
+   if(in->src[0].ssa->bit_size!=32 || in->num_components!=1 || nir_intrinsic_write_mask(in)!=1 ||
+      nir_intrinsic_offset_shift(in)!=0 || nir_intrinsic_align_mul(in)<4 || nir_intrinsic_align_offset(in)%4)
+      refuse(c,"store_ssbo: aligned scalar32-bit byte offsets only");
+   unsigned set,binding,base=0;block_binding(in->src[1].ssa,&set,&binding);
+   for(unsigned i=0;i<c->nssbo;i++)if(c->ssbo_set[i]==set && c->ssbo_binding[i]==binding)base=2*i;
+   struct ref offset=resolve_value(c,in->src[2].ssa,0),value=resolve_value(c,in->src[0].ssa,0);
+   unsigned index=reg_of(c,offset,"store_ssbo byte offset"),data=reg_of(c,value,"store_ssbo value");
+   unsigned pair;
+   for(pair=0;pair+2<=NUM_DWORDS;pair+=2)
+      if(!((c->busy|c->reserved)&BITFIELD_RANGE(pair,2)))break;
+   if(pair+2>NUM_DWORDS)refuse(c,"store_ssbo: register pressure for address pair");
+   c->busy|=BITFIELD_RANGE(pair,2);
+   c->max_dword=MAX2(c->max_dword,pair+2);c->max_written=MAX2(c->max_written,pair+2);
+   uint8_t raw[G5P_USC_MAX];
+   put(c,raw,g5p_usc_address_add_shift(raw,2*pair,base,2*index,0,false,c->vs),"SSBO address");
+   if(c->vs)put(c,raw,g5p_usc_global_store(raw,4,2*data,2*pair,0),"vertex SSBO store");
+   else {
+      put(c,raw,g5p_usc_fs_store_predicate(raw),"fragment store predicate");
+      put(c,raw,g5p_usc_fs_store(raw,4,2*data,2*pair,1),"fragment SSBO store");
+   }
+   put(c,raw,g5p_usc_wait(raw,0),"SSBO store completion");
+   c->busy&=~BITFIELD_RANGE(pair,2);free_scratch(c);
+   c->p->evidence|=c->vs?PCO_G5P_EV_VS_STORE:PCO_G5P_EV_FS_STORE;
+}
+
 static void emit_intrinsic(struct gctx *c, nir_intrinsic_instr *in)
 {
    uint8_t raw[G5P_USC_MAX];
@@ -3470,6 +3506,9 @@ static void emit_intrinsic(struct gctx *c, nir_intrinsic_instr *in)
       v->imm = c->xfb_common + PCO_G5P_XFB_NUM_VERTICES;
       break;
    }
+   case nir_intrinsic_store_ssbo:
+      stage_ssbo_store(c,in);
+      break;
    case nir_intrinsic_store_global:
       vs_store(c, in);
       break;

@@ -69,6 +69,7 @@ enum pco_g5p_evidence {
    /* g5p-hypr (bits 20..22 on that lane) */
    PCO_G5P_EV_COMMON_HIGH = 1u << 24, /* HOST: fragment common store past dword 63 (f_u80all, f_u256all) */
    PCO_G5P_EV_DERIV = 1u << 25,      /* HOST: dfdx/dfdy (f_ddx_*, f_ddy_*), fine or coarse unmeasured */
+   PCO_G5P_EV_FS_STORE = 1u << 27, /* HOST: helper predicate + fragment class70/71 store */
    PCO_G5P_EV_HIGH_REGS = 1u << 26,  /* HOST: homes above r31 (G9P's moves; Apple's r32..r69 operands) */
 };
 

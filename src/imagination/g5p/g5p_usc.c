@@ -542,7 +542,7 @@ unsigned g5p_usc_special(uint8_t *out, bool end)
 /* End of a task that writes no output: 5e 01 00 a0. The TA's end-of-stream
  * program (GET_RENDER_INFO's TA program slot, W+0x88) is a branch to the next
  * 64-byte block, 0xc000 padding, and this word: Apple's A9 job layout has it
- * there, and Henrik Klee's G9P builds the same program for the same register
+ * there, and the G9P driver builds the same program for the same register
  * on the A10 (pvr_arch_g9p_gfx.c, "Register 0x470's program"). */
 unsigned g5p_usc_task_end(uint8_t *out)
 {
@@ -1020,7 +1020,7 @@ unsigned g5p_usc_address_load(uint8_t *out, unsigned dst_half, unsigned byte_cou
  * `base` + (index << shift). Bytes from Apple's own compiles of a constant
  * buffer indexed by a register (tools/mesa-a9-gles3tex/dynubo.metal: v_cexpr,
  * v_cbase `89 11 00 03 81 81 00 41 a1 01 00 86`, f_cflat `89 01 00 01 ...`);
- * the same fields as Hendrik's A10 g9p_addr (dst, 0x81 | 4 * base,
+ * the same fields as the A10 port's g9p_addr (dst, 0x81 | 4 * base,
  * 1 | index << 2 | kill << 7, shift in b11[7:5]). The shift field is
  * corpus-verified 0-4 (isa-g5p.md); kill marks the index's last read. */
 unsigned g5p_usc_address_add_shift(uint8_t *out, unsigned pair_half, unsigned base_common_dword,
@@ -1037,8 +1037,8 @@ unsigned g5p_usc_address_add_shift(uint8_t *out, unsigned pair_half, unsigned ba
 }
 
 /* Vertex class-10 load from an address pair, six bytes: `10 3b 00 01 00 88`
- * (dynubo.metal v_cbase; Hendrik's g9p_mem_at vertex form). b4 is 0 here
- * and in Hendrik's; Apple's v_cexpr has 1 there (unresolved). */
+ * (dynubo.metal v_cbase; G9P's g9p_mem_at vertex form). b4 is 0 here
+ * and in G9P's; Apple's v_cexpr has 1 there (unresolved). */
 unsigned g5p_usc_vertex_address_load(uint8_t *out, unsigned dst_half, unsigned byte_count,
                                      unsigned address_half)
 {
@@ -1812,7 +1812,7 @@ unsigned g5p_usc_stack(uint8_t *out, enum g5p_stack_op op, unsigned st, bool imm
    }
    if (st >= 32) {
       /* a source above r31: r & 31 in the field, bit 0 set, r >> 5 in an
-       * extension word (Henrik's g9p_mov_from_high(); Apple's f_k16) */
+       * extension word (G9P's g9p_mov_from_high(); Apple's f_k16) */
       const uint16_t w[] = {0x01c8, dst, 0x0101 | (2 * (st & 31) + 1) << 1 | (last ? 0x80 : 0),
                             0x0100 | (st >> 5) << 1, w3};
       return put_words(out, w, 5);
@@ -1900,7 +1900,7 @@ unsigned g5p_usc_derivative(uint8_t *out, bool y, unsigned dst_half, unsigned sr
  * in its 5-bit field and puts r >> 5 in an extension word (A at bit 1, B at
  * bit 9). Apple's A9 compiler emits the same words (f_k8, f_k16, f_kv16 use
  * r32..r69; control-flow.md). op: the binop code (fadd 44, fmul 48, iadd a1,
- * or ce, ...). Henrik's moves to and from a home are op ce (or) with a == b. */
+ * or ce, ...). G9P's moves to and from a home are op ce (or) with a == b. */
 unsigned g5p_usc_alu2_wide(uint8_t *out, unsigned op, unsigned dst, unsigned a, unsigned a_group, unsigned b,
                            unsigned b_group)
 {
@@ -1912,4 +1912,21 @@ unsigned g5p_usc_alu2_wide(uint8_t *out, unsigned op, unsigned dst, unsigned a, 
    }
    const uint16_t w[] = {0x0199, 0x0100 | 2 * dst, srcs | 1, 0x0100 | (a >> 5) << 1 | (b >> 5) << 9, op};
    return put_words(out, w, 5);
+}
+
+/* Graphics storage differential host compiles, compute-gfx-storage-isa.md.
+ * Unlike compute/vertex class10, fragment stores use the pixel side-effect
+ * port70/71 and the observed active-fragment predicate. */
+unsigned g5p_usc_fs_store_predicate(uint8_t *out)
+{
+   const uint16_t w[]={0x0182,0x0101,0x0120,0x0129,0x0110,0xa1bd,0x00b0};
+   return put_words(out,w,7);
+}
+unsigned g5p_usc_fs_store(uint8_t *out,unsigned bytes,unsigned data_half,unsigned addr_half,unsigned slot)
+{
+   CHECK(bytes==4 || bytes==8 || bytes==16,"fragment stores:4/8/16bytes witnessed");
+   CHECK(data_half<64 && !(data_half&1) && addr_half<62 && !(addr_half&3) && slot<=1,"fragment store register/slot fields");
+   unsigned size=bytes==4?4:bytes==8?5:7;
+   const uint16_t w[]={size<<11|0x0370|slot,0x0080|data_half|addr_half<<9};
+   return put_words(out,w,2);
 }

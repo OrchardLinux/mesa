@@ -25,7 +25,7 @@ extern _Thread_local const char *g5p_usc_error;
 enum g5p_binop {
    G5P_BIN_FADD, G5P_BIN_FMUL, G5P_BIN_IADD, G5P_BIN_IMUL,
    G5P_BIN_AND, G5P_BIN_OR, G5P_BIN_XOR, G5P_BIN_ISHR,
-   G5P_BIN_ISUB, /* two registers only (Apple's 00a5; Henrik's G9P_ISUB) */
+   G5P_BIN_ISUB, /* two registers only (Apple's 00a5; G9P_ISUB) */
    G5P_BIN_COUNT,
 };
 enum g5p_minmax { G5P_UMIN, G5P_UMAX, G5P_IMIN, G5P_IMAX, G5P_MINMAX_COUNT };
@@ -397,6 +397,10 @@ unsigned g5p_usc_address_add(uint8_t *out, unsigned dst_half, unsigned ptr_dword
  * v_st_bytes, 2 in v_st_stride12, 3 in v_st_off12):
  * `10 (0x23+8(n-1)) (0x80|data_half) (addr_half<<1|1) OO 88`.
  * Vertex tasks commit only the 4-byte form (xfb.md, device run 2). */
+/* Host fragment store predicate and class70/71 memory side effect;
+ * helper-lane interpretation is inferred, pending graphics-storage rungs. */
+unsigned g5p_usc_fs_store_predicate(uint8_t *out);
+unsigned g5p_usc_fs_store(uint8_t *out,unsigned bytes,unsigned data_half,unsigned addr_half,unsigned slot);
 unsigned g5p_usc_global_store(uint8_t *out, unsigned bytes, unsigned data_half, unsigned addr_half,
                               unsigned dword_offset);
 /* Vertex integer add of a literal: short prefix + `a1 09 70 00` up to 0xffff
@@ -411,7 +415,7 @@ unsigned g5p_usc_shl_literal(uint8_t *out, unsigned dst_half, unsigned src_half,
 /* Register move with destination control (v_st_gather: `98 21 DD 83 SS 01 54 01 38 00`). */
 unsigned g5p_usc_move2(uint8_t *out, unsigned dst_half, unsigned src_half, unsigned bank,
                        unsigned src_group, unsigned header, unsigned dst_control);
-/* Control flow (from Henrik Klee's G9P encoders, d91427625ff; g5p_usc.c):
+/* Control flow (from the G9P encoders, d91427625ff; g5p_usc.c):
  * the execution-mask stack in the upper half of register st, the compares
  * that set the relation it reads, and jumps (byte offset from the jump's
  * start; any: back while some lane runs, else forward when none does).
@@ -429,7 +433,7 @@ unsigned g5p_usc_cf_compare(uint8_t *out, enum g5p_cmp op, unsigned a, unsigned 
                             unsigned b_group);
 unsigned g5p_usc_cf_compare_imm(uint8_t *out, enum g5p_cmp op, unsigned reg, unsigned group, unsigned imm);
 
-/* Registers above r31 (from Henrik Klee's G9P encoders, d1ab45daed3; g5p_usc.c):
+/* Registers above r31 (from the G9P encoders, d1ab45daed3; g5p_usc.c):
  * the two-source ALU form with any of r0..r127, fragment bank. A source above
  * r31 takes the extension word. op: the binop code. */
 unsigned g5p_usc_alu2_wide(uint8_t *out, unsigned op, unsigned dst, unsigned a, unsigned a_group, unsigned b,
