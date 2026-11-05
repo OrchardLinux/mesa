@@ -3,6 +3,12 @@
 #define PVR_G5P_COMPUTE_HOOKS_H
 #if defined(PVR_APPLE_G5P)
 #include "pvr_g5p_compute.h"
+/* All G5P engines use typed kernel contexts and kernel fault recovery. The
+ * generic Rogue reset command is empty and its BVNC compute precondition does
+ * not describe A9's native CDM path. Its matching cleanup is a no-op too. */
+#define PVR_G5P_HOOK_ctx_reset_cmd_init() \
+   if (PVR_HAS_FEATURE(dev_info, apple_g5p)) \
+      return VK_SUCCESS;
 #define PVR_G5P_HOOK_compute_pipeline() \
    if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p)) { \
       result = pvr_arch_g5p_compute_pipeline_compile(device, pCreateInfo, compute_pipeline); \

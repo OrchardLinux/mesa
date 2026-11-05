@@ -64,7 +64,7 @@ static VkResult pvr_ctx_reset_cmd_init(struct pvr_device *device,
                                        struct pvr_reset_cmd *const reset_cmd)
 {
    const struct pvr_device_info *dev_info = &device->pdevice->dev_info;
-
+   PVR_G5P_HOOK(ctx_reset_cmd_init)
    /* The reset framework depends on compute support in the hw. */
    assert(PVR_HAS_FEATURE(dev_info, compute));
 
