@@ -81,6 +81,7 @@ struct pco_g5p_fs_key {
    bool blend;
    /* Real kill feedback for depth/stencil writes; merge conditions into one token. */
    bool punch;
+   bool depth_feedback; /* qualification admission; false by default */
    uint8_t src_rgb, dst_rgb, src_a, dst_a, op_rgb, op_a;
    uint8_t write_mask; /* VkColorComponentFlags; 0xf = all */
    bool srgb;          /* _AGCDrawBuffer.gammaCorrection (bit location unmeasured: refused) */
@@ -173,6 +174,7 @@ struct pco_g5p_program {
    unsigned blend_mode; /* 0 none, 1 premultiplied, 2 straight-over (pre-multiplied in f32), 4 general */
    size_t size;
    bool vertex;
+   bool depth_feedback; /* native f32 fragment depth replacement */
    unsigned input_mask;                            /* VS generic locations read */
    uint8_t input_components[PCO_G5P_MAX_ATTRIBS];  /* VS components read */
    unsigned outputs;                               /* VS output dwords */

@@ -255,6 +255,8 @@ unsigned g5p_usc_square(uint8_t *out, unsigned dst_half, struct g5p_src s, struc
 unsigned g5p_usc_discard_test(uint8_t *out, enum g5p_cmp op, unsigned dst_half, struct g5p_src a,
                               struct g5p_src b, unsigned relation_control);
 unsigned g5p_usc_discard(uint8_t *out, int src_half);
+/* Fragment depth replacement (A9 depth(any) compiler witnesses). */
+unsigned g5p_usc_depth_feedback(uint8_t *out, unsigned src_half);
 struct g5p_lit3 {
    unsigned opcode, dst_half;
    uint32_t value;

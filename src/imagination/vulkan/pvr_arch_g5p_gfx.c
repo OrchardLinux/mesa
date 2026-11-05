@@ -586,6 +586,8 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
    struct pvr_g5p_vertex_layout vertex;
    pvr_g5p_vertex_layout_init(&vertex, s->vi, BITSET_TEST(s->dynamic, MESA_VK_DYNAMIC_VI_BINDING_STRIDES));
 
+   const char *depth_probe = getenv("PVR_G5P_DEPTH_EXPORT");
+   key.depth_feedback = depth_probe && !strcmp(depth_probe, "probe");
    /* the fragment program first: the vertex program is compiled against the
     * varyings it reads (Apple's VertexProgramKey; Rogue's pco_rev_link_nir) */
    if (!pvr_g5p_compile_stage(fs_info, true, g->samples, NULL, &key, NULL, fs))
@@ -667,6 +669,9 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
       return G5P_REFUSE(device, "punch-through variant needs exactly one real discard token");
    g->fs_side_effects = fs->side_effects;
    g->vs_side_effects = vs->side_effects;
+   g->fs_depth_feedback = fs->depth_feedback;
+   if (g->fs_depth_feedback && g->samples != 1)
+      return G5P_REFUSE(device, "multisample fragment depth export is not qualified");
    g->fs_blend_mode = fs->blend_mode;
    g->fs_write_mask = key.write_mask;
    g->color_targets = key.color_targets;
@@ -1441,6 +1446,8 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
    result = pvr_arch_g5p_vertex_draw_check(cmd_buffer, g, draw);
    if (result != VK_SUCCESS)
       return result;
+   if (g->fs_depth_feedback)
+      cs->current_sub_cmd->gfx.has_depth_feedback = true;
    /* what the draw can read outside the arena, for the job's resource list (pvr_g5p_perf.h) */
    pvr_arch_g5p_perf_draw(cmd_buffer, draw->indexed);
 
@@ -1512,6 +1519,8 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
    /* rasterizer discard: no depth/stencil aspects (Rogue's rule), the colour-only ISP form */
    const VkImageAspectFlags ds_aspects = discard ? 0 : pvr_arch_g5p_ds_aspects(cmd_buffer);
    const bool dbias = ds_aspects && dyn->rs.depth_bias.enable;
+   if (g->fs_depth_feedback && dbias)
+      return G5P_REFUSE(cmd_buffer, "fragment depth export with depth bias is not qualified");
    uint32_t dbias_index = 0;
    /* Real single-token feedback defers depth/stencil writes until the kill
     * result is known (g5p-punch-ds@8150a8195df); preserve all DS test/ops. */
@@ -1600,7 +1609,7 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
    {
       struct pvr_g5p_blend_isp isp;
       pvr_arch_g5p_blend_isp(g->fs_blend_mode, g->fs_discard, g->fs_write_mask, discard, &isp);
-      const enum ROGUE_TA_PASSTYPE pass = isp.pass_type;
+      const enum ROGUE_TA_PASSTYPE pass = g->fs_depth_feedback ? ROGUE_TA_PASSTYPE_DEPTH_FEEDBACK : isp.pass_type;
       /* points rasterize as sprites (g3b-points: SPRITE_01UV, front and back) */
       /* triangles in line/point polygon mode: AGXMetalA9 encodeISPPrimitiveType
        * 0x207d66360 picks LINE_FILLED_TRIANGLE (fill mode 1) or

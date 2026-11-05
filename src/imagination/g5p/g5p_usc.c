@@ -1203,6 +1203,14 @@ unsigned g5p_usc_discard(uint8_t *out, int src_half)
    return finish(out, raw, 4);
 }
 
+unsigned g5p_usc_depth_feedback(uint8_t *out, unsigned src_half)
+{
+   CHECK(src_half < 256 && !(src_half & 1), "depth feedback source must be a dword half-index");
+   /* DEPTHF, unlike coverage/discard feedback, consumes an f32 depth. */
+   uint8_t raw[4] = {4, 0x21, src_half, 0};
+   return finish(out, raw, sizeof(raw));
+}
+
 /* (opcode, operation-control, routing) tuples observed in the fast and
  * strict corpus (PACKED_TERNARY_CONTROLS); routing -1 = no parcel. */
 static const struct { uint8_t op, ctl; int route; } lit3_seen[] = {

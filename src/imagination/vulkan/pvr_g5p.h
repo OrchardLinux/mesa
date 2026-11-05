@@ -213,6 +213,7 @@ struct pvr_g5p_pipeline {
     * program's draws bound the shaded pixels with the ISP scissor; a vertex
     * program's draws run even when no pixel is left (pvr_arch_g5p_gfx.c) */
    bool fs_side_effects, vs_side_effects;
+   bool fs_depth_feedback;
    /* a point pipeline: the vertex program writes the point size after the
     * position (pco_g5p_vs_link::point_size) */
    bool vs_point_size;

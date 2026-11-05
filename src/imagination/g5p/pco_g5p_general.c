@@ -208,6 +208,8 @@ struct gctx {
    struct g5p_mrt_out_plan mrt;
    struct ref out[G5P_MRT_MAX_HALVES];
    bool out_written[G5P_MRT_MAX_HALVES];
+   bool has_depth;
+   struct ref depth;
    uint8_t slot_written[G5P_MRT_FS_SLOTS]; /* component mask stored per FRAG_RESULT_DATA slot */
    nir_tex_instr *narrow_tex;
    nir_intrinsic_instr *narrow_iter;
@@ -1458,6 +1460,18 @@ static void liveness(struct gctx *c)
                bool now = c->eager_vout && base >= 0 && !(in == c->vend_store && k == c->vend_comp);
                struct ref r = resolve_value(c, in->src[0].ssa, k);
                mark(c, r, now ? (int)nir_def_instr(r.def)->index : LAST_END);
+            } else if (loc == FRAG_RESULT_DEPTH) {
+               if (!c->key->depth_feedback)
+                  refuse(c, "fragment depth export awaits A9 qualification");
+               if (c->nir->info.fs.early_fragment_tests)
+                  refuse(c, "fragment depth export with early fragment tests is not qualified");
+               if (comp + k || in->src[0].ssa->bit_size != 32)
+                  refuse(c, "fragment depth export must be one f32 scalar");
+               c->depth = resolve_float(c, in->src[0].ssa, k);
+               if (c->depth.neg || c->depth.abs)
+                  refuse(c, "fragment depth export source modifiers are not qualified");
+               c->has_depth = true;
+               mark(c, c->depth, LAST_END);
             } else if (loc < FRAG_RESULT_DATA0 || !g5p_mrt_slot_is_attached(loc - FRAG_RESULT_DATA0, c->mrt.targets) ||
                        comp + k >= 4) {
                refuse(c, "store_output to %s", gl_frag_result_name(loc));
@@ -4198,6 +4212,14 @@ static void fs_output(struct gctx *c)
 {
    uint8_t raw[G5P_USC_MAX];
    c->now = DISCARD_AT;
+   if (c->has_depth) {
+      if (c->ndiscards || c->discard_always || c->blend != BLEND_NONE ||
+          c->mrt.targets != 1 || c->key->write_mask != 15)
+         refuse(c, "fragment depth export with discard, blend, MRT or partial colour mask is not qualified");
+      const unsigned reg = reg_of(c, c->depth, "fragment depth export");
+      put(c, raw, g5p_usc_depth_feedback(raw, 2 * reg), "fragment depth feedback");
+      c->p->depth_feedback = true;
+   }
    fs_discards(c);
    c->now = LAST_END;
    if (!any_color(c)) { /* colour write mask 0: Apple's f_mask_none is `00 80` */
@@ -5385,6 +5407,8 @@ static void codegen_reset(struct gctx *c)
    memset(c->narrow_sat, 0, sizeof(c->narrow_sat));
    memset(c->out, 0, sizeof(c->out));
    memset(c->out_written, 0, sizeof(c->out_written));
+   c->has_depth = false;
+   memset(&c->depth, 0, sizeof(c->depth));
    memset(c->slot_written, 0, sizeof(c->slot_written));
    uint32_t ev = c->p->evidence & (PCO_G5P_EV_FLATTEN | PCO_G5P_EV_CF);
    unsigned blend = c->p->blend_mode;
