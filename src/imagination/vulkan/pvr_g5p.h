@@ -3,7 +3,7 @@
  * Apple's A9 GPU (G5P, has_apple_g5p): the G5P paths of the PowerVR driver.
  * Built only with -Dimagination-g5p-experimental=true (PVR_APPLE_G5P).
  *
- * G5P follows G9P's shape (pvr_g9p.h, Henrik Klee): it keeps the pvr_*
+ * G5P follows G9P's shape (pvr_g9p.h, the G9P driver): it keeps the pvr_*
  * object model (devices, command buffers, render passes, descriptors,
  * images, the queue, WSI, pdsc and csbgen) and replaces the pieces that
  * face the hardware through hooks, each in a
@@ -191,6 +191,12 @@ struct pvr_g5p_pipeline {
    /* the fragment program discards (punch-through, no triangle merging);
     * it reads a flat varying */
    bool fs_discard, fs_flat;
+   unsigned fs_discard_tokens;
+   bool fs_discard_select;
+   /* Full linked variant: its uploads/varyings may differ after retaining a kill.
+    * Original colour-only programs remain byte-identical. */
+   struct pvr_g5p_pipeline *punch;
+   bool punch_variant;
    /* a point pipeline: the vertex program writes the point size after the
     * position (pco_g5p_vs_link::point_size) */
    bool vs_point_size;

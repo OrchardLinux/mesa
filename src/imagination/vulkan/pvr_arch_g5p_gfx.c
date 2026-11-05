@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * Graphics on Apple's A9 GPU (G5P, has_apple_g5p), in the shape of Henrik
- * Klee's G9P (pvr_arch_g9p_gfx.c): pipelines compiled by the G5P backend
+ * Graphics on Apple's A9 GPU (G5P, has_apple_g5p), in the shape of the
+ * G9P driver (pvr_arch_g9p_gfx.c): pipelines compiled by the G5P backend
  * (src/imagination/g5p, through pvr_g5p_nir.c), and draws as Rogue VDM/PPP
  * words with pdsc PDS programs (Apple's DOUT form). Every word is derived as
  * the A9 ICD's recorder derives it (g5p_record.c of the route-b tree:
@@ -61,7 +61,7 @@
 #include "pvr_pipeline.h"
 
 /* Named register values of a draw (the A9 ICD's g5p_record.c, from the
- * captured round6/round16 user draws; Henrik's G9P carries the same) */
+ * captured round6/round16 user draws; the G9P carries the same) */
 /* VDM_STATE5: PDS temps 2, PDS data and unified store set per draw */
 #define G5P_VS_STATE5 0x1082u
 /* VDM_STATE0 cam_size of a vertex up to 32 dwords (output dwords + 5) */
@@ -503,6 +503,7 @@ g5p_pipeline_free(struct pvr_device *device, struct pvr_g5p_pipeline *g)
    pvr_bo_suballoc_free(g->static_vary);
    pvr_bo_suballoc_free(g->static_frag);
    g5p_pipeline_free(device, g->xfb);
+   g5p_pipeline_free(device, g->punch);
    vk_free(&device->vk.alloc, g);
 }
 
@@ -526,6 +527,7 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
    VkResult result = g5p_check_state(device, create_info, s, &key);
    if (result != VK_SUCCESS)
       return result;
+   key.punch = g->punch_variant;
    g->samples = s->ms ? MAX2(s->ms->rasterization_samples, VK_SAMPLE_COUNT_1_BIT) : VK_SAMPLE_COUNT_1_BIT;
 
    for (uint32_t i = 0; i < create_info->stageCount; i++) {
@@ -615,6 +617,10 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
    g->vs_id_mask = vs->id_mask;
    memcpy(g->vs_id_reg, vs->id_reg, sizeof(g->vs_id_reg));
    g->fs_discard = (fs->evidence & PCO_G5P_EV_DISCARD) != 0;
+   g->fs_discard_tokens = fs->discard_tokens;
+   g->fs_discard_select = fs->discard_select;
+   if (g->punch_variant && (fs->discard_tokens != 1 || fs->discard_select))
+      return G5P_REFUSE(device, "punch-through variant needs exactly one real discard token");
    g->fs_blend_mode = fs->blend_mode;
    g->fs_write_mask = key.write_mask;
    g->color_targets = key.color_targets;
@@ -747,7 +753,7 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
          }
       }
       /* A discarding program runs punch-through with triangle merging off
-       * (Apple's discard capture; Henrik's G9P; Rogue's pvr) */
+       * (Apple's discard capture; the G9P; Rogue's pvr) */
       pvr_csb_pack (&w[4], TA_STATE_PDS_SIZEINFO2, s2) {
          s2.pds_tri_merge_disable = g->fs_discard;
          if (g->fs_num_uploads)
@@ -776,6 +782,40 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
    return VK_SUCCESS;
 }
 
+
+/* Port of the device-proven g5p-punch-ds@8150a8195df recipe. Unlike the
+ * standalone USC-only swap, a full linked variant owns its matching vertex
+ * program, varyings and upload layout; no old interface is reused by accident. */
+static VkResult
+g5p_pipeline_build_punch(struct pvr_device *device,
+                        const VkGraphicsPipelineCreateInfo *create_info,
+                        const struct vk_graphics_pipeline_state *state,
+                        struct pvr_g5p_pipeline *g)
+{
+   if (g->fs_discard_tokens < 2 && !g->fs_discard_select)
+      return VK_SUCCESS;
+   struct pvr_g5p_pipeline *p =
+      vk_zalloc(&device->vk.alloc, sizeof(*p), 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   if (!p)
+      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+   p->punch_variant = true;
+   p->xfb_variant = g->xfb_variant;
+   struct pco_g5p_program vs = { 0 }, fs = { 0 };
+   VkResult result = g5p_pipeline_build(device, create_info, state, p, &vs, &fs);
+   free(vs.code);
+   free(fs.code);
+   if (result == VK_SUCCESS) {
+      g->punch = p;
+   } else {
+      g5p_pipeline_free(device, p);
+      /* A normal colour-only shader remains valid. A draw that requires the
+       * absent punch variant refuses by name before emitting any draw state. */
+      if (result == VK_ERROR_FEATURE_NOT_PRESENT)
+         return VK_SUCCESS;
+   }
+   return result;
+}
+
 VkResult
 PVR_PER_ARCH(g5p_graphics_pipeline_compile)(struct pvr_device *device,
                                             const VkGraphicsPipelineCreateInfo *create_info,
@@ -792,6 +832,11 @@ PVR_PER_ARCH(g5p_graphics_pipeline_compile)(struct pvr_device *device,
    /* the program bytes are the backend's (malloc'd); uploaded or refused */
    free(vs.code);
    free(fs.code);
+   if (result != VK_SUCCESS) {
+      g5p_pipeline_free(device, g);
+      return result;
+   }
+   result = g5p_pipeline_build_punch(device, create_info, vk_state, g);
    if (result != VK_SUCCESS) {
       g5p_pipeline_free(device, g);
       return result;
@@ -814,6 +859,8 @@ PVR_PER_ARCH(g5p_graphics_pipeline_compile)(struct pvr_device *device,
       result = g5p_pipeline_build(device, create_info, vk_state, x, &xvs, &xfs);
       free(xvs.code);
       free(xfs.code);
+      if (result == VK_SUCCESS && x->xfb_layout.buffers)
+         result = g5p_pipeline_build_punch(device, create_info, vk_state, x);
       if (result == VK_SUCCESS && x->xfb_layout.buffers) {
          g->xfb = x;
       } else {
@@ -1303,10 +1350,7 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
       return VK_SUCCESS;
    if (!g5p_topology(dyn->ia.primitive_topology, &hw_topology, &split, &lines))
       return G5P_REFUSE(cmd_buffer, "topology %d", dyn->ia.primitive_topology);
-   /* the vertex input: instances, indices, the bound vertex buffers (pvr_arch_g5p_vertex.c) */
-   VkResult result = pvr_arch_g5p_vertex_draw_check(cmd_buffer, g, draw);
-   if (result != VK_SUCCESS)
-      return result;
+   VkResult result;
    /* rasterizer discard: the vertex program runs (transform feedback), no
     * fragment is shaded or tested (pvr_g5p_xfb.h; the ISP words below); a
     * pipeline that discards has no viewport state: the render area stands
@@ -1329,6 +1373,27 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
       return mrt;
 
    result = pvr_arch_cmd_buffer_start_sub_cmd(cmd_buffer, PVR_SUB_CMD_TYPE_GRAPHICS);
+   if (result != VK_SUCCESS)
+      return result;
+   /* Starting the sub-command establishes the actual DS attachment even
+    * for a discarding first draw after CLEAR. Select before any shader-specific
+    * vertex fetch, uploads, varyings or fragment state is emitted. */
+   const VkImageAspectFlags punch_aspects = dyn->rs.rasterizer_discard_enable
+                                              ? 0 : pvr_arch_g5p_ds_aspects(cmd_buffer);
+   if (punch_aspects) {
+      struct vk_depth_stencil_state ds = dyn->ds;
+      vk_optimize_depth_stencil_state(&ds, punch_aspects, true);
+      const bool testing = ds.depth.test_enable || ds.stencil.test_enable;
+      const bool writing = ds.depth.write_enable || ds.stencil.write_enable;
+      if ((testing && g->fs_discard_tokens > 1) || (writing && g->fs_discard_select)) {
+         if (!g->punch)
+            return G5P_REFUSE(cmd_buffer, "discard under depth/stencil requires an unsupported punch-through variant");
+         g = g->punch;
+      }
+      if (testing && g->fs_discard && g->samples != 1)
+         return G5P_REFUSE(cmd_buffer, "discard under multisample depth/stencil is not hardware-qualified");
+   }
+   result = pvr_arch_g5p_vertex_draw_check(cmd_buffer, g, draw);
    if (result != VK_SUCCESS)
       return result;
    /* what the draw can read outside the arena, for the job's resource list (pvr_g5p_perf.h) */
@@ -1365,8 +1430,8 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
    const VkImageAspectFlags ds_aspects = discard ? 0 : pvr_arch_g5p_ds_aspects(cmd_buffer);
    const bool dbias = ds_aspects && dyn->rs.depth_bias.enable;
    uint32_t dbias_index = 0;
-   if (ds_aspects && g->fs_discard && (dyn->ds.depth.test_enable || dyn->ds.stencil.test_enable))
-      return G5P_REFUSE(cmd_buffer, "a discarding program under a depth/stencil test (no capture of the pass)");
+   /* Real single-token feedback defers depth/stencil writes until the kill
+    * result is known (g5p-punch-ds@8150a8195df); preserve all DS test/ops. */
    if ((ds_aspects & VK_IMAGE_ASPECT_DEPTH_BIT) && dyn->ds.depth.bounds_test.enable)
       return G5P_REFUSE(cmd_buffer, "a depth bounds test");
    if (dbias) {
@@ -1421,7 +1486,7 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
    if (result != VK_SUCCESS)
       return result;
 
-   /* the draw's PPP blocks, each 16-byte aligned in one buffer (as Henrik's G9P) */
+   /* the draw's PPP blocks, each 16-byte aligned in one buffer (as the G9P) */
    uint32_t ppp[64] = { 0 }, at = 0, blocks[8][2], nb = 0;
 #define PPP_BLOCK(words, n)                                                                                        \
    do {                                                                                                            \
@@ -1493,6 +1558,13 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
       /* with a depth/stencil attachment: its tests, Apple's face form */
       if (ds_aspects)
          pvr_arch_g5p_ds_isp(dyn, ds_aspects, g->samples, lines, pass, scissor, dbias, false, &w[1]);
+      /* DS packing owns tests/ops, while shader feedback owns tag/upass.
+       * Mask-zero kill programs still need feedback, with upass0. */
+      struct ROGUE_TA_STATE_ISPCTL ctl;
+      ROGUE_TA_STATE_ISPCTL_unpack(&w[1], &ctl);
+      ctl.upass = isp.upass ? pvr_g5p_msaa_upass(g->samples) : 0;
+      ctl.tagwritedisable = isp.tag_write_disable;
+      ROGUE_TA_STATE_ISPCTL_pack(&w[1], &ctl);
       /* ... with the sprite object type of a point pipeline */
       if (ds_aspects && g->vs_point_size) {
          for (unsigned k = 2; k <= 4; k += 2) {
@@ -1558,7 +1630,7 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
       PPP_BLOCK(w, 2);
    }
    /* 10. stream out to the TA: the device HALT's 16 zero bytes of data, its
-    * HALT at +0x10 (as Henrik's G9P stream_out) */
+    * HALT at +0x10 (as the G9P stream_out) */
    {
       pvr_csb_pack (&w[0], TA_STATE_HEADER, h) {
          h.pres_stream_out_size = true;

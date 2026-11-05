@@ -81,6 +81,7 @@ PVR_PER_ARCH(g5p_blend_fs_key)(const struct vk_graphics_pipeline_state *state, u
  *   phase);
  * - a program that writes no colour (write mask 0, Apple's f_mask_none) has
  *   tag writes disabled and upass 0, so it only updates depth/stencil;
+ *   a real kill must keep tag writes even with no colour (Apple kill mode1);
  * - rasterizer discard: no tag write (the Rogue rule).
  * The pass type is the same with a depth/stencil attachment; that ISP form
  * takes upass and the tag write as below.
@@ -92,9 +93,9 @@ PVR_PER_ARCH(g5p_blend_isp)(unsigned blend_mode, bool shader_discard, uint8_t wr
    const bool no_colour = write_mask == 0;
 
    if (shader_discard)
-      isp->pass_type = blend_mode ? ROGUE_TA_PASSTYPE_PUNCH_THROUGH : ROGUE_TA_PASSTYPE_FAST_PUNCH_THROUGH;
+      isp->pass_type = blend_mode && !no_colour ? ROGUE_TA_PASSTYPE_PUNCH_THROUGH : ROGUE_TA_PASSTYPE_FAST_PUNCH_THROUGH;
    else
       isp->pass_type = blend_mode ? ROGUE_TA_PASSTYPE_TRANSLUCENT : ROGUE_TA_PASSTYPE_OPAQUE;
    isp->upass = no_colour && !rasterizer_discard ? 0 : 15;
-   isp->tag_write_disable = rasterizer_discard || no_colour;
+   isp->tag_write_disable = rasterizer_discard || (no_colour && !shader_discard);
 }

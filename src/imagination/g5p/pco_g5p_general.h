@@ -69,7 +69,7 @@ enum pco_g5p_evidence {
    /* g5p-hypr (bits 20..22 on that lane) */
    PCO_G5P_EV_COMMON_HIGH = 1u << 24, /* HOST: fragment common store past dword 63 (f_u80all, f_u256all) */
    PCO_G5P_EV_DERIV = 1u << 25,      /* HOST: dfdx/dfdy (f_ddx_*, f_ddy_*), fine or coarse unmeasured */
-   PCO_G5P_EV_HIGH_REGS = 1u << 26,  /* HOST: homes above r31 (Henrik's moves; Apple's r32..r69 operands) */
+   PCO_G5P_EV_HIGH_REGS = 1u << 26,  /* HOST: homes above r31 (G9P's moves; Apple's r32..r69 operands) */
 };
 
 /* Fragment program key (ds-isa-state.md §3.1, Apple FragmentProgramKey):
@@ -78,6 +78,8 @@ enum pco_g5p_evidence {
  * Factors/ops use the VkBlendFactor/VkBlendOp numbering. */
 struct pco_g5p_fs_key {
    bool blend;
+   /* Real kill feedback for depth/stencil writes; merge conditions into one token. */
+   bool punch;
    uint8_t src_rgb, dst_rgb, src_a, dst_a, op_rgb, op_a;
    uint8_t write_mask; /* VkColorComponentFlags; 0xf = all */
    bool srgb;          /* _AGCDrawBuffer.gammaCorrection (bit location unmeasured: refused) */
@@ -165,6 +167,8 @@ struct pco_g5p_upload {
 
 struct pco_g5p_program {
    uint8_t *code; /* malloc'd */
+   unsigned discard_tokens; /* Emitted fragment kill feedback tokens. */
+   bool discard_select; /* Discard lowered to transparent black (colour-only safe). */
    unsigned blend_mode; /* 0 none, 1 premultiplied, 2 straight-over (pre-multiplied in f32), 4 general */
    size_t size;
    bool vertex;

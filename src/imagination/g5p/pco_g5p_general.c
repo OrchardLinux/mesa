@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: MIT
- * Copyright 2026 Henrik Klee: the parts marked "From Henrik Klee's G9P
+ * Copyright 2026 Henrik Klee: the parts marked "From the G9P
  * compiler" (discards to a select, FMA fusion, control flow, registers above
  * r31), ported from OrchardLinux/mesa src/imagination/g9p.
  *
@@ -259,7 +259,7 @@ struct gctx {
    unsigned pushes;   /* if levels pushed since the innermost loop began */
    unsigned exits[G5P_MAX_EXITS]; /* byte offsets of the breaks' exit jumps */
    unsigned nexits;
-   /* Registers above r31 (Henrik Klee's homes, fragment only): per value, its
+   /* Registers above r31 (G9P's homes, fragment only): per value, its
     * home register or -1. Chosen between codegen attempts; kept by
     * codegen_reset(). */
    int8_t *home;
@@ -1263,7 +1263,7 @@ static int def_ip(nir_def *d)
 }
 
 /* A value read in a loop it is defined outside of stays live to the loop's
- * end: the next iteration reads it again (Henrik's use_scalar()). Defined
+ * end: the next iteration reads it again (G9P's use_scalar()). Defined
  * outside means where it gets its register (def_ip()): gl_FragCoord read in a
  * loop is NIR's instruction inside the loop, but its register is written
  * once, at the start (device run cf4: its register went to the loop counter
@@ -1305,7 +1305,7 @@ static void mark_bool(struct gctx *c, nir_def *d, unsigned comp, int idx)
 }
 
 /* The arm of an if is one block ending in a break: 1 if the break is all of
- * it, 2 if work precedes it; *side: 0 then, 1 else (Henrik's emit_if()). */
+ * it, 2 if work precedes it; *side: 0 then, 1 else (G9P's emit_if()). */
 static nir_block *single_block(struct exec_list *list)
 {
    if (!exec_list_is_singular(list))
@@ -1550,7 +1550,7 @@ static unsigned load_offset(struct gctx *c, nir_intrinsic_instr *in, unsigned sr
 /* ---- register-indexed UBO loads (gles3-tex.md §3) ----
  * vkcube's `ubuf.attr[gl_VertexIndex]` is load_ubo(offset = (index << 4) +
  * C). Apple's compiler builds a pointer pair = buffer pointer + (index <<
- * shift) and loads from it (dynubo.metal v_cexpr/v_cbase), as Hendrik's A10
+ * shift) and loads from it (dynubo.metal v_cexpr/v_cbase), as the A10 port
  * compiler does for every buffer load. Here the pointer is the UBO's VA + C
  * (a loader upload), so the offset arithmetic folds away entirely. */
 static bool dyn_ubo_load(nir_intrinsic_instr *in)
@@ -1805,7 +1805,7 @@ static void plan_common(struct gctx *c)
 }
 
 /* ---- registers above r31 ----
- * From Henrik Klee's G9P compiler (OrchardLinux/mesa g9p_compile.c,
+ * From the G9P compiler (OrchardLinux/mesa g9p_compile.c,
  * d1ab45daed3: park_def(), src_reg(), the victim rule in g9p_compile();
  * MIT): when a fragment program runs out of r0..r31, the value live at that
  * point with the furthest last read gets a home above r31 and the program is
@@ -1841,7 +1841,7 @@ static void park(struct gctx *c, nir_instr *ins)
 }
 
 /* After a pass that ran out of registers at c->now: the value held across
- * that point with the furthest last read (Henrik's rule for SSA values),
+ * that point with the furthest last read (G9P's rule for SSA values),
  * or -1. */
 static int pick_home(struct gctx *c)
 {
@@ -2775,8 +2775,8 @@ static void emit_ibin(struct gctx *c, nir_alu_instr *a)
    define(c, &a->def, dst);
 }
 
-/* a - b: Apple's two-register integer subtract (op a5, f_udiv_reg; Henrik
- * Klee's G9P_ISUB, OrchardLinux/mesa g9p_isa.h), operands in their order;
+/* a - b: Apple's two-register integer subtract (op a5, f_udiv_reg; G9P's
+ * G9P_ISUB, OrchardLinux/mesa g9p_isa.h), operands in their order;
  * ineg is 0 - x, as his emit_alu_op() does it. */
 static void emit_isub(struct gctx *c, nir_alu_instr *a)
 {
@@ -3360,7 +3360,7 @@ static void emit_dyn_ubo(struct gctx *c, nir_intrinsic_instr *in)
    dyn_ubo_offset(in, &ix, &shift, &base);
    unsigned bytes = 4 * n;
    /* Witnessed: 16-byte loads (Apple's v_cexpr, vec4 elements at shift 4) and
-    * 4-byte loads (Hendrik's, at any byte offset); the shift field is
+    * 4-byte loads (G9P's, at any byte offset); the shift field is
     * corpus-verified 0-4. vec2/vec3 (8-byte, 12-byte) loads are not. */
    if (in->def.bit_size != 32 || !((n == 4 && shift == 4) || (n == 1 && shift != 1)) || base % bytes)
       refuse(c, "load_ubo: register-indexed %u x %u-bit at shift %u, base %u (witnessed: vec4 at shift 4, "
@@ -4107,6 +4107,7 @@ static void fs_prologue(struct gctx *c)
 static void fs_discards(struct gctx *c)
 {
    uint8_t raw[G5P_USC_MAX];
+   c->p->discard_tokens = c->ndiscards + c->discard_always;
    for (unsigned i = 0; i < c->ndiscards; i++) {
       struct cond k = cond_of(c, c->discards[i], 0);
       unsigned b = k.zero_b ? reg_of(c, k.a, "discard condition")
@@ -4577,7 +4578,7 @@ static void apply_fs_key(struct gctx *c, nir_shader *nir, const struct pco_g5p_f
  * draws get. On A10 a hardware discard in that pass lost the colour of
  * other objects in random 32x32 tiles (Hyprland's border shader).
  *
- * From Henrik Klee's G9P compiler (OrchardLinux/mesa,
+ * From the G9P compiler (OrchardLinux/mesa,
  * src/imagination/g9p/g9p_compile.c discards_to_select(), commits
  * 7013b551398 and 7a64e1d1bf4; MIT), its native source-over form. It runs
  * after flattening, so every discard and colour store is outside control
@@ -4676,7 +4677,7 @@ static bool discards_to_select(nir_shader *nir)
  * Apple's measured FMA forms, and a vertex program above 12 temps wedges
  * the TA.
  *
- * From Henrik Klee's G9P compiler (OrchardLinux/mesa 28cdfceab8e, which
+ * From the G9P compiler (OrchardLinux/mesa 28cdfceab8e, which
  * enables NIR's fusion there: on A10 a shader of 512 multiply-adds went
  * from 15.4 to 12.4 KB and Hyprland's Kawase blur passes got faster). His
  * follow-up 906f3eab2a6 (the addend's last-use bit was always set) is
@@ -4733,6 +4734,7 @@ static void select_discards(struct gctx *c, nir_shader *nir)
    if (c->vs || (c->blend != BLEND_PREMULT && c->blend != BLEND_STRAIGHT_OVER))
       return;
    NIR_PASS(progress, nir, discards_to_select);
+   c->p->discard_select = progress;
    if (!progress)
       return;
    NIR_PASS(_, nir, nir_lower_alu_to_scalar, NULL, NULL);
@@ -4747,7 +4749,7 @@ static void select_discards(struct gctx *c, nir_shader *nir)
 }
 
 /* ---- control flow left after flattening (fragment) ----
- * discards_to_if() and discards_to_flag() are Henrik Klee's
+ * discards_to_if() and discards_to_flag() are G9P's
  * (OrchardLinux/mesa src/imagination/g9p/g9p_compile.c, d1ab45daed3; MIT):
  * `if (c) discard;` becomes demote_if(c); any other discard inside control
  * flow sets a flag, and one demote_if on the flag ends the program (the
@@ -4817,6 +4819,51 @@ static bool discards_to_flag(nir_shader *nir)
       return nir_no_progress(impl);
    b = nir_builder_at(nir_after_impl(impl));
    nir_demote_if(&b, nir_load_var(&b, flag));
+   return nir_progress(true, impl, nir_metadata_none);
+}
+
+/* Key punch: every discard left at the top level (all of them after
+ * flattening and cf_discards()) becomes one demote_if on the OR of their
+ * conditions, or one demote if any is unconditional, at the end of the
+ * program; fs_discards() then emits one token. Apple's compiler gives a
+ * program with two discard conditions one `04 60` (f_discard2,
+ * tools/mesa-a9-punchds), and the OR of materialized conditions is the
+ * flag form discards_to_flag() already runs on hardware (cf7). */
+static bool merge_discards(nir_shader *nir)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_intrinsic_instr *list[32];
+   unsigned n = 0;
+   bool always = false;
+   nir_foreach_block(block, impl) {
+      if (block->cf_node.parent->type != nir_cf_node_function)
+         continue;
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+         if (in->intrinsic != nir_intrinsic_demote && in->intrinsic != nir_intrinsic_terminate &&
+             in->intrinsic != nir_intrinsic_demote_if && in->intrinsic != nir_intrinsic_terminate_if)
+            continue;
+         if (n == ARRAY_SIZE(list))
+            return nir_no_progress(impl); /* fs_discards() refuses this many anyway */
+         always |= in->intrinsic == nir_intrinsic_demote || in->intrinsic == nir_intrinsic_terminate;
+         list[n++] = in;
+      }
+   }
+   if (n < 2)
+      return nir_no_progress(impl);
+   nir_builder b = nir_builder_at(nir_after_impl(impl));
+   if (always) {
+      nir_demote(&b);
+   } else {
+      nir_def *k = list[0]->src[0].ssa;
+      for (unsigned i = 1; i < n; i++)
+         k = nir_ior(&b, k, list[i]->src[0].ssa);
+      nir_demote_if(&b, k);
+   }
+   for (unsigned i = 0; i < n; i++)
+      nir_instr_remove(&list[i]->instr);
    return nir_progress(true, impl, nir_metadata_none);
 }
 
@@ -4899,7 +4946,7 @@ static bool hoist_break_work(nir_shader *nir)
 }
 
 /* Out of SSA for the mask-stack code: phis become NIR registers
- * (Henrik's order: convert_from_ssa, then trivialize_registers). */
+ * (G9P's order: convert_from_ssa, then trivialize_registers). */
 static void cf_out_of_ssa(nir_shader *nir)
 {
    NIR_PASS(_, nir, nir_lower_phis_to_scalar, NULL, NULL);
@@ -4915,8 +4962,8 @@ bool pco_g5p_compile_general(nir_shader *nir, bool half_output, const uint8_t *a
    return pco_g5p_compile_general_key(nir, half_output, attrib_components, NULL, out);
 }
 
-/* ---- control flow (from Henrik Klee's G9P compiler) ----
- * Structured on the execution-mask stack, as Henrik's g9p_compile.c
+/* ---- control flow (from the G9P compiler) ----
+ * Structured on the execution-mask stack, as G9P's g9p_compile.c
  * (OrchardLinux/mesa d91427625ff: emit_if(), emit_if_else(), emit_loop(),
  * emit_break(), emit_branch_cmp(); MIT) and Apple's A9 compiler: an if is a
  * compare, a push, a jump past the arm when no lane takes it, the arm, else
@@ -5263,7 +5310,9 @@ static void codegen_reset(struct gctx *c)
    uint32_t ev = c->p->evidence & (PCO_G5P_EV_FLATTEN | PCO_G5P_EV_CF);
    unsigned blend = c->p->blend_mode;
    bool vertex = c->p->vertex;
+   bool discard_select = c->p->discard_select;
    memset(c->p, 0, sizeof(*c->p));
+   c->p->discard_select = discard_select;
    c->p->evidence = ev;
    c->p->blend_mode = blend;
    c->p->vertex = vertex;
@@ -5352,7 +5401,23 @@ bool pco_g5p_compile_general_link(nir_shader *nir, bool half_output, const uint8
    fuse_ffma(c, nir);
    if (!c->vs && cf_left(nir))
       cf_discards(nir);
-   select_discards(c, nir);
+   if (c->vs || !c->key->punch)
+      select_discards(c, nir);
+   if (!c->vs && c->key->punch) {
+      bool progress = false;
+      NIR_PASS(progress, nir, merge_discards);
+      if (progress) {
+         NIR_PASS(_, nir, nir_lower_alu_to_scalar, NULL, NULL);
+         do {
+            progress = false;
+            NIR_PASS(progress, nir, nir_opt_copy_prop);
+            NIR_PASS(progress, nir, nir_opt_dce);
+            NIR_PASS(progress, nir, nir_opt_constant_folding);
+            NIR_PASS(progress, nir, nir_opt_algebraic);
+            NIR_PASS(progress, nir, nir_opt_cse);
+         } while (progress);
+      }
+   }
    if (!c->vs && cf_left(nir)) {
       c->cf = true;
       out->evidence |= PCO_G5P_EV_CF;
