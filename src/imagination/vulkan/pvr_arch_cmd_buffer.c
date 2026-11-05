@@ -2969,6 +2969,17 @@ void PVR_PER_ARCH(CmdBindPipeline)(VkCommandBuffer commandBuffer,
                                    VkPipeline _pipeline)
 {
    VK_FROM_HANDLE(pvr_cmd_buffer, cmd_buffer, commandBuffer);
+
+   /* Zink binds a pipeline G9P's backend refused to compile: its draws are
+    * skipped, so the application misses them instead of crashing.
+    */
+   if (_pipeline == VK_NULL_HANDLE &&
+       PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g9p)) {
+      if (pipelineBindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS)
+         cmd_buffer->state.gfx_pipeline = NULL;
+      return;
+   }
+
    VK_FROM_HANDLE(pvr_pipeline, pipeline, _pipeline);
 
    switch (pipelineBindPoint) {
@@ -4193,6 +4204,7 @@ void PVR_PER_ARCH(CmdBeginRenderPass2)(
    state->render_pass_info.pass = pass;
    state->render_pass_info.framebuffer = framebuffer;
    state->render_pass_info.rstate = framebuffer->rstate;
+   state->render_pass_info.g9p_stencil_cleared = false;
    state->render_pass_info.subpass_idx = 0;
    state->render_pass_info.render_area = pRenderPassBeginInfo->renderArea;
    state->render_pass_info.current_hw_subpass = 0;
@@ -9234,6 +9246,9 @@ void PVR_PER_ARCH(CmdDraw)(VkCommandBuffer commandBuffer,
    PVR_TRACE_BEGIN_DRAW(cmd_buffer, PVR_DRAW);
 
    if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g9p)) {
+      if (!state->gfx_pipeline)
+         return;
+
       const struct pvr_g9p_draw draw = {
          .count = vertexCount,
          .instances = instanceCount,
@@ -9298,7 +9313,10 @@ void PVR_PER_ARCH(CmdDrawIndexed)(VkCommandBuffer commandBuffer,
    PVR_TRACE_BEGIN_DRAW(cmd_buffer, PVR_DRAW_INDEXED);
 
    if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g9p)) {
-      const unsigned size = state->index_buffer_binding.type == VK_INDEX_TYPE_UINT16 ? 2 : 4;
+      if (!state->gfx_pipeline)
+         return;
+
+      const unsigned size = vk_index_type_to_bytes(state->index_buffer_binding.type);
       const struct pvr_g9p_draw draw = {
          .indexed = true,
          .index_addr = state->index_buffer_binding.buffer->dev_addr.addr +

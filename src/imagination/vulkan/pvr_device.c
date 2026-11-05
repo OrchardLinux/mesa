@@ -445,6 +445,13 @@ VkResult pvr_MapMemory2(VkDevice _device,
     *    "memory must not be currently host mapped"
     */
    if (mem->bo->map != NULL) {
+      /* G9P's CPU transfers map memory the application never mapped; that
+       * mapping stays until the memory is freed, see pvr_UnmapMemory2().
+       */
+      if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p) && !addr) {
+         *ppData = (uint8_t *)mem->bo->map + offset;
+         return VK_SUCCESS;
+      }
       return vk_errorf(device,
                        VK_ERROR_MEMORY_MAP_FAILED,
                        "Memory object already mapped.");
@@ -459,6 +466,7 @@ VkResult pvr_MapMemory2(VkDevice _device,
    if (result != VK_SUCCESS)
       return result;
 
+   mem->map_placed = addr != NULL;
    *ppData = (uint8_t *)mem->bo->map + offset;
 
    return VK_SUCCESS;
@@ -469,6 +477,10 @@ VkResult pvr_UnmapMemory2(VkDevice _device,
 {
    VK_FROM_HANDLE(pvr_device, device, _device);
    VK_FROM_HANDLE(pvr_device_memory, mem, pMemoryUnmapInfo->memory);
+
+   /* A CPU transfer on G9P's queue may be using the mapping */
+   if (mem && PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p) && !mem->map_placed)
+      return VK_SUCCESS;
 
    if (mem && mem->bo->map) {
       bool reserve =

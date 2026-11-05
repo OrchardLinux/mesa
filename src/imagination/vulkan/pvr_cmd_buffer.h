@@ -341,6 +341,8 @@ struct pvr_render_pass_info {
    bool dynamic_render;
    bool suspend;
    bool resume;
+   /* G9P: a stencil load op clear drawn (pvr_arch_g9p_gfx.c) */
+   bool g9p_stencil_cleared;
 };
 
 struct pvr_ppp_state {

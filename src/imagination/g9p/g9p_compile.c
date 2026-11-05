@@ -61,6 +61,9 @@ static const nir_shader_compiler_options nir_options = {
    .float_mul_add32 = nir_float_muladd_support_has_ffma | nir_float_muladd_support_fuse,
    .lower_int64_options = ~0U,
    .lower_fdiv = true,
+   .lower_iabs = true,
+   .lower_mul_high = true,
+   .lower_isign = true,
    .lower_fmod = true,
    .lower_fpow = true,
    .lower_fsqrt = true,
@@ -141,6 +144,7 @@ struct g9p_ctx {
    uint64_t temps;  /* released after the current instruction */
    unsigned max_reg;
    unsigned st;     /* mask stack register */
+   bool reserve_st_low; /* the mask stack is r15, reserved (compile_back()) */
    unsigned ip;
 
    struct {
@@ -182,7 +186,10 @@ dump_busy(struct g9p_ctx *ctx)
 static int
 alloc_reg(struct g9p_ctx *ctx)
 {
+   /* Vertex shaders: r11-r14 stay free for address work (alloc_pair(), low_reg()) */
    for (unsigned r = 0; r < G9P_NUM_REGS; r++) {
+      if (ctx->stage == MESA_SHADER_VERTEX && r >= 11 && r <= 14)
+         continue;
       if (!(ctx->busy & BITFIELD64_BIT(r))) {
          ctx->busy |= BITFIELD64_BIT(r);
          ctx->max_reg = MAX2(ctx->max_reg, r);
@@ -193,10 +200,44 @@ alloc_reg(struct g9p_ctx *ctx)
    return -1;
 }
 
+/* A scratch register for an address index: its operand reaches r15 only too */
+static int
+alloc_low_temp(struct g9p_ctx *ctx)
+{
+   for (unsigned r = 0; r < MIN2(16, G9P_NUM_REGS); r++) {
+      if (!(ctx->busy & BITFIELD64_BIT(r))) {
+         ctx->busy |= BITFIELD64_BIT(r);
+         ctx->temps |= BITFIELD64_BIT(r);
+         ctx->max_reg = MAX2(ctx->max_reg, r);
+         return r;
+      }
+   }
+   dump_busy(ctx);
+   return -1;
+}
+
+/* @r, or a copy of it below r16 for an operand that reaches r15 only */
+static int
+low_reg(struct g9p_ctx *ctx, int r)
+{
+   int low;
+
+   if (r < 16)
+      return r;
+   low = alloc_low_temp(ctx);
+   if (low >= 0)
+      g9p_alu2(ctx->c, G9P_OR, low, r, r, false);
+   return low;
+}
+
+/*
+ * A pair for a memory address: its operand reaches r15 only (a pair across r16
+ * read the wrong memory: dEQP vertex shaders of 17 registers and more)
+ */
 static int
 alloc_pair(struct g9p_ctx *ctx)
 {
-   for (unsigned r = 0; r + 1 < G9P_NUM_REGS; r++) {
+   for (unsigned r = 0; r + 1 < MIN2(16, G9P_NUM_REGS); r++) {
       if (!(ctx->busy & BITFIELD64_RANGE(r, 2))) {
          ctx->busy |= BITFIELD64_RANGE(r, 2);
          ctx->max_reg = MAX2(ctx->max_reg, r + 1);
@@ -600,6 +641,13 @@ only_tex_uses(nir_def *def)
 {
    nir_foreach_use_including_if(src, def) {
       if (nir_src_is_if(src) || nir_src_use_instr(src)->type != nir_instr_type_tex)
+         return false;
+
+      /* arrays and cubes take their coordinates in registers (emit_tex_layered()) */
+      const nir_tex_instr *tex = nir_instr_as_tex(nir_src_use_instr(src));
+
+      if (tex->is_array || tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE ||
+          tex->op == nir_texop_txl || tex->op == nir_texop_txb)
          return false;
    }
    return true;
@@ -1024,6 +1072,9 @@ emit_mem(struct g9p_ctx *ctx, nir_intrinsic_instr *intr, int slot, nir_scalar of
       g9p_alu2(ctx->c, G9P_IADD, t, off, rb, false);
       off = t;
    }
+   off = low_reg(ctx, off);
+   if (off < 0)
+      return false;
    pair = alloc_pair(ctx);
    if (pair < 0)
       return false;
@@ -1089,13 +1140,14 @@ emit_attrib_load(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
    stride_slot = g9p_buffer_slot(ctx->out, G9P_VERTEX_STRIDES, a->binding);
    if (slot < 0 || stride_slot < 0)
       return false;
-   offset = a->offset + 4 * nir_intrinsic_component(intr) +
+   offset = (a->offset & ~3u) + 4 * nir_intrinsic_component(intr) +
             16 * nir_src_as_uint(intr->src[0]);
 
    /* the stride from its slot: the address form with 0 added (rs:rs+1) */
    zero = const_reg(ctx, 0);
+   zero = zero < 0 ? zero : low_reg(ctx, zero);
    rs = alloc_pair(ctx);
-   t = alloc_temp(ctx);
+   t = alloc_low_temp(ctx);
    if (zero < 0 || rs < 0 || t < 0)
       return false;
    g9p_addr(ctx->c, rs, 2 * stride_slot, zero, 0, false);
@@ -1390,6 +1442,111 @@ emit_txs(struct g9p_ctx *ctx, nir_tex_instr *tex)
 }
 
 /*
+ * A sample's explicit level (txl) or bias (txb) from a register: the A9's general
+ * sample form (PR #4's g5p_usc_sample_ext(): byte 6 = 0x80 temp | 0x40 level or
+ * 0x20 bias | register, byte 8 = 0x80 LOD source present) in the words of
+ * g9p_sample_regs() at @at.
+ */
+static bool
+sample_lod(struct g9p_ctx *ctx, nir_tex_instr *tex, unsigned at)
+{
+   const nir_tex_src_type type = tex->op == nir_texop_txl ? nir_tex_src_lod : nir_tex_src_bias;
+   const int i = nir_tex_instr_src_index(tex, type);
+   int r;
+
+   if (i < 0)
+      return tex->op != nir_texop_txl && tex->op != nir_texop_txb;
+   r = src_reg(ctx, nir_get_scalar(tex->src[i].src.ssa, 0));
+   if (r < 0)
+      return false;
+   ctx->c->w[at + 3] = (ctx->c->w[at + 3] & 0xff00) | 0x80 |
+                       (tex->op == nir_texop_txl ? 0x40 : 0x20) | r;
+   ctx->c->w[at + 4] = (ctx->c->w[at + 4] & 0xff00) | 0x80;
+   return true;
+}
+
+/*
+ * The fragment shader samples a 2D array or a cube, whose coordinates take
+ * r0-r3 (emit_tex_layered())
+ */
+static bool
+uses_layered_tex(nir_function_impl *impl)
+{
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_tex &&
+             (nir_instr_as_tex(instr)->is_array ||
+              nir_instr_as_tex(instr)->sampler_dim == GLSL_SAMPLER_DIM_CUBE))
+            return true;
+      }
+   }
+   return false;
+}
+
+/*
+ * A 2D array or cube sample, ported from the A9 (G5P) backend (OrchardLinux/mesa
+ * PR #5, Berkay Kösebay; Apple's operand layout): the coordinates in r0-r2, where
+ * the sample reads them (as g9p_sample_regs() reads r0-r1); an array's layer
+ * as an integer in r2's low half, uint(z + 0.5); a cube's direction turned
+ * into face coordinates in place by the cube op; then the sample with the
+ * dimension in W0. r0-r3 are reserved in such shaders (generate()).
+ */
+static bool
+emit_tex_layered(struct g9p_ctx *ctx, nir_tex_instr *tex)
+{
+   const bool cube = tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE;
+   int ci = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   int slot = texture_slot(ctx, tex);
+   unsigned at;
+   int dst;
+
+   if (ctx->stage != MESA_SHADER_FRAGMENT || ci < 0 || slot < 0 || tex->is_shadow ||
+       (cube && tex->is_array) ||
+       (!cube && tex->sampler_dim != GLSL_SAMPLER_DIM_2D) ||
+       (tex->op != nir_texop_tex && tex->op != nir_texop_txl && tex->op != nir_texop_txb) ||
+       nir_tex_instr_src_index(tex, nir_tex_src_offset) >= 0) {
+      fprintf(stderr, "g9p: only plain samples of 2D arrays and cubes\n");
+      return false;
+   }
+   for (unsigned c = 0; c < 3; c++) {
+      const int r = src_reg(ctx, nir_get_scalar(tex->src[ci].src.ssa, c));
+
+      if (r < 0)
+         return false;
+      if (c == 2 && !cube) {
+         const int half = const_reg(ctx, 0x3f000000);
+
+         if (half < 0)
+            return false;
+         g9p_alu2(ctx->c, G9P_FADD, 2, r, half, false);
+         g9p_convert(ctx->c, 2, 2, G9P_F2U);
+      } else {
+         g9p_alu2(ctx->c, G9P_OR, c, r, r, false);
+      }
+   }
+   if (cube)
+      g9p_cube_coords(ctx->c, 0, 0);
+   release(ctx, &tex->instr);
+   dst = alloc_range(ctx, 4);
+   if (dst < 0)
+      return false;
+   at = ctx->c->n;
+   g9p_sample_regs(ctx->c, dst, G9P_FS_TEX_BASE + G9P_TEX_STRIDE * slot,
+                   G9P_FS_TEX_BASE + G9P_TEX_STRIDE * slot + 8);
+   ctx->c->w[at] = (ctx->c->w[at] & ~0x0f00) |
+                   (cube ? G9P_TEX_CUBE : G9P_TEX_2D_ARRAY) << 8;
+   if (!sample_lod(ctx, tex, at))
+      return false;
+   g9p_wait(ctx->c);
+   for (unsigned c = 0; c < 4; c++) {
+      ctx->reg[key(&tex->def, c)] = dst + c;
+      if (c >= tex->def.num_components || !ctx->last_use[key(&tex->def, c)])
+         ctx->busy &= ~BITFIELD64_BIT(dst + c);
+   }
+   return true;
+}
+
+/*
  * A 2D sample, the f32 result in four consecutive registers. Coordinates
  * that are two consecutive varying components (texture(t, v_uv)) are
  * iterated straight to the sampler; computed ones are copied to r0-r1,
@@ -1405,16 +1562,18 @@ emit_tex(struct g9p_ctx *ctx, nir_tex_instr *tex)
 
    if (tex->op == nir_texop_txs)
       return emit_txs(ctx, tex);
+   if (tex->is_array || tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE)
+      return emit_tex_layered(ctx, tex);
    if (ctx->stage != MESA_SHADER_FRAGMENT || tex->sampler_dim != GLSL_SAMPLER_DIM_2D ||
        tex->is_array || tex->is_shadow || ci < 0 || slot < 0 ||
-       (tex->op != nir_texop_tex && tex->op != nir_texop_txl) ||
+       (tex->op != nir_texop_tex && tex->op != nir_texop_txl && tex->op != nir_texop_txb) ||
        nir_tex_instr_src_index(tex, nir_tex_src_offset) >= 0) {
       fprintf(stderr, "g9p: only plain 2D samples of combined image samplers so far\n");
       return false;
    }
    first = varying_component(nir_get_scalar(tex->src[ci].src.ssa, 0));
    second = varying_component(nir_get_scalar(tex->src[ci].src.ssa, 1));
-   if (first >= 0 && second == first + 1) {
+   if (tex->op == nir_texop_tex && first >= 0 && second == first + 1) {
       release(ctx, &tex->instr);
       dst = alloc_range(ctx, 4);
       if (dst < 0)
@@ -1434,8 +1593,14 @@ emit_tex(struct g9p_ctx *ctx, nir_tex_instr *tex)
       dst = alloc_range(ctx, 4);
       if (dst < 0)
          return false;
-      g9p_sample_regs(ctx->c, dst, G9P_FS_TEX_BASE + G9P_TEX_STRIDE * slot,
-                      G9P_FS_TEX_BASE + G9P_TEX_STRIDE * slot + 8);
+      {
+         const unsigned at = ctx->c->n;
+
+         g9p_sample_regs(ctx->c, dst, G9P_FS_TEX_BASE + G9P_TEX_STRIDE * slot,
+                         G9P_FS_TEX_BASE + G9P_TEX_STRIDE * slot + 8);
+         if (!sample_lod(ctx, tex, at))
+            return false;
+      }
    }
    g9p_wait(ctx->c);
    for (unsigned c = 0; c < 4; c++) {
@@ -1916,6 +2081,11 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
     */
    if (ctx->stage == MESA_SHADER_VERTEX || ctx->stage == MESA_SHADER_FRAGMENT)
       ctx->busy = ctx->pinned = BITFIELD64_RANGE(0, 2);
+   if (ctx->reserve_st_low)
+      ctx->busy |= BITFIELD64_BIT(15), ctx->pinned |= BITFIELD64_BIT(15);
+   /* 2D array and cube samples: their coordinates in r0-r3 (emit_tex_layered()) */
+   if (ctx->stage == MESA_SHADER_FRAGMENT && uses_layered_tex(impl))
+      ctx->busy |= BITFIELD64_RANGE(0, 4), ctx->pinned |= BITFIELD64_RANGE(0, 4);
 
    /* compute: r0 holds the local index from the start when it is used */
    nir_foreach_block(block, impl) {
@@ -2195,6 +2365,14 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
    nir_function_impl *impl;
    unsigned st;
 
+   /* integer division through floats: no such instruction (GLSL ES 1.00 int and ivec /) */
+   {
+      const nir_lower_idiv_options idiv = { .allow_fp16 = false };
+
+      NIR_PASS(_, nir, nir_lower_idiv, &idiv);
+      /* its umul_high (nir_shader_compiler_options.lower_mul_high) */
+      NIR_PASS(_, nir, nir_lower_alu);
+   }
    optimize(nir);
    NIR_PASS(_, nir, nir_lower_io_to_scalar,
             nir_var_mem_ssbo | nir_var_mem_ubo | nir_var_mem_push_const |
@@ -2298,7 +2476,18 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
       ctx.home[victim] = 32 + ctx.num_homes++;
    }
    st = ctx.max_reg + 1;
-   if (!generate(&ctx, impl, st))
+   /*
+    * Vertex shaders with control flow: their mask stack below r16 (dEQP vertex
+    * loops of 17 registers and more hung the geometry job). Reserved in the
+    * second pass.
+    */
+   if (stage == MESA_SHADER_VERTEX && st > 15 && !nir_cf_list_is_empty_block(&impl->body) &&
+       !exec_list_is_singular(&impl->body)) {
+      ctx.reserve_st_low = true;
+      if (!generate(&ctx, impl, 15))
+         return false;
+      st = MAX2(ctx.max_reg, 15);
+   } else if (!generate(&ctx, impl, st))
       return false;
 
    out->num_regs = MAX2(st + 1, ctx.num_homes ? 32 + ctx.num_homes : 0);
@@ -2416,13 +2605,52 @@ lower_attrib_format(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       return true;
    }
    desc = util_format_description(attribs[loc].format);
-   if (!desc || desc->channel[0].size == 32)
+   if (!desc)
       return false;
+   if (desc->channel[0].size == 32) {
+      /* fewer channels than the shader reads (a vec3 position): GL's 0, 0, 0, 1 */
+      const unsigned first = nir_intrinsic_component(intr);
+      const unsigned wanted = intr->def.num_components;
+      const bool is_int = nir_alu_type_get_base_type(nir_intrinsic_dest_type(intr)) !=
+                          nir_type_float;
+      nir_def *load;
 
-   packed = nir_load_input(b, DIV_ROUND_UP(desc->block.bits, 32), 32, intr->src[0].ssa,
+      if (first + wanted <= desc->nr_channels)
+         return false;
+      load = first < desc->nr_channels
+                ? nir_load_input(b, desc->nr_channels - first, 32, intr->src[0].ssa,
+                                 .base = nir_intrinsic_base(intr),
+                                 .range = nir_intrinsic_range(intr), .component = first,
+                                 .dest_type = nir_intrinsic_dest_type(intr), .io_semantics = sem)
+                : NULL;
+      for (unsigned i = 0; i < wanted; i++) {
+         const unsigned k = first + i;
+
+         comps[i] = k < desc->nr_channels ? nir_channel(b, load, i)
+                    : k == 3 ? (is_int ? nir_imm_int(b, 1) : nir_imm_float(b, 1.0f))
+                             : nir_imm_int(b, 0);
+      }
+      nir_def_replace(&intr->def, nir_vec(b, comps, wanted));
+      return true;
+   }
+
+   /* an attribute off a word boundary: the words around it (emit_input aligns) */
+   const unsigned shift = (attribs[loc].offset % 4) * 8;
+   const unsigned words = DIV_ROUND_UP(desc->block.bits, 32);
+
+   packed = nir_load_input(b, DIV_ROUND_UP(desc->block.bits + shift, 32), 32, intr->src[0].ssa,
                            .base = nir_intrinsic_base(intr),
                            .range = nir_intrinsic_range(intr), .component = 0,
                            .dest_type = nir_type_uint32, .io_semantics = sem);
+   if (shift) {
+      for (unsigned i = 0; i < words; i++) {
+         comps[i] = nir_ushr_imm(b, nir_channel(b, packed, i), shift);
+         if (i + 1 < packed->num_components)
+            comps[i] = nir_ior(b, comps[i],
+                               nir_ishl_imm(b, nir_channel(b, packed, i + 1), 32 - shift));
+      }
+      packed = nir_vec(b, comps, words);
+   }
    rgba = nir_format_unpack_rgba(b, packed, attribs[loc].format);
    nir_def_replace(&intr->def, nir_channels(b, rgba, nir_component_mask(intr->def.num_components)
                                                         << nir_intrinsic_component(intr)));
@@ -2624,6 +2852,31 @@ discards_to_select(nir_shader *nir, bool zero)
  * Premultiplied source-over on all four channels of a colour attachment
  * (Hyprland's and Zink's usual blend): done natively at the end
  */
+/* The dynamic blend constants of nir_lower_blend: a buffer the draw uploads */
+static bool
+lower_blend_constant(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   unsigned c;
+
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_blend_const_color_r_float: c = 0; break;
+   case nir_intrinsic_load_blend_const_color_g_float: c = 1; break;
+   case nir_intrinsic_load_blend_const_color_b_float: c = 2; break;
+   case nir_intrinsic_load_blend_const_color_a_float: c = 3; break;
+   default: return false;
+   }
+   b->cursor = nir_before_instr(&intr->instr);
+
+   nir_def *index = nir_vulkan_resource_index(b, 2, 32, nir_imm_int(b, 0),
+                                              .desc_set = G9P_BLEND_CONSTANTS, .binding = 0,
+                                              .desc_type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
+
+   nir_def_replace(&intr->def,
+                   nir_load_ubo(b, 1, 32, index, nir_imm_int(b, 4 * c), .align_mul = 4,
+                                .range = ~0));
+   return true;
+}
+
 static bool
 is_src_over(const nir_lower_blend_options *blend)
 {
@@ -2679,8 +2932,11 @@ g9p_compile_fragment(nir_shader *nir, unsigned frag_coord_slot,
    NIR_PASS(_, nir, nir_shader_tex_pass, lower_txf, nir_metadata_control_flow, NULL);
    lower_io(nir);
    out->native_blend = blend && is_src_over(blend) && !getenv("G9P_NO_NATIVE_BLEND");
-   if (blend && !out->native_blend)
+   if (blend && !out->native_blend) {
       NIR_PASS(_, nir, nir_lower_blend, blend);
+      NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_blend_constant,
+               nir_metadata_control_flow, NULL);
+   }
    out->uses_fbfetch = nir->info.fs.uses_fbfetch_output || out->native_blend;
    if (out->uses_fbfetch)
       NIR_PASS(_, nir, discards_to_select, out->native_blend);

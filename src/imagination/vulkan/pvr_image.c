@@ -64,6 +64,11 @@ static void pvr_image_init_memlayout(const struct pvr_device *device,
        * MESA.md "The GPU desktop against pixman"); the GPU samples and
        * renders linear images as well.
        */
+      /* G9P: arrays and cube maps twiddled, the only way they are sampled (A9, PR #5) */
+      else if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p) &&
+               (image->vk.array_layers > 1 ||
+                (image->vk.create_flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT)))
+         image->memlayout = PVR_MEMLAYOUT_TWIDDLED;
       else if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p) &&
                image->vk.image_type == VK_IMAGE_TYPE_2D && image->vk.mip_levels == 1 &&
                image->vk.samples == VK_SAMPLE_COUNT_1_BIT &&
@@ -206,6 +211,21 @@ static void pvr_image_plane_setup_mip_levels(struct pvr_image *image, uint8_t i)
     * RGX_CR_TPU_TAG_CEM_4K_FACE_PACKING_EN, assuming this is where the
     * requirement comes from.
     */
+   /*
+    * G9P: an array's layer stride is the chain's size rounded to 64 bytes, to
+    * 16 KiB past 16 KiB; the texture state's bit 125 says which (A9, PR #5)
+    */
+   {
+      const struct pvr_device *g9p_device =
+         container_of(image->vk.base.device, struct pvr_device, vk);
+
+      if (PVR_HAS_FEATURE(&g9p_device->pdevice->dev_info, apple_g9p) &&
+          image->vk.array_layers > 1 && image->memlayout == PVR_MEMLAYOUT_TWIDDLED) {
+         plane->layer_size = align64(plane->layer_size, plane->layer_size >= 16384 ? 16384 : 64);
+         plane->size = plane->layer_size * image->vk.array_layers;
+         return;
+      }
+   }
    if (image->vk.array_layers > 1)
       plane->layer_size = align64(plane->layer_size, image->alignment);
 

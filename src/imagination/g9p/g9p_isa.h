@@ -586,4 +586,22 @@ g9p_end_fragment(struct g9p_code *c, bool colour)
       G9P_EMIT(c, 0x0000);
 }
 
+/*
+ * Texture dimensions of the sample instruction: W0 bits 8-11 (2D 5, as
+ * g9p_sample_regs()'s f51a; 2D array 7, cube d). From the A9 (PR #5).
+ */
+#define G9P_TEX_2D_ARRAY 0x7
+#define G9P_TEX_CUBE     0xd
+
+/*
+ * The cube op: the direction in halves @src_half.. (f32 x, y, z) becomes the
+ * cube sample's coordinates in halves @dst_half.. (Apple's A9 fragment code
+ * 087d dst (src << 1 | 1) 0080 before a cube sample of a computed direction)
+ */
+static inline void
+g9p_cube_coords(struct g9p_code *c, unsigned dst_half, unsigned src_half)
+{
+   G9P_EMIT(c, 0x7d08, (uint16_t)(((src_half << 1) | 1) << 8 | dst_half), 0x8000);
+}
+
 #endif /* G9P_ISA_H */

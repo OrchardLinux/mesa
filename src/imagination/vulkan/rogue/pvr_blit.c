@@ -290,10 +290,22 @@ void pvr_rogue_CmdBlitImage2(VkCommandBuffer commandBuffer,
       const uint32_t max_dst_z = inverted_dst_z ? region->dstOffsets[0].z
                                                 : region->dstOffsets[1].z;
 
+      /* The source may be inverted too (Zink's Y-flipped readback) */
+      const bool inverted_src_x =
+         (region->srcOffsets[1].x < region->srcOffsets[0].x);
+      const bool inverted_src_y =
+         (region->srcOffsets[1].y < region->srcOffsets[0].y);
       const uint32_t src_width =
-         region->srcOffsets[1].x - region->srcOffsets[0].x;
+         inverted_src_x ? region->srcOffsets[0].x - region->srcOffsets[1].x
+                        : region->srcOffsets[1].x - region->srcOffsets[0].x;
       const uint32_t src_height =
-         region->srcOffsets[1].y - region->srcOffsets[0].y;
+         inverted_src_y ? region->srcOffsets[0].y - region->srcOffsets[1].y
+                        : region->srcOffsets[1].y - region->srcOffsets[0].y;
+      const VkOffset3D src_offset = {
+         .x = inverted_src_x ? region->srcOffsets[1].x : region->srcOffsets[0].x,
+         .y = inverted_src_y ? region->srcOffsets[1].y : region->srcOffsets[0].y,
+         .z = region->srcOffsets[0].z,
+      };
       uint32_t dst_width;
       uint32_t dst_height;
 
@@ -322,6 +334,9 @@ void pvr_rogue_CmdBlitImage2(VkCommandBuffer commandBuffer,
          flip_y = true;
          dst_offset.y = region->dstOffsets[1].y;
       }
+
+      flip_x ^= inverted_src_x;
+      flip_y ^= inverted_src_y;
 
       /* If any of the extent regions is zero, then reject the blit and
        * continue.
@@ -406,7 +421,7 @@ void pvr_rogue_CmdBlitImage2(VkCommandBuffer commandBuffer,
                                     src,
                                     region->srcSubresource.baseArrayLayer + j,
                                     region->srcSubresource.mipLevel,
-                                    &region->srcOffsets[0],
+                                    &src_offset,
                                     &src_extent,
                                     initial_depth_offset,
                                     vk_format_get_plane_aspect_format(

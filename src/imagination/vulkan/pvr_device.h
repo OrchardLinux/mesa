@@ -230,6 +230,7 @@ struct pvr_device {
 struct pvr_device_memory {
    struct vk_device_memory vk;
    struct pvr_winsys_bo *bo;
+   bool map_placed;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(pvr_device_memory,

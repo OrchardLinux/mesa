@@ -44,6 +44,8 @@
 
 /* The set of the push-constant slot (its address is loaded like a buffer's) */
 #define G9P_PUSH_CONSTANTS (~0u)
+/* The set of the dynamic blend constants (binding 0): 4 floats */
+#define G9P_BLEND_CONSTANTS (~5u)
 /* The set of vertex buffer slots (binding = the vertex buffer binding) */
 #define G9P_VERTEX_BUFFERS (~1u)
 /*
