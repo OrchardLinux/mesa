@@ -7,8 +7,8 @@
  * is inferred beyond the CAP-executed local64 target1. N counts down to1.
  * Only shared memory ordering is covered; device fences require more work. */
 static inline void
-g5p_shared_barrier(struct g9p_code *c, unsigned r, unsigned T,
-                   unsigned k, unsigned st, unsigned N)
+g5p_shared_barrier_fenced(struct g9p_code *c, unsigned r, unsigned T,
+                   unsigned k, unsigned st, unsigned N, int fence_pair)
 {
    assert(!c->fragment && k < 128 && N && N <= 31);
    g9p_wait(c);
@@ -27,6 +27,10 @@ g5p_shared_barrier(struct g9p_code *c, unsigned r, unsigned T,
    unsigned retry = g9p_jump(c, 0x0161, 0);
    g9p_jump_patch(c, retry, 2 * ((int)ll - (int)retry));
    assert(2 * ((int)ll - (int)retry) == -0x32);
+   if (fence_pair >= 0) {
+      G9P_EMIT(c, 0xc330, 0x0100 | (unsigned)fence_pair << 10, 0x0900, 0x1000);
+      g9p_wait(c);
+   }
    G9P_EMIT(c, 0x1181, 0x0101 | r << 10, 0x0120, 0xa5bd, 0x0070);
    G9P_EMIT(c, (N << 11) | 0x042f);
    unsigned last = g9p_jump(c, 0x0120, 0);
@@ -43,7 +47,11 @@ g5p_shared_barrier(struct g9p_code *c, unsigned r, unsigned T,
    assert(2 * (pop - last) == 0x1e);
    G9P_EMIT(c, 0x21c8, 0x0300 | 2 * st, 0x0100 | st << 2, 0x86d2);
    g9p_jump_patch(c, skip, 2 * (c->n - skip));
-   assert(2 * (c->n - skip) == 0x86);
+   assert(2 * (c->n - skip) == 0x86 + (fence_pair >= 0 ? 10 : 0));
    g9p_wait(c);
 }
+static inline void
+g5p_shared_barrier(struct g9p_code *c, unsigned r, unsigned T,
+                   unsigned k, unsigned st, unsigned N)
+{ g5p_shared_barrier_fenced(c,r,T,k,st,N,-1); }
 #endif

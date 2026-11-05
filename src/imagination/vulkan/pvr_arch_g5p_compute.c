@@ -63,6 +63,7 @@ PVR_PER_ARCH(g5p_compute_pipeline_compile)(
    state->num_regs = shader.num_regs;
    state->a9_local_dwords = shader.a9_local_dwords;
    state->a9_has_barriers = shader.a9_has_barriers;
+   state->a9_device_fence = shader.a9_device_fence;
    state->uses_workgroup_id = shader.uses_workgroup_id;
    memcpy(state->local_size, shader.local_size, sizeof(state->local_size));
 
@@ -101,9 +102,9 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
       state->local_size[0] * state->local_size[1] * state->local_size[2];
    const uint32_t count = threads | threads << 16;
    struct pvr_suballoc_bo *uniforms_bo;
-   uint32_t uniforms[2 * G9P_MAX_BUFFERS + 1] = { 0 };
+   uint32_t uniforms[2 * G9P_MAX_BUFFERS + 3] = { 0 };
    uint32_t bind_data[4 * (G9P_MAX_BUFFERS + 1) + 4] = { 0 };
-   uint32_t bind_code[G9P_MAX_BUFFERS + 2];
+   uint32_t bind_code[G9P_MAX_BUFFERS + 3];
    uint32_t kernel_data[12] = { 0 }, kernel_code[8];
    struct pvr_pds_upload bind, kernel;
    unsigned bind_dwords, ctrl0, nc = 0;
@@ -131,9 +132,18 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
          uniforms[2 * k + 1] = pc->dev_addr.addr >> 32;
       }
    }
+   unsigned transfers=n+1+(state->a9_device_fence ? 1 : 0);
+   if (state->a9_device_fence) {
+      uint32_t zero=0;
+      struct pvr_suballoc_bo *fence;
+      result=pvr_arch_cmd_buffer_upload_general(cmd_buffer,&zero,sizeof(zero),&fence);
+      if (result != VK_SUCCESS) return result;
+      uniforms[2*n+1]=fence->dev_addr.addr;
+      uniforms[2*n+2]=fence->dev_addr.addr>>32;
+   }
    uniforms[2 * n] = count;
    result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, uniforms,
-                                               sizeof(uint32_t) * (2 * n + 1),
+                                               sizeof(uint32_t) * (2 * n + 1 + (state->a9_device_fence ? 2 : 0)),
                                                &uniforms_bo);
    if (result != VK_SUCCESS)
       return result;
@@ -143,8 +153,8 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
     * control word per transfer: Rogue DOUTD src1, last (bit 31), common
     * store (bit 28), destination dword << 13, dwords.
     */
-   ctrl0 = 2 * (n + 1);
-   for (unsigned k = 0; k <= n; k++) {
+   ctrl0 = 2 * transfers;
+   for (unsigned k = 0; k < transfers; k++) {
       uint64_t src;
       uint32_t dest = 2 * k, dwords = 2;
 
@@ -157,6 +167,9 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
          binding = &set->layout->bindings[state->buffers[k].binding];
          /* pvr_buffer_descriptor: the address comes first */
          src = set->dev_addr.addr + binding->offset;
+      } else if (k > n) {
+         src=uniforms_bo->dev_addr.addr + 4*(2*n+1);
+         dest=56;
       } else {
          src = uniforms_bo->dev_addr.addr + 8 * k;
          if (k == n)
@@ -165,12 +178,12 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
       bind_data[2 * k] = src;
       bind_data[2 * k + 1] = src >> 32;
       bind_data[ctrl0 + k] =
-         (k == n ? BITFIELD_BIT(31) : 0) | BITFIELD_BIT(28) | dest << 13 | dwords;
+         (k+1 == transfers ? BITFIELD_BIT(31) : 0) | BITFIELD_BIT(28) | dest << 13 | dwords;
       bind_code[nc++] = g9p_pds_dout(G9P_DOUTD, k, G9P_PDS_DATA, ctrl0 + k,
-                                     k == n ? G9P_PDS_END : 0);
+                                     k+1 == transfers ? G9P_PDS_END : 0);
    }
    bind_code[nc++] = g9p_pds_halt();
-   bind_dwords = ALIGN_POT(ctrl0 + n + 1, 4);
+   bind_dwords = ALIGN_POT(ctrl0 + transfers, 4);
 
    result = pvr_arch_cmd_buffer_upload_pds(cmd_buffer, bind_data, bind_dwords,
                                            ROGUE_CDMCTRL_KERNEL1_DATA_ADDR_ALIGNMENT,
@@ -226,7 +239,7 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
       struct pvr_csb *csb = &sub_cmd->control_stream;
       const struct g5p_cdm_record bind_rec =
          g5p_cdm_dma_task(G9P_CDM_DATA_BLOCKS(bind_dwords / 4), bind.data_offset,
-                          bind.code_offset, DIV_ROUND_UP(2 * n + 1, 16));
+                          bind.code_offset, state->a9_device_fence ? 4 : DIV_ROUND_UP(2 * n + 1, 16));
       const struct g5p_cdm_record kernel_rec = g5p_cdm_kernel(
          G9P_CDM_KERNEL_REGS(state->num_regs) | G9P_CDM_ANY_CLUSTER | G9P_CDM_FENCE |
             G9P_CDM_DATA_BLOCKS(kernel_dwords / 4),

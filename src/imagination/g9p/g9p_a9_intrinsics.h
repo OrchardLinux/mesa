@@ -51,12 +51,16 @@ static bool a9_shared(struct g9p_ctx *ctx, nir_intrinsic_instr *in)
 static void a9_generate_init(struct g9p_ctx *ctx, nir_function_impl *impl)
 {
    ctx->a9_barriers_remaining = 0;
+   ctx->out->a9_device_fence = false;
    if (!ctx->out->a9) return;
    unsigned n = ctx->out->local_size[0] * ctx->out->local_size[1] * ctx->out->local_size[2];
    nir_foreach_block(block, impl) {
       nir_foreach_instr(instr, block) {
          if (instr->type != nir_instr_type_intrinsic) continue;
          nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+         if (in->intrinsic == nir_intrinsic_barrier &&
+             (nir_intrinsic_memory_modes(in) & (nir_var_mem_ssbo | nir_var_image)))
+            ctx->out->a9_device_fence = true;
          if (in->intrinsic == nir_intrinsic_ssbo_atomic_swap)
             ctx->busy |= ctx->pinned |= BITFIELD64_BIT(0);
          if (in->intrinsic == nir_intrinsic_barrier &&
@@ -72,10 +76,22 @@ static bool a9_barrier(struct g9p_ctx *ctx, nir_intrinsic_instr *in)
    if (!ctx->out->a9) return false;
    unsigned n = ctx->out->local_size[0] * ctx->out->local_size[1] * ctx->out->local_size[2];
    unsigned scope = nir_intrinsic_execution_scope(in);
-   if ((nir_intrinsic_memory_modes(in) & ~nir_var_mem_shared) ||
+   unsigned modes=nir_intrinsic_memory_modes(in);
+   bool device=modes & (nir_var_mem_ssbo | nir_var_image);
+   if ((modes & ~(nir_var_mem_shared | nir_var_mem_ssbo | nir_var_image)) ||
        (scope != SCOPE_NONE && scope != SCOPE_INVOCATION && scope != SCOPE_WORKGROUP)) {
-      fprintf(stderr, "g5p: device/image memory barrier not implemented\n");
+      fprintf(stderr, "g5p: unsupported barrier memory mode or execution scope\n");
       return false;
+   }
+   int fence_pair=-1;
+   if (device) {
+      int zero=const_reg(ctx,0);
+      fence_pair=alloc_pair(ctx);
+      if (zero<0 || fence_pair<0 || fence_pair>30) return false;
+      ctx->temps |= BITFIELD64_RANGE(fence_pair,2);
+      /* Reserved common dwords56/57 hold this dispatch's writable scratch VA. */
+      g9p_mov_uniform(ctx->c,fence_pair,56,zero);
+      g9p_mov_uniform(ctx->c,fence_pair+1,57,zero);
    }
    if (scope == SCOPE_WORKGROUP) {
       unsigned N = ctx->a9_barriers_remaining--;
@@ -85,11 +101,15 @@ static bool a9_barrier(struct g9p_ctx *ctx, nir_intrinsic_instr *in)
          if (r < 0 || t < 0) return false;
          /* Local size is fixed per pipeline: specialize Apple's target uniform. */
          g9p_mov_imm(ctx->c, t, DIV_ROUND_UP(n, 32) - 1);
-         g5p_shared_barrier(ctx->c, r, 2 * t, 2, ctx->st, N);
+         g5p_shared_barrier_fenced(ctx->c, r, 2 * t, 2, ctx->st, N, fence_pair);
          release(ctx, &in->instr);
          return true;
       }
       /* Apple's <=32 compiler form; cross-lane hardware qualification pending. */
+   }
+   if (device) {
+      G9P_EMIT(ctx->c,0xc330,0x0100 | (unsigned)fence_pair<<10,0x0900,0x1000);
+      release(ctx,&in->instr);
    }
    g9p_wait(ctx->c);
    return true;
