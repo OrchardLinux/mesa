@@ -197,6 +197,9 @@ struct pvr_g5p_pipeline {
     * Original colour-only programs remain byte-identical. */
    struct pvr_g5p_pipeline *punch;
    bool punch_variant;
+   /* the fragment program writes memory (PCO_G5P_EV_FS_STORE): its draws
+    * bound the shaded pixels with the ISP scissor (pvr_arch_g5p_gfx.c) */
+   bool fs_side_effects;
    /* a point pipeline: the vertex program writes the point size after the
     * position (pco_g5p_vs_link::point_size) */
    bool vs_point_size;

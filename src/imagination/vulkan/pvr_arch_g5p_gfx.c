@@ -640,6 +640,7 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
    g->fs_discard_select = fs->discard_select;
    if (g->punch_variant && (fs->discard_tokens != 1 || fs->discard_select))
       return G5P_REFUSE(device, "punch-through variant needs exactly one real discard token");
+   g->fs_side_effects = (fs->evidence & PCO_G5P_EV_FS_STORE) != 0;
    g->fs_blend_mode = fs->blend_mode;
    g->fs_write_mask = key.write_mask;
    g->color_targets = key.color_targets;
@@ -1431,7 +1432,19 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
                            (int64_t)height);
    if (x1 <= x0 || y1 <= y0)
       return VK_SUCCESS;
-   const bool scissor = x0 || y0 || x1 != (int32_t)width || y1 != (int32_t)height;
+   /* The ISP shades whole 32-pixel tiles: without a scissor, the pixels of
+    * an edge tile past the attachment (a 31x29 target's column 31 and rows
+    * 29..31) run the fragment program as covered pixels. The PBE cuts their
+    * colour to the attachment, so colour-only programs need no scissor
+    * (Apple's AGXMetalA9 ClipRectContext::updateClipRegions() enables it
+    * only for a clip inside the attachment, as above). Their memory stores
+    * are not cut (hardware, zink-fs-store: 116 such words, every one past
+    * the 31x29 attachment), and Vulkan's scissor test removes those
+    * fragments before shading: a program with side effects takes the ISP
+    * scissor unless the clip ends on tile edges, as Rogue's driver scissors
+    * every draw (pvr_arch_cmd_buffer.c). */
+   const bool side_effects_past_clip = g->fs_side_effects && ((x1 % G5P_TILE) || (y1 % G5P_TILE));
+   const bool scissor = x0 || y0 || x1 != (int32_t)width || y1 != (int32_t)height || side_effects_past_clip;
    uint32_t scissor_index = 0;
    if (scissor) {
       result = g5p_scissor_index(cmd_buffer, x0, y0, x1, y1, &scissor_index);
