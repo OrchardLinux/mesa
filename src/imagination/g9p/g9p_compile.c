@@ -2333,9 +2333,10 @@ zero_descriptor_offset(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 /*
  * Framebuffer fetch (nir_lower_blend's load_output): each f32 component
  * from a raw 32-bit word of the tile (emit_fb_fetch(), dest_type uint32),
- * f16 to f32 in integer code: h ? (h & 0x7fff) << 13 + 0x38000000 : 0,
- * exact for the zero and normal values of unorm attachments (no denormals,
- * infinities or NaNs there)
+ * f16 to f32 in integer code: (h & 0x7fff) << 13 + 0x38000000, clamped to
+ * [0, 1] as the attachment's unorm format would. The tile holds what the last
+ * shader wrote, unclamped until it is written to memory: a blend that went
+ * negative read back positive (dEQP fragment_ops).
  */
 static bool
 lower_fb_fetch_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
@@ -2356,7 +2357,12 @@ lower_fb_fetch_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       nir_def *bits = nir_iadd_imm(b, nir_ishl_imm(b, nir_iand_imm(b, h, 0x7fff), 13),
                                    0x38000000);
 
-      comps[i] = nir_bcsel(b, nir_ieq_imm(b, h, 0), nir_imm_int(b, 0), bits);
+      /* h - 1 >= 0x7fff: zero or negative */
+      nir_def *low = nir_uge_imm(b, nir_iand_imm(b, nir_iadd_imm(b, h, -1), 0xffff), 0x7fff);
+
+      comps[i] = nir_bcsel(b, low, nir_imm_int(b, 0),
+                           nir_bcsel(b, nir_uge_imm(b, h, 0x3c00),
+                                     nir_imm_int(b, 0x3f800000), bits));
    }
    nir_def_replace(&intr->def, nir_vec(b, comps, intr->def.num_components));
    return true;
