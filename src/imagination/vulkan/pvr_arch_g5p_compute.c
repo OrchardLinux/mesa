@@ -61,6 +61,7 @@ PVR_PER_ARCH(g5p_compute_pipeline_compile)(
       state->buffers[i].binding = shader.buffers[i].binding;
    }
    state->num_regs = shader.num_regs;
+   state->a9_bodyless = shader.a9_bodyless;
    state->a9_local_dwords = shader.a9_local_dwords;
    state->a9_has_barriers = shader.a9_has_barriers;
    state->a9_device_fence = shader.a9_device_fence;
@@ -124,6 +125,16 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
       return VK_SUCCESS;
    if (!threads || threads > 512 || group_count[0] > 65536 || group_count[1] > 65536 || group_count[2] > 65536)
       return vk_error(cmd_buffer, VK_ERROR_FEATURE_NOT_PRESENT);
+
+   /* A bodyless shader has no observable invocation.  Apple's standalone
+    * empty program does not retire under our CDM launch contract, so do not
+    * launch it: the sub-command's ordinary completion tail still establishes
+    * command-buffer ordering and signals the submit fence. */
+   if (state->a9_bodyless) {
+      if (getenv("PVR_G5P_WS_LOG"))
+         fprintf(stderr, "G5P-COMPUTE bodyless dispatch omitted; completion tail retained\n");
+      return VK_SUCCESS;
+   }
 
    /*
     * Values the DMA copies that are not in descriptor memory: the

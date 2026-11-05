@@ -3735,6 +3735,7 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
     */
    stack = ctx->stage == MESA_SHADER_COMPUTE || ctx->c->uses_stack;
    body_n = ctx->c->n;
+   G9P_A9_SET_BODYLESS(ctx, body_n);
    body = malloc(body_n * sizeof(uint16_t) + 1);
    if (!body)
       return false;
