@@ -420,10 +420,10 @@ usc_off(const struct pvr_device *device, const struct pvr_suballoc_bo *bo)
 /* ---- pipelines ---- */
 
 static bool
-g5p_bresenham_line_probe(const struct vk_graphics_pipeline_state *s)
+g5p_native_bresenham_line(const struct vk_graphics_pipeline_state *s)
 {
-   const char *probe = getenv("PVR_G5P_BRESENHAM");
-   return probe && !strcmp(probe, "probe") && s->rs && s->ia &&
+   const char *mode = getenv("PVR_G5P_BRESENHAM");
+   return (!mode || strcmp(mode, "0")) && s->rs && s->ia &&
       (s->ia->primitive_topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST ||
        s->ia->primitive_topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP) &&
       s->rs->line.mode == VK_LINE_RASTERIZATION_MODE_BRESENHAM;
@@ -490,9 +490,9 @@ g5p_check_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo *c
    const bool fill_bresenham = s->rs && s->rs->polygon_mode != VK_POLYGON_MODE_FILL &&
                                s->rs->line.mode == VK_LINE_RASTERIZATION_MODE_BRESENHAM;
    /* The ordinary LINE object is A9's native aliased-line path. Its
-    * Bresenham coverage still needs the GL/GLES pixel qualification; do
-    * not borrow the polygon-edge proof or add a guessed ISP mode bit. */
-   const bool bresenham_line = g5p_bresenham_line_probe(s);
+    * width-1, single-sample Bresenham coverage is qualified by the GL/GLES
+    * c47 line-list and strip flight. Keep other widths and samples refused. */
+   const bool bresenham_line = g5p_native_bresenham_line(s);
    if (s->rs && ((s->rs->line.mode != VK_LINE_RASTERIZATION_MODE_DEFAULT && !fill_bresenham && !bresenham_line) ||
                  s->rs->line.stipple.enable))
       return G5P_REFUSE(device, "line rasterization mode %d, stipple %d", s->rs->line.mode,
@@ -588,7 +588,7 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
       return result;
    key.punch = g->punch_variant;
    g->samples = s->ms ? MAX2(s->ms->rasterization_samples, VK_SAMPLE_COUNT_1_BIT) : VK_SAMPLE_COUNT_1_BIT;
-   g->bresenham_line_probe = g5p_bresenham_line_probe(s);
+   g->bresenham_line_probe = g5p_native_bresenham_line(s);
 
    for (uint32_t i = 0; i < create_info->stageCount; i++) {
       const VkPipelineShaderStageCreateInfo *st = &create_info->pStages[i];
@@ -1430,7 +1430,7 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
       return G5P_REFUSE(cmd_buffer, "topology %d", dyn->ia.primitive_topology);
    VkResult result;
    if (g->bresenham_line_probe && (!lines || dyn->rs.line.width != 1.0f || g->samples != 1))
-      return G5P_REFUSE(cmd_buffer, "Bresenham line probe needs line topology, width 1 and one sample");
+      return G5P_REFUSE(cmd_buffer, "Bresenham lines need line topology, width 1 and one sample");
    /* rasterizer discard: the vertex program runs (transform feedback), no
     * fragment is shaded or tested (pvr_g5p_xfb.h; the ISP words below); a
     * pipeline that discards has no viewport state: the render area stands
