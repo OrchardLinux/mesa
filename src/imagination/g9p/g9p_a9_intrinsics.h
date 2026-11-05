@@ -59,7 +59,7 @@ static void a9_generate_init(struct g9p_ctx *ctx, nir_function_impl *impl)
          if (instr->type != nir_instr_type_intrinsic) continue;
          nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
          if (in->intrinsic == nir_intrinsic_barrier &&
-             (nir_intrinsic_memory_modes(in) & (nir_var_mem_ssbo | nir_var_image)))
+             (nir_intrinsic_memory_modes(in) & (nir_var_mem_ssbo | nir_var_mem_global | nir_var_image)))
             ctx->out->a9_device_fence = true;
          if (in->intrinsic == nir_intrinsic_ssbo_atomic_swap)
             ctx->busy |= ctx->pinned |= BITFIELD64_BIT(0);
@@ -77,8 +77,8 @@ static bool a9_barrier(struct g9p_ctx *ctx, nir_intrinsic_instr *in)
    unsigned n = ctx->out->local_size[0] * ctx->out->local_size[1] * ctx->out->local_size[2];
    unsigned scope = nir_intrinsic_execution_scope(in);
    unsigned modes=nir_intrinsic_memory_modes(in);
-   bool device=modes & (nir_var_mem_ssbo | nir_var_image);
-   if ((modes & ~(nir_var_mem_shared | nir_var_mem_ssbo | nir_var_image)) ||
+   bool device=modes & (nir_var_mem_ssbo | nir_var_mem_global | nir_var_image);
+   if ((modes & ~(nir_var_mem_shared | nir_var_mem_ssbo | nir_var_mem_global | nir_var_image)) ||
        (scope != SCOPE_NONE && scope != SCOPE_INVOCATION && scope != SCOPE_WORKGROUP)) {
       fprintf(stderr, "g5p: unsupported barrier memory mode or execution scope\n");
       return false;
