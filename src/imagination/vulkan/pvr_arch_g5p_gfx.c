@@ -1518,7 +1518,10 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
    /* a depth/stencil attachment: its tests and bias (pvr_arch_g5p_ds.c) */
    /* rasterizer discard: no depth/stencil aspects (Rogue's rule), the colour-only ISP form */
    const VkImageAspectFlags ds_aspects = discard ? 0 : pvr_arch_g5p_ds_aspects(cmd_buffer);
-   const bool dbias = ds_aspects && dyn->rs.depth_bias.enable;
+   /* Zink keeps bias enabled with zero factors when polygon offset is off.
+    * Only a potential nonzero offset needs the bias table or its refusals. */
+   const bool dbias = ds_aspects && dyn->rs.depth_bias.enable &&
+                      (dyn->rs.depth_bias.constant_factor != 0.0f || dyn->rs.depth_bias.slope_factor != 0.0f);
    if (g->fs_depth_feedback && dbias)
       return G5P_REFUSE(cmd_buffer, "fragment depth export with depth bias is not qualified");
    uint32_t dbias_index = 0;
