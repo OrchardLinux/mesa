@@ -72,9 +72,13 @@ static const unsigned g5p_mrt_variant_targets[PVR_G5P_MRT_VARIANTS] = { 1, 2, 4 
 /* The TA scratch the kernel's records point into, and its pointer offsets */
 #define G5P_SCRATCH_BYTES 0x8000u
 static const uint32_t g5p_scratch_ptr_off[6] = { 0x20, 0x24, 0x28, 0x2c, 0x6240, 0x6040 };
-/* The V1 pool sizes, as V2 tables (a render without tables of its own) */
-#define G5P_SCISSOR_POOL_BYTES 0x80000u
-#define G5P_DBIAS_POOL_BYTES 0xc0000u
+/* The default scissor and depth-bias tables of a render without tables of its
+ * own. Its draws index entry 0 only (scindex/dbindex 0, scissor and bias
+ * disabled): a draw that clips or biases makes the render's own table
+ * (upstream's per-render tables, pvr_arch_g5p_gfx.c). One page each, not
+ * the 65536-entry V1 pools (512 + 768 KiB of every device's arena). */
+#define G5P_SCISSOR_POOL_BYTES 0x4000u
+#define G5P_DBIAS_POOL_BYTES 0x3000u
 
 /* ---- pdsc programs ---- */
 

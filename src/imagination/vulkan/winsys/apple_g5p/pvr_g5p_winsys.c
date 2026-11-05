@@ -7,7 +7,8 @@
  * pins at most 256 MiB per VM in BOs of at most 64 MiB. So this winsys keeps
  * an arena: a range of GPU VA at the kernel's code base (pds_base ==
  * usc_base), reserved up front for PVR_G5P_ARENA_MIB and committed in
- * READ|WRITE|EXEC chunks as it fills (2 MiB minimum, demand sized), each
+ * READ|WRITE|EXEC chunks as it fills (the first at the first slice, 512 KiB minimum; then 2 MiB minimum,
+ * demand sized), each
  * CPU-mapped at its place in one reservation. Pinned memory is what a process
  * uses, not the maximum (g5p_ws_arena_grow()). Every BO is a slice of it, taken at buffer_create:
  * its CPU and GPU addresses are fixed from then on. Because the whole arena
@@ -62,9 +63,10 @@
 
 #define G5P_WS_PAGE 16384ull
 #define G5P_WS_CHUNK (64ull << 20)         /* the kernel's largest BO */
-#define G5P_WS_MAX_CHUNKS 64                /* at least 2 MiB per chunk; 128 MiB default, 256 MiB kernel cap */
+#define G5P_WS_MAX_CHUNKS 64                /* at least 2 MiB per chunk after the first; 128 MiB default, 256 MiB kernel cap */
 #define G5P_WS_ARENA_DEFAULT (128ull << 20) /* the most the arena grows to; PVR_G5P_ARENA_MIB overrides */
-#define G5P_WS_ARENA_FIRST (2ull << 20)    /* initial demand floor; PVR_G5P_ARENA_FIRST_MIB overrides */
+#define G5P_WS_ARENA_FIRST (512ull << 10) /* the first chunk; PVR_G5P_ARENA_FIRST_MIB overrides */
+#define G5P_WS_CHUNK_FLOOR (2ull << 20)    /* every later chunk: demand, at least this */
 #define G5P_WS_DEDICATED_SIZE (1ull << 30) /* VA window for display BOs and imports */
 /* Render programs are 32-bit USC/PDS offsets from the code base, so no code window is larger. The kernel's
  * (GET_RENDER_INFO.code_window) bounds the arena; GET_EXEC_INFO.window_size (0x34000) is the older compute path's
@@ -97,6 +99,7 @@ struct g5p_ws {
     * holds only committed chunks. */
    uint64_t arena_va, arena_size;
    uint64_t arena_max;      /* the most the chunks may total (PVR_G5P_ARENA_MIB) */
+   uint64_t arena_first;    /* the first chunk's floor (PVR_G5P_ARENA_FIRST_MIB), committed at the first slice */
    uint64_t arena_next;     /* the offset of the next chunk */
    uint64_t arena_committed; /* bytes in chunks */
    uint64_t arena_live, arena_peak, arena_allocs, arena_reused; /* slice bytes, high-water, allocation/reuse counts */
@@ -345,17 +348,17 @@ static void g5p_ws_wait_jobs(struct g5p_ws *ws, int64_t deadline);
    } while (0)
 /* ---- the arena: committed on demand ---- */
 
-/* One more chunk, at least `need` bytes (lock held), at most a kernel BO (64 MiB)
+/* One more chunk, at least `need` and `min_bytes` (lock held), at most a kernel BO (64 MiB)
  * and what is left of PVR_G5P_ARENA_MIB. A fresh kernel
  * BO reads as zero, so its pages are not memset (arena_used). The bind is a VM edit: the kernel refuses it (EBUSY)
  * while the context has queued jobs and no job has retired on its binding yet; then it is retried for up to 2 s. */
-static int g5p_ws_arena_grow(struct g5p_ws *ws, uint64_t need, uint64_t alignment)
+static int g5p_ws_arena_grow(struct g5p_ws *ws, uint64_t need, uint64_t alignment, uint64_t min_bytes)
 {
    if (ws->chunk_count == G5P_WS_MAX_CHUNKS || ws->arena_committed >= ws->arena_max)
       return -ENOSPC;
    /* Bounded demand, not geometric commitment: a transient large allocation must not
     * double every later chunk. The VA, not extra physical memory, provides alignment. */
-   uint64_t bytes = MAX2(need, 2ull << 20);
+   uint64_t bytes = MAX2(need, min_bytes);
    bytes = MIN3(align64(bytes, G5P_WS_PAGE), G5P_WS_CHUNK, ws->arena_max - ws->arena_committed);
    const uint64_t off = align64(ws->arena_va + ws->arena_next, alignment) - ws->arena_va;
    if (bytes < need || off > ws->arena_size || bytes > ws->arena_size - off)
@@ -515,7 +518,10 @@ static VkResult g5p_ws_buffer_create(struct pvr_winsys *ws_, uint64_t size, uint
       simple_mtx_lock(&ws->lock);
       g5p_ws_arena_trim(ws);
       uint64_t va = util_vma_heap_alloc(&ws->slices, alloc, align);
-      if (!va && g5p_ws_arena_grow(ws, alloc, align) == 0)
+      /* the first chunk starts at the code base, as an eager one did; the slice fits at its alignment */
+      const bool first_chunk = !ws->chunk_count;
+      if (!va && g5p_ws_arena_grow(ws, first_chunk ? alloc + align : alloc, first_chunk ? G5P_WS_PAGE : align,
+                                   first_chunk ? ws->arena_first : G5P_WS_CHUNK_FLOOR) == 0)
          va = util_vma_heap_alloc(&ws->slices, alloc, align);
       if (va) {
          for (unsigned i = 0; i < ws->chunk_count; i++)
@@ -1345,8 +1351,8 @@ static const struct pvr_winsys_ops g5p_ws_ops = {
    .null_job_submit = g5p_ws_null_job_submit,
 };
 
-/* Commit the arena: one CPU reservation, then one READ|WRITE|EXEC BO per
- * chunk, mapped into it and bound at the kernel's code base. */
+/* Reserve the arena: one CPU reservation at the kernel's code base; its chunks
+ * (one READ|WRITE|EXEC BO each, mapped into it) are committed as slices need them. */
 static VkResult g5p_ws_arena_init(struct g5p_ws *ws)
 {
    const char *e = getenv("PVR_G5P_ARENA_MIB"), *f = getenv("PVR_G5P_ARENA_FIRST_MIB");
@@ -1375,10 +1381,12 @@ static VkResult g5p_ws_arena_init(struct g5p_ws *ws)
    /* the slices heap starts empty; every chunk adds its range */
    util_vma_heap_init(&ws->slices, ws->arena_va, size);
    util_vma_heap_alloc_addr(&ws->slices, ws->arena_va, size);
-   int r = g5p_ws_arena_grow(ws, first, G5P_WS_PAGE);
-   if (r)
-      return g5p_ws_fail(VK_ERROR_INITIALIZATION_FAILED, "the arena's first chunk at %#" PRIx64 ": %s",
-                       ws->arena_va, strerror(-r));
+   /* No chunk yet: the first slice commits it (g5p_ws_buffer_create()). The winsys exists from
+    * vkEnumeratePhysicalDevices on, and a process may keep an instance it never makes a device with
+    * (Hyprland holds one beside its renderer's): an eager 2 MiB first chunk was committed memory nothing
+    * used. A device's own first slices are a few programs and one-page tables, so the first chunk's floor
+    * is 512 KiB; later chunks keep the 2 MiB floor. */
+   ws->arena_first = first;
    g5p_ws_perf_init(&ws->perf, ws->arena_va, size, ws->arena_cpu);
    if (ws->arena_log)
       g5p_ws_arena_stats(ws, "init");
