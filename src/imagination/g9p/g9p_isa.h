@@ -185,15 +185,15 @@ g9p_alu2(struct g9p_code *c, unsigned op, unsigned dst, unsigned a, unsigned b,
 static inline void
 g9p_mov_to_high(struct g9p_code *c, unsigned hi, unsigned src)
 {
-   assert(c->fragment && src < 32 && hi < 128);
-   G9P_EMIT(c, 0x0199, 0x0100 | 2 * hi, 0x0100 | src << 2 | src << 10, 0x00ce);
+   assert(src < 32 && hi < 128);
+   G9P_EMIT(c, g9p_w0(c, 0x3199), g9p_dst(c, hi), 0x0100 | src << 2 | src << 10, 0x00ce);
 }
 
 static inline void
 g9p_mov_from_high(struct g9p_code *c, unsigned dst, unsigned hi)
 {
-   assert(c->fragment && dst < 32 && hi < 128);
-   G9P_EMIT(c, 0x0199, 0x0100 | 2 * dst, 0x0101 | (hi & 31) << 2 | (hi & 31) << 10,
+   assert(dst < 32 && hi < 128);
+   G9P_EMIT(c, g9p_w0(c, 0x3199), g9p_dst(c, dst), 0x0101 | (hi & 31) << 2 | (hi & 31) << 10,
             0x0100 | (hi >> 5) << 1 | (hi >> 5) << 9, 0x00ce);
 }
 

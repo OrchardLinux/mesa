@@ -1790,10 +1790,11 @@ emit_tex_vertex(struct g9p_ctx *ctx, nir_tex_instr *tex)
    /* The cube op reads r0-r2 (no other source in Apple's code), reserved in such a shader */
    if (cube) {
       for (unsigned c = 0; c < 3; c++)
-         G9P_EMIT(ctx->c, 0x1199, 0x0100 | 2 * c, g9p_srcs(coord + c, coord + c, false), G9P_OR);
+         G9P_EMIT(ctx->c, 0x1199, 0x0100 | 2 * c, g9p_srcs(coord + c, coord + c, false) | 0x80,
+                  G9P_OR);
       g9p_cube_coords(ctx->c, 2 * coord, 0);
    }
-   dst = alloc_low_range(ctx, 4);
+   dst = alloc_range(ctx, 4);
    if (dst < 0)
       return false;
    at = ctx->c->n;
@@ -2791,13 +2792,14 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
       int victim = -1;
 
       ctx.oom = false;
-      if (generate(&ctx, impl, G9P_NUM_REGS))
+      if (generate(&ctx, impl, ctx.reserve_st_low ? 15 : G9P_NUM_REGS))
          break;
       if (ctx.oom && stage == MESA_SHADER_VERTEX && !ctx.reserve_low) {
          ctx.reserve_low = true;
+         ctx.reserve_st_low = true;
          continue;
       }
-      if (!ctx.oom || stage != MESA_SHADER_FRAGMENT || ctx.num_homes >= 96)
+      if (!ctx.oom || stage == MESA_SHADER_COMPUTE || ctx.num_homes >= 96)
          return false;
       for (unsigned d = 0; d < ctx.num_decls; d++) {
          const unsigned k = key(ctx.decls[d], 0);
@@ -2833,7 +2835,9 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
     * shaders of 17 registers and more drew wrong values or hung the geometry
     * job). Reserved in the second pass.
     */
-   if (stage == MESA_SHADER_VERTEX && st > 15) {
+   if (stage == MESA_SHADER_VERTEX && ctx.reserve_st_low) {
+      st = MAX2(ctx.max_reg, 15);
+   } else if (stage == MESA_SHADER_VERTEX && st > 15) {
       ctx.reserve_st_low = true;
       if (!generate(&ctx, impl, 15)) {
          /* without r15, address work can run out of low registers */
