@@ -27,12 +27,13 @@
  * Texture state in the common store (Apple's layout for n textures, metal-tt):
  * texture t's state (8 dwords) at dword 8t, its sampler (2 dwords) at 8n + 2t,
  * from dword 0 in fragment shaders and after the buffers' address slots in
- * vertex shaders. In fragment shaders the buffers' contents follow: buffer k's
- * first G9P_FS_BUF_DWORDS dwords at g9p_fs_buf_base() + G9P_FS_BUF_DWORDS k,
- * which the shader reads as uniform operands (as Apple's fragment code does).
+ * vertex shaders. In fragment shaders the buffers' contents follow from
+ * g9p_fs_buf_base(), one after the other with the dwords each is read for (at
+ * most G9P_FS_BUF_DWORDS), which the shader reads as uniform operands (as Apple's
+ * fragment code does).
  */
 #define G9P_VS_TEX_BASE (2 * G9P_MAX_BUFFERS)
-#define G9P_FS_BUF_DWORDS 128
+#define G9P_FS_BUF_DWORDS 512
 
 static inline unsigned
 g9p_tex_state(unsigned base, unsigned t)

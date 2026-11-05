@@ -554,10 +554,9 @@ PVR_PER_ARCH(g9p_graphics_pipeline_compile)(struct pvr_device *device,
       state->fs_buffers[i].set = fs.buffers[i].set;
       state->fs_buffers[i].binding = fs.buffers[i].binding;
       state->fs_buffers[i].dwords = fs.buffers[i].dwords;
-      if (fs.buffers[i].dwords)
-         state->fs_common_dwords = MAX2(state->fs_common_dwords,
-                                        g9p_fs_buf_base(fs.num_textures) + G9P_FS_BUF_DWORDS * i +
-                                           fs.buffers[i].dwords);
+      state->fs_common_dwords = (state->fs_common_dwords ? state->fs_common_dwords
+                                                         : g9p_fs_buf_base(fs.num_textures)) +
+                                fs.buffers[i].dwords;
    }
    state->num_textures = fs.num_textures;
    for (unsigned i = 0; i < fs.num_textures; i++) {
@@ -736,11 +735,16 @@ upload_textures(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics
                             PVR_STAGE_ALLOCATION_FRAGMENT, addrs);
       if (result != VK_SUCCESS)
          return result;
+      unsigned next = g9p_fs_buf_base(state->num_textures);
+
       for (unsigned k = 0; k < state->fs_num_buffers; k++) {
+         const unsigned base = next;
+
+         next += state->fs_buffers[k].dwords;
          if (!state->fs_buffers[k].dwords || !addrs[k])
             continue;
          src[n] = addrs[k];
-         ctrl[n++] = doutd_ctrl(g9p_fs_buf_base(state->num_textures) + G9P_FS_BUF_DWORDS * k,
+         ctrl[n++] = doutd_ctrl(base,
                                 state->fs_buffers[k].dwords, false);
       }
    }
@@ -1483,7 +1487,15 @@ emit_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state
                     ? state->varying_units << 10 | (2 * state->num_varyings) << 4
                     : 0),
              DIV_ROUND_UP(4 * dp->fs_common_dwords, 64) << 23 |
-                (state->uses_discard ? BITFIELD_BIT(14) : 0),
+                /*
+                 * No triangle merging for textures: a helper pixel taken from the
+                 * neighbouring triangle has another gradient when W varies (dEQP
+                 * texture.mipmap.2d.projected). Rogue disables it for lines too.
+                 */
+                (state->uses_discard || state->num_textures ||
+                       g9p_is_line(cmd_buffer->vk.dynamic_graphics_state.ia.primitive_topology)
+                    ? BITFIELD_BIT(14)
+                    : 0),
              state->num_varyings ? state->varyings.data_offset : p->halt.code_offset);
    /* 1b: PDS state pointer 3: the texture/buffer program's data */
    if (tex)
