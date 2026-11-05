@@ -10942,7 +10942,7 @@ void PVR_PER_ARCH(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
           *     by the compute data master are completed before starting
           *     anything new.
           */
-
+         PVR_G5P_HOOK(compute_barrier)
          /* Issue Data Fence, Wait for Data Fence (IDFWDF) makes the PDS wait
           * for data.
           */

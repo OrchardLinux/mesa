@@ -33,6 +33,12 @@
       result = pvr_arch_g5p_compute_end_pass(cmd_buffer, compute_sub_cmd); \
       if (result != VK_SUCCESS) return pvr_cmd_buffer_set_error_unwarned(cmd_buffer, result); \
    } else
+#define PVR_G5P_HOOK_compute_barrier() \
+   if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g5p)) { \
+      result = pvr_arch_g5p_compute_end_pass(cmd_buffer, &current_sub_cmd->compute); \
+      if (result != VK_SUCCESS) { pvr_cmd_buffer_set_error_unwarned(cmd_buffer, result); return; } \
+      break; \
+   }
 #define PVR_G5P_HOOK_compute_job_submit() \
    if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p)) \
       return pvr_arch_g5p_compute_job_submit(ctx, sub_cmd, wait, signal_sync);
