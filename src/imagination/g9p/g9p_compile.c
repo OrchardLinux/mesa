@@ -1871,14 +1871,8 @@ emit_tex_vertex(struct g9p_ctx *ctx, nir_tex_instr *tex)
    }
    /* The cube op reads r0-r2 (no other source in Apple's code), reserved in such a shader */
    if (cube) {
-      int zero = const_reg(ctx, 0);
-
-      zero = zero < 0 ? zero : low_reg(ctx, zero);
-      if (zero < 0)
-         return false;
-      for (unsigned c = 0; c < 3; c++)
-         G9P_EMIT(ctx->c, 0x1199, 0x0100 | 2 * c, g9p_srcs(zero, coord + c, false) | 0x80,
-                  G9P_FADD);
+      for (unsigned c = 3; c-- > 0;)
+         G9P_EMIT(ctx->c, 0x2198, 0x0100 | 2 * c, 0x0100 | (coord + c) << 2, 0x0154, 0x0038);
       g9p_cube_coords(ctx->c, 2 * coord, 0);
    }
    /* a cube's result over its coordinates, as in Apple's code */
