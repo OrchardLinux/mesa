@@ -554,7 +554,10 @@ static bool alu_supported(struct gctx *c, nir_alu_instr *a)
    case nir_op_fabs: case nir_op_fsat: case nir_op_fsub: case nir_op_u2f32:
       return bits == 32;
    case nir_op_inot:
-      return c->vs ? bits == 32 : (bits == 32 || bits == 1);
+      /* vertex: v_inot32 (unary not, bank 1, header 0x21); a 1-bit one is the
+       * literal XOR of a materialized 1.0/0.0 boolean in the vertex literal
+       * form (v_bnot's binary literal: bank 1, header 0x11) */
+      return bits == 32 || bits == 1;
    case nir_op_iand: case nir_op_ior: case nir_op_ixor:
       /* vertex: register pairs only (v_iand, v_ior, v_ixor: bank 1, header 0x31); a 1-bit one combines
        * materialized 1.0/0.0 booleans */
@@ -2380,8 +2383,11 @@ static void emit_bool_alu(struct gctx *c, nir_alu_instr *a)
    unsigned g = vgrp(c, x);
    free_dying(c, &x, 1);
    unsigned dst = alloc_reg(c, d ? (int)xr : -1);
-   put(c, raw, g5p_usc_binary_literal2(raw, G5P_BIN_XOR, 2 * dst, F32_ONE, 2 * xr, 0, g, g ? 1 : 0x41, G5P_LIT_U32, -1,
-                                       g ? 0 : 4, 0, false), "boolean not");
+   /* vertex: the binary literal form of v_bnot (bank 1, header 0x11; 0x40 and extension 4 on a repeated read, as
+    * the vertex f16-literal ALU) */
+   put(c, raw, g5p_usc_binary_literal2(raw, G5P_BIN_XOR, 2 * dst, F32_ONE, 2 * xr, c->vs, g,
+                                       (c->vs ? 0x11 : 1) | (g ? 0 : 0x40), G5P_LIT_U32, -1, g ? 0 : 4, 0, false),
+       "boolean not");
    define(c, &a->def, dst);
 }
 
@@ -2930,7 +2936,9 @@ static void emit_unary_like(struct gctx *c, nir_alu_instr *a)
    case nir_op_fexp2: /* vertex (v_exp2) */
       n = g5p_usc_unary2(raw, G5P_EXP2, 2 * dst, 2 * xr, c->vs, g, c->vs ? 0x21 : 1, false, cx, 0, false);
       break;
-   case nir_op_inot: n = g5p_usc_unary2(raw, G5P_NOT, 2 * dst, 2 * xr, 0, g, 1, false, cx, 0, false); break;
+   case nir_op_inot: /* vertex (v_inot32): bank 1, header 0x20 (A) */
+      n = g5p_usc_unary2(raw, G5P_NOT, 2 * dst, 2 * xr, c->vs, g, c->vs ? 0x21 : 1, false, cx, 0, false);
+      break;
    case nir_op_bit_count: n = g5p_usc_unary2(raw, G5P_POPCOUNT, 2 * dst, 2 * xr, 0, g, 1, false, cx, 0, false); break;
    default: n = g5p_usc_unary2(raw, G5P_BITREVERSE, 2 * dst, 2 * xr, 0, g, 1, false, cx, 0, false); break;
    }

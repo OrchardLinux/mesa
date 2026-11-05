@@ -38,6 +38,12 @@ int main(void)
    /* v_f2i_i2f: the i2f32 of the same program (the existing vertex i2f form) */
    n = g5p_usc_convert(b, G5P_I2F32, 8, 8, 1, 1, 0x11);
    check("v_f2i_i2f", b, n, "99110803179120016804");
+   /* v_inot32: unary not, bank 1, header 0x21 */
+   n = g5p_usc_unary2(b, G5P_NOT, 8, 8, 1, 1, 0x21, false, 0, 0, false);
+   check("v_inot32", b, n, "982108039001c500");
+   /* v_bnot: the vertex u32 binary literal (and 1), bank 1, header 0x11, the form the boolean not's XOR takes */
+   n = g5p_usc_binary_literal2(b, G5P_BIN_AND, 8, 1, 8, 1, 1, 0x11, G5P_LIT_U32, -1, 0, 0, false);
+   check("v_bnot_and", b, n, "9911080303912001c8017000");
    printf("G5P VSOPS ENCODERS %s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
    return fails != 0;
 }
