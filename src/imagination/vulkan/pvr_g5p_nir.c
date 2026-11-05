@@ -254,12 +254,19 @@ clamp_dyn_ubo(nir_shader *nir)
                x = nir_scalar_chase_alu_src(s, 0);
             }
             unsigned size, bytes = in->def.num_components * 4;
-            if (!ubo_block_bytes(nir, in->src[0].ssa, &size) || c > size || size - c < bytes)
-               continue; /* c may be a folded negative */
-            uint32_t last = (size - c - bytes) >> shift;
+            /* A negative intermediate index can still yield a valid final
+             * address: (2-i)*8+4 is folded to (-i)*8+20. Clamp the complete
+             * 32-bit byte address, preserving its known low offset bits,
+             * rather than clamping -i before adding the base. */
+            uint32_t low = c & ((1u << shift) - 1);
+            if (!ubo_block_bytes(nir, in->src[0].ssa, &size) || low > size || size - low < bytes)
+               continue;
+            uint32_t last = (size - low - bytes) >> shift;
             b.cursor = nir_before_instr(instr);
-            nir_def *i = nir_umin(&b, nir_channel(&b, x.def, x.comp), nir_imm_int(&b, last));
-            nir_def *off = nir_iadd_imm(&b, nir_ishl_imm(&b, i, shift), c);
+            nir_def *address = nir_iadd_imm(&b,
+               nir_ishl_imm(&b, nir_channel(&b, x.def, x.comp), shift), c);
+            nir_def *i = nir_umin(&b, nir_ushr_imm(&b, address, shift), nir_imm_int(&b, last));
+            nir_def *off = nir_iadd_imm(&b, nir_ishl_imm(&b, i, shift), low);
             nir_src_rewrite(&in->src[1], off);
             progress = true;
          }
