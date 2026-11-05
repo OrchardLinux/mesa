@@ -44,7 +44,7 @@ PVR_PER_ARCH(g5p_compute_pipeline_compile)(
    if (result != VK_SUCCESS)
       goto out;
 
-   if (!g9p_compile_compute(nir, &shader, mem_ctx)) {
+   if (!g9p_a9_compile_compute(nir, &shader, mem_ctx)) {
       result = vk_errorf(device, VK_ERROR_FEATURE_NOT_PRESENT,
                          "G5P compute: shader not supported by the backend yet");
       goto out;
