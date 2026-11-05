@@ -146,8 +146,10 @@ struct g9p_ctx {
    unsigned max_reg;
    unsigned st;     /* mask stack register */
    unsigned tex_total;  /* textures the shader samples (count_textures()) */
+   bool flush_outputs;  /* vertex outputs written at once, for shaders that ran out */
    bool point_size;     /* a point pipeline's vertex shader: the size is the last output */
    int psize_reg;
+   uint64_t flushed_outputs;
    int vertex_reg, instance_reg; /* vertex shaders: r0-r1, or copies of them */
    bool reserve_st_low; /* the mask stack is r15, reserved (compile_back()) */
    bool reserve_low;    /* r11-r14 for address work, after running out (compile_back()) */
@@ -1434,6 +1436,25 @@ emit_output(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
    }
    pin(ctx, r);
    if (ctx->stage == MESA_SHADER_VERTEX) {
+      /*
+       * The previous output now, which frees its register: the last one has to
+       * stay for the end of the program.
+       */
+      if (ctx->flush_outputs && ctx->num_outputs &&
+          intr->instr.block->cf_node.parent->type == nir_cf_node_function) {
+         const int prev = ctx->outputs[ctx->num_outputs - 1].reg;
+         bool live = prev == r;
+
+         g9p_vs_output(ctx->c, prev, ctx->outputs[ctx->num_outputs - 1].slot);
+         ctx->flushed_outputs |= BITFIELD64_BIT(ctx->outputs[ctx->num_outputs - 1].slot);
+         ctx->num_outputs--;
+         for (unsigned k = 0; k < ctx->num_keys && !live; k++)
+            live = ctx->reg[k] == prev && ctx->last_use[k] > ctx->ip;
+         if (!live) {
+            ctx->pinned &= ~BITFIELD64_BIT(prev);
+            ctx->busy &= ~BITFIELD64_BIT(prev);
+         }
+      }
       ctx->outputs[ctx->num_outputs].reg = r;
       ctx->outputs[ctx->num_outputs].slot = slot;
       ctx->num_outputs++;
@@ -1939,6 +1960,24 @@ emit_intrinsic(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
       /* resolved where they are used */
       return true;
 
+   case nir_intrinsic_load_front_face: {
+      /* Apple's read of the face register, then 0/~0 */
+      int r, zero, dst;
+
+      if (ctx->stage != MESA_SHADER_FRAGMENT)
+         return false;
+      r = alloc_temp(ctx);
+      zero = const_reg(ctx, 0);
+      dst = alloc_reg(ctx);
+      if (r < 0 || zero < 0 || dst < 0)
+         return false;
+      G9P_EMIT(ctx->c, 0x0198, g9p_dst(ctx->c, r), 0x0131, 0x0110, 0x0154, 0x0038);
+      if (!emit_select_const(ctx, G9P_EQ, false, r, zero, 0, ~0u, dst))
+         return false;
+      ctx->reg[key(&intr->def, 0)] = dst;
+      release(ctx, &intr->instr);
+      return true;
+   }
    case nir_intrinsic_load_vertex_id:
       /* r0 at entry (the vertex kick's DOUTW), pinned in vertex shaders */
       ctx->reg[key(&intr->def, 0)] = 0;
@@ -2431,7 +2470,7 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
 
    switch (ctx->stage) {
    case MESA_SHADER_VERTEX:
-      if (!ctx->num_outputs) {
+      if (!ctx->num_outputs && !ctx->point_size) {
          fprintf(stderr, "g9p: vertex shader without outputs\n");
          return false;
       }
@@ -2722,7 +2761,7 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
              const struct g9p_vertex_attrib *attribs, unsigned frag_coord_slot,
              bool repeat_loads, bool point_size, void *mem_ctx)
 {
-   struct g9p_ctx ctx = { .point_size = point_size };
+   struct g9p_ctx ctx = { .point_size = point_size, .flush_outputs = repeat_loads };
    nir_function_impl *impl;
    unsigned st;
 

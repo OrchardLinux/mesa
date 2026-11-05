@@ -1865,7 +1865,9 @@ PVR_PER_ARCH(g9p_pack_image_view)(const struct pvr_image_view *iview, uint64_t w
       }
       selectors |= sel << (15 + 3 * c);
    }
-   d[0] = selectors | (fmt & 0x7f) << 8 | (linear ? 0x02 : 0x0a) | (w - 1) << 27;
+   /* the format code starts at bit 5: RGBA16F, code 0x232, has its low bits there too */
+   d[0] = selectors | (fmt & 0x7f) << 8 | (fmt == 0x4446 ? 0x40 : 0) | (linear ? 0x02 : 0x0a) |
+          (w - 1) << 27;
    if (image->memlayout == PVR_MEMLAYOUT_TWIDDLED) {
       /*
        * Twiddled, mip chains (from the A9, its captures g3b-samp-mip,
