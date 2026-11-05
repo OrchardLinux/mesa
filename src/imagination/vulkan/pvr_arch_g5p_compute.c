@@ -64,6 +64,11 @@ PVR_PER_ARCH(g5p_compute_pipeline_compile)(
    state->a9_local_dwords = shader.a9_local_dwords;
    state->a9_has_barriers = shader.a9_has_barriers;
    state->a9_device_fence = shader.a9_device_fence;
+   state->a9_num_images=shader.num_textures;
+   for(unsigned i=0;i<shader.num_textures;i++) {
+      state->a9_images[i].set=shader.textures[i].set;
+      state->a9_images[i].binding=shader.textures[i].binding;
+   }
    state->uses_workgroup_id = shader.uses_workgroup_id;
    memcpy(state->local_size, shader.local_size, sizeof(state->local_size));
 
@@ -102,9 +107,9 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
       state->local_size[0] * state->local_size[1] * state->local_size[2];
    const uint32_t count = threads | threads << 16;
    struct pvr_suballoc_bo *uniforms_bo;
-   uint32_t uniforms[2 * G9P_MAX_BUFFERS + 3] = { 0 };
+   uint32_t uniforms[2 * G9P_MAX_BUFFERS + 4] = { 0 };
    uint32_t bind_data[4 * (G9P_MAX_BUFFERS + 1) + 4] = { 0 };
-   uint32_t bind_code[G9P_MAX_BUFFERS + 3];
+   uint32_t bind_code[G9P_MAX_BUFFERS + 5];
    uint32_t kernel_data[12] = { 0 }, kernel_code[8];
    struct pvr_pds_upload bind, kernel;
    unsigned bind_dwords, ctrl0, nc = 0;
@@ -132,7 +137,8 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
          uniforms[2 * k + 1] = pc->dev_addr.addr >> 32;
       }
    }
-   unsigned transfers=n+1+(state->a9_device_fence ? 1 : 0);
+   unsigned images=state->a9_num_images;
+   unsigned transfers=n+1+images+(state->a9_device_fence ? 1 : 0)+(images ? 1 : 0);
    if (state->a9_device_fence) {
       uint32_t zero=0;
       struct pvr_suballoc_bo *fence;
@@ -143,7 +149,7 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
    }
    uniforms[2 * n] = count;
    result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, uniforms,
-                                               sizeof(uint32_t) * (2 * n + 1 + (state->a9_device_fence ? 2 : 0)),
+                                               sizeof(uint32_t) * (2 * n + 1 + (state->a9_device_fence ? 2 : 0) + (images ? 1 : 0)),
                                                &uniforms_bo);
    if (result != VK_SUCCESS)
       return result;
@@ -167,9 +173,19 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
          binding = &set->layout->bindings[state->buffers[k].binding];
          /* pvr_buffer_descriptor: the address comes first */
          src = set->dev_addr.addr + binding->offset;
-      } else if (k > n) {
+      } else if(k>n && k<n+1+images) {
+         unsigned i=k-n-1;
+         const struct pvr_descriptor_set *set=desc->sets[state->a9_images[i].set];
+         if(!set)return vk_error(cmd_buffer,VK_ERROR_UNKNOWN);
+         const struct pvr_descriptor_set_layout_binding *binding=&set->layout->bindings[state->a9_images[i].binding];
+         src=set->dev_addr.addr+binding->offset;
+         dest=40+8*i;dwords=8;
+      } else if(k>n && state->a9_device_fence && k==n+1+images) {
          src=uniforms_bo->dev_addr.addr + 4*(2*n+1);
          dest=56;
+      } else if(k>n) {
+         src=uniforms_bo->dev_addr.addr+4*(2*n+1+(state->a9_device_fence ? 2 : 0));
+         dest=54;dwords=1;
       } else {
          src = uniforms_bo->dev_addr.addr + 8 * k;
          if (k == n)
@@ -239,7 +255,7 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
       struct pvr_csb *csb = &sub_cmd->control_stream;
       const struct g5p_cdm_record bind_rec =
          g5p_cdm_dma_task(G9P_CDM_DATA_BLOCKS(bind_dwords / 4), bind.data_offset,
-                          bind.code_offset, state->a9_device_fence ? 4 : DIV_ROUND_UP(2 * n + 1, 16));
+                          bind.code_offset, (state->a9_device_fence || images) ? 4 : DIV_ROUND_UP(2 * n + 1, 16));
       const struct g5p_cdm_record kernel_rec = g5p_cdm_kernel(
          G9P_CDM_KERNEL_REGS(state->num_regs) | G9P_CDM_ANY_CLUSTER | G9P_CDM_FENCE |
             G9P_CDM_DATA_BLOCKS(kernel_dwords / 4),
