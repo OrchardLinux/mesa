@@ -168,6 +168,7 @@ struct pvr_g9p_graphics_state {
    } textures[16]; /* G9P_MAX_TEXTURES */
    /* the vertex shader's, and the size of its common store in dwords */
    unsigned vs_num_textures, vs_common_dwords;
+   bool vs_point_size;
    struct {
       unsigned set, binding, index;
    } vs_textures[16]; /* G9P_MAX_TEXTURES */

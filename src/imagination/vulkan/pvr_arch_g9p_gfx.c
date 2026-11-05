@@ -413,12 +413,13 @@ static VkResult
 compile_stage(struct pvr_device *device, nir_shader *nir,
               const VkPipelineShaderStageCreateInfo *stage,
               const struct g9p_vertex_attrib *attribs, int frag_coord_slot,
-              const nir_lower_blend_options *blend, struct g9p_shader *out, void *mem_ctx)
+              const nir_lower_blend_options *blend, struct g9p_shader *out, bool point_size,
+              void *mem_ctx)
 {
    bool ok;
 
    if (stage->stage == VK_SHADER_STAGE_VERTEX_BIT)
-      ok = g9p_compile_vertex(nir, attribs, frag_coord_slot, out, mem_ctx);
+      ok = g9p_compile_vertex(nir, attribs, frag_coord_slot, out, point_size, mem_ctx);
    else
       ok = g9p_compile_fragment(nir, frag_coord_slot, blend, out, mem_ctx);
    if (!ok)
@@ -469,6 +470,8 @@ PVR_PER_ARCH(g9p_graphics_pipeline_compile)(struct pvr_device *device,
                                             struct pvr_graphics_pipeline *pipeline,
                                             const struct vk_graphics_pipeline_state *vk_state)
 {
+   const bool point_size = vk_state->ia &&
+                           vk_state->ia->primitive_topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
    struct pvr_g9p_graphics_state *state = &pipeline->g9p;
    const VkPipelineShaderStageCreateInfo *vs_info = NULL, *fs_info = NULL;
    struct g9p_vertex_attrib attribs[G9P_MAX_ATTRIBS] = { 0 };
@@ -533,10 +536,10 @@ PVR_PER_ARCH(g9p_graphics_pipeline_compile)(struct pvr_device *device,
          goto out;
       slot = g9p_frag_coord_slot(vs_nir);
       result = compile_stage(device, fs_nir, fs_info, NULL, slot,
-                             blend_options(vk_state, &blend) ? &blend : NULL, &fs, mem_ctx);
+                             blend_options(vk_state, &blend) ? &blend : NULL, &fs, false, mem_ctx);
       if (result == VK_SUCCESS)
          result = compile_stage(device, vs_nir, vs_info, attribs,
-                                fs.uses_frag_coord ? (int)slot : -1, NULL, &vs, mem_ctx);
+                                fs.uses_frag_coord ? (int)slot : -1, NULL, &vs, point_size, mem_ctx);
    }
    if (result != VK_SUCCESS)
       goto out;
@@ -581,6 +584,7 @@ PVR_PER_ARCH(g9p_graphics_pipeline_compile)(struct pvr_device *device,
 
    state->num_varyings = vs.num_varyings;
    state->vs_outputs = vs.num_outputs;
+   state->vs_point_size = point_size;
    state->uses_discard = fs.uses_discard;
    state->uses_fbfetch = fs.uses_fbfetch;
    /*
@@ -1107,6 +1111,8 @@ g9p_is_line(VkPrimitiveTopology t)
 static uint32_t
 g9p_isp_objtype(const struct vk_dynamic_graphics_state *dyn)
 {
+   if (dyn->ia.primitive_topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST)
+      return ROGUE_TA_OBJTYPE_SPRITE_01UV;
    return g9p_is_line(dyn->ia.primitive_topology) ? ROGUE_TA_OBJTYPE_LINE
                                                   : ROGUE_TA_OBJTYPE_TRIANGLE;
 }
@@ -1472,7 +1478,8 @@ emit_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state
    if (tex)
       PPP_BLOCK(0x200, tex->data_offset);
    /* 2: output selects: vertex size, rhw */
-   PPP_BLOCK(0x00020000, state->vs_outputs << 24 | 0x00010000);
+   PPP_BLOCK(0x00020000, state->vs_outputs << 24 | 0x00010000 |
+                            (state->vs_point_size ? BITFIELD_BIT(18) : 0));
    /*
     * 3: ISP control and front/back words; pass type in
     * ISPA/BA bits 24-26: 1 translucent for shaders that read the tile
@@ -1497,7 +1504,8 @@ emit_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state
    } else {
       PPP_BLOCK(0x1f, 0x03c40000 | (dp->scissor >= 0 ? BITFIELD_BIT(16) : 0) |
                          (dp->dbias >= 0 ? BITFIELD_BIT(17) : 0),
-                0x003e0000 | obj | pass << 24, 0x0e000000, 0x00100000 | obj | pass << 24, 0);
+                0x003e0000 | obj | pass << 24, 0x0e000000, 0x00100000 | obj | pass << 24,
+                state->vs_point_size ? 0x0e000000 : 0);
    }
    if (dp->isp_set)
       memcpy(&ppp[blocks[nb - 1][0] + 1], dp->isp, sizeof(dp->isp));

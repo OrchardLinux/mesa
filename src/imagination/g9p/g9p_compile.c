@@ -146,6 +146,8 @@ struct g9p_ctx {
    unsigned max_reg;
    unsigned st;     /* mask stack register */
    unsigned tex_total;  /* textures the shader samples (count_textures()) */
+   bool point_size;     /* a point pipeline's vertex shader: the size is the last output */
+   int psize_reg;
    int vertex_reg, instance_reg; /* vertex shaders: r0-r1, or copies of them */
    bool reserve_st_low; /* the mask stack is r15, reserved (compile_back()) */
    bool reserve_low;    /* r11-r14 for address work, after running out (compile_back()) */
@@ -1388,8 +1390,24 @@ emit_output(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
 
          slot = 4 + 4 * n + comp;
          ctx->out->num_varyings = MAX2(ctx->out->num_varyings, n + 1);
+      } else if (sem.location == VARYING_SLOT_PSIZ && ctx->point_size) {
+         r = src_reg(ctx, v);
+         if (r < 0)
+            return false;
+         if (ctx->temps & BITFIELD64_BIT(r)) {
+            int own = alloc_reg(ctx);
+
+            if (own < 0)
+               return false;
+            g9p_alu2(ctx->c, G9P_OR, own, r, r, false);
+            r = own;
+         }
+         pin(ctx, r);
+         ctx->psize_reg = r;
+         release(ctx, &intr->instr);
+         return true;
       } else {
-         /* point size, clip distances: not passed on yet */
+         /* clip distances: not passed on yet */
          release(ctx, &intr->instr);
          return true;
       }
@@ -2345,6 +2363,7 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
    ctx->out->uses_discard = false;
    ctx->num_exit_jumps = 0;
    ctx->num_outputs = 0;
+   ctx->psize_reg = -1;
    for (unsigned i = 0; i < 4; i++)
       ctx->colour[i] = -1;
 
@@ -2416,11 +2435,23 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
          fprintf(stderr, "g9p: vertex shader without outputs\n");
          return false;
       }
+      /* points: the size is the last output dword (Apple's vertex code) */
+      if (ctx->point_size) {
+         if (ctx->psize_reg < 0) {
+            ctx->psize_reg = alloc_reg(ctx);
+            if (ctx->psize_reg < 0)
+               return false;
+            g9p_mov_imm(ctx->c, ctx->psize_reg, 0x3f800000);
+         }
+         ctx->outputs[ctx->num_outputs].reg = ctx->psize_reg;
+         ctx->outputs[ctx->num_outputs].slot = 4 + 4 * ctx->out->num_varyings;
+         ctx->num_outputs++;
+      }
       for (unsigned i = 0; i + 1 < ctx->num_outputs; i++)
          g9p_vs_output(ctx->c, ctx->outputs[i].reg, ctx->outputs[i].slot);
       g9p_end_vertex(ctx->c, ctx->outputs[ctx->num_outputs - 1].reg,
                      ctx->outputs[ctx->num_outputs - 1].slot);
-      ctx->out->num_outputs = 4 + 4 * ctx->out->num_varyings;
+      ctx->out->num_outputs = 4 + 4 * ctx->out->num_varyings + ctx->point_size;
       break;
    case MESA_SHADER_FRAGMENT: {
       bool colour = false;
@@ -2689,9 +2720,9 @@ lower_dynamic_ubo_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 static bool
 compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
              const struct g9p_vertex_attrib *attribs, unsigned frag_coord_slot,
-             bool repeat_loads, void *mem_ctx)
+             bool repeat_loads, bool point_size, void *mem_ctx)
 {
-   struct g9p_ctx ctx = { 0 };
+   struct g9p_ctx ctx = { .point_size = point_size };
    nir_function_impl *impl;
    unsigned st;
 
@@ -2879,7 +2910,7 @@ g9p_compile_compute(nir_shader *nir, struct g9p_shader *out, void *mem_ctx)
    memset(out, 0, sizeof(*out));
    lower_front(nir);
    NIR_PASS(_, nir, nir_lower_compute_system_values, &csv);
-   return compile_back(nir, out, MESA_SHADER_COMPUTE, NULL, 0, false, mem_ctx);
+   return compile_back(nir, out, MESA_SHADER_COMPUTE, NULL, 0, false, false, mem_ctx);
 }
 
 /*
@@ -3021,7 +3052,7 @@ lower_attrib_format(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 
 bool
 g9p_compile_vertex(nir_shader *nir, const struct g9p_vertex_attrib *attribs,
-                   int frag_coord_slot, struct g9p_shader *out, void *mem_ctx)
+                   int frag_coord_slot, struct g9p_shader *out, bool point_size, void *mem_ctx)
 {
    memset(out, 0, sizeof(*out));
    lower_front(nir);
@@ -3033,8 +3064,8 @@ g9p_compile_vertex(nir_shader *nir, const struct g9p_vertex_attrib *attribs,
    /* out of registers: again with a value's loads repeated, not kept live */
    nir_shader *copy = nir_shader_clone(mem_ctx, nir);
 
-   return compile_back(nir, out, MESA_SHADER_VERTEX, attribs, 0, false, mem_ctx) ||
-          compile_back(copy, out, MESA_SHADER_VERTEX, attribs, 0, true, mem_ctx);
+   return compile_back(nir, out, MESA_SHADER_VERTEX, attribs, 0, false, point_size, mem_ctx) ||
+          compile_back(copy, out, MESA_SHADER_VERTEX, attribs, 0, true, point_size, mem_ctx);
 }
 
 /*
@@ -3310,6 +3341,6 @@ g9p_compile_fragment(nir_shader *nir, unsigned frag_coord_slot,
             NULL);
    nir_shader *copy = nir_shader_clone(mem_ctx, nir);
 
-   return compile_back(nir, out, MESA_SHADER_FRAGMENT, NULL, frag_coord_slot, false, mem_ctx) ||
-          compile_back(copy, out, MESA_SHADER_FRAGMENT, NULL, frag_coord_slot, true, mem_ctx);
+   return compile_back(nir, out, MESA_SHADER_FRAGMENT, NULL, frag_coord_slot, false, false, mem_ctx) ||
+          compile_back(copy, out, MESA_SHADER_FRAGMENT, NULL, frag_coord_slot, true, false, mem_ctx);
 }

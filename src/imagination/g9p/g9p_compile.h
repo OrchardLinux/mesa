@@ -166,7 +166,8 @@ unsigned g9p_frag_coord_slot(const nir_shader *vs);
  * gl_FragCoord's varying at @frag_coord_slot, or not with -1.
  */
 bool g9p_compile_vertex(nir_shader *nir, const struct g9p_vertex_attrib *attribs,
-                        int frag_coord_slot, struct g9p_shader *out, void *mem_ctx);
+                        int frag_coord_slot, struct g9p_shader *out, bool point_size,
+                        void *mem_ctx);
 
 /*
  * Fragment shader: @blend, if not NULL, is done in the shader (Apple's way:
