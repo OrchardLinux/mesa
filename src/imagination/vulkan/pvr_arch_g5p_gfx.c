@@ -660,12 +660,12 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
          return G5P_REFUSE(device, "fragment upload kind %u", u->kind);
       }
       if (!u->dwords || u->dwords > UINT8_MAX || u->set > UINT8_MAX || u->binding > UINT8_MAX ||
-          u->offset > UINT16_MAX)
+          u->offset > UINT16_MAX || u->element > UINT16_MAX)
          return G5P_REFUSE(device, "fragment upload %u: set %u binding %u offset %u, %u dwords", i, u->set,
                            u->binding, u->offset, u->dwords);
       g->fs_uploads[i] = (struct pvr_g5p_upload){ .kind = u->kind, .set = u->set, .binding = u->binding,
                                                   .dwords = u->dwords, .offset = u->offset,
-                                                  .common = u->common };
+                                                  .common = u->common, .element = u->element };
    }
    g->fs_num_uploads = fs->num_uploads;
    g->fs_common_dwords = fs->common_dwords;
@@ -1376,7 +1376,12 @@ fs_uploads(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_pipeline *g, 
       if (!set || !set->layout || u->binding >= set->layout->binding_count)
          return G5P_REFUSE(cmd_buffer, "fragment upload: set %u binding %u is not bound", u->set, u->binding);
       const struct pvr_descriptor_set_layout_binding *lb = &set->layout->bindings[u->binding];
-      const uint32_t *desc = (const uint32_t *)((const uint8_t *)set->mapping + lb->offset);
+      /* an arrayed binding: the element the program reads (a sampler array at a constant index) */
+      if (u->element >= MAX2(lb->descriptor_count, 1))
+         return G5P_REFUSE(cmd_buffer, "fragment upload: set %u binding %u element %u past its %u descriptors",
+                           u->set, u->binding, u->element, lb->descriptor_count);
+      const uint32_t *desc = (const uint32_t *)((const uint8_t *)set->mapping + lb->offset +
+                                                (size_t)u->element * lb->stride);
       switch (u->kind) {
       case PCO_G5P_UPLOAD_IMAGE:
          if (!pvr_g5p_tex_state_valid(desc))

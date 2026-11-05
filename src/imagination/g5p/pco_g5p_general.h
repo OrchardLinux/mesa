@@ -165,6 +165,10 @@ struct pco_g5p_upload {
    unsigned offset; /* bytes (push/UBO) */
    unsigned dwords;
    unsigned common;
+   /* IMAGE, SAMPLER, IMAGE_SIZE: the element of an arrayed binding (a
+    * sampler array read at a constant index; 0 otherwise). The driver reads
+    * that element's own descriptor. */
+   unsigned element;
 };
 
 struct pco_g5p_program {

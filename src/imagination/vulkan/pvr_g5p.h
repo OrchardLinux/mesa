@@ -162,6 +162,7 @@ struct pvr_g5p_fetch {
 struct pvr_g5p_upload {
    uint8_t kind, set, binding, dwords;
    uint16_t offset, common;
+   uint16_t element; /* image/sampler/size: the element of an arrayed binding */
 };
 
 /*

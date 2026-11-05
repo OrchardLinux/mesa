@@ -83,6 +83,7 @@ struct ref {
 
 struct tex_bind {
    unsigned set, binding, sset, sbinding;
+   unsigned element, selement; /* array elements of the texture / sampler binding */
    unsigned image, sampler; /* common dwords */
 };
 
@@ -229,7 +230,7 @@ struct gctx {
    /* common store */
    struct tex_bind tex[4];
    unsigned ntex;
-   struct { unsigned set, binding, lod, common; } tsize[4]; /* textureSize/QueryLevels */
+   struct { unsigned set, binding, element, lod, common; } tsize[4]; /* textureSize/QueryLevels */
    unsigned nsize;
    struct range ranges[8];
    unsigned nranges;
@@ -1644,16 +1645,41 @@ static bool dyn_offset_alu(nir_alu_instr *a)
    return any && !nir_def_used_by_if(&a->def);
 }
 
+/* A texture or sampler deref: its variable and the array element it reads.
+ * A variable, or one array level of a variable at a constant index (GLSL ES
+ * 1.00 indexes sampler arrays with constant-index expressions, constants once
+ * loops are unrolled); the element selects the descriptor the driver
+ * uploads. A non-constant index (dynamically uniform indexing, ES 3.x /
+ * GL 4) and bindless handles are refused by name: a dynamic index would
+ * extend this with a per-draw descriptor table indexed in the program. */
+static nir_variable *tex_deref(struct gctx *c, nir_deref_instr *d, unsigned *element)
+{
+   *element = 0;
+   if (d && d->deref_type == nir_deref_type_array) {
+      nir_deref_instr *parent = nir_deref_instr_parent(d);
+      if (!parent || parent->deref_type != nir_deref_type_var)
+         refuse(c, "tex: arrays of arrays of textures/samplers");
+      if (!nir_src_is_const(d->arr.index))
+         refuse(c, "tex: a texture/sampler array read at a non-constant index (dynamically uniform indexing)");
+      *element = nir_src_as_uint(d->arr.index);
+      return nir_deref_instr_get_variable(d);
+   }
+   if (!d || d->deref_type != nir_deref_type_var)
+      refuse(c, "tex: bindless texture/sampler handles");
+   return nir_deref_instr_get_variable(d);
+}
+
 static void tex_bindings(struct gctx *c, nir_tex_instr *t, struct tex_bind *b)
 {
    nir_deref_instr *td = nir_get_tex_deref(t, nir_tex_src_texture_deref);
    nir_deref_instr *sd = nir_get_tex_deref(t, nir_tex_src_sampler_deref);
-   if (!td || td->deref_type != nir_deref_type_var || (sd && sd->deref_type != nir_deref_type_var))
-      refuse(c, "tex: texture/sampler arrays or bindless handles");
-   nir_variable *tv = nir_deref_instr_get_variable(td);
-   nir_variable *sv = sd ? nir_deref_instr_get_variable(sd) : tv;
+   unsigned element, selement;
+   nir_variable *tv = tex_deref(c, td, &element);
+   nir_variable *sv = sd ? tex_deref(c, sd, &selement) : tv;
+   if (!sd)
+      selement = element;
    *b = (struct tex_bind){tv->data.descriptor_set, tv->data.binding, sv->data.descriptor_set,
-                          sv->data.binding};
+                          sv->data.binding, element, selement};
 }
 
 static struct tex_bind *tex_for(struct gctx *c, nir_tex_instr *t)
@@ -1662,7 +1688,7 @@ static struct tex_bind *tex_for(struct gctx *c, nir_tex_instr *t)
    tex_bindings(c, t, &b);
    for (unsigned i = 0; i < c->ntex; i++)
       if (c->tex[i].set == b.set && c->tex[i].binding == b.binding && c->tex[i].sset == b.sset &&
-          c->tex[i].sbinding == b.sbinding)
+          c->tex[i].sbinding == b.sbinding && c->tex[i].element == b.element && c->tex[i].selement == b.selement)
          return &c->tex[i];
    if (c->ntex == ARRAY_SIZE(c->tex))
       refuse(c, "more than %zu textures", ARRAY_SIZE(c->tex));
@@ -1679,29 +1705,35 @@ static unsigned size_level(nir_tex_instr *t)
 
 static unsigned size_for(struct gctx *c, nir_tex_instr *t)
 {
-   nir_deref_instr *td = nir_get_tex_deref(t, nir_tex_src_texture_deref);
-   if (!td || td->deref_type != nir_deref_type_var)
-      refuse(c, "tex: texture arrays or bindless handles");
-   nir_variable *tv = nir_deref_instr_get_variable(td);
+   unsigned element;
+   nir_variable *tv = tex_deref(c, nir_get_tex_deref(t, nir_tex_src_texture_deref), &element);
    unsigned set = tv->data.descriptor_set, binding = tv->data.binding, lod = size_level(t);
    for (unsigned i = 0; i < c->nsize; i++)
-      if (c->tsize[i].set == set && c->tsize[i].binding == binding && c->tsize[i].lod == lod)
+      if (c->tsize[i].set == set && c->tsize[i].binding == binding && c->tsize[i].element == element &&
+          c->tsize[i].lod == lod)
          return i;
    if (c->nsize == ARRAY_SIZE(c->tsize))
       refuse(c, "more than %zu texture size queries", ARRAY_SIZE(c->tsize));
    c->tsize[c->nsize].set = set;
    c->tsize[c->nsize].binding = binding;
+   c->tsize[c->nsize].element = element;
    c->tsize[c->nsize].lod = lod;
    return c->nsize++;
+}
+
+static void add_upload_element(struct gctx *c, enum pco_g5p_upload_kind kind, unsigned set, unsigned binding,
+                               unsigned offset, unsigned dwords, unsigned common, unsigned element)
+{
+   struct pco_g5p_program *p = c->p;
+   if (p->num_uploads == PCO_G5P_MAX_UPLOADS)
+      refuse(c, "more than %u common-store uploads", PCO_G5P_MAX_UPLOADS);
+   p->uploads[p->num_uploads++] = (struct pco_g5p_upload){kind, set, binding, offset, dwords, common, element};
 }
 
 static void add_upload(struct gctx *c, enum pco_g5p_upload_kind kind, unsigned set, unsigned binding,
                        unsigned offset, unsigned dwords, unsigned common)
 {
-   struct pco_g5p_program *p = c->p;
-   if (p->num_uploads == PCO_G5P_MAX_UPLOADS)
-      refuse(c, "more than %u common-store uploads", PCO_G5P_MAX_UPLOADS);
-   p->uploads[p->num_uploads++] = (struct pco_g5p_upload){kind, set, binding, offset, dwords, common};
+   add_upload_element(c, kind, set, binding, offset, dwords, common, 0);
 }
 
 static void plan_common(struct gctx *c)
@@ -1792,8 +1824,8 @@ static void plan_common(struct gctx *c)
       next = t->image + 10;
       if (t->image / 2 > 28 || t->sampler / 2 > 32)
          refuse(c, "texture descriptors beyond the measured common-store selectors");
-      add_upload(c, PCO_G5P_UPLOAD_IMAGE, t->set, t->binding, 0, 8, t->image);
-      add_upload(c, PCO_G5P_UPLOAD_SAMPLER, t->sset, t->sbinding, 32, 2, t->sampler);
+      add_upload_element(c, PCO_G5P_UPLOAD_IMAGE, t->set, t->binding, 0, 8, t->image, t->element);
+      add_upload_element(c, PCO_G5P_UPLOAD_SAMPLER, t->sset, t->sbinding, 32, 2, t->sampler, t->selement);
    }
    /* Pointer pairs of register-indexed UBO arrays: even dwords below 32 (the
     * addr.add_shift base field, 0x81 | 4 * dword). */
@@ -1809,8 +1841,8 @@ static void plan_common(struct gctx *c)
    for (unsigned i = 0; i < c->nsize; i++) {
       c->tsize[i].common = next;
       next += 4;
-      add_upload(c, PCO_G5P_UPLOAD_IMAGE_SIZE, c->tsize[i].set, c->tsize[i].binding, c->tsize[i].lod, 4,
-                 c->tsize[i].common);
+      add_upload_element(c, PCO_G5P_UPLOAD_IMAGE_SIZE, c->tsize[i].set, c->tsize[i].binding, c->tsize[i].lod, 4,
+                         c->tsize[i].common, c->tsize[i].element);
    }
    unsigned limit = c->vs ? PCO_G5P_VS_COMMON_DWORDS : PCO_G5P_FS_COMMON_DWORDS;
    for (unsigned i = 0; i < c->nranges; i++) {
