@@ -43,8 +43,19 @@
          iview, &(iview)->image_state[PVR_TEXTURE_STATE_SAMPLE]);
 
 /* Release integration of the vertex-store capability, preserving shared lines. */
+/* Also the polygon-mode and indirect lanes' feature lines (their
+ * pvr_g5p_publish_hooks.h, which this base no longer has): line and point
+ * polygon modes default on (pvr_g5p_polygon_mode_enabled()); indirect draws
+ * without draw parameters or a non-zero firstInstance, whose ptemp1 input
+ * has no qualified producer. Expands in pvr_physical_device_init(), whose
+ * supported_extensions it uses. */
 #define PVR_G5P_HOOK_release9_features(features) \
-   (features).vertexPipelineStoresAndAtomics = true;
+   (features).vertexPipelineStoresAndAtomics = true; \
+   if (pvr_g5p_polygon_mode_enabled()) \
+      (features).fillModeNonSolid = true; \
+   (features).shaderDrawParameters = false; \
+   supported_extensions.KHR_shader_draw_parameters = false; \
+   (features).drawIndirectFirstInstance = false;
 
 /* pvr_arch_sampler.c, pvr_CreateSampler(): the A9's sampler words, both
  * forms (pvr_arch_g5p_pack_sampler()).

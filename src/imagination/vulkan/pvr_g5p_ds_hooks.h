@@ -14,6 +14,7 @@
 #if defined(PVR_APPLE_G5P)
 #   include "pvr_g5p_ds.h"
 #   include "pvr_g5p_msaa.h"
+#   include "pvr_g5p_draw_hooks.h"
 #endif
 
 #ifndef PVR_G5P_HOOK
