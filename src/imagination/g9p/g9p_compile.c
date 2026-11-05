@@ -729,6 +729,7 @@ only_tex_uses(nir_def *def)
       const nir_tex_instr *tex = nir_instr_as_tex(nir_src_use_instr(src));
 
       if (tex->is_array || tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE ||
+          tex->sampler_dim == GLSL_SAMPLER_DIM_3D ||
           tex->op == nir_texop_txl || tex->op == nir_texop_txb)
          return false;
    }
@@ -1752,7 +1753,8 @@ uses_layered_tex(nir_function_impl *impl)
       nir_foreach_instr(instr, block) {
          if (instr->type == nir_instr_type_tex &&
              (nir_instr_as_tex(instr)->is_array ||
-              nir_instr_as_tex(instr)->sampler_dim == GLSL_SAMPLER_DIM_CUBE))
+              nir_instr_as_tex(instr)->sampler_dim == GLSL_SAMPLER_DIM_CUBE ||
+              nir_instr_as_tex(instr)->sampler_dim == GLSL_SAMPLER_DIM_3D))
             return true;
       }
    }
@@ -1771,6 +1773,7 @@ static bool
 emit_tex_layered(struct g9p_ctx *ctx, nir_tex_instr *tex)
 {
    const bool cube = tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE;
+   const bool is3d = tex->sampler_dim == GLSL_SAMPLER_DIM_3D;
    int ci = nir_tex_instr_src_index(tex, nir_tex_src_coord);
    int slot = texture_slot(ctx, tex);
    unsigned at;
@@ -1778,10 +1781,10 @@ emit_tex_layered(struct g9p_ctx *ctx, nir_tex_instr *tex)
 
    if (ctx->stage != MESA_SHADER_FRAGMENT || ci < 0 || slot < 0 || tex->is_shadow ||
        (cube && tex->is_array) ||
-       (!cube && tex->sampler_dim != GLSL_SAMPLER_DIM_2D) ||
+       (!cube && !is3d && tex->sampler_dim != GLSL_SAMPLER_DIM_2D) ||
        (tex->op != nir_texop_tex && tex->op != nir_texop_txl && tex->op != nir_texop_txb) ||
        nir_tex_instr_src_index(tex, nir_tex_src_offset) >= 0) {
-      fprintf(stderr, "g9p: only plain samples of 2D arrays and cubes\n");
+      fprintf(stderr, "g9p: only plain samples of 2D arrays, cubes and 3D textures\n");
       return false;
    }
    lod = lod_source(ctx, tex);
@@ -1792,7 +1795,7 @@ emit_tex_layered(struct g9p_ctx *ctx, nir_tex_instr *tex)
 
       if (r < 0)
          return false;
-      if (c == 2 && !cube) {
+      if (c == 2 && !cube && !is3d) {
          const int half = const_reg(ctx, 0x3f000000);
 
          if (half < 0)
@@ -1812,7 +1815,7 @@ emit_tex_layered(struct g9p_ctx *ctx, nir_tex_instr *tex)
    at = ctx->c->n;
    g9p_sample_regs(ctx->c, dst, tex_state_dword(ctx, slot), tex_sampler_dword(ctx, slot));
    ctx->c->w[at] = (ctx->c->w[at] & ~0x0f00) |
-                   (cube ? G9P_TEX_CUBE : G9P_TEX_2D_ARRAY) << 8;
+                   (cube ? G9P_TEX_CUBE : is3d ? G9P_TEX_3D : G9P_TEX_2D_ARRAY) << 8;
    sample_lod(ctx, tex, at, lod);
    g9p_wait(ctx->c);
    for (unsigned c = 0; c < 4; c++) {
@@ -1832,13 +1835,14 @@ static bool
 emit_tex_vertex(struct g9p_ctx *ctx, nir_tex_instr *tex)
 {
    const bool cube = tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE;
+   const bool is3d = tex->sampler_dim == GLSL_SAMPLER_DIM_3D;
    const int ci = nir_tex_instr_src_index(tex, nir_tex_src_coord);
    const int slot = texture_slot(ctx, tex);
    int lod = -1, coord, dst;
    unsigned at;
 
    if (ci < 0 || slot < 0 || tex->is_shadow || tex->is_array ||
-       (!cube && tex->sampler_dim != GLSL_SAMPLER_DIM_2D) ||
+       (!cube && !is3d && tex->sampler_dim != GLSL_SAMPLER_DIM_2D) ||
        (tex->op != nir_texop_tex && tex->op != nir_texop_txl) ||
        nir_tex_instr_src_index(tex, nir_tex_src_offset) >= 0) {
       fprintf(stderr, "g9p: only 2D and cube samples with a level in vertex shaders\n");
@@ -1858,7 +1862,7 @@ emit_tex_vertex(struct g9p_ctx *ctx, nir_tex_instr *tex)
    if (coord < 0)
       return false;
    ctx->temps |= BITFIELD64_RANGE(coord, 4);
-   for (unsigned c = 0; c < (cube ? 3 : 2); c++) {
+   for (unsigned c = 0; c < (cube || is3d ? 3 : 2); c++) {
       const int r = src_reg(ctx, nir_get_scalar(tex->src[ci].src.ssa, c));
 
       if (r < 0)
@@ -1877,15 +1881,23 @@ emit_tex_vertex(struct g9p_ctx *ctx, nir_tex_instr *tex)
                   G9P_FADD);
       g9p_cube_coords(ctx->c, 2 * coord, 0);
    }
-   dst = alloc_range(ctx, 4);
-   if (dst < 0)
-      return false;
+   /* a cube's result over its coordinates, as in Apple's code */
+   if (cube) {
+      dst = coord;
+      ctx->temps &= ~BITFIELD64_RANGE(coord, 4);
+   } else {
+      dst = alloc_range(ctx, 4);
+      if (dst < 0)
+         return false;
+   }
    at = ctx->c->n;
    g9p_sample_vertex(ctx->c, dst, tex_state_dword(ctx, slot), tex_sampler_dword(ctx, slot), coord,
                      lod);
    if (cube) {
       ctx->c->w[at] = (ctx->c->w[at] & ~0x0f00) | G9P_TEX_CUBE << 8;
       ctx->c->w[at + 2] |= 0x8000;
+   } else if (is3d) {
+      ctx->c->w[at] = (ctx->c->w[at] & ~0x0f00) | G9P_TEX_3D << 8;
    }
    g9p_wait(ctx->c);
    release(ctx, &tex->instr);
@@ -1915,7 +1927,8 @@ emit_tex(struct g9p_ctx *ctx, nir_tex_instr *tex)
       return emit_txs(ctx, tex);
    if (ctx->stage == MESA_SHADER_VERTEX)
       return emit_tex_vertex(ctx, tex);
-   if (tex->is_array || tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE)
+   if (tex->is_array || tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE ||
+       tex->sampler_dim == GLSL_SAMPLER_DIM_3D)
       return emit_tex_layered(ctx, tex);
    if (ctx->stage != MESA_SHADER_FRAGMENT || tex->sampler_dim != GLSL_SAMPLER_DIM_2D ||
        tex->is_array || tex->is_shadow || ci < 0 || slot < 0 ||

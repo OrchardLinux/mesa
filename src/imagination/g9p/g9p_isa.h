@@ -625,6 +625,7 @@ g9p_end_fragment(struct g9p_code *c, bool colour)
  * g9p_sample_regs()'s f51a; 2D array 7, cube d). From the A9 (PR #5).
  */
 #define G9P_TEX_2D_ARRAY 0x7
+#define G9P_TEX_3D       0xb
 #define G9P_TEX_CUBE     0xd
 
 /*

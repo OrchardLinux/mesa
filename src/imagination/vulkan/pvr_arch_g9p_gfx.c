@@ -1891,7 +1891,8 @@ PVR_PER_ARCH(g9p_pack_image_view)(const struct pvr_image_view *iview, uint64_t w
    /* the format code starts at bit 5: RGBA16F, code 0x232, has its low bits there too */
    d[0] = selectors | (fmt & 0x7f) << 8 | (fmt == 0x4446 ? 0x40 : 0) | (linear ? 0x02 : 0x0a) |
           (w - 1) << 27;
-   if (image->memlayout == PVR_MEMLAYOUT_TWIDDLED) {
+   if (image->memlayout == PVR_MEMLAYOUT_TWIDDLED ||
+       image->memlayout == PVR_MEMLAYOUT_3DTWIDDLED) {
       /*
        * Twiddled, mip chains (from the A9, its captures g3b-samp-mip,
        * g3b-rt-mip2): level 0's size, the chain's base, the base level at bit
@@ -1910,11 +1911,15 @@ PVR_PER_ARCH(g9p_pack_image_view)(const struct pvr_image_view *iview, uint64_t w
              (image->vk.mip_levels > 1 ? 0x10 : 0);
       d[3] = (uint32_t)(base >> 33);
       if (iview->vk.view_type == VK_IMAGE_VIEW_TYPE_2D_ARRAY ||
-          iview->vk.view_type == VK_IMAGE_VIEW_TYPE_CUBE) {
+          iview->vk.view_type == VK_IMAGE_VIEW_TYPE_CUBE ||
+          iview->vk.view_type == VK_IMAGE_VIEW_TYPE_3D) {
          const bool cube = iview->vk.view_type == VK_IMAGE_VIEW_TYPE_CUBE;
+         const bool is3d = iview->vk.view_type == VK_IMAGE_VIEW_TYPE_3D;
 
-         d[0] = (d[0] & ~7u) | (cube ? 6 : 3);
-         if (!cube)
+         d[0] = (d[0] & ~7u) | (cube ? 6 : is3d ? 5 : 3);
+         if (is3d)
+            d[3] |= (image->vk.extent.depth - 1) << 15;
+         else if (!cube)
             d[3] |= (iview->vk.layer_count - 1) << 15;
          if (plane->layer_size >= 16384)
             d[3] |= BITFIELD_BIT(29);

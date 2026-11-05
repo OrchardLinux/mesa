@@ -162,6 +162,41 @@ static void pvr_image_plane_setup_mip_levels(struct pvr_image *image, uint8_t i)
    struct pvr_image_plane *plane = &image->planes[i];
    VkFormat plane_format = vk_format_get_plane_format(image->vk.format, i);
 
+   /*
+    * G9P: a 3D image is a 2D array of its slices (A9, PR #6: Apple's
+    * getLevelOffset has no depth term): one slice's twiddled 2D levels, slice z
+    * of every level z layer pitches on. A layer holds the whole 2D chain when
+    * the image has levels, rounded as an array's layer.
+    */
+   {
+      const struct pvr_device *g9p_device =
+         container_of(image->vk.base.device, struct pvr_device, vk);
+
+      if (PVR_HAS_FEATURE(&g9p_device->pdevice->dev_info, apple_g9p) &&
+          image->memlayout == PVR_MEMLAYOUT_3DTWIDDLED) {
+         const unsigned cpp3d = vk_format_get_blocksize(plane_format);
+         const uint32_t pw = plane->physical_extent.width, ph = plane->physical_extent.height;
+         const uint32_t chain = image->vk.mip_levels > 1 ? util_logbase2(MAX2(pw, ph)) + 1 : 1;
+         VkDeviceSize size = 0;
+
+         for (uint32_t l = 0; l < MAX2(chain, image->vk.mip_levels); l++) {
+            const uint32_t ew = u_minify(pw, l), eh = u_minify(ph, l);
+            const VkDeviceSize level_size = (VkDeviceSize)cpp3d * ew * eh;
+
+            if (l < image->vk.mip_levels) {
+               plane->mip_levels[l].pitch = cpp3d * ew;
+               plane->mip_levels[l].height_pitch = eh;
+               plane->mip_levels[l].size = level_size;
+               plane->mip_levels[l].offset = size;
+            }
+            size += level_size;
+         }
+         plane->layer_size = align64(size, size >= 16384 ? 16384 : 64);
+         plane->size = plane->layer_size * image->vk.extent.depth;
+         return;
+      }
+   }
+
    const uint32_t extent_alignment =
       image->vk.image_type == VK_IMAGE_TYPE_3D ? 4 : 1;
    const unsigned int cpp = vk_format_get_blocksize(plane_format);
@@ -473,6 +508,12 @@ void pvr_get_image_subresource_layout(const struct pvr_image *image,
                     mip_level->offset;
    layout->rowPitch = mip_level->pitch;
    layout->depthPitch = mip_level->pitch * mip_level->height_pitch;
+   /* G9P: slices are layers (pvr_image_plane_setup_mip_levels()) */
+   if (image->memlayout == PVR_MEMLAYOUT_3DTWIDDLED &&
+       PVR_HAS_FEATURE(&container_of(image->vk.base.device, struct pvr_device, vk)
+                           ->pdevice->dev_info,
+                       apple_g9p))
+      layout->depthPitch = plane->layer_size;
    layout->arrayPitch = plane->layer_size;
    layout->size = mip_level->size;
 }

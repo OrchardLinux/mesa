@@ -224,7 +224,14 @@ static void pvr_setup_transfer_surface(struct pvr_device *device,
    surface->mem_layout = image->memlayout;
    surface->sample_count = image->vk.samples;
 
-   if (image->memlayout == PVR_MEMLAYOUT_3DTWIDDLED)
+   /* G9P: a 3D image's slices are twiddled 2D layers, one depthPitch apart */
+   if (image->memlayout == PVR_MEMLAYOUT_3DTWIDDLED &&
+       PVR_HAS_FEATURE(&container_of(image->vk.base.device, struct pvr_device, vk)
+                           ->pdevice->dev_info,
+                       apple_g9p))
+      surface->mem_layout = PVR_MEMLAYOUT_TWIDDLED;
+
+   if (surface->mem_layout == PVR_MEMLAYOUT_3DTWIDDLED)
       surface->z_position = fdepth;
    else
       surface->dev_addr.addr += info.depthPitch * ((uint32_t)fdepth);
