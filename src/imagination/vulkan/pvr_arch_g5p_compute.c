@@ -138,6 +138,7 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
       }
    }
    unsigned images=state->a9_num_images;
+   if(images && n>15)return vk_errorf(cmd_buffer,VK_ERROR_FEATURE_NOT_PRESENT,"G5P image LOD common31 overlaps the16th buffer pointer");
    unsigned transfers=n+1+images+(state->a9_device_fence ? 1 : 0)+(images ? 1 : 0);
    if (state->a9_device_fence) {
       uint32_t zero=0;
@@ -185,7 +186,7 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
          dest=56;
       } else if(k>n) {
          src=uniforms_bo->dev_addr.addr+4*(2*n+1+(state->a9_device_fence ? 2 : 0));
-         dest=54;dwords=1;
+         dest=31;dwords=1;
       } else {
          src = uniforms_bo->dev_addr.addr + 8 * k;
          if (k == n)

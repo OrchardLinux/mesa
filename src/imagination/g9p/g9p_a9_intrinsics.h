@@ -199,7 +199,7 @@ static bool a9_image(struct g9p_ctx *ctx, nir_intrinsic_instr *in)
          g9p_alu2(ctx->c,G9P_OR,data+j,r,r,false);
       }
    } else if(in->def.bit_size!=32 || in->def.num_components>4)return false;
-   g5p_image_raw32(ctx->c,store,data,co,40,54);
+   g5p_image_raw32(ctx->c,store,data,co,40,31);
    release(ctx,&in->instr);
    if(!store) for(unsigned j=0;j<4;j++) {
       ctx->reg[key(&in->def,j)]=data+j;

@@ -21,6 +21,9 @@ g5p_device_cas(struct g9p_code *c, unsigned pair, unsigned old,
                unsigned cmp, unsigned val, unsigned i, unsigned st)
 {
    assert(!c->fragment && pair < 32 && old < 32 && i < 32);
+   /* Observed in every Apple device CAS, absent from native ALU atomics.
+    * Exact broader mode semantics remain unknown. */
+   G9P_EMIT(c,0x000e);g9p_wait(c);
    G9P_EMIT(c, 0x0198, 0x0300 | 2*i, 0x0101, 0x0120, 0x01b9, 0x0038);
    G9P_EMIT(c, 0x21c8, 0x0300 | 2*st, 0x0100 | st<<2, 0x86d0);
    unsigned loop=c->n;
@@ -44,5 +47,6 @@ g5p_device_cas(struct g9p_code *c, unsigned pair, unsigned old,
    g9p_jump_patch(c,again,2*((int)loop-(int)again));
    assert(2*((int)loop-(int)again)==-0x62);
    G9P_EMIT(c, 0x21c8, 0x0300 | 2*st, 0x0100 | st<<2, 0x86d2);
+   G9P_EMIT(c,0x040e);
 }
 #endif

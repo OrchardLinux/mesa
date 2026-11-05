@@ -3899,7 +3899,7 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
       break;
    }
    default:
-      g9p_end(ctx->c);
+      G9P_A9_END_PAD(ctx); g9p_end(ctx->c);
       break;
    }
    return true;
