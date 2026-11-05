@@ -360,6 +360,13 @@ g9p_movf(struct g9p_code *c, unsigned dst, unsigned d)
    G9P_EMIT(c, g9p_w0(c, 0x21f8), g9p_dst(c, dst), 0x0180 | d << 2, 0x0154, 0x0038);
 }
 
+/* The low half of r[@dst] = f16 of f32 r[@src] (Apple's 1189 ... 0b44; src < r16 outside fragments) */
+static inline void
+g9p_f16_of(struct g9p_code *c, unsigned dst, unsigned src)
+{
+   G9P_EMIT(c, g9p_w0(c, 0x1189), g9p_dst(c, dst), 0x0101 | src << 10, 0x01a0, 0x0b44, 0x0070);
+}
+
 /* Compare a register with an immediate (< 1024), for a following push */
 static inline void
 g9p_cmp_imm(struct g9p_code *c, unsigned cond, unsigned reg, unsigned imm)

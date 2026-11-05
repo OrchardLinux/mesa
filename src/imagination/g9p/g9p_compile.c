@@ -1537,27 +1537,41 @@ emit_txs(struct g9p_ctx *ctx, nir_tex_instr *tex)
 }
 
 /*
- * A sample's explicit level (txl) or bias (txb) from a register: the A9's general
- * sample form (PR #4's g5p_usc_sample_ext(): byte 6 = 0x80 temp | 0x40 level or
- * 0x20 bias | register, byte 8 = 0x80 LOD source present) in the words of
- * g9p_sample_regs() at @at.
+ * A sample's explicit level (txl) or bias (txb): an f16 in the low half of a
+ * register (Apple's code: 0b0a into a half, or 1189 converting), which
+ * lod_source() makes. -1: the sample has none; -2: failed.
  */
-static bool
-sample_lod(struct g9p_ctx *ctx, nir_tex_instr *tex, unsigned at)
+static int
+lod_source(struct g9p_ctx *ctx, nir_tex_instr *tex)
 {
    const nir_tex_src_type type = tex->op == nir_texop_txl ? nir_tex_src_lod : nir_tex_src_bias;
    const int i = nir_tex_instr_src_index(tex, type);
-   int r;
+   int r, t;
 
    if (i < 0)
-      return tex->op != nir_texop_txl && tex->op != nir_texop_txb;
+      return tex->op != nir_texop_txl && tex->op != nir_texop_txb ? -1 : -2;
    r = src_reg(ctx, nir_get_scalar(tex->src[i].src.ssa, 0));
-   if (r < 0)
-      return false;
+   r = r < 0 ? r : one_src(ctx, r);
+   t = r < 0 ? r : alloc_low_temp(ctx);
+   if (t < 0)
+      return -2;
+   g9p_f16_of(ctx->c, t, r);
+   return t;
+}
+
+/*
+ * The source in the words of a sample at @at (PR #4's g5p_usc_sample_ext():
+ * byte 6 = 0x80 temp | 0x40 level or 0x20 bias | register, byte 8 = 0x80 LOD
+ * source present)
+ */
+static void
+sample_lod(struct g9p_ctx *ctx, nir_tex_instr *tex, unsigned at, int lod)
+{
+   if (lod < 0)
+      return;
    ctx->c->w[at + 3] = (ctx->c->w[at + 3] & 0xff00) | 0x80 |
-                       (tex->op == nir_texop_txl ? 0x40 : 0x20) | r;
+                       (tex->op == nir_texop_txl ? 0x40 : 0x20) | lod;
    ctx->c->w[at + 4] = (ctx->c->w[at + 4] & 0xff00) | 0x80;
-   return true;
 }
 
 /*
@@ -1593,7 +1607,7 @@ emit_tex_layered(struct g9p_ctx *ctx, nir_tex_instr *tex)
    int ci = nir_tex_instr_src_index(tex, nir_tex_src_coord);
    int slot = texture_slot(ctx, tex);
    unsigned at;
-   int dst;
+   int dst, lod;
 
    if (ctx->stage != MESA_SHADER_FRAGMENT || ci < 0 || slot < 0 || tex->is_shadow ||
        (cube && tex->is_array) ||
@@ -1603,6 +1617,9 @@ emit_tex_layered(struct g9p_ctx *ctx, nir_tex_instr *tex)
       fprintf(stderr, "g9p: only plain samples of 2D arrays and cubes\n");
       return false;
    }
+   lod = lod_source(ctx, tex);
+   if (lod == -2)
+      return false;
    for (unsigned c = 0; c < 3; c++) {
       const int r = src_reg(ctx, nir_get_scalar(tex->src[ci].src.ssa, c));
 
@@ -1630,8 +1647,7 @@ emit_tex_layered(struct g9p_ctx *ctx, nir_tex_instr *tex)
                    G9P_FS_TEX_BASE + G9P_TEX_STRIDE * slot + 8);
    ctx->c->w[at] = (ctx->c->w[at] & ~0x0f00) |
                    (cube ? G9P_TEX_CUBE : G9P_TEX_2D_ARRAY) << 8;
-   if (!sample_lod(ctx, tex, at))
-      return false;
+   sample_lod(ctx, tex, at, lod);
    g9p_wait(ctx->c);
    for (unsigned c = 0; c < 4; c++) {
       ctx->reg[key(&tex->def, c)] = dst + c;
@@ -1677,6 +1693,10 @@ emit_tex(struct g9p_ctx *ctx, nir_tex_instr *tex)
                          G9P_FS_TEX_BASE + G9P_TEX_STRIDE * slot + 8);
       ctx->out->num_varyings = MAX2(ctx->out->num_varyings, first / 4 + 1);
    } else {
+      const int lod = lod_source(ctx, tex);
+
+      if (lod == -2)
+         return false;
       for (unsigned c = 0; c < 2; c++) {
          const int r = src_reg(ctx, nir_get_scalar(tex->src[ci].src.ssa, c));
 
@@ -1693,8 +1713,7 @@ emit_tex(struct g9p_ctx *ctx, nir_tex_instr *tex)
 
          g9p_sample_regs(ctx->c, dst, G9P_FS_TEX_BASE + G9P_TEX_STRIDE * slot,
                          G9P_FS_TEX_BASE + G9P_TEX_STRIDE * slot + 8);
-         if (!sample_lod(ctx, tex, at))
-            return false;
+         sample_lod(ctx, tex, at, lod);
       }
    }
    g9p_wait(ctx->c);
