@@ -274,9 +274,20 @@ pvr_g5p_ds_isp(const struct pvr_g5p_isp_state *s, uint32_t w[5])
 }
 
 /*
- * The texture unit reads a ZLS plane in place, in the ZLS's Morton order:
- * the two agree when both sides pad to the same power of two (the captured
- * shadow-sampling scene's case), so other extents are refused.
+ * The texture unit reads a ZLS plane in place. Both use Morton order with y
+ * in bit 0 (the captured shadow-sampling scene, 64x64; the measured 100x75
+ * footprint). The texture unit pads each side of the view to its own power
+ * of two and twiddles a rectangle as Morton over the smaller power with the
+ * larger side's remaining bits above. The ZLS works in whole 32-pixel tiles.
+ * Candidate (g5p-1b-zls-sample, pending tools/g5p-1b-compute/vk-zls-order on
+ * hardware): the ZLS orders a rectangle the same way over its 32-aligned
+ * sides. The two orders then agree when both sides pad to the same power of
+ * two (Morton over a square is a prefix of a larger one), and otherwise
+ * by the bit-placement rule below (tools/g5p-1b-compute/zls-order/
+ * plane-test.c checks it against both orders at every pixel of every size
+ * up to 130x130). If the hardware stores a rectangle as Morton
+ * over the larger side's square instead, only equal powers agree and this
+ * returns to refusing every other extent.
  */
 const char *
 pvr_g5p_ds_texture_plane(VkFormat format, VkImageAspectFlags aspect, uint32_t width, uint32_t height,
@@ -287,8 +298,16 @@ pvr_g5p_ds_texture_plane(VkFormat format, VkImageAspectFlags aspect, uint32_t wi
 
    if (!f || !f->sampled)
       return "a sampled depth/stencil plane without a texture key (D16, S8)";
-   if (g5p_pot(width) != g5p_pot(height))
-      return "a sampled ZLS plane whose sides pad to different powers of two";
+   /* the texture's padded sides tw x th, the ZLS's zw x zh (32-aligned first). Morton bit b of x sits at 2b + 1
+    * and of y at 2b; past the smaller power the larger side's bits continue linearly. Wider: the extra x bits
+    * agree only when both orders interleave the same number of bits (the height pads alike: zh == th). Taller:
+    * the extra y bits agree when the width pads alike (zw == tw), or when there is exactly one extra y bit (y's
+    * Morton slot 2b equals its linear slot m + b at b = m, y being the bit-0 coordinate). */
+   const uint32_t tw = g5p_pot(width), th = g5p_pot(height);
+   const uint32_t zw = g5p_pot(g5p_align(width, 32)), zh = g5p_pot(g5p_align(height, 32));
+   if ((tw > th && zh != th) || (th > tw && zw != tw && th != 2 * tw))
+      return "a sampled ZLS plane whose texture order differs from its store order (a side of 16 pixels or fewer "
+             "the ZLS pads to a 32-pixel tile and the texture unit does not, next to a side of another power of two)";
    if (!pvr_g5p_ds_layout(format, width, height, 1, &plane))
       return "a sampled depth/stencil image of 0 pixels";
    switch (aspect) {
