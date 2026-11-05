@@ -686,7 +686,16 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
        * do not perform a numeric conversion. LOAD/sampling below retains
        * the original signed image key. Blending is rejected for integers.
        */
-      const uint32_t store_key = raw ? key & ~(0x80u << 5) : key;
+      uint32_t store_key = raw ? key & ~(0x80u << 5) : key;
+      if (raw == 5) {
+         /* Clear-only RGBA16UI: CPU clamps and packs RG/BA into two
+          * uint32 words. Store those exact eight bytes through RG32UI,
+          * whose two-word raw PBE path is device-proven. The logical
+          * image/view key stays RGBA16UI; no draw/LOAD admission follows. */
+         bool physical_srgb;
+         if (!g5p_pbe_key(VK_FORMAT_R32G32_UINT, &store_key, &physical_srgb))
+            return G5P_REFUSE(cmd_buffer, "RGBA16UI clear needs the RG32UI physical store");
+      }
       if (ms_store) {
          pvr_g5p_msaa_pbe_store(pbe[t], key, addr, iview->vk.extent.width, iview->vk.extent.height,
                                 vk_format_is_srgb(iview->vk.format));

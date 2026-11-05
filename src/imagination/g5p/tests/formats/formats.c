@@ -1701,9 +1701,14 @@ run_integer_clear(const struct rung *r)
       {0x80000001u, 0x7fffffffu, 0x12345678u, 0xffffffffu},
       {0x0000ffffu, 0x00010000u, 0xffff0000u, 0x80000000u},
       {0x55555555u, 0xaaaaaaaau, 0x01234567u, 0x89abcdefu},
+      {0x0001u, 0x1234u, 0x89abu, 0xfedcu},
+      {0xfedcu, 0x89abu, 0x1234u, 0x0001u},
+      {0, 0xffffu, 0x8000u, 0x7fffu},
+      {0x8000u, 0x7fffu, 0, 0xffffu},
    };
    int failed = 0;
-   for (unsigned k = 0; k < ARRAY_LEN(values); k++) {
+   const unsigned patterns = r->f->vk == VK_FORMAT_R16G16B16A16_UINT ? ARRAY_LEN(values) : 4;
+   for (unsigned k = 0; k < patterns; k++) {
       const struct fmt *f = r->f;
       struct img target;
       struct buf rb;
