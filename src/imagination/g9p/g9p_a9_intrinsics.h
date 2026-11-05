@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 #ifdef PVR_APPLE_G5P
 #include "../g5p/g5p_barrier.h"
+#include "../g5p/g5p_atomic.h"
 /* Static threadgroup operands: A9 host-compiler forms (compute.md §4).
  * Reserve TG0/1 for IDs and TG2/3 for the future software-barrier counters.
  * CDM allocation covers system words plus the native shared block. */
@@ -91,7 +92,39 @@ static bool a9_barrier(struct g9p_ctx *ctx, nir_intrinsic_instr *in)
    g9p_wait(ctx->c);
    return true;
 }
+static bool a9_ssbo_atomic(struct g9p_ctx *ctx, nir_intrinsic_instr *in)
+{
+   if (!ctx->out->a9 || ctx->stage != MESA_SHADER_COMPUTE ||
+       in->def.bit_size != 32 || in->def.num_components != 1 ||
+       nir_intrinsic_offset_shift(in) != 0) return false;
+   unsigned group, op;
+   switch (nir_intrinsic_atomic_op(in)) {
+   case nir_atomic_op_iadd: group=0; op=0; break;
+   case nir_atomic_op_isub: group=0; op=1; break;
+   case nir_atomic_op_xchg: group=0; op=2; break;
+   case nir_atomic_op_umin: group=1; op=0; break;
+   case nir_atomic_op_imin: group=1; op=1; break;
+   case nir_atomic_op_umax: group=1; op=2; break;
+   case nir_atomic_op_imax: group=1; op=3; break;
+   case nir_atomic_op_iand: group=2; op=0; break;
+   case nir_atomic_op_ior: group=2; op=1; break;
+   case nir_atomic_op_ixor: group=2; op=2; break;
+   default: return false;
+   }
+   int slot=buffer_slot(ctx,in->src[0]);
+   int off=src_reg(ctx,nir_get_scalar(in->src[1].ssa,0));
+   int val=src_reg(ctx,nir_get_scalar(in->src[2].ssa,0));
+   int zero=const_reg(ctx,0), pair=alloc_pair(ctx), dst=alloc_reg(ctx);
+   if (slot<0 || off<0 || val<0 || zero<0 || pair<0 || dst<0) return false;
+   ctx->temps |= BITFIELD64_RANGE(pair,2);
+   g9p_addr(ctx->c,pair,2*slot,off,0,false);
+   g5p_device_atomic(ctx->c,group,op,pair,dst,zero,val);
+   release(ctx,&in->instr);
+   ctx->reg[key(&in->def,0)]=dst;
+   return true;
+}
 #define G9P_A9_INTRINSICS \
+   case nir_intrinsic_ssbo_atomic: return a9_ssbo_atomic(ctx, intr); \
    case nir_intrinsic_load_shared: case nir_intrinsic_store_shared: return a9_shared(ctx, intr); \
    case nir_intrinsic_barrier: return a9_barrier(ctx, intr);
 #else
