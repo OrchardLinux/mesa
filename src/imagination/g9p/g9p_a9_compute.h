@@ -16,6 +16,7 @@ bool g9p_a9_compile_compute(nir_shader *nir, struct g9p_shader *out, void *mem_c
    }
    out->a9_local_dwords = 4 + DIV_ROUND_UP(nir->info.shared_size, 4);
    NIR_PASS(_, nir, nir_lower_compute_system_values, &csv);
+   NIR_PASS(_, nir, nir_lower_undef_to_zero, NULL);
    return compile_back(nir, out, MESA_SHADER_COMPUTE, NULL, 0, mem_ctx);
 }
 #endif
