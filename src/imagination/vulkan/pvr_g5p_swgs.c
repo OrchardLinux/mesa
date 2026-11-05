@@ -67,6 +67,11 @@ prepare(nir_shader *s)
    cleanup(s);
    nir_lower_io_passes(s, false);
    cleanup(s);
+   /* Poly changes the GS clone to VS. Dead per-vertex compact arrays must not
+    * survive that stage transition after their IO has become intrinsics.
+    */
+   NIR_PASS(_, s, nir_remove_dead_variables,
+            nir_var_shader_in | nir_var_shader_out, NULL);
    nir_shader_gather_info(s, nir_shader_get_entrypoint(s));
 }
 
@@ -80,9 +85,14 @@ admit(nir_shader *s, struct pvr_g5p_swgs *out)
    nir_foreach_function_impl(impl, s) {
       nir_foreach_block(block, impl) {
          nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_tex)
+               return refuse(out, "source texture resources are not qualified");
             if (instr->type != nir_instr_type_intrinsic)
                continue;
             nir_intrinsic_instr *i = nir_instr_as_intrinsic(instr);
+            if ((i->intrinsic == nir_intrinsic_store_output && nir_src_bit_size(i->src[0]) != 32) ||
+                (i->intrinsic == nir_intrinsic_load_per_vertex_input && i->def.bit_size != 32))
+               return refuse(out, "prototype requires 32-bit input/output records");
             switch (i->intrinsic) {
             case nir_intrinsic_store_output:
             case nir_intrinsic_load_per_vertex_input:
@@ -204,7 +214,8 @@ binding(nir_builder *b, unsigned index)
 {
    return nir_vulkan_resource_index(b, 2, 32, nir_imm_int(b, 0),
                                     .desc_set = 0, .binding = index,
-                                    .desc_type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+                                    .desc_type = nir_descriptor_type_storage_buffer,
+                                    .resource_type = nir_resource_type_read_write_storage_buffer);
 }
 
 static bool
@@ -276,7 +287,7 @@ finish(nir_shader *s, struct bridge *state)
       cleanup(s);
    } while (progress);
    NIR_PASS(_, s, nir_shader_intrinsics_pass, lower_memory,
-            nir_metadata_control_flow, state);
+            nir_metadata_none, state);
    if (state->failed)
       return refuse(state->out, "poly memory provenance/layout is not qualified");
    cleanup(s);
@@ -292,6 +303,8 @@ finish(nir_shader *s, struct bridge *state)
    NIR_PASS(_, s, nir_lower_alu);
    cleanup(s);
    s->options = saved_options;
+   NIR_PASS(_, s, nir_remove_dead_variables,
+            nir_var_shader_in | nir_var_shader_out | nir_var_function_temp, NULL);
    s->info.stage = MESA_SHADER_COMPUTE;
    memset(&s->info.cs, 0, sizeof(s->info.cs));
    s->info.workgroup_size[0] = s->info.workgroup_size[1] = s->info.workgroup_size[2] = 1;
