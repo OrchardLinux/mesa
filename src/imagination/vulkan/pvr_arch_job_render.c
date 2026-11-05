@@ -55,7 +55,7 @@
 #include "vk_alloc.h"
 #include "vk_log.h"
 #include "vk_util.h"
-#include "pvr_g5p_publish_hooks.h"
+
 static_assert(pvr_cmd_length(PBESTATE_REG_WORD0) == 2,
               "PBESTATE_REG_WORD0 cannot be stored in uint64_t");
 static_assert(pvr_cmd_length(PBESTATE_REG_WORD1) == 2,
@@ -876,7 +876,12 @@ pvr_render_job_ws_geometry_state_init(struct pvr_render_ctx *ctx,
                                       struct vk_sync *wait,
                                       struct pvr_winsys_geometry_state *state)
 {
-   PVR_G5P_HOOK(pub_pvr_arch_job_render_879)
+#ifdef PVR_APPLE_G5P
+   if (job->g5p.enabled) {
+      /* G5P: the pass is in the fragment stream; no geometry words */
+      state->fw_stream_len = 0;
+   } else
+#endif
    if (job->g9p.enabled) {
       state->fw_stream_len = pvr_arch_g9p_geom_stream(ctx->device, job, state->fw_stream,
                                                       sizeof(state->fw_stream));
@@ -884,6 +889,7 @@ pvr_render_job_ws_geometry_state_init(struct pvr_render_ctx *ctx,
       pvr_geom_state_stream_init(ctx, job, state);
       pvr_geom_state_stream_ext_init(ctx, job, state);
    }
+
    state->wait = wait;
    pvr_geom_state_flags_init(job, &state->flags);
 }
@@ -1382,7 +1388,13 @@ pvr_render_job_ws_fragment_state_init(struct pvr_render_ctx *ctx,
                                       struct vk_sync *wait,
                                       struct pvr_winsys_fragment_state *state)
 {
-   PVR_G5P_HOOK(pub_pvr_arch_job_render_1390)
+#ifdef PVR_APPLE_G5P
+   if (job->g5p.enabled) {
+      /* G5P: the TYPED_V3 pass the apple_g5p winsys submits */
+      state->fw_stream_len = pvr_arch_g5p_frag_stream(ctx->device, job, state->fw_stream,
+                                                      sizeof(state->fw_stream));
+   } else
+#endif
    if (job->g9p.enabled) {
       state->fw_stream_len = pvr_arch_g9p_frag_stream(ctx->device, job, state->fw_stream,
                                                       sizeof(state->fw_stream));
@@ -1390,6 +1402,7 @@ pvr_render_job_ws_fragment_state_init(struct pvr_render_ctx *ctx,
       pvr_frag_state_stream_init(ctx, job, state);
       pvr_frag_state_stream_ext_init(ctx, job, state);
    }
+
    state->wait = wait;
    pvr_frag_state_flags_init(job, &state->flags);
 }
@@ -1489,7 +1502,13 @@ static void pvr_render_job_ws_submit_info_init(
     * there. For now we'll always setup the pr.
     */
    /* G9P: no partial renders (the kernel's Apple path has none yet) */
-   PVR_G5P_HOOK(pub_pvr_arch_job_render_1503)
+#ifdef PVR_APPLE_G5P
+   if (job->g5p.enabled) {
+      /* G5P: no partial renders yet */
+      submit_info->fragment_pr.fw_stream_len = 0;
+      submit_info->fragment_pr.wait = wait_frag;
+   } else
+#endif
    if (job->g9p.enabled) {
       submit_info->fragment_pr.fw_stream_len = 0;
       submit_info->fragment_pr.wait = wait_frag;
@@ -1502,6 +1521,7 @@ static void pvr_render_job_ws_submit_info_init(
          &submit_info->fragment_pr);
    }
 }
+
 VkResult pvr_arch_render_job_submit(struct pvr_render_ctx *ctx,
                                     struct pvr_render_job *job,
                                     struct vk_sync *wait_geom,

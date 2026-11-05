@@ -32,7 +32,7 @@
 #include "pvr_physical_device.h"
 #include "pvr_winsys.h"
 #include "pvr_wsi.h"
-#include "pvr_g5p_publish_hooks.h"
+
 static const struct vk_instance_extension_table pvr_instance_extensions = {
    .KHR_device_group_creation = true,
    .KHR_display = PVR_USE_WSI_PLATFORM_DISPLAY,
@@ -114,7 +114,11 @@ pvr_drm_device_is_compatible(drmDevicePtr drm_dev)
 #if defined(PVR_SUPPORT_SERVICES_DRIVER)
    is_pvr |= !strcmp(version->name, PVR_SRV_DRIVER_NAME);
 #endif /* defined(PVR_SUPPORT_SERVICES_DRIVER) */
-   PVR_G5P_HOOK(pub_pvr_instance_117)
+#if defined(PVR_APPLE_G5P)
+   /* Apple A9 (G5P): our kernel's typed UAPI (winsys/apple_g5p) */
+   is_pvr |= !strcmp(version->name, "apple_g5p");
+#endif
+
    drmFreeVersion(version);
    close(fd);
 

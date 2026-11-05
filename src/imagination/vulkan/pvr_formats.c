@@ -31,6 +31,9 @@
 #include "g9p_formats.h"
 #include "hwdef/rogue_hw_utils.h"
 #include "pvr_g5p_ds_hooks.h"
+#if defined(PVR_APPLE_G5P)
+#   include "pvr_g5p_vertex.h"
+#endif
 #include "pvr_common.h"
 #include "pvr_csb.h"
 #include "pvr_device.h"
@@ -54,7 +57,7 @@
 #include "vk_format.h"
 #include "vk_log.h"
 #include "vk_util.h"
-#include "pvr_g5p_publish_hooks.h"
+
 uint32_t pvr_get_pbe_accum_format_size_in_bytes(VkFormat vk_format)
 {
    enum pvr_pbe_accum_format pbe_accum_format;
@@ -435,6 +438,20 @@ pvr_get_format_swizzle_for_tpu(const struct util_format_description *desc)
    return desc->swizzle;
 }
 
+#if defined(PVR_APPLE_G5P)
+/* G5P fetches the vertex formats of pvr_g5p_vertex_format_info() (32-bit
+ * float and integer, 8/16-bit normalized and scaled, 16-bit float) with
+ * dword strides. Of those, it advertises the ones a whole number of dwords
+ * in size, whose tightly packed strides are dword multiples too (Zink passes
+ * GL's strides through), and no other, so that Zink converts the rest. */
+static bool
+pvr_g5p_vertex_buffer_format(VkFormat vk_format)
+{
+   return pvr_g5p_vertex_format_info(vk_format, &(struct pvr_g5p_vertex_format){ 0 }) &&
+          vk_format_get_blocksize(vk_format) % 4 == 0;
+}
+#endif
+
 static VkFormatFeatureFlags2
 pvr_get_buffer_format_features2(struct pvr_physical_device *pdevice,
                                 VkFormat vk_format)
@@ -443,9 +460,15 @@ pvr_get_buffer_format_features2(struct pvr_physical_device *pdevice,
    VkFormatFeatureFlags2 flags = 0;
 
    const struct pvr_format *pvr_format = pvr_get_format(pdevice, vk_format);
-   PVR_G5P_HOOK(pub_pvr_formats_437)
+#if defined(PVR_APPLE_G5P)
+   /* the scaled formats have no entry of their own */
+   if (!pvr_format && PVR_HAS_FEATURE(&pdevice->dev_info, apple_g5p) &&
+       pvr_g5p_vertex_buffer_format(vk_format))
+      return VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT;
+#endif
    if (!pvr_format)
       return 0;
+
    assert(pvr_format->bind != 0);
 
    if (!vk_format_is_color(vk_format))
@@ -455,7 +478,15 @@ pvr_get_buffer_format_features2(struct pvr_physical_device *pdevice,
 
    if (pvr_format->bind & PVR_BIND_VERTEX_BUFFER)
       flags |= VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT;
-   PVR_G5P_HOOK(pub_pvr_formats_454)
+#if defined(PVR_APPLE_G5P)
+   /* the vertex formats G5P fetches, and no other */
+   if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g5p)) {
+      flags &= ~VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT;
+      if (pvr_g5p_vertex_buffer_format(vk_format))
+         flags |= VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT;
+   }
+#endif
+
    if (vk_format_is_scaled(vk_format))
       /*
     * G9P: no texel buffers yet. Mesa's PBO path samples one when it is offered, and
@@ -520,7 +551,16 @@ pvr_get_buffer_format_features2(struct pvr_physical_device *pdevice,
    default:
       break;
    }
-   PVR_G5P_HOOK(pub_pvr_formats_519)
+
+#if defined(PVR_APPLE_G5P)
+   /* no texel buffers on G5P: the backend refuses buffer textures
+    * (tex_shape_refusal()), so neither uniform nor storage texel buffers
+    * (nor the storage bits derived from them below) are claimed */
+   if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g5p))
+      flags &= ~(VK_FORMAT_FEATURE_2_UNIFORM_TEXEL_BUFFER_BIT | VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_BIT |
+                 VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_ATOMIC_BIT);
+#endif
+
    if (flags & VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_BIT) {
       flags |= VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |
                VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;

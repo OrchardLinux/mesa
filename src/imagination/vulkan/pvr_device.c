@@ -72,7 +72,7 @@
 #include "vk_physical_device_properties.h"
 #include "vk_sampler.h"
 #include "vk_util.h"
-#include "pvr_g5p_publish_hooks.h"
+
 /** Gets the amount of memory to allocate per-core for a tile buffer. */
 static uint32_t
 pvr_get_tile_buffer_size_per_core(const struct pvr_device *device)
@@ -246,7 +246,15 @@ VkResult pvr_AllocateMemory(VkDevice _device,
          break;
       }
    }
-   PVR_G5P_HOOK(pub_pvr_device_245)
+#if defined(PVR_APPLE_G5P)
+   /* G5P: memory that may become a dma-buf (exportable, or a WSI image) is a
+    * kernel BO of its own; the winsys's arena slices cannot be exported. */
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p) &&
+       (vk_find_struct_const(pAllocateInfo->pNext, EXPORT_MEMORY_ALLOCATE_INFO) ||
+        vk_find_struct_const(pAllocateInfo->pNext, WSI_MEMORY_ALLOCATE_INFO_MESA)))
+      type = PVR_WINSYS_BO_TYPE_DISPLAY;
+#endif
+
    if (fd_info && fd_info->handleType) {
       assert(
          fd_info->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT ||
@@ -583,7 +591,15 @@ VkResult pvr_bind_memory(struct pvr_device *device,
       util_dynarray_append_typed(&device->g9p_vmas.vmas, struct pvr_winsys_vma *, vma);
       simple_mtx_unlock(&device->g9p_vmas.lock);
    }
-   PVR_G5P_HOOK(pub_pvr_device_567)
+#ifdef PVR_APPLE_G5P
+   /* G5P: its CPU transfers find memory by device address too */
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p)) {
+      simple_mtx_lock(&device->g9p_vmas.lock);
+      util_dynarray_append_typed(&device->g9p_vmas.vmas, struct pvr_winsys_vma *, vma);
+      simple_mtx_unlock(&device->g9p_vmas.lock);
+   }
+#endif
+
    return VK_SUCCESS;
 
 err_free_vma:
@@ -600,7 +616,14 @@ void pvr_unbind_memory(struct pvr_device *device, struct pvr_winsys_vma *vma)
       util_dynarray_delete_unordered(&device->g9p_vmas.vmas, struct pvr_winsys_vma *, vma);
       simple_mtx_unlock(&device->g9p_vmas.lock);
    }
-   PVR_G5P_HOOK(pub_pvr_device_592)
+#ifdef PVR_APPLE_G5P
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p)) {
+      simple_mtx_lock(&device->g9p_vmas.lock);
+      util_dynarray_delete_unordered(&device->g9p_vmas.vmas, struct pvr_winsys_vma *, vma);
+      simple_mtx_unlock(&device->g9p_vmas.lock);
+   }
+#endif
+
    device->ws->ops->vma_unmap(vma);
    device->ws->ops->heap_free(vma);
 }

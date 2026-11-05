@@ -67,7 +67,7 @@
 #include "vk_sync.h"
 #include "vk_sync_dummy.h"
 #include "vk_util.h"
-#include "pvr_g5p_publish_hooks.h"
+
 static inline enum pvr_winsys_ctx_priority
 pvr_winsys_from_vk_queue_priority(const VkQueueGlobalPriority priority)
 {
@@ -673,7 +673,20 @@ static VkResult pvr_process_transfer_cmds(struct pvr_device *device,
                            &sync);
    if (result != VK_SUCCESS)
       return result;
-   PVR_G5P_HOOK(pub_pvr_arch_queue_619)
+
+#ifdef PVR_APPLE_G5P
+   /* G5P: the A9's firmware has no transfer engine either (the apple_g5p
+    * winsys refuses transfer jobs); the CPU does them, as on G9P, plus what
+    * only the A9's copies know (pvr_g5p_layout.h)
+    */
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p))
+      result = pvr_arch_g5p_transfer_submit(
+         device,
+         sub_cmd,
+         queue->next_job_wait_sync[PVR_JOB_TYPE_TRANSFER],
+         sync);
+   else
+#endif
    /* G9P: no GPU transfer path yet; done by the CPU */
    if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p))
       result = pvr_arch_g9p_transfer_submit(

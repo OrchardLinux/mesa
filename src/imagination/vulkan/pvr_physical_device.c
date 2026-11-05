@@ -36,7 +36,7 @@
 #include "pvr_macros.h"
 #include "pvr_winsys.h"
 #include "pvr_wsi.h"
-#include "pvr_g5p_publish_hooks.h"
+
 #define VK_VENDOR_ID_IMAGINATION 0x1010
 
 void pvr_physical_device_dump_info(const struct pvr_physical_device *pdevice,
@@ -1280,7 +1280,21 @@ VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
                          "Failed to collect physical device properties");
       goto err_pvr_winsys_destroy;
    }
-   PVR_G5P_HOOK(pub_pvr_physical_device_1275)
+   PVR_G5P_HOOK(msaa_limits, pdevice, &supported_properties)
+#if defined(PVR_APPLE_G5P)
+   /* G5P: transform feedback is the vertex program's own stores and a CPU
+    * resolve (pvr_g5p_xfb.h): stream 0, no byte-count draws; its stream
+    * queries count on the CPU too. No dynamic colour-write enables: G5P compiles the write
+    * mask into the fragment program, and Zink makes them dynamic whenever
+    * they exist. */
+   if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g5p)) {
+      supported_features.geometryStreams = false;
+      supported_properties.transformFeedbackDraw = false;
+      supported_properties.transformFeedbackQueries = true;
+      supported_extensions.EXT_color_write_enable = false;
+      supported_features.colorWriteEnable = false;
+   }
+#endif
    /*
     * G9P: host image copies through the driver's CPU copies (all its memory
     * is CPU-visible; pvr_arch_g9p_transfer.c)

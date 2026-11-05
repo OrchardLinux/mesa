@@ -73,9 +73,12 @@
 #include "vk_render_pass.h"
 #include "vk_util.h"
 #include "pvr_g9p.h"
+#if defined(PVR_APPLE_G5P)
+#   include "pvr_g5p.h"
+#endif
 #include "vulkan/runtime/vk_pipeline.h"
 #include "vulkan/vulkan_core.h"
-#include "pvr_g5p_publish_hooks.h"
+
 /*****************************************************************************
    PDS functions
 *****************************************************************************/
@@ -1311,7 +1314,16 @@ pvr_graphics_pipeline_destroy(struct pvr_device *const device,
       ARRAY_SIZE(gfx_pipeline->shader_state.vertex.pds_attrib_programs);
    struct pvr_fragment_shader_state *fragment_state =
       &gfx_pipeline->shader_state.fragment;
-   PVR_G5P_HOOK(pub_pvr_arch_pipeline_1317)
+
+#ifdef PVR_APPLE_G5P
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p)) {
+      /* G5P: the programs of pvr_arch_g5p_graphics_pipeline_compile() */
+      pvr_arch_g5p_graphics_pipeline_destroy(device, gfx_pipeline);
+      pvr_pipeline_finish(device, &gfx_pipeline->base);
+      vk_free2(&device->vk.alloc, allocator, gfx_pipeline);
+      return;
+   }
+#endif
    if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p)) {
       pvr_arch_g9p_graphics_pipeline_destroy(gfx_pipeline);
       pvr_pipeline_finish(device, &gfx_pipeline->base);
@@ -3121,7 +3133,13 @@ pvr_graphics_pipeline_compile(struct pvr_device *const device,
    struct pvr_fragment_shader_state *fragment_state =
       &gfx_pipeline->shader_state.fragment;
    struct usc_mrt_setup mrt_setup = { 0 };
-   PVR_G5P_HOOK(pub_pvr_arch_pipeline_3136)
+
+#ifdef PVR_APPLE_G5P
+   /* G5P: its own compile, the G5P backend from NIR (pvr_arch_g5p_gfx.c) */
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p))
+      return pvr_arch_g5p_graphics_pipeline_compile(device, pCreateInfo, gfx_pipeline,
+                                                    state);
+#endif
    if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p))
       return pvr_arch_g9p_graphics_pipeline_compile(device, pCreateInfo, gfx_pipeline,
                                                     state);
