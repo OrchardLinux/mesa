@@ -250,7 +250,7 @@ write_buffer_view(const struct pvr_descriptor_set *set,
    if (is_texel_buffer && buffer_view->vk.buffer)
       container_of(buffer_view->vk.buffer, struct pvr_buffer, vk)->g9p_gpu_written = true;
 
-   if (is_texel_buffer &&
+   if (is_texel_buffer && !PVR_G5P_NATIVE_STORAGE(dev_info) &&
        !PVR_HAS_FEATURE(dev_info, tpu_extended_integer_lookup)) {
       struct ROGUE_TEXSTATE_STRIDE_IMAGE_WORD1 word1;
       ROGUE_TEXSTATE_STRIDE_IMAGE_WORD1_unpack(&buffer_view_state.words[1],
