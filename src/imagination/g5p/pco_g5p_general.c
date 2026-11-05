@@ -310,6 +310,58 @@ static void put(struct gctx *c, const uint8_t *raw, unsigned n, const char *what
    c->nput++;
 }
 
+/* ---- vertex register banks (docs/gpu/vs-two-bank-allocator.md) ----
+ * A vertex register below VS_BANK0 is bank 1 (the attributes, outputs and
+ * unified store; every vertex temp so far); VS_BANK0 + i is bank 0 r<i>, the
+ * temps the DOUTU declares. An instruction's bank field is its destination's
+ * bank, and the header marks register operands A, B and C in bank 1 with
+ * 0x20, 0x10 and 0x08 (checked on 111 of Apple's vertex programs,
+ * tools/g5p-1b-dgl/vs2bank/bank-check.py). Fragment registers are bank 0. */
+#define VS_BANK0 32u
+#define VS_A 0x20u
+#define VS_B 0x10u
+#define VS_C 0x08u
+
+static inline unsigned vbank(const struct gctx *c, unsigned r)
+{
+   return c->vs && r < VS_BANK0;
+}
+
+/* The 16-bit half selector of register r's low half within its bank. */
+static inline unsigned H(const struct gctx *c, unsigned r)
+{
+   return 2 * (c->vs && r >= VS_BANK0 ? r - VS_BANK0 : r);
+}
+
+/* A witnessed all-bank-1 vertex header with the bit of each bank-0 register
+ * operand cleared; -1 for a slot that is not a register operand. The base
+ * header must carry the bit of every register operand passed. */
+static unsigned vhdr(const struct gctx *c, unsigned header, int a, int b, int cc)
+{
+   assert(c->vs);
+   assert(a < 0 || (header & VS_A));
+   assert(b < 0 || (header & VS_B));
+   assert(cc < 0 || (header & VS_C));
+   if (a >= 0 && !vbank(c, a))
+      header &= ~VS_A;
+   if (b >= 0 && !vbank(c, b))
+      header &= ~VS_B;
+   if (cc >= 0 && !vbank(c, cc))
+      header &= ~VS_C;
+   return header;
+}
+
+/* A vertex form witnessed only with every register in bank 1: refused by
+ * name when an operand or the destination is in bank 0 (-1 ends the list). */
+static void refuse(struct gctx *c, const char *fmt, ...);
+static void vs_bank1_only(struct gctx *c, const char *what, int r0, int r1, int r2, int r3)
+{
+   const int r[4] = {r0, r1, r2, r3};
+   for (unsigned i = 0; i < 4; i++)
+      if (r[i] >= 0 && !vbank(c, r[i]))
+         refuse(c, "%s with a register in vertex bank 0 (no witnessed mixed-bank form)", what);
+}
+
 /* ---- registers (dwords) ---- */
 static unsigned alloc_run(struct gctx *c, unsigned n, const char *why)
 {
@@ -1941,7 +1993,7 @@ static unsigned reg_of(struct gctx *c, struct ref r, const char *what)
    switch (v->state) {
    case VAL_CONST: {
       unsigned reg = alloc_reg(c, -1);
-      put(c, raw, g5p_usc_immediate(raw, 2 * reg, v->imm, c->vs, -1), "movi");
+      put(c, raw, g5p_usc_immediate(raw, H(c, reg), v->imm, vbank(c, reg), -1), "movi");
       if (scratch)
          c->scratch |= BITFIELD_BIT(reg);
       else
@@ -1957,7 +2009,7 @@ static unsigned reg_of(struct gctx *c, struct ref r, const char *what)
    }
    case VAL_SHARED: {
       unsigned reg = alloc_reg(c, -1);
-      put(c, raw, g5p_usc_mov_shared(raw, 2 * reg, v->imm, c->vs), "mov.shared");
+      put(c, raw, g5p_usc_mov_shared(raw, H(c, reg), v->imm, vbank(c, reg)), "mov.shared");
       c->p->evidence |= c->vs ? PCO_G5P_EV_VS_SHARED : PCO_G5P_EV_SHARED;
       if (scratch)
          c->scratch |= BITFIELD_BIT(reg);
@@ -1985,7 +2037,7 @@ static unsigned scratch_imm(struct gctx *c, uint32_t value)
 {
    uint8_t raw[G5P_USC_MAX];
    unsigned reg = alloc_reg(c, -1);
-   put(c, raw, g5p_usc_immediate(raw, 2 * reg, value, c->vs, -1), "movi");
+   put(c, raw, g5p_usc_immediate(raw, H(c, reg), value, vbank(c, reg), -1), "movi");
    c->scratch |= BITFIELD_BIT(reg);
    return reg;
 }
@@ -1997,7 +2049,7 @@ static unsigned one_reg(struct gctx *c)
    if (c->one_reg < 0) {
       uint8_t raw[G5P_USC_MAX];
       c->one_reg = alloc_reg(c, -1);
-      put(c, raw, g5p_usc_immediate(raw, 2 * c->one_reg, F32_ONE, c->vs, -1), "movi 1.0");
+      put(c, raw, g5p_usc_immediate(raw, H(c, c->one_reg), F32_ONE, vbank(c, c->one_reg), -1), "movi 1.0");
    }
    return c->one_reg;
 }
@@ -2018,9 +2070,9 @@ static void define(struct gctx *c, nir_def *d, unsigned reg)
    hold(c, v, reg);
 }
 
-static struct g5p_src gsrc(unsigned reg, struct ref r, unsigned group)
+static struct g5p_src gsrc(const struct gctx *c, unsigned reg, struct ref r, unsigned group)
 {
-   return (struct g5p_src){.half = 2 * reg, .group = group, .neg = r.neg, .abs = r.abs};
+   return (struct g5p_src){.half = H(c, reg), .group = group, .neg = r.neg, .abs = r.abs};
 }
 
 /* ---- round 19: Apple's fragment source hints ----
@@ -2107,7 +2159,8 @@ static void emit_times_one(struct gctx *c, struct ref x, bool sat, int rh, nir_d
       unsigned g = vgrp(c, x);
       unsigned dst = vs_dst(c, &x, 1);
       uint8_t raw[G5P_USC_MAX];
-      put(c, raw, g5p_usc_fadd_literal_mods(raw, 2 * dst, 0x8000, 2 * xr, 1, g, 0x11, x.neg, x.abs, sat),
+      put(c, raw, g5p_usc_fadd_literal_mods(raw, H(c, dst), 0x8000, H(c, xr), vbank(c, dst), g,
+                                             vhdr(c, 0x11, -1, xr, -1), x.neg, x.abs, sat),
           "vertex fneg/fabs/fsat");
       c->p->evidence |= PCO_G5P_EV_VS_ALU;
       if (def)
@@ -2128,7 +2181,7 @@ static void emit_times_one(struct gctx *c, struct ref x, bool sat, int rh, nir_d
       dst = alloc_reg(c, dies(c, x) ? (int)xr : -1);
       f.dst_half = 2 * dst;
    }
-   f.a = gsrc(xr, x, gx);
+   f.a = gsrc(c, xr, x, gx);
    f.b = (struct g5p_src){.half = 2 * one, .group = g1};
    f.saturate = sat;
    alu_hint(c, &f, false);
@@ -2146,7 +2199,7 @@ static unsigned zero_reg(struct gctx *c)
    if (c->zero_reg < 0) {
       uint8_t raw[G5P_USC_MAX];
       c->zero_reg = alloc_reg(c, -1);
-      put(c, raw, g5p_usc_immediate(raw, 2 * c->zero_reg, 0, c->vs, -1), "movi 0");
+      put(c, raw, g5p_usc_immediate(raw, H(c, c->zero_reg), 0, vbank(c, c->zero_reg), -1), "movi 0");
    }
    return c->zero_reg;
 }
@@ -2158,7 +2211,7 @@ static unsigned ione_reg(struct gctx *c)
    if (c->ione_reg < 0) {
       uint8_t raw[G5P_USC_MAX];
       c->ione_reg = alloc_reg(c, -1);
-      put(c, raw, g5p_usc_immediate(raw, 2 * c->ione_reg, 1, c->vs, -1), "movi 1");
+      put(c, raw, g5p_usc_immediate(raw, H(c, c->ione_reg), 1, vbank(c, c->ione_reg), -1), "movi 1");
    }
    return c->ione_reg;
 }
@@ -2168,8 +2221,12 @@ static void put_recipe(struct gctx *c, enum g5p_recipe r, unsigned d, unsigned x
 {
    uint8_t buf[256];
    const char *err = NULL;
-   unsigned n = g5p_recipe(r, buf, sizeof(buf), 2 * d, 2 * x, 2 * y, 2 * t, flags | (c->vs ? G5P_RC_VERTEX : 0),
-                           &err);
+   /* The vertex recipes are witnessed with every operand and temp in bank 1
+    * (g5p_recipes.c); a bank-0 one has no witnessed form yet. */
+   if (c->vs && !(vbank(c, d) && vbank(c, x) && vbank(c, y) && vbank(c, t)))
+      refuse(c, "%s lowering: an operand in vertex bank 0 (no witnessed mixed-bank form)", g5p_recipe_name[r]);
+   unsigned n = g5p_recipe(r, buf, sizeof(buf), H(c, d), H(c, x), H(c, y), H(c, t),
+                           flags | (c->vs ? G5P_RC_VERTEX : 0), &err);
    if (!n)
       refuse(c, "%s lowering: %s (%s)", g5p_recipe_name[r], err ? err : "?", g5p_usc_error ? g5p_usc_error : "?");
    /* The whole lowering is one put (one read index for its operands). */
@@ -2190,7 +2247,7 @@ static unsigned consumable(struct gctx *c, struct ref x, const char *what)
    unsigned d = alloc_reg(c, -1);
    uint8_t raw[G5P_USC_MAX];
    /* vertex: the class-98 single-source form (floor, minmax merge) with bank 1, header 0x21 */
-   put(c, raw, g5p_usc_move(raw, 2 * d, 2 * xr, c->vs, vgrp(c, x), c->vs ? 0x21 : 1),
+   put(c, raw, g5p_usc_move(raw, H(c, d), H(c, xr), vbank(c, d), vgrp(c, x), c->vs ? vhdr(c, 0x21, xr, -1, -1) : 1),
        "copy before an in-place lowering");
    return d;
 }
@@ -2318,9 +2375,9 @@ static void cmp_select_regs(struct gctx *c, nir_op op, unsigned a, unsigned b, u
        * source are temps in bank 1; a read that is not the last one keeps
        * group 0 without the fragment's repeated-read controls (Apple's B and
        * C there are read again by the outputs: header 0x39, extension 0) */
-      kw.bank = km.bank = 1;
-      kw.header |= 0x38;
-      km.header |= 0x20;
+      kw.bank = km.bank = vbank(c, dst);
+      kw.header |= (vbank(c, a) ? VS_A : 0) | (vbank(c, b) ? VS_B : 0) | (vbank(c, t) ? VS_C : 0);
+      km.header |= vbank(c, f) ? VS_A : 0;
    } else {
       if (!g.b || !g.t)
          kw.source_extension = 4;
@@ -2329,9 +2386,10 @@ static void cmp_select_regs(struct gctx *c, nir_op op, unsigned a, unsigned b, u
          km.source_extension = 4;
    }
    uint8_t raw[G5P_USC_MAX];
-   put(c, raw, g5p_usc_compare_write(raw, code, 2 * dst, S(2 * a, g.a), S(2 * b, g.b), S(2 * t, g.t), kw, rc),
+   put(c, raw, g5p_usc_compare_write(raw, code, H(c, dst), S(H(c, a), g.a), S(H(c, b), g.b), S(H(c, t), g.t), kw,
+                                     rc),
        "compare/write");
-   put(c, raw, g5p_usc_predicated_move(raw, 2 * dst, S(2 * f, g.f), km), "inverse move");
+   put(c, raw, g5p_usc_predicated_move(raw, H(c, dst), S(H(c, f), g.f), km), "inverse move");
    c->p->evidence |= PCO_G5P_EV_SELECT;
 }
 
@@ -2436,8 +2494,8 @@ static void emit_bool_alu(struct gctx *c, nir_alu_instr *a)
    /* vertex: Apple's v_ixor_big / v_ixor_big_rr (x ^ 0x3f800000): bank 1, header 0x11, the source group alone
     * marks a repeated read (no extension) */
    if (c->vs)
-      put(c, raw, g5p_usc_binary_literal2(raw, G5P_BIN_XOR, 2 * dst, F32_ONE, 2 * xr, 1, g, 0x11, G5P_LIT_U32, -1, 0,
-                                          0, false), "boolean not");
+      put(c, raw, g5p_usc_binary_literal2(raw, G5P_BIN_XOR, H(c, dst), F32_ONE, H(c, xr), vbank(c, dst), g,
+                                          vhdr(c, 0x11, -1, xr, -1), G5P_LIT_U32, -1, 0, 0, false), "boolean not");
    else
       put(c, raw, g5p_usc_binary_literal2(raw, G5P_BIN_XOR, 2 * dst, F32_ONE, 2 * xr, 0, g, g ? 1 : 0x41, G5P_LIT_U32,
                                           -1, g ? 0 : 4, 0, false), "boolean not");
@@ -2500,7 +2558,8 @@ static void vs_fbin(struct gctx *c, nir_alu_instr *a)
       if (!dies(c, x))
          continue; /* B is read again: no witnessed group-0 literal form */
       unsigned dst = vs_dst(c, &x, 1);
-      put(c, raw, g5p_usc_binary_literal(raw, op, 2 * dst, h, 2 * xr, 1, 1, 0x11, true, -1), "f16-literal ALU");
+      put(c, raw, g5p_usc_binary_literal(raw, op, H(c, dst), h, H(c, xr), vbank(c, dst), 1, vhdr(c, 0x11, -1, xr, -1),
+                                         true, -1), "f16-literal ALU");
       c->p->evidence |= PCO_G5P_EV_VS_ALU;
       define(c, &a->def, dst);
       return;
@@ -2512,12 +2571,12 @@ static void vs_fbin(struct gctx *c, nir_alu_instr *a)
        * {h31 x0 dc0} with each operand's negate/abs and group (its last read), operands in order */
       unsigned ra = reg_of(c, r[0], "fadd"), rb = reg_of(c, r[1], "fadd");
       struct g5p_alu f = G5P_ALU(0);
-      f.bank = 1;
-      f.header = 0x31;
-      f.a = gsrc(ra, r[0], vgrp(c, r[0]));
-      f.b = gsrc(rb, r[1], vgrp(c, r[1]));
+      f.a = gsrc(c, ra, r[0], vgrp(c, r[0]));
+      f.b = gsrc(c, rb, r[1], vgrp(c, r[1]));
       unsigned dst = vs_dst(c, r, 2);
-      f.dst_half = 2 * dst;
+      f.bank = vbank(c, dst);
+      f.header = vhdr(c, 0x31, ra, rb, -1);
+      f.dst_half = H(c, dst);
       put(c, raw, g5p_usc_binary(raw, op, &f), nir_op_infos[a->op].name);
       c->p->evidence |= PCO_G5P_EV_VS_ALU;
       define(c, &a->def, dst);
@@ -2536,7 +2595,8 @@ static void vs_fbin(struct gctx *c, nir_alu_instr *a)
       unsigned br = reg_of(c, r[1], "uniform ALU");
       unsigned bg = dies(c, r[1]);
       unsigned dst = vs_dst(c, r, 2);
-      put(c, raw, g5p_usc_alu_shared(raw, op, 2 * dst, sd, 2 * br, 1, bg, 0x11, 0, 0, false, -1, 1),
+      vs_bank1_only(c, "uniform ALU", dst, br, -1, -1);
+      put(c, raw, g5p_usc_alu_shared(raw, op, H(c, dst), sd, H(c, br), 1, bg, 0x11, 0, 0, false, -1, 1),
           "uniform ALU");
       c->p->evidence |= PCO_G5P_EV_VS_SHARED;
       define(c, &a->def, dst);
@@ -2546,20 +2606,19 @@ static void vs_fbin(struct gctx *c, nir_alu_instr *a)
    unsigned reg[2] = {reg_of(c, r[0], "ALU"), reg_of(c, r[1], "ALU")};
    bool d[2] = {dies(c, r[0]), dies(c, r[1])};
    struct g5p_alu f = G5P_ALU(0);
-   f.bank = 1;
-   unsigned ia, ib;
+   unsigned ia = 0, ib = 1; /* the operands in A and B */
    if (!d[0] && !d[1]) {
       /* both read again (vsops-probes.py v_fmul_rr / v_fadd_rr, fast and strict): {h31 x0 dc0 ag0 bg0} */
       f.header = 0x31;
-      f.a = gsrc(reg[0], r[0], 0);
-      f.b = gsrc(reg[1], r[1], 0);
+      f.a = gsrc(c, reg[0], r[0], 0);
+      f.b = gsrc(c, reg[1], r[1], 0);
    } else if (op == G5P_BIN_FADD) {
       /* round 18 / v_depth: {h31 x0 dc0, A group 0, B read last} */
       ia = d[0] ? 1 : 0;
       ib = 1 - ia;
       f.header = 0x31;
-      f.a = gsrc(reg[ia], r[ia], 0);
-      f.b = gsrc(reg[ib], r[ib], 1);
+      f.a = gsrc(c, reg[ia], r[ia], 0);
+      f.b = gsrc(c, reg[ib], r[ib], 1);
    } else {
       /* v_uniform_live_*: {h31 x0 dc128 ag1 bg1} or {h71 x4 dc128 ag1 bg0} */
       ia = d[0] ? 0 : 1;
@@ -2567,11 +2626,13 @@ static void vs_fbin(struct gctx *c, nir_alu_instr *a)
       f.header = d[ib] ? 0x31 : 0x71;
       f.source_extension = d[ib] ? 0 : 4;
       f.dst_control = 0x80;
-      f.a = gsrc(reg[ia], r[ia], 1);
-      f.b = gsrc(reg[ib], r[ib], d[ib]);
+      f.a = gsrc(c, reg[ia], r[ia], 1);
+      f.b = gsrc(c, reg[ib], r[ib], d[ib]);
    }
    unsigned dst = vs_dst(c, r, 2);
-   f.dst_half = 2 * dst;
+   f.bank = vbank(c, dst);
+   f.header = vhdr(c, f.header, reg[ia], reg[ib], -1);
+   f.dst_half = H(c, dst);
    put(c, raw, g5p_usc_binary(raw, op, &f), nir_op_infos[a->op].name);
    c->p->evidence |= PCO_G5P_EV_VS_ALU;
    define(c, &a->def, dst);
@@ -2602,7 +2663,8 @@ static void vs_ffma(struct gctx *c, nir_alu_instr *a)
             continue;
          struct ref both[2] = {x, r[2]};
          unsigned dst = vs_dst(c, both, 2);
-         put(c, raw, g5p_usc_fma_literal(raw, 2 * dst, h, 2 * xr, 2 * cr, 1, 1, 1, 0x19), "f16-literal ffma");
+         put(c, raw, g5p_usc_fma_literal(raw, H(c, dst), h, H(c, xr), H(c, cr), vbank(c, dst), 1, 1,
+                                         vhdr(c, 0x19, -1, xr, cr)), "f16-literal ffma");
          c->p->evidence |= PCO_G5P_EV_VS_ALU;
          define(c, &a->def, dst);
          return;
@@ -2625,7 +2687,8 @@ static void vs_ffma(struct gctx *c, nir_alu_instr *a)
       unsigned br = reg_of(c, r[1], "uniform FMA");
       unsigned bg = dies(c, r[1]);
       dst = vs_dst(c, r, 3);
-      put(c, raw, g5p_usc_fma_shared_ac(raw, 2 * dst, V(c, r[0].def, r[0].comp)->imm, 2 * br,
+      vs_bank1_only(c, "uniform FMA (shared A/C)", dst, br, -1, -1);
+      put(c, raw, g5p_usc_fma_shared_ac(raw, H(c, dst), V(c, r[0].def, r[0].comp)->imm, H(c, br),
                                         V(c, r[2].def, r[2].comp)->imm, 1, bg, 0x11, 0, 0, 0x70, 1, 1),
           "uniform FMA (shared A/C)");
       c->p->evidence |= PCO_G5P_EV_VS_SHARED;
@@ -2637,7 +2700,8 @@ static void vs_ffma(struct gctx *c, nir_alu_instr *a)
          refuse(c, "ffma: uniform x register + register addend that is read again "
                    "(no witnessed vertex control tuple)");
       dst = vs_dst(c, r, 3);
-      put(c, raw, g5p_usc_fma_shared_a(raw, 2 * dst, V(c, r[0].def, r[0].comp)->imm, 2 * br, 2 * cr, 1, db, 1,
+      vs_bank1_only(c, "uniform FMA (shared A)", dst, br, cr, -1);
+      put(c, raw, g5p_usc_fma_shared_a(raw, H(c, dst), V(c, r[0].def, r[0].comp)->imm, H(c, br), H(c, cr), 1, db, 1,
                                        db ? 0x19 : 0x59, db ? 0 : 4, 0, -1, 1), "uniform FMA (shared A)");
       c->p->evidence |= PCO_G5P_EV_VS_SHARED;
    } else if (sc) {
@@ -2645,7 +2709,8 @@ static void vs_ffma(struct gctx *c, nir_alu_instr *a)
       unsigned br = reg_of(c, r[0], "uniform FMA"), cr = reg_of(c, r[1], "uniform FMA");
       bool last = dies(c, r[0]) && dies(c, r[1]);
       dst = vs_dst(c, r, 3);
-      put(c, raw, g5p_usc_fma_shared_a(raw, 2 * dst, V(c, r[2].def, r[2].comp)->imm, 2 * br, 2 * cr, 1, last,
+      vs_bank1_only(c, "uniform FMA (shared addend)", dst, br, cr, -1);
+      put(c, raw, g5p_usc_fma_shared_a(raw, H(c, dst), V(c, r[2].def, r[2].comp)->imm, H(c, br), H(c, cr), 1, last,
                                        last, last ? 0x19 : 0x59, last ? 0 : 4, 0, 0x58, 1),
           "uniform FMA (shared addend)");
       c->p->evidence |= PCO_G5P_EV_VS_SHARED;
@@ -2657,14 +2722,14 @@ static void vs_ffma(struct gctx *c, nir_alu_instr *a)
          refuse(c, "ffma of registers read again (no witnessed vertex control tuple)");
       unsigned ia = d[0] ? 0 : 1, ib = 1 - ia;
       struct g5p_alu f = G5P_ALU(0);
-      f.bank = 1;
-      f.header = d[ib] ? 0x39 : 0x79;
       f.source_extension = d[ib] ? 0 : 4;
-      f.a = gsrc(reg[ia], r[ia], 1);
-      f.b = gsrc(reg[ib], r[ib], d[ib]);
-      f.c = gsrc(reg[2], r[2], 1);
+      f.a = gsrc(c, reg[ia], r[ia], 1);
+      f.b = gsrc(c, reg[ib], r[ib], d[ib]);
+      f.c = gsrc(c, reg[2], r[2], 1);
       dst = vs_dst(c, r, 3);
-      f.dst_half = 2 * dst;
+      f.bank = vbank(c, dst);
+      f.header = vhdr(c, d[ib] ? 0x39 : 0x79, reg[ia], reg[ib], reg[2]);
+      f.dst_half = H(c, dst);
       put(c, raw, g5p_usc_fma(raw, &f), "ffma");
       c->p->evidence |= PCO_G5P_EV_VS_ALU;
    }
@@ -2734,8 +2799,8 @@ static void emit_fbin(struct gctx *c, nir_alu_instr *a)
    }
    f.bank = c->vs;
    f.header = c->vs ? 0x31 : 1;
-   f.a = gsrc(reg[ia], r[ia], c->vs ? 0 : ga);
-   f.b = gsrc(reg[ib], r[ib], gb);
+   f.a = gsrc(c, reg[ia], r[ia], c->vs ? 0 : ga);
+   f.b = gsrc(c, reg[ib], r[ib], gb);
    f.saturate = sat;
    alu_hint(c, &f, false);
    put(c, raw, g5p_usc_binary(raw, op, &f), nir_op_infos[a->op].name);
@@ -2817,9 +2882,9 @@ static void emit_ffma(struct gctx *c, nir_alu_instr *a)
       dst = alloc_reg(c, prefer);
       f.dst_half = 2 * dst;
    }
-   f.a = gsrc(reg[ia], r[ia], ga);
-   f.b = gsrc(reg[ib], r[ib], gb);
-   f.c = gsrc(reg[2], r[2], gc);
+   f.a = gsrc(c, reg[ia], r[ia], ga);
+   f.b = gsrc(c, reg[ib], r[ib], gb);
+   f.c = gsrc(c, reg[2], r[2], gc);
    f.saturate = sat;
    alu_hint(c, &f, true);
    put(c, raw, g5p_usc_fma(raw, &f), "ffma");
@@ -2856,8 +2921,8 @@ static void emit_ibin(struct gctx *c, nir_alu_instr *a)
    free_dying(c, r, 2);
    unsigned dst = alloc_reg(c, d0 ? (int)reg[0] : d1 ? (int)reg[1] : -1);
    struct g5p_alu f = G5P_ALU(2 * dst);
-   f.a = gsrc(reg[ia], (struct ref){0}, ga);
-   f.b = gsrc(reg[ib], (struct ref){0}, gb);
+   f.a = gsrc(c, reg[ia], (struct ref){0}, ga);
+   f.b = gsrc(c, reg[ib], (struct ref){0}, gb);
    unsigned n;
    switch (a->op) {
    case nir_op_iadd: n = g5p_usc_binary(raw, G5P_BIN_IADD, &f); break;
@@ -2912,16 +2977,16 @@ static void emit_shift(struct gctx *c, nir_alu_instr *a)
    unsigned xr = reg_of(c, x, nir_op_infos[a->op].name);
    if (is_const(c, amt)) {
       unsigned s = V(c, amt.def, amt.comp)->imm & 31;
-      const unsigned bank = c->vs ? 1 : 0, header = c->vs ? 0x11 : 1;
       bool d = dies(c, x);
       unsigned gx = vgrp(c, x);
       free_dying(c, &x, 1);
       unsigned dst = alloc_reg(c, d ? (int)xr : -1);
+      const unsigned bank = vbank(c, dst), header = c->vs ? vhdr(c, 0x11, -1, xr, -1) : 1;
       if (a->op == nir_op_ishr)
-         put(c, raw, g5p_usc_binary_literal(raw, G5P_BIN_ISHR, 2 * dst, s, 2 * xr, bank, gx, header, false, -1),
+         put(c, raw, g5p_usc_binary_literal(raw, G5P_BIN_ISHR, H(c, dst), s, H(c, xr), bank, gx, header, false, -1),
              "ishr literal");
       else
-         put(c, raw, g5p_usc_shift(raw, a->op == nir_op_ishl, 2 * dst, 2 * xr, s, true, bank, gx, 1, header),
+         put(c, raw, g5p_usc_shift(raw, a->op == nir_op_ishl, H(c, dst), H(c, xr), s, true, bank, gx, 1, header),
              "immediate shift");
       define(c, &a->def, dst);
       return;
@@ -2961,36 +3026,39 @@ static void emit_unary_like(struct gctx *c, nir_alu_instr *a)
    unsigned n;
    /* Repeated reads: convert (B slot) ext 4 + header 0x40, unary (A) ext 4. */
    unsigned cx = g ? 0 : 4, ch = g ? 1 : 0x41;
+   /* the vertex unary form: the source in A */
+   const unsigned uh = c->vs ? vhdr(c, 0x21, xr, -1, -1) : 1;
    switch (a->op) {
    /* vertex (v_f2i, v_f2u, v_f2i_rr: tools/g5p-1b-dgl/vs-canary/vsops2-probes.py): bank 1, header 0x11, the
     * source group 1 on the last read, no extension, as v_base's u2f32 */
    case nir_op_f2i32:
-      n = c->vs ? g5p_usc_convert(raw, G5P_F2I32, 2 * dst, 2 * xr, c->vs, g, 0x11)
-                : g5p_usc_convert2(raw, G5P_F2I32, 2 * dst, 2 * xr, 0, g, ch, cx, 0);
+      n = c->vs ? g5p_usc_convert(raw, G5P_F2I32, H(c, dst), H(c, xr), vbank(c, dst), g, vhdr(c, 0x11, -1, xr, -1))
+                : g5p_usc_convert2(raw, G5P_F2I32, H(c, dst), H(c, xr), 0, g, ch, cx, 0);
       break;
    case nir_op_f2u32:
-      n = c->vs ? g5p_usc_convert(raw, G5P_F2U32, 2 * dst, 2 * xr, c->vs, g, 0x11)
-                : g5p_usc_convert2(raw, G5P_F2U32, 2 * dst, 2 * xr, 0, g, ch, cx, 0);
+      n = c->vs ? g5p_usc_convert(raw, G5P_F2U32, H(c, dst), H(c, xr), vbank(c, dst), g, vhdr(c, 0x11, -1, xr, -1))
+                : g5p_usc_convert2(raw, G5P_F2U32, H(c, dst), H(c, xr), 0, g, ch, cx, 0);
       break;
    case nir_op_i2f32: /* vertex (v_i2f): bank 1, header 0x10 (B) */
-      n = g5p_usc_convert2(raw, G5P_I2F32, 2 * dst, 2 * xr, c->vs, g, ch | (c->vs ? 0x10 : 0), cx, 0);
+      n = g5p_usc_convert2(raw, G5P_I2F32, H(c, dst), H(c, xr), vbank(c, dst), g, ch | (vbank(c, xr) ? VS_B : 0),
+                           cx, 0);
       break;
    case nir_op_u2f32:
       /* v_base: u2f32 in the vertex stage uses header 0x11. */
-      n = c->vs ? g5p_usc_convert(raw, G5P_U2F32, 2 * dst, 2 * xr, c->vs, g, 0x11)
-                : g5p_usc_convert2(raw, G5P_U2F32, 2 * dst, 2 * xr, 0, g, ch, cx, 0);
+      n = c->vs ? g5p_usc_convert(raw, G5P_U2F32, H(c, dst), H(c, xr), vbank(c, dst), g, vhdr(c, 0x11, -1, xr, -1))
+                : g5p_usc_convert2(raw, G5P_U2F32, H(c, dst), H(c, xr), 0, g, ch, cx, 0);
       break;
    case nir_op_ffloor: /* vertex (v_floor): bank 1, header 0x20 (A) */
-      n = g5p_usc_unary2(raw, G5P_FLOOR, 2 * dst, 2 * xr, c->vs, g, c->vs ? 0x21 : 1, false, cx, 0, false);
+      n = g5p_usc_unary2(raw, G5P_FLOOR, H(c, dst), H(c, xr), vbank(c, dst), g, uh, false, cx, 0, false);
       break;
    case nir_op_flog2: /* vertex (v_log2): bank 1, header 0x20 (A) */
-      n = g5p_usc_unary2(raw, G5P_LOG2, 2 * dst, 2 * xr, c->vs, g, c->vs ? 0x21 : 1, false, cx, 0, false);
+      n = g5p_usc_unary2(raw, G5P_LOG2, H(c, dst), H(c, xr), vbank(c, dst), g, uh, false, cx, 0, false);
       break;
    case nir_op_fexp2: /* vertex (v_exp2) */
-      n = g5p_usc_unary2(raw, G5P_EXP2, 2 * dst, 2 * xr, c->vs, g, c->vs ? 0x21 : 1, false, cx, 0, false);
+      n = g5p_usc_unary2(raw, G5P_EXP2, H(c, dst), H(c, xr), vbank(c, dst), g, uh, false, cx, 0, false);
       break;
    case nir_op_inot: /* vertex (v_inot32): bank 1, header 0x20 (A) */
-      n = g5p_usc_unary2(raw, G5P_NOT, 2 * dst, 2 * xr, c->vs, g, c->vs ? 0x21 : 1, false, cx, 0, false);
+      n = g5p_usc_unary2(raw, G5P_NOT, H(c, dst), H(c, xr), vbank(c, dst), g, uh, false, cx, 0, false);
       break;
    case nir_op_bit_count: n = g5p_usc_unary2(raw, G5P_POPCOUNT, 2 * dst, 2 * xr, 0, g, 1, false, cx, 0, false); break;
    default: n = g5p_usc_unary2(raw, G5P_BITREVERSE, 2 * dst, 2 * xr, 0, g, 1, false, cx, 0, false); break;
@@ -3100,17 +3168,18 @@ static bool vs_mul_literal(struct gctx *c, nir_alu_instr *a, struct ref x, uint3
          unsigned sh = MIN2(pend, 4), dst = acc_is_x ? alloc_reg(c, -1) : acc;
          /* x is read again by the adds; the partial product is rewritten in place. */
          unsigned g = acc_is_x ? vgrp(c, x) : 1;
-         put(c, raw, g5p_usc_shl_literal(raw, 2 * dst, 2 * acc, 1, g, sh), "shift-add");
+         vs_bank1_only(c, "vertex shift-add", acc, -1, -1, -1);
+         put(c, raw, g5p_usc_shl_literal(raw, H(c, dst), H(c, acc), vbank(c, dst), g, sh), "shift-add");
          acc = dst;
          acc_is_x = false;
          pend -= sh;
       }
       if (b >= 0) {
-         struct g5p_alu f = G5P_ALU(2 * acc);
-         f.bank = 1;
-         f.header = 0x31;
-         f.a = gsrc(xr, (struct ref){0}, vgrp(c, x));
-         f.b = gsrc(acc, (struct ref){0}, 1);
+         struct g5p_alu f = G5P_ALU(H(c, acc));
+         f.bank = vbank(c, acc);
+         f.header = vhdr(c, 0x31, xr, acc, -1);
+         f.a = gsrc(c, xr, (struct ref){0}, vgrp(c, x));
+         f.b = gsrc(c, acc, (struct ref){0}, 1);
          put(c, raw, g5p_usc_binary(raw, G5P_BIN_IADD, &f), "iadd");
       }
    }
@@ -3138,7 +3207,8 @@ static void vs_bitwise(struct gctx *c, nir_alu_instr *a)
       unsigned xr = reg_of(c, x, "vertex bitwise literal");
       unsigned g = vgrp(c, x);
       unsigned dst = vs_dst(c, &x, 1);
-      put(c, raw, g5p_usc_binary_literal2(raw, bop, 2 * dst, k, 2 * xr, 1, g, 0x11, G5P_LIT_U32, -1, 0, 0, false),
+      put(c, raw, g5p_usc_binary_literal2(raw, bop, H(c, dst), k, H(c, xr), vbank(c, dst), g, vhdr(c, 0x11, -1, xr, -1),
+                                          G5P_LIT_U32, -1, 0, 0, false),
           "vertex bitwise literal");
       c->p->evidence |= PCO_G5P_EV_VS_ALU;
       define(c, &a->def, dst);
@@ -3155,11 +3225,11 @@ static void vs_bitwise(struct gctx *c, nir_alu_instr *a)
    unsigned ga = vgrp(c, r[ia]), gb = vgrp(c, r[ib]);
    free_dying(c, r, 2);
    unsigned dst = alloc_reg(c, d0 ? (int)reg[0] : d1 ? (int)reg[1] : -1);
-   struct g5p_alu f = G5P_ALU(2 * dst);
-   f.bank = 1;
-   f.header = 0x31;
-   f.a = gsrc(reg[ia], (struct ref){0}, ga);
-   f.b = gsrc(reg[ib], (struct ref){0}, gb);
+   struct g5p_alu f = G5P_ALU(H(c, dst));
+   f.bank = vbank(c, dst);
+   f.header = vhdr(c, 0x31, reg[ia], reg[ib], -1);
+   f.a = gsrc(c, reg[ia], (struct ref){0}, ga);
+   f.b = gsrc(c, reg[ib], (struct ref){0}, gb);
    put(c, raw, g5p_usc_binary(raw, bop, &f), nir_op_infos[a->op].name);
    c->p->evidence |= PCO_G5P_EV_VS_ALU;
    define(c, &a->def, dst);
@@ -3188,7 +3258,8 @@ static void vs_minsub(struct gctx *c, nir_alu_instr *a)
       unsigned xr = reg_of(c, x, name);
       unsigned g = vgrp(c, x);
       unsigned dst = vs_dst(c, &x, 1);
-      put(c, raw, g5p_usc_isub_literal(raw, 2 * dst, 0, 2 * xr, 1, g, 0x11), "ineg");
+      put(c, raw, g5p_usc_isub_literal(raw, H(c, dst), 0, H(c, xr), vbank(c, dst), g, vhdr(c, 0x11, -1, xr, -1)),
+          "ineg");
       define(c, &a->def, dst);
       return;
    }
@@ -3202,12 +3273,14 @@ static void vs_minsub(struct gctx *c, nir_alu_instr *a)
       unsigned g = vgrp(c, x);
       unsigned dst = vs_dst(c, &x, 1);
       unsigned n;
-      if (sub && i == 1)
-         n = g5p_usc_iadd_literal(raw, 2 * dst, -k, 2 * xr, 1, g);
+      if (sub && i == 1) {
+         vs_bank1_only(c, "vertex iadd literal", xr, -1, -1, -1);
+         n = g5p_usc_iadd_literal(raw, H(c, dst), -k, H(c, xr), vbank(c, dst), g);
+      }
       else if (sub)
-         n = g5p_usc_isub_literal(raw, 2 * dst, k, 2 * xr, 1, g, 0x11);
+         n = g5p_usc_isub_literal(raw, H(c, dst), k, H(c, xr), vbank(c, dst), g, vhdr(c, 0x11, -1, xr, -1));
       else
-         n = g5p_usc_minmax_literal(raw, mop, 2 * dst, k, 2 * xr, 1, g, 0x11);
+         n = g5p_usc_minmax_literal(raw, mop, H(c, dst), k, H(c, xr), vbank(c, dst), g, vhdr(c, 0x11, -1, xr, -1));
       put(c, raw, n, sub && i == 1 ? "isub literal (iadd)" : sub ? "isub literal" : "min/max literal");
       define(c, &a->def, dst);
       return;
@@ -3220,9 +3293,12 @@ static void vs_minsub(struct gctx *c, nir_alu_instr *a)
       unsigned xr = reg_of(c, x, name);
       unsigned g = vgrp(c, x);
       unsigned dst = vs_dst(c, &x, 1);
-      unsigned n = sub ? g5p_usc_alu_shared(raw, G5P_BIN_ISUB, 2 * dst, sd, 2 * xr, 1, g, 0x11, 0, 0, false,
+      vs_bank1_only(c, sub ? "vertex shared isub" : "vertex shared min/max", dst, xr, -1, -1);
+      unsigned n = sub ? g5p_usc_alu_shared(raw, G5P_BIN_ISUB, H(c, dst), sd, H(c, xr), vbank(c, dst), g,
+                                            vhdr(c, 0x11, -1, xr, -1), 0, 0, false,
                                             i ? 0x70 : -1, 1)
-                       : g5p_usc_minmax_shared(raw, mop, 2 * dst, sd, 2 * xr, 1, g, 0x11, 1);
+                       : g5p_usc_minmax_shared(raw, mop, H(c, dst), sd, H(c, xr), vbank(c, dst), g,
+                                               vhdr(c, 0x11, -1, xr, -1), 1);
       put(c, raw, n, sub ? "shared isub" : "shared min/max");
       define(c, &a->def, dst);
       return;
@@ -3234,11 +3310,11 @@ static void vs_minsub(struct gctx *c, nir_alu_instr *a)
    unsigned ga = vgrp(c, r[ia]), gb = vgrp(c, r[ib]);
    free_dying(c, r, 2);
    unsigned dst = alloc_reg(c, d0 ? (int)reg[0] : d1 ? (int)reg[1] : -1);
-   struct g5p_alu f = G5P_ALU(2 * dst);
-   f.bank = 1;
-   f.header = 0x31;
-   f.a = gsrc(reg[ia], (struct ref){0}, ga);
-   f.b = gsrc(reg[ib], (struct ref){0}, gb);
+   struct g5p_alu f = G5P_ALU(H(c, dst));
+   f.bank = vbank(c, dst);
+   f.header = vhdr(c, 0x31, reg[ia], reg[ib], -1);
+   f.a = gsrc(c, reg[ia], (struct ref){0}, ga);
+   f.b = gsrc(c, reg[ib], (struct ref){0}, gb);
    put(c, raw, sub ? g5p_usc_binary(raw, G5P_BIN_ISUB, &f) : g5p_usc_minmax(raw, mop, &f), name);
    define(c, &a->def, dst);
 }
@@ -3252,7 +3328,8 @@ static void vs_int(struct gctx *c, nir_alu_instr *a)
       unsigned xr = reg_of(c, r[0], "not");
       unsigned g = vgrp(c, r[0]);
       unsigned dst = vs_dst(c, r, 1);
-      put(c, raw, g5p_usc_unary2(raw, G5P_NOT, 2 * dst, 2 * xr, 1, g, 0x21, false, 0, 0, false), "not");
+      put(c, raw, g5p_usc_unary2(raw, G5P_NOT, H(c, dst), H(c, xr), vbank(c, dst), g, vhdr(c, 0x21, xr, -1, -1), false,
+                                 0, 0, false), "not");
       define(c, &a->def, dst);
       return;
    }
@@ -3275,7 +3352,8 @@ static void vs_int(struct gctx *c, nir_alu_instr *a)
          unsigned xr = reg_of(c, x, "iadd literal");
          unsigned g = vgrp(c, x);
          unsigned dst = vs_dst(c, &x, 1);
-         put(c, raw, g5p_usc_iadd_literal(raw, 2 * dst, k, 2 * xr, 1, g), "iadd literal");
+         vs_bank1_only(c, "vertex iadd literal", xr, -1, -1, -1);
+         put(c, raw, g5p_usc_iadd_literal(raw, H(c, dst), k, H(c, xr), vbank(c, dst), g), "iadd literal");
          define(c, &a->def, dst);
          return;
       }
@@ -3292,7 +3370,8 @@ static void vs_int(struct gctx *c, nir_alu_instr *a)
       unsigned xr = reg_of(c, x, "shift");
       unsigned g = vgrp(c, x);
       unsigned dst = vs_dst(c, &x, 1);
-      put(c, raw, g5p_usc_shl_literal(raw, 2 * dst, 2 * xr, 1, g, shift), "shift-add");
+      vs_bank1_only(c, "vertex shift-add", xr, -1, -1, -1);
+      put(c, raw, g5p_usc_shl_literal(raw, H(c, dst), H(c, xr), vbank(c, dst), g, shift), "shift-add");
       define(c, &a->def, dst);
       return;
    }
@@ -3306,11 +3385,11 @@ static void vs_int(struct gctx *c, nir_alu_instr *a)
       unsigned kr = scratch_imm(c, 1u << s);
       unsigned g = vgrp(c, r[0]);
       unsigned dst = vs_dst(c, r, 1);
-      struct g5p_alu f = G5P_ALU(2 * dst);
-      f.bank = 1;
-      f.header = 0x31;
-      f.a = gsrc(kr, (struct ref){0}, 1);
-      f.b = gsrc(xr, r[0], g);
+      struct g5p_alu f = G5P_ALU(H(c, dst));
+      f.bank = vbank(c, dst);
+      f.header = vhdr(c, 0x31, kr, xr, -1);
+      f.a = gsrc(c, kr, (struct ref){0}, 1);
+      f.b = gsrc(c, xr, r[0], g);
       put(c, raw, g5p_usc_binary(raw, G5P_BIN_IMUL, &f), "imul");
       define(c, &a->def, dst);
       return;
@@ -3323,7 +3402,9 @@ static void vs_int(struct gctx *c, nir_alu_instr *a)
       unsigned xr = reg_of(c, x, "shared integer ALU");
       unsigned g = vgrp(c, x);
       unsigned dst = vs_dst(c, &x, 1);
-      put(c, raw, g5p_usc_alu_shared(raw, op, 2 * dst, sd, 2 * xr, 1, g, 0x11, 0, 0, false, -1, 1),
+      vs_bank1_only(c, "vertex shared integer ALU", dst, xr, -1, -1);
+      put(c, raw, g5p_usc_alu_shared(raw, op, H(c, dst), sd, H(c, xr), vbank(c, dst), g, vhdr(c, 0x11, -1, xr, -1), 0,
+                                     0, false, -1, 1),
           "shared integer ALU");
       define(c, &a->def, dst);
       return;
@@ -3334,11 +3415,11 @@ static void vs_int(struct gctx *c, nir_alu_instr *a)
    unsigned ga = vgrp(c, r[ia]), gb = vgrp(c, r[ib]);
    free_dying(c, r, 2);
    unsigned dst = alloc_reg(c, d0 ? (int)reg[0] : d1 ? (int)reg[1] : -1);
-   struct g5p_alu f = G5P_ALU(2 * dst);
-   f.bank = 1;
-   f.header = 0x31;
-   f.a = gsrc(reg[ia], (struct ref){0}, ga);
-   f.b = gsrc(reg[ib], (struct ref){0}, gb);
+   struct g5p_alu f = G5P_ALU(H(c, dst));
+   f.bank = vbank(c, dst);
+   f.header = vhdr(c, 0x31, reg[ia], reg[ib], -1);
+   f.a = gsrc(c, reg[ia], (struct ref){0}, ga);
+   f.b = gsrc(c, reg[ib], (struct ref){0}, gb);
    put(c, raw, g5p_usc_binary(raw, op, &f), nir_op_infos[a->op].name);
    define(c, &a->def, dst);
 }
@@ -3365,14 +3446,16 @@ static void vs_store(struct gctx *c, nir_intrinsic_instr *in)
       unsigned oreg = reg_of(c, off, "store offset");
       unsigned og = vgrp(c, off);
       unsigned addr = alloc_run(c, 2, "store address");
-      put(c, raw, g5p_usc_address_add(raw, 2 * addr, c->xfb_common + PCO_G5P_XFB_ADDR(b), 1, 2 * oreg, og, 0),
+      vs_bank1_only(c, "transform feedback address add", addr, addr + 1, oreg, -1);
+      put(c, raw, g5p_usc_address_add(raw, H(c, addr), c->xfb_common + PCO_G5P_XFB_ADDR(b), 1, H(c, oreg), og, 0),
           "address add");
       c->st_base[i].pair = addr;
       c->reserved |= BITFIELD_RANGE(addr, 2);
    }
    struct ref r = resolve_value(c, in->src[0].ssa, 0);
    unsigned data = reg_of(c, r, "store data");
-   put(c, raw, g5p_usc_global_store(raw, 4, 2 * data, 2 * c->st_base[i].pair, k), "store");
+   vs_bank1_only(c, "transform feedback store", data, -1, -1, -1);
+   put(c, raw, g5p_usc_global_store(raw, 4, H(c, data), H(c, c->st_base[i].pair), k), "store");
    c->reserved |= BITFIELD_BIT(data);
    c->p->evidence |= PCO_G5P_EV_VS_STORE;
 }
@@ -3517,6 +3600,8 @@ static void emit_dyn_ubo(struct gctx *c, nir_intrinsic_instr *in)
       if (c->uptr[i].set == set && c->uptr[i].binding == binding && c->uptr[i].base == base)
          common = c->uptr[i].common;
    unsigned index = reg_of(c, ix, "register-indexed UBO load index");
+   if (c->vs)
+      vs_bank1_only(c, "vertex register-indexed UBO load", index, -1, -1, -1);
    bool kill = dies(c, ix);
    /* Registers are read at issue: like Apple's v_cexpr (index r0 -> pair
     * r0:r1 -> data r0..r3), the pair may take a dying index's register and
@@ -3584,6 +3669,7 @@ static void stage_ssbo_store(struct gctx *c,nir_intrinsic_instr *in)
    for(unsigned i=0;i<c->nssbo;i++)if(c->ssbo_set[i]==set && c->ssbo_binding[i]==binding)base=2*i;
    struct ref offset=resolve_value(c,in->src[2].ssa,0),value=resolve_value(c,in->src[0].ssa,0);
    unsigned index=reg_of(c,offset,"store_ssbo byte offset"),data=reg_of(c,value,"store_ssbo value");
+   if(c->vs)vs_bank1_only(c,"vertex SSBO store",index,data,-1,-1);
    unsigned pair;
    for(pair=0;pair+2<=NUM_DWORDS;pair+=2)
       if(!((c->busy|c->reserved)&BITFIELD_RANGE(pair,2)))break;
@@ -3851,7 +3937,7 @@ static void emit_tex_ext(struct gctx *c, nir_tex_instr *t)
       scratch |= BITFIELD_BIT(l);
       struct g5p_alu f = G5P_ALU(2 * l);
       f.result_half = true;
-      f.a = gsrc(lr, r, gl);
+      f.a = gsrc(c, lr, r, gl);
       f.b = (struct g5p_src){.half = 2 * one, .group = g1};
       alu_hint(c, &f, false);
       put(c, raw, g5p_usc_binary(raw, G5P_BIN_FMUL, &f), "level/bias f32 -> f16");
@@ -3993,9 +4079,9 @@ static void vs_converts(struct gctx *c, struct vs_convert *cv, unsigned n)
       if (cv[i].fmt == PCO_G5P_VSF_F16) {
          if (!last_half)
             refuse(c, "an f16 vertex input half read twice (no probe)");
-         m = g5p_usc_half_to_float(raw, 2 * dst, half, 1, 1, 0x11);
+         m = g5p_usc_half_to_float(raw, H(c, dst), half, vbank(c, dst), 1, 0x11);
       } else {
-         m = g5p_usc_convert_small(raw, cv[i].fmt, 2 * dst, half, cv[i].byte & 1, 1, last_half,
+         m = g5p_usc_convert_small(raw, cv[i].fmt, H(c, dst), half, cv[i].byte & 1, vbank(c, dst), last_half,
                                    last_half ? 0x11 : 0x51, last_half ? 0 : 4);
       }
       put(c, raw, m, "vertex input convert");
@@ -4446,8 +4532,12 @@ static void vs_output(struct gctx *c)
    if (!n)
       refuse(c, "no final vertex output");
    util_qsort_r(order, n, sizeof(order[0]), vout_order, c);
+   /* Apple's vertex outputs read bank 1 (888 of them in the bank probes and
+    * the vertex probe sets; none reads a bank-0-only value). */
+   for (unsigned i = 0; i < n; i++)
+      vs_bank1_only(c, "vertex output", reg[order[i]], -1, -1, -1);
    for (unsigned i = 0; i + 1 < n; i++)
-      put(c, raw, g5p_usc_vout(raw, 2 * reg[order[i]], c->vout[order[i]].slot, true, false), "vertex output");
+      put(c, raw, g5p_usc_vout(raw, H(c, reg[order[i]]), c->vout[order[i]].slot, true, false), "vertex output");
    /* Characterized convention: branch to the 64-byte block holding the
     * final output/end-task, padding in between. */
    unsigned target = align(c->size + 6, 64);
@@ -4455,7 +4545,7 @@ static void vs_output(struct gctx *c)
    while (c->size < target)
       put(c, raw, g5p_usc_special(raw, false), "padding");
    unsigned last = order[n - 1];
-   put(c, raw, g5p_usc_vout(raw, 2 * reg[last], c->vout[last].slot, true, true), "last vertex output");
+   put(c, raw, g5p_usc_vout(raw, H(c, reg[last]), c->vout[last].slot, true, true), "last vertex output");
 }
 
 /* Eager vertex outputs whose value instruction idx just produced. */
@@ -4463,9 +4553,11 @@ static void eager_outputs(struct gctx *c, int idx)
 {
    uint8_t raw[G5P_USC_MAX];
    for (unsigned i = 0; i < c->nvout; i++)
-      if (c->vout[i].at == idx)
-         put(c, raw, g5p_usc_vout(raw, 2 * reg_of(c, c->vout[i].r, "vertex output"), c->vout[i].slot, true, false),
-             "vertex output");
+      if (c->vout[i].at == idx) {
+         unsigned r = reg_of(c, c->vout[i].r, "vertex output");
+         vs_bank1_only(c, "vertex output", r, -1, -1, -1);
+         put(c, raw, g5p_usc_vout(raw, H(c, r), c->vout[i].slot, true, false), "vertex output");
+      }
 }
 
 /* fsat folds into a single-use fadd/fsub/fmul/ffma producer. Not in the
