@@ -417,12 +417,15 @@ xfb_captures(const nir_shader *nir, gl_varying_slot slot)
 
 /* The graphics lowerings of a prepared stage (the ICD's graphics_nir()) */
 static nir_shader *
-graphics_lower(nir_shader *nir, unsigned color_targets, bool *sample_mask, bool point_size)
+graphics_lower(nir_shader *nir, unsigned color_targets, bool *sample_mask, bool point_size, bool *psize_dropped)
 {
    const mesa_shader_stage stage = nir ? nir->info.stage : MESA_SHADER_NONE;
 
    if (nir && stage == MESA_SHADER_VERTEX && !point_size && !xfb_captures(nir, VARYING_SLOT_PSIZ) &&
        nir_shader_intrinsics_pass(nir, drop_point_size, nir_metadata_control_flow, NULL)) {
+      /* polygon mode POINT needs to know (pco_g5p_program::psize_dropped) */
+      if (psize_dropped)
+         *psize_dropped = true;
       nir->info.outputs_written &= ~BITFIELD64_BIT(VARYING_SLOT_PSIZ);
       nir_opt_dce(nir);
       nir_index_ssa_defs(nir_shader_get_entrypoint(nir));
@@ -458,9 +461,9 @@ graphics_lower(nir_shader *nir, unsigned color_targets, bool *sample_mask, bool 
 
 static nir_shader *
 graphics_nir(const uint32_t *spv, size_t words, mesa_shader_stage stage, const char *entry, unsigned color_targets,
-             bool *sample_mask, bool point_size)
+             bool *sample_mask, bool point_size, bool *psize_dropped)
 {
-   return graphics_lower(g5p_nir(spv, words, stage, entry), color_targets, sample_mask, point_size);
+   return graphics_lower(g5p_nir(spv, words, stage, entry), color_targets, sample_mask, point_size, psize_dropped);
 }
 
 /* Vertex system values: the hardware index the PDS writes is the draw's
@@ -604,9 +607,11 @@ compile_stage(const VkPipelineShaderStageCreateInfo *stage_info, bool half_outpu
    const unsigned color_targets = key && key->color_targets ? key->color_targets : 1;
    bool sample_mask = false;
    const bool point_size = stage == MESA_SHADER_VERTEX && link && link->point_size;
+   bool psize_dropped = false;
    nir_shader *nir = internal ? graphics_lower(g5p_nir_prepare(nir_shader_clone(NULL, internal)), color_targets,
-                                               &sample_mask, point_size)
-                              : graphics_nir(spv, bytes / 4, stage, entry, color_targets, &sample_mask, point_size);
+                                               &sample_mask, point_size, &psize_dropped)
+                              : graphics_nir(spv, bytes / 4, stage, entry, color_targets, &sample_mask, point_size,
+                                             &psize_dropped);
    bool ok = false;
    if (!nir) {
       snprintf(out->refusal, sizeof(out->refusal), "SPIR-V -> NIR failed");
@@ -625,6 +630,7 @@ compile_stage(const VkPipelineShaderStageCreateInfo *stage_info, bool half_outpu
       if (stage == MESA_SHADER_VERTEX)
          vs_sysvals(nir);
       ok = pco_g5p_compile_general_link(nir, half_output, vertex ? vertex->components : NULL, key, link, out);
+      out->psize_dropped = psize_dropped;
    }
    ralloc_free(nir);
    glsl_type_singleton_decref();
@@ -693,7 +699,7 @@ pvr_g5p_compile_load(struct pco_g5p_program *out)
    nir_store_var(&b, color, texel, 0xf);
 
    bool sample_mask = false; /* the load program reads no sample mask */
-   nir_shader *nir = graphics_lower(g5p_nir_prepare(b.shader), 1, &sample_mask, false);
+   nir_shader *nir = graphics_lower(g5p_nir_prepare(b.shader), 1, &sample_mask, false, NULL);
    /* Apple's source groups, as every pipeline's fragment program (g5p_check_state()): 1 only on a register's last
     * read. The default, 1 on every read, returns a wrong value on a re-read: the LOAD probe's texelFetch wrote only
     * output component 0 (B G R A = 0 0 R 0). */

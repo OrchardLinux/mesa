@@ -453,8 +453,18 @@ g5p_check_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo *c
 
    if (s->shader_stages != (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT) || s->ts)
       return G5P_REFUSE(device, "shader stages %#x (a vertex and a fragment shader)", s->shader_stages);
-   if (s->rs && (s->rs->depth_clamp_enable || s->rs->polygon_mode != VK_POLYGON_MODE_FILL))
+   if (s->rs && (s->rs->depth_clamp_enable ||
+                 (s->rs->polygon_mode != VK_POLYGON_MODE_FILL && !pvr_g5p_polygon_mode_probe())))
       return G5P_REFUSE(device, "depth clamp or polygon mode %d", s->rs->polygon_mode);
+   /* line and point fill (PVR_G5P_POLYGON_MODE=probe): the qualified scope only */
+   if (s->rs && s->rs->polygon_mode != VK_POLYGON_MODE_FILL) {
+      if (s->rs->polygon_mode != VK_POLYGON_MODE_LINE && s->rs->polygon_mode != VK_POLYGON_MODE_POINT)
+         return G5P_REFUSE(device, "polygon mode %d", s->rs->polygon_mode);
+      if (s->rs->depth_bias.enable || BITSET_TEST(s->dynamic, MESA_VK_DYNAMIC_RS_DEPTH_BIAS_ENABLE))
+         return G5P_REFUSE(device, "polygon offset with line or point fill is not qualified");
+      if (BITSET_TEST(s->dynamic, MESA_VK_DYNAMIC_RS_POLYGON_MODE))
+         return G5P_REFUSE(device, "dynamic polygon mode");
+   }
    if (s->rs && (s->rs->line.mode != VK_LINE_RASTERIZATION_MODE_DEFAULT || s->rs->line.stipple.enable))
       return G5P_REFUSE(device, "line rasterization mode %d, stipple %d", s->rs->line.mode,
                         s->rs->line.stipple.enable);
@@ -575,6 +585,7 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
     * topology class is fixed per pipeline even when the topology is dynamic */
    link.point_size = s->ia && s->ia->primitive_topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
    g->vs_point_size = link.point_size;
+   g->polygon_mode = s->rs ? s->rs->polygon_mode : VK_POLYGON_MODE_FILL;
    for (unsigned i = 0; i < fs->num_varyings; i++)
       link.interp[fs->vary[i].location] = fs->vary[i].interp;
    /* the transform feedback variant (pvr_g5p_xfb.h): the capturing vertex program */
@@ -583,6 +594,10 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
       return G5P_REFUSE(device, "vertex shader%s: %s", g->xfb_variant ? " (transform feedback)" : "", vs->refusal);
    if (g->xfb_variant && !g->xfb_layout.buffers)
       return VK_SUCCESS; /* captures nothing: no variant */
+   /* point fill rasterizes ISP points of one size per draw (pointlinewidth): a per-vertex
+    * gl_PointSize would be ignored, so it is refused rather than drawn at 1.0 */
+   if (g->polygon_mode == VK_POLYGON_MODE_POINT && vs->psize_dropped)
+      return G5P_REFUSE(device, "polygon mode point with the vertex program's gl_PointSize");
    for (unsigned i = 0; i < fs->num_varyings; i++)
       if (!vs->vout_dword[fs->vary[i].location])
          return G5P_REFUSE(device, "the fragment program reads VAR%u, which the vertex program does not write",
@@ -1573,10 +1588,21 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
       pvr_arch_g5p_blend_isp(g->fs_blend_mode, g->fs_discard, g->fs_write_mask, discard, &isp);
       const enum ROGUE_TA_PASSTYPE pass = isp.pass_type;
       /* points rasterize as sprites (g3b-points: SPRITE_01UV, front and back) */
+      /* triangles in line/point polygon mode: AGXMetalA9 encodeISPPrimitiveType
+       * 0x207d66360 picks LINE_FILLED_TRIANGLE (fill mode 1) or
+       * POINT_FILLED_TRIANGLE (2) for triangle primitives; its
+       * encodeAndEmitRenderState 0x207d67814 sets pointlinewidth from the line
+       * width, or for point fill from a point size, as width * 16 - 1 */
+      const bool tri_fill_mode = !lines && !g->vs_point_size && g->polygon_mode != VK_POLYGON_MODE_FILL;
       const enum ROGUE_TA_OBJTYPE objtype = g->vs_point_size ? ROGUE_TA_OBJTYPE_SPRITE_01UV
                                             : lines         ? ROGUE_TA_OBJTYPE_LINE
-                                                            : ROGUE_TA_OBJTYPE_TRIANGLE;
-      uint32_t lw = util_unsigned_fixed(dyn->rs.line.width, 4);
+                                            : !tri_fill_mode ? ROGUE_TA_OBJTYPE_TRIANGLE
+                                            : g->polygon_mode == VK_POLYGON_MODE_LINE ? ROGUE_TA_OBJTYPE_LINE_FILLED_TRIANGLE
+                                                                                       : ROGUE_TA_OBJTYPE_POINT_FILLED_TRIANGLE;
+      /* point fill: the vertex program writes no gl_PointSize (refused at
+       * pipeline creation), so the points are 1.0 (Vulkan's default) */
+      const float width = tri_fill_mode && g->polygon_mode == VK_POLYGON_MODE_POINT ? 1.0f : dyn->rs.line.width;
+      uint32_t lw = util_unsigned_fixed(width, 4);
       lw = MIN2(lw ? lw - 1 : 0, 255);
       pvr_csb_pack (&w[0], TA_STATE_HEADER, h) {
          h.pres_ispctl = true;
@@ -1623,12 +1649,14 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
       ctl.upass = isp.upass ? pvr_g5p_msaa_upass(g->samples) : 0;
       ctl.tagwritedisable = isp.tag_write_disable;
       ROGUE_TA_STATE_ISPCTL_pack(&w[1], &ctl);
-      /* ... with the sprite object type of a point pipeline */
-      if (ds_aspects && g->vs_point_size) {
+      /* ... with the sprite object type of a point pipeline, or a triangle's fill mode */
+      if (ds_aspects && (g->vs_point_size || tri_fill_mode)) {
          for (unsigned k = 2; k <= 4; k += 2) {
             struct ROGUE_TA_STATE_ISPA a;
             ROGUE_TA_STATE_ISPA_unpack(&w[k], &a);
             a.objtype = objtype;
+            if (tri_fill_mode)
+               a.pointlinewidth = lw;
             ROGUE_TA_STATE_ISPA_pack(&w[k], &a);
          }
       }

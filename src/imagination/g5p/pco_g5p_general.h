@@ -203,6 +203,9 @@ struct pco_g5p_program {
     * scissor; a vertex program's draws run their vertices even when no
     * pixel is left (pvr_arch_g5p_gfx.c). */
    bool side_effects;
+   /* VS of a non-point pipeline: it wrote gl_PointSize, which was dropped
+    * (set by pvr_g5p_nir.c after compilation; polygon mode POINT refuses it) */
+   bool psize_dropped;
    char refusal[512];
 };
 

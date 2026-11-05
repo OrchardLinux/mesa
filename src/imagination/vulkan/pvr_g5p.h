@@ -17,6 +17,8 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 #include <vulkan/vulkan_core.h>
 
 #include "pvr_common.h"
@@ -165,6 +167,15 @@ struct pvr_g5p_upload {
  * draws, uploaded once, and what each draw's words derive from. The PDS
  * programs are pdsc's, the USC programs the G5P backend's.
  */
+/* PVR_G5P_POLYGON_MODE=probe: line and point polygon modes (plan row R8)
+ * qualification; fillModeNonSolid stays false otherwise */
+static inline bool
+pvr_g5p_polygon_mode_probe(void)
+{
+   const char *e = getenv("PVR_G5P_POLYGON_MODE");
+   return e && !strcmp(e, "probe");
+}
+
 struct pvr_g5p_pipeline {
    struct pvr_suballoc_bo *vs_usc, *fs_usc;
    uint32_t vs_usc_size, fs_usc_size;
@@ -204,6 +215,10 @@ struct pvr_g5p_pipeline {
    /* a point pipeline: the vertex program writes the point size after the
     * position (pco_g5p_vs_link::point_size) */
    bool vs_point_size;
+   /* polygon mode of a triangle pipeline (PVR_G5P_POLYGON_MODE=probe): the
+    * ISP object type, as AGXMetalA9 encodeISPPrimitiveType picks it from
+    * its triangle fill mode (desktop-gl-polygon-mode.md) */
+   VkPolygonMode polygon_mode;
    /* the fragment program's tile read (pco_g5p_program::blend_mode: 0 none)
     * and colour write mask, for the ISP pass type (pvr_g5p_blend.h) */
    unsigned fs_blend_mode;
