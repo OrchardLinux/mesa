@@ -188,6 +188,7 @@ struct pvr_g5p_pipeline {
     * g3b-basevertex), for draws with a first instance: only when the
     * program reads the instance index or a fetch is per instance */
    struct pvr_pds_upload fetch_base;
+   struct pvr_pds_upload fetch_indirect;
    /* static PPP blocks: the varying format (4 words) and the fragment
     * pointers and sizes (6 words) */
    struct pvr_suballoc_bo *static_vary, *static_frag;

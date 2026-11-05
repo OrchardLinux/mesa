@@ -289,7 +289,7 @@ fetch_reads_instance(const struct pvr_g5p_pipeline *g)
 }
 
 static unsigned
-fetch_program(uint32_t *dest, const struct pvr_g5p_pipeline *g, bool base_instance)
+fetch_program(uint32_t *dest, const struct pvr_g5p_pipeline *g, bool base_instance, bool indirect)
 {
    const struct pvr_g5p_fetch *list = g->fetch_list;
    const unsigned fetches = g->fetch_count, id_mask = g->vs_id_mask;
@@ -298,6 +298,9 @@ fetch_program(uint32_t *dest, const struct pvr_g5p_pipeline *g, bool base_instan
    const unsigned ndiv = fetch_divisors(g, div, slot);
    pdsc_init();
    pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-vertex-fetch");
+   /* A9's indirect base-instance variant reads persistent temporary 1
+    * (encoded selector 0xc1), not a CPU-specialized data constant. */
+   const pdsc_ref base = indirect ? pdsc_ref_ptemp32(1) : pdsc_ref_const32(fetch_base_instance(fetches));
    /* divisor k: t(2 + 2k) = t1 / d, then plus the base instance; t1 is
     * still the 0-based instance here. Apple's forms (our decode of
     * AGX::PDSEncoderGen1<>::EncodeVertexPDSProgram's step-rate path, which
@@ -317,10 +320,10 @@ fetch_program(uint32_t *dest, const struct pvr_g5p_pipeline *g, bool base_instan
          pdsc_shr64(p, pair, pair, 31 + divisor_shift(div[k]));
       }
       if (base_instance)
-         pdsc_add32(p, pdsc_ref_temp32(t), pdsc_ref_const32(fetch_base_instance(fetches)), pdsc_ref_temp32(t));
+         pdsc_add32(p, pdsc_ref_temp32(t), base, pdsc_ref_temp32(t));
    }
    if (base_instance)
-      pdsc_add32(p, pdsc_ref_temp32(1), pdsc_ref_const32(fetch_base_instance(fetches)), pdsc_ref_temp32(1));
+      pdsc_add32(p, pdsc_ref_temp32(1), base, pdsc_ref_temp32(1));
    for (unsigned f = 0; f < fetches; f++) {
       const unsigned c = f * 8;
       /* a per-instance fetch multiplies by the instance (Apple's s1=t1), a
@@ -328,7 +331,9 @@ fetch_program(uint32_t *dest, const struct pvr_g5p_pipeline *g, bool base_instan
       const unsigned t = list[f].rate == PVR_G5P_FETCH_INSTANCE           ? 1
                          : list[f].rate == PVR_G5P_FETCH_INSTANCE_DIVISOR ? 2 + 2 * slot[f]
                                                                           : 0;
-      pdsc_ddmad(p, pdsc_ref_const32(c + 6), pdsc_ref_temp32(t), pdsc_ref_const64(c), pdsc_ref_const64(c + 4));
+      const pdsc_ref index = indirect && list[f].rate == PVR_G5P_FETCH_INSTANCE_DIVISOR0 ?
+                               pdsc_ref_ptemp32(1) : pdsc_ref_temp32(t);
+      pdsc_ddmad(p, pdsc_ref_const32(c + 6), index, pdsc_ref_const64(c), pdsc_ref_const64(c + 4));
    }
    unsigned k = 0;
    u_foreach_bit (i, id_mask)
@@ -549,6 +554,7 @@ g5p_pipeline_free(struct pvr_device *device, struct pvr_g5p_pipeline *g)
    pvr_bo_suballoc_free(g->fs_usc);
    pvr_bo_suballoc_free(g->fetch.pvr_bo);
    pvr_bo_suballoc_free(g->fetch_base.pvr_bo);
+   pvr_bo_suballoc_free(g->fetch_indirect.pvr_bo);
    pvr_bo_suballoc_free(g->fs_launch.pvr_bo);
    pvr_bo_suballoc_free(g->varying.pvr_bo);
    pvr_bo_suballoc_free(g->fs_loader.pvr_bo);
@@ -721,16 +727,21 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
 
    /* PDS: vertex fetch code */
    uint32_t code[96], data[2 * (1 + PCO_G5P_MAX_FS_VARYINGS) + 4];
-   unsigned n = fetch_program(code, g, false);
+   unsigned n = fetch_program(code, g, false, false);
    result = pvr_gpu_upload_pds(device, NULL, 0, 0, code, n, 16, 64, &g->fetch);
    if (result != VK_SUCCESS)
       return result;
    if (fetch_reads_instance(g)) {
-      n = fetch_program(code, g, true);
+      n = fetch_program(code, g, true, false);
       result = pvr_gpu_upload_pds(device, NULL, 0, 0, code, n, 16, 64, &g->fetch_base);
       if (result != VK_SUCCESS)
          return result;
    }
+
+   n = fetch_program(code, g, fetch_reads_instance(g), true);
+   result = pvr_gpu_upload_pds(device, NULL, 0, 0, code, n, 16, 64, &g->fetch_indirect);
+   if (result != VK_SUCCESS)
+      return result;
 
    /* PDS: the fragment launch, data {DOUTU} and its code at +0x20 */
    {
@@ -1562,7 +1573,8 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
    uint32_t fdata[4 * 2 * PVR_G5P_MAX_FETCH + 8] = { 0 };
    /* a first instance takes the program that adds it to t1 */
    const bool base_instance = draw->first_instance && fetch_reads_instance(g);
-   const struct pvr_pds_upload *fetch_code = base_instance ? &g->fetch_base : &g->fetch;
+   const struct pvr_pds_upload *fetch_code = draw->indirect_addr ? &g->fetch_indirect :
+                                                 base_instance ? &g->fetch_base : &g->fetch;
    const unsigned fbytes = fetch_data_bytes(g, base_instance);
    if (base_instance)
       fdata[fetch_base_instance(g->fetch_count)] = draw->first_instance;
@@ -1590,13 +1602,13 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
          /* divisor 0: every instance reads the first instance's element */
          const bool divisor0 = fe->rate == PVR_G5P_FETCH_INSTANCE_DIVISOR0;
          const uint64_t base = vb->buffer->dev_addr.addr + vb->offset + fe->offset +
-                               (divisor0 ? (uint64_t)draw->first_instance * stride : 0);
+                               (divisor0 && !draw->indirect_addr ? (uint64_t)draw->first_instance * stride : 0);
          const uint64_t ctl = ddmad_src3(fe->dwords, fe->ao, f == g->fetch_count - 1);
          fdata[8 * f] = (uint32_t)base;
          fdata[8 * f + 1] = (uint32_t)(base >> 32);
          fdata[8 * f + 4] = (uint32_t)ctl;
          fdata[8 * f + 5] = (uint32_t)(ctl >> 32);
-         fdata[8 * f + 6] = divisor0 ? 0 : stride;
+         fdata[8 * f + 6] = divisor0 && !draw->indirect_addr ? 0 : stride;
       }
    }
    struct pvr_pds_upload fetch_data;

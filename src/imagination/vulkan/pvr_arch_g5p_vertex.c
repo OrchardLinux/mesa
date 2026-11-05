@@ -227,9 +227,9 @@ PVR_PER_ARCH(g5p_cmd_draw_indirect)(struct pvr_cmd_buffer *cmd_buffer, struct pv
        (count > 1 && (stride < size || stride % 4 ||
                      (uint64_t)(count - 1) * stride > buffer->vk.size - offset - size)))
       return G5P_REFUSE(cmd_buffer, "indirect graphics argument range/alignment");
-   /* drawIndirectFirstInstance is false. Valid Vulkan commands therefore
-    * have firstInstance == 0; no record-time host read is used to verify it.
-    * XFB's CPU resolve cannot account for unknown GPU counts and refuses.
+   /* The native VDM supplies firstInstance in PDS persistent temporary 1.
+    * The indirect vertex-fetch variant applies it on the GPU. XFB's CPU
+    * resolve cannot account for unknown GPU counts and refuses.
     */
    for (unsigned i = 0; i < count; i++) {
       const struct pvr_g5p_draw draw = {
