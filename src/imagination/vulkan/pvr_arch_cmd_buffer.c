@@ -9786,7 +9786,7 @@ void PVR_PER_ARCH(CmdDrawIndexedIndirect)(VkCommandBuffer commandBuffer,
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
 
    PVR_TRACE_BEGIN_DRAW(cmd_buffer, PVR_DRAW_INDEXED_INDIRECT);
-   PVR_G5P_HOOK(swgs_indexed_indirect_refuse)
+   PVR_G5P_HOOK(g5p_indexed_indirect)
    pvr_update_draw_state(state, &draw_state);
 
    result = pvr_validate_draw_state(cmd_buffer);
@@ -9830,7 +9830,7 @@ void PVR_PER_ARCH(CmdDrawIndirect)(VkCommandBuffer commandBuffer,
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
 
    PVR_TRACE_BEGIN_DRAW(cmd_buffer, PVR_DRAW_INDIRECT);
-   PVR_G5P_HOOK(swgs_indirect_refuse)
+   PVR_G5P_HOOK(g5p_indirect)
    pvr_update_draw_state(state, &draw_state);
 
    result = pvr_validate_draw_state(cmd_buffer);

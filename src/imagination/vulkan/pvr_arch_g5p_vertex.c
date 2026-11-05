@@ -16,6 +16,7 @@
 #include "vk_log.h"
 #include "vk_util.h"
 
+#include "pvr_bo.h"
 #include "pvr_buffer.h"
 #include "pvr_cmd_buffer.h"
 #include "pvr_csb.h"
@@ -113,5 +114,131 @@ PVR_PER_ARCH(g5p_vertex_index_list)(struct pvr_cmd_buffer *cmd_buffer, const str
     * index is gl_VertexIndex); else the first vertex */
    w[(*n)++] = draw->indexed ? (uint32_t)draw->vertex_offset : draw->first;
    w[(*n)++] = split;
+   return VK_SUCCESS;
+}
+
+/* Native A9 indirect INDEX_LIST: the VDM reads the Vulkan/Metal argument
+ * layout directly. Two 16-bit conditional links skip instanceCount == 0,
+ * avoiding the hardware's count-minus-one underflow. This is the protocol
+ * emitted by the A9 draw-indirect encoder, expressed with csbgen fields.
+ *
+ * Put the whole self-addressing block in a separate allocation and enter it
+ * with RETURN. Flattening a long main CSB must not relocate its branch
+ * targets. No PDS/USC program reads or rewrites the argument buffer.
+ */
+VkResult
+PVR_PER_ARCH(g5p_vertex_indirect)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_draw *draw,
+                                  uint32_t topology, uint32_t split, struct pvr_csb *csb)
+{
+   uint32_t words[14 + ROGUE_VDMCTRL_GUARD_SIZE_DEFAULT / 4] = { 0 };
+   struct pvr_suballoc_bo *bo;
+   VkResult result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, words, sizeof(words), &bo);
+   if (result != VK_SUCCESS)
+      return result;
+   const uint64_t va = bo->dev_addr.addr;
+   const unsigned end = draw->indexed ? 13 : 12;
+   /* Low half nonzero: go to the draw. Otherwise high half zero: skip it. */
+   for (unsigned c = 0; c < 2; c++) {
+      const uint64_t compare = draw->indirect_addr + 4 + 2 * c;
+      const uint64_t target = va + 4 * (c ? end : 8);
+      pvr_csb_pack (&words[4 * c], VDMCTRL_STREAM_LINK0, link) {
+         link.compare_present = true;
+         link.compare_mode = c ? 2 : 5;
+         link.link_addrmsb = PVR_DEV_ADDR(target);
+      }
+      pvr_csb_pack (&words[4 * c + 1], VDMCTRL_STREAM_LINK1, link) {
+         link.link_addrlsb = PVR_DEV_ADDR(target);
+      }
+      /* STREAM_LINK comparison address is 40-bit, 16-bit aligned. */
+      words[4 * c + 2] = compare >> 32;
+      words[4 * c + 3] = (uint32_t)compare & ~1u;
+   }
+   uint64_t index_va = 0;
+   unsigned isize = 4;
+   if (draw->indexed) {
+      const struct pvr_cmd_buffer_state *state = &cmd_buffer->state;
+      isize = vk_index_type_to_bytes(state->index_buffer_binding.type);
+      index_va = state->index_buffer_binding.buffer->dev_addr.addr + state->index_buffer_binding.offset;
+   }
+   unsigned n = 8;
+   pvr_csb_pack (&words[n++], VDMCTRL_INDEX_LIST0, list) {
+      list.indirect_addr_present = true;
+      list.split_count_present = true;
+      list.index_size = isize == 1 ? ROGUE_VDMCTRL_INDEX_SIZE_B8 :
+                        isize == 2 ? ROGUE_VDMCTRL_INDEX_SIZE_B16 : ROGUE_VDMCTRL_INDEX_SIZE_B32;
+      list.primitive_topology = topology;
+      list.index_addr_present = draw->indexed;
+      list.index_base_addrmsb = PVR_DEV_ADDR(index_va);
+   }
+   if (draw->indexed) {
+      pvr_csb_pack (&words[n++], VDMCTRL_INDEX_LIST1, list) {
+         list.index_base_addrlsb = PVR_DEV_ADDR(index_va);
+      }
+   }
+   pvr_csb_pack (&words[n++], VDMCTRL_INDEX_LIST7, list) {
+      list.indirect_base_addrmsb = PVR_DEV_ADDR(draw->indirect_addr);
+   }
+   pvr_csb_pack (&words[n++], VDMCTRL_INDEX_LIST8, list) {
+      list.indirect_base_addrlsb = PVR_DEV_ADDR(draw->indirect_addr);
+   }
+   words[n++] = split;
+   assert(n == end);
+   pvr_csb_pack (&words[n++], VDMCTRL_STREAM_RETURN, ret);
+   memcpy(pvr_bo_suballoc_get_map_addr(bo), words, sizeof(words));
+   if (draw->indexed && cmd_buffer->vk.dynamic_graphics_state.ia.primitive_restart_enable) {
+      const unsigned vector = cmd_buffer->state.gfx_pipeline->g5p->vs_outputs + 5;
+      pvr_csb_emit (csb, VDMCTRL_VDM_STATE0, state) {
+         state.cut_index_present = true;
+         state.cut_index_enable = true;
+         state.cam_size = vector <= 32 ? 95 : vector <= 48 ? 63 : vector <= 64 ? 31 : 15;
+      }
+      pvr_csb_emit (csb, VDMCTRL_VDM_STATE1, state) {
+         state.cut_index = isize == 1 ? 0xff : isize == 2 ? 0xffff : 0xffffffff;
+      }
+   }
+   pvr_csb_emit (csb, VDMCTRL_STREAM_LINK0, link) {
+      link.with_return = true;
+      link.link_addrmsb = PVR_DEV_ADDR(va);
+   }
+   pvr_csb_emit (csb, VDMCTRL_STREAM_LINK1, link) {
+      link.link_addrlsb = PVR_DEV_ADDR(va);
+   }
+   if (getenv("PVR_G5P_INDIRECT_LOG")) {
+      fprintf(stderr, "G5P-INDIRECT packet va=%#" PRIx64 " args=%#" PRIx64 " indexed=%u words=%u:",
+              va, draw->indirect_addr, draw->indexed, n);
+      for (unsigned i = 0; i < n; i++)
+         fprintf(stderr, " %08x", words[i]);
+      fprintf(stderr, "\n");
+   }
+   return csb->status;
+}
+
+VkResult
+PVR_PER_ARCH(g5p_cmd_draw_indirect)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_buffer *buffer,
+                                    VkDeviceSize offset, uint32_t count, uint32_t stride, bool indexed)
+{
+   const char *probe = getenv("PVR_G5P_INDIRECT");
+   if (!probe || strcmp(probe, "probe"))
+      return G5P_REFUSE(cmd_buffer, "indirect graphics draw awaits native A9 qualification (PVR_G5P_INDIRECT=probe)");
+   if (!count)
+      return VK_SUCCESS;
+   const unsigned size = indexed ? sizeof(VkDrawIndexedIndirectCommand) : sizeof(VkDrawIndirectCommand);
+   if (!buffer || offset % 4 || offset > buffer->vk.size || size > buffer->vk.size - offset ||
+       (count > 1 && (stride < size || stride % 4 ||
+                     (uint64_t)(count - 1) * stride > buffer->vk.size - offset - size)))
+      return G5P_REFUSE(cmd_buffer, "indirect graphics argument range/alignment");
+   /* drawIndirectFirstInstance is false. Valid Vulkan commands therefore
+    * have firstInstance == 0; no record-time host read is used to verify it.
+    * XFB's CPU resolve cannot account for unknown GPU counts and refuses.
+    */
+   for (unsigned i = 0; i < count; i++) {
+      const struct pvr_g5p_draw draw = {
+         .count = 1, .instances = 1, .indexed = indexed,
+         .indirect_addr = buffer->dev_addr.addr + offset + (uint64_t)i * stride,
+      };
+      VkResult result = pvr_arch_g5p_cmd_draw(cmd_buffer, &draw);
+      if (result != VK_SUCCESS)
+         return result;
+   }
    return VK_SUCCESS;
 }

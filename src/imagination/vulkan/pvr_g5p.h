@@ -250,12 +250,17 @@ struct pvr_g5p_pipeline {
    struct g5p_xfb_layout xfb_layout;
 };
 
+struct pvr_buffer;
+struct pvr_csb;
+
 /* A draw (CmdDraw, CmdDrawIndexed): `first` is the first vertex, or the
  * first index of an indexed draw, whose indices are offset by vertex_offset */
 struct pvr_g5p_draw {
    uint32_t count, instances, first, first_instance;
    bool indexed;
    int32_t vertex_offset;
+   /* Native VDM argument address; zero selects the ordinary direct packet. */
+   uint64_t indirect_addr;
 };
 
 /* SPIR-V of one stage -> the G5P backend's program (pvr_g5p_nir.c), for a
@@ -298,6 +303,10 @@ VkResult PVR_PER_ARCH(g5p_graphics_pipeline_compile)(struct pvr_device *device,
 void PVR_PER_ARCH(g5p_graphics_pipeline_destroy)(struct pvr_device *device,
                                                  struct pvr_graphics_pipeline *pipeline);
 VkResult PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_draw *draw);
+VkResult PVR_PER_ARCH(g5p_cmd_draw_indirect)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_buffer *buffer,
+                                             VkDeviceSize offset, uint32_t count, uint32_t stride, bool indexed);
+VkResult PVR_PER_ARCH(g5p_vertex_indirect)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_draw *draw,
+                                           uint32_t topology, uint32_t split, struct pvr_csb *csb);
 VkResult PVR_PER_ARCH(g5p_cmd_draw_indexed)(struct pvr_cmd_buffer *cmd_buffer, uint32_t index_count,
                                             uint32_t instances, uint32_t first_index, int32_t vertex_offset,
                                             uint32_t first_instance);
@@ -305,6 +314,8 @@ VkResult PVR_PER_ARCH(g5p_cmd_draw_indexed)(struct pvr_cmd_buffer *cmd_buffer, u
 #   define pvr_arch_g5p_graphics_pipeline_compile PVR_PER_ARCH(g5p_graphics_pipeline_compile)
 #   define pvr_arch_g5p_graphics_pipeline_destroy PVR_PER_ARCH(g5p_graphics_pipeline_destroy)
 #   define pvr_arch_g5p_cmd_draw PVR_PER_ARCH(g5p_cmd_draw)
+#   define pvr_arch_g5p_cmd_draw_indirect PVR_PER_ARCH(g5p_cmd_draw_indirect)
+#   define pvr_arch_g5p_vertex_indirect PVR_PER_ARCH(g5p_vertex_indirect)
 #   define pvr_arch_g5p_cmd_draw_indexed PVR_PER_ARCH(g5p_cmd_draw_indexed)
 
 VkResult PVR_PER_ARCH(g5p_device_init)(struct pvr_device *device);

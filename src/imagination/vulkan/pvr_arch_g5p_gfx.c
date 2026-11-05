@@ -1405,6 +1405,8 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
    /* transform feedback: while capturing, the pipeline's capturing variant
     * (pvr_g5p_xfb.h); a pipeline that captures nothing draws as it is */
    const bool xfb = g->xfb && pvr_arch_g5p_xfb_capturing(cmd_buffer);
+   if (xfb && draw->indirect_addr)
+      return G5P_REFUSE(cmd_buffer, "indirect graphics transform-feedback accounting is not implemented");
    if (xfb) {
       VkResult xr = pvr_arch_g5p_xfb_draw_check(cmd_buffer, dyn->ia.primitive_topology);
       if (xr != VK_SUCCESS)
@@ -1897,7 +1899,11 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
 
    /* 11. the index list: [the index buffer], count, instances - 1, first vertex or vertex offset, split
     * (pvr_arch_g5p_vertex.c) */
-   {
+   if (draw->indirect_addr) {
+      result = pvr_arch_g5p_vertex_indirect(cmd_buffer, draw, hw_topology, split, csb);
+      if (result != VK_SUCCESS)
+         return result;
+   } else {
       unsigned n;
       result = pvr_arch_g5p_vertex_index_list(cmd_buffer, draw, hw_topology, split, w, &n);
       if (result != VK_SUCCESS)
