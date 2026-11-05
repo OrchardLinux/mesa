@@ -145,6 +145,7 @@ struct g9p_ctx {
    unsigned max_reg;
    unsigned st;     /* mask stack register */
    bool reserve_st_low; /* the mask stack is r15, reserved (compile_back()) */
+   bool reserve_low;    /* r11-r14 for address work, after running out (compile_back()) */
    unsigned ip;
 
    struct {
@@ -186,9 +187,21 @@ dump_busy(struct g9p_ctx *ctx)
 static int
 alloc_reg(struct g9p_ctx *ctx)
 {
-   /* Vertex shaders: r11-r14 stay free for address work (alloc_pair(), low_reg()) */
+   /*
+    * A vertex shader that ran out: values above r15 first, and r11-r14 stay
+    * free, for what reaches r15 only (one_src(), alloc_pair()).
+    */
+   if (ctx->reserve_low) {
+      for (unsigned r = 16; r < G9P_NUM_REGS; r++) {
+         if (!(ctx->busy & BITFIELD64_BIT(r))) {
+            ctx->busy |= BITFIELD64_BIT(r);
+            ctx->max_reg = MAX2(ctx->max_reg, r);
+            return r;
+         }
+      }
+   }
    for (unsigned r = 0; r < G9P_NUM_REGS; r++) {
-      if (ctx->stage == MESA_SHADER_VERTEX && r >= 11 && r <= 14)
+      if (ctx->reserve_low && r >= 11 && r <= 14)
          continue;
       if (!(ctx->busy & BITFIELD64_BIT(r))) {
          ctx->busy |= BITFIELD64_BIT(r);
@@ -228,6 +241,17 @@ low_reg(struct g9p_ctx *ctx, int r)
    if (low >= 0)
       g9p_alu2(ctx->c, G9P_OR, low, r, r, false);
    return low;
+}
+
+/*
+ * Forms with one source and an immediate (1189, 1199, 1181, 199e) reach r15
+ * only outside fragment code: read r16 they gave wrong values (dEQP vertex
+ * shaders of 17 registers and more). Two-source forms reach all registers.
+ */
+static int
+one_src(struct g9p_ctx *ctx, int r)
+{
+   return ctx->c->fragment ? r : low_reg(ctx, r);
 }
 
 /*
@@ -442,6 +466,40 @@ branch_compare(nir_def *def)
          return NULL;
    }
    return alu;
+}
+
+/*
+ * branch_compare() runs the compare at the if, but a load_reg names the
+ * register, not its value: a store between the compare and the if (a loop's
+ * "i++ < n") or in a branch (compared again for a break, emit_if()) would
+ * change what is compared. Such operands get a copy at the compare.
+ */
+static bool
+copy_branch_compare_operands(nir_shader *nir)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_builder b = nir_builder_create(impl);
+
+      nir_foreach_block(block, impl) {
+         nir_if *nif = nir_block_get_following_if(block);
+         nir_alu_instr *cmp = nif ? branch_compare(nif->condition.ssa) : NULL;
+
+         if (!cmp)
+            continue;
+         for (unsigned i = 0; i < 2; i++) {
+            nir_def *def = cmp->src[i].src.ssa;
+
+            if (!nir_def_is_intrinsic(def) ||
+                nir_def_as_intrinsic(def)->intrinsic != nir_intrinsic_load_reg)
+               continue;
+            b.cursor = nir_before_instr(&cmp->instr);
+            nir_src_rewrite(&cmp->src[i].src, nir_mov(&b, def));
+            cmp->src[i].swizzle[0] = 0;
+         }
+      }
+      nir_progress(true, impl, nir_metadata_control_flow);
+   }
+   return true;
 }
 
 /* --- Liveness ------------------------------------------------------------ */
@@ -744,6 +802,8 @@ emit_alu(struct g9p_ctx *ctx, nir_alu_instr *alu)
       }
       if (is_const(s[1], &imm) && imm < 0x40) {
          r[0] = src_reg(ctx, s[0]);
+         if (r[0] >= 0)
+            r[0] = one_src(ctx, r[0]);
          if (r[0] < 0)
             return false;
          release(ctx, &alu->instr);
@@ -833,12 +893,22 @@ emit_alu_op(struct g9p_ctx *ctx, nir_alu_instr *alu, const int *r, int dst)
    case nir_op_ixor:
       g9p_alu2(ctx->c, G9P_XOR, dst, r[0], r[1], false);
       return true;
-   case nir_op_ishl:
-      g9p_shift(ctx->c, dst, r[0], r[1], false);
+   case nir_op_ishl: {
+      const int a = one_src(ctx, r[0]);
+
+      if (a < 0)
+         return false;
+      g9p_shift(ctx->c, dst, a, r[1], false);
       return true;
-   case nir_op_ushr:
-      g9p_shift(ctx->c, dst, r[0], r[1], true);
+   }
+   case nir_op_ushr: {
+      const int a = one_src(ctx, r[0]);
+
+      if (a < 0)
+         return false;
+      g9p_shift(ctx->c, dst, a, r[1], true);
       return true;
+   }
    case nir_op_ishr:
       g9p_alu2(ctx->c, G9P_ISHR, dst, r[0], r[1], false);
       return true;
@@ -851,18 +921,38 @@ emit_alu_op(struct g9p_ctx *ctx, nir_alu_instr *alu, const int *r, int dst)
    case nir_op_ffma:
       g9p_ffma(ctx->c, dst, r[0], r[1], r[2]);
       return true;
-   case nir_op_u2f32:
-      g9p_convert(ctx->c, dst, r[0], G9P_U2F);
+   case nir_op_u2f32: {
+      const int a = one_src(ctx, r[0]);
+
+      if (a < 0)
+         return false;
+      g9p_convert(ctx->c, dst, a, G9P_U2F);
       return true;
-   case nir_op_i2f32:
-      g9p_convert(ctx->c, dst, r[0], G9P_I2F);
+   }
+   case nir_op_i2f32: {
+      const int a = one_src(ctx, r[0]);
+
+      if (a < 0)
+         return false;
+      g9p_convert(ctx->c, dst, a, G9P_I2F);
       return true;
-   case nir_op_f2u32:
-      g9p_convert(ctx->c, dst, r[0], G9P_F2U);
+   }
+   case nir_op_f2u32: {
+      const int a = one_src(ctx, r[0]);
+
+      if (a < 0)
+         return false;
+      g9p_convert(ctx->c, dst, a, G9P_F2U);
       return true;
-   case nir_op_f2i32:
-      g9p_convert(ctx->c, dst, r[0], G9P_F2I);
+   }
+   case nir_op_f2i32: {
+      const int a = one_src(ctx, r[0]);
+
+      if (a < 0)
+         return false;
+      g9p_convert(ctx->c, dst, a, G9P_F2I);
       return true;
+   }
 
    case nir_op_ffloor:
       g9p_funary(ctx->c, G9P_FFLOOR, dst, r[0]);
@@ -1154,11 +1244,16 @@ emit_attrib_load(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
    g9p_alu2(ctx->c, G9P_IMUL, t, a->per_instance ? 1 : 0, rs, false);
    ctx->busy &= ~BITFIELD64_RANGE(rs, 2);
    if (offset) {
-      int ro = const_reg(ctx, offset);
+      if (offset < 64) {
+         g9p_add_imm(ctx->c, t, t, offset);
+      } else {
+         int ro = const_reg(ctx, offset);
 
-      if (ro < 0)
-         return false;
-      g9p_alu2(ctx->c, G9P_IADD, t, t, ro, false);
+         ro = ro < 0 ? ro : low_reg(ctx, ro);
+         if (ro < 0)
+            return false;
+         g9p_alu2(ctx->c, G9P_IADD, t, t, ro, false);
+      }
    }
    pair = alloc_pair(ctx);
    if (pair < 0)
@@ -1849,6 +1944,8 @@ emit_branch_cmp(struct g9p_ctx *ctx, nir_if *nif, bool *sense)
    if (!cmp) {
       int r = src_reg(ctx, nir_get_scalar(nif->condition.ssa, 0));
 
+      if (r >= 0)
+         r = one_src(ctx, r);
       if (r < 0)
          return false;
       /* condition true: != 0, as unsigned > 0 */
@@ -2316,10 +2413,11 @@ lower_io(nir_shader *nir)
  * varyings, the fragment position): a copy right before each use in another
  * block, instead of one value live across branches (graphics shaders have
  * 32 registers; Hyprland's rounded-rectangle shader kept dozens of uniforms
- * live from its first block)
+ * live from its first block). @every_use: for a vertex shader that ran out
+ * of registers, a copy before each use after the first, attributes too.
  */
 static bool
-rematerialize_loads(nir_shader *nir)
+rematerialize_loads(nir_shader *nir, bool every_use)
 {
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
    bool progress = false;
@@ -2336,15 +2434,20 @@ rematerialize_loads(nir_shader *nir)
              intr->intrinsic != nir_intrinsic_load_interpolated_input &&
              intr->intrinsic != nir_intrinsic_load_frag_coord &&
              !(intr->intrinsic == nir_intrinsic_load_input &&
-               nir->info.stage == MESA_SHADER_FRAGMENT))
+               (nir->info.stage == MESA_SHADER_FRAGMENT || every_use)))
             continue;
+         bool first = true;
+
          nir_foreach_use_safe(src, &intr->def) {
             nir_instr *user = nir_src_use_instr(src);
             nir_instr *copy;
 
-            if (nir_src_is_if(src) || user->type == nir_instr_type_phi ||
-                user->block == instr->block)
+            if (nir_src_is_if(src) || user->type == nir_instr_type_phi)
                continue;
+            if (user->block == instr->block && (!every_use || first)) {
+               first = false;
+               continue;
+            }
             copy = nir_instr_clone(nir, instr);
             nir_instr_insert_before(user, copy);
             nir_src_rewrite(src, &nir_instr_as_intrinsic(copy)->def);
@@ -2359,7 +2462,7 @@ rematerialize_loads(nir_shader *nir)
 static bool
 compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
              const struct g9p_vertex_attrib *attribs, unsigned frag_coord_slot,
-             void *mem_ctx)
+             bool repeat_loads, void *mem_ctx)
 {
    struct g9p_ctx ctx = { 0 };
    nir_function_impl *impl;
@@ -2383,7 +2486,7 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
    NIR_PASS(_, nir, nir_lower_bool_to_int32);
    NIR_PASS(_, nir, nir_opt_copy_prop);
    NIR_PASS(_, nir, nir_opt_dce);
-   NIR_PASS(_, nir, rematerialize_loads);
+   NIR_PASS(_, nir, rematerialize_loads, repeat_loads);
    NIR_PASS(_, nir, nir_opt_dce);
    /* values computed early for late uses: compute them right before */
    NIR_PASS(_, nir, nir_opt_move, nir_move_alu | nir_move_const_undef |
@@ -2391,6 +2494,7 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
             nir_move_load_input);
    NIR_PASS(_, nir, nir_convert_from_ssa, true, false);
    NIR_PASS(_, nir, nir_trivialize_registers);
+   copy_branch_compare_operands(nir);
 
    impl = nir_shader_get_entrypoint(nir);
    if (!impl)
@@ -2445,6 +2549,10 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
       ctx.oom = false;
       if (generate(&ctx, impl, G9P_NUM_REGS))
          break;
+      if (ctx.oom && stage == MESA_SHADER_VERTEX && !ctx.reserve_low) {
+         ctx.reserve_low = true;
+         continue;
+      }
       if (!ctx.oom || stage != MESA_SHADER_FRAGMENT || ctx.num_homes >= 96)
          return false;
       for (unsigned d = 0; d < ctx.num_decls; d++) {
@@ -2477,15 +2585,21 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
    }
    st = ctx.max_reg + 1;
    /*
-    * Vertex shaders with control flow: their mask stack below r16 (dEQP vertex
-    * loops of 17 registers and more hung the geometry job). Reserved in the
-    * second pass.
+    * Vertex shaders: the mask stack below r16, selects use it too (dEQP vertex
+    * shaders of 17 registers and more drew wrong values or hung the geometry
+    * job). Reserved in the second pass.
     */
-   if (stage == MESA_SHADER_VERTEX && st > 15 && !nir_cf_list_is_empty_block(&impl->body) &&
-       !exec_list_is_singular(&impl->body)) {
+   if (stage == MESA_SHADER_VERTEX && st > 15) {
       ctx.reserve_st_low = true;
-      if (!generate(&ctx, impl, 15))
-         return false;
+      if (!generate(&ctx, impl, 15)) {
+         /* without r15, address work can run out of low registers */
+         if (!ctx.oom || ctx.reserve_low)
+            return false;
+         ctx.reserve_low = true;
+         ctx.oom = false;
+         if (!generate(&ctx, impl, 15))
+            return false;
+      }
       st = MAX2(ctx.max_reg, 15);
    } else if (!generate(&ctx, impl, st))
       return false;
@@ -2517,7 +2631,7 @@ g9p_compile_compute(nir_shader *nir, struct g9p_shader *out, void *mem_ctx)
    memset(out, 0, sizeof(*out));
    lower_front(nir);
    NIR_PASS(_, nir, nir_lower_compute_system_values, &csv);
-   return compile_back(nir, out, MESA_SHADER_COMPUTE, NULL, 0, mem_ctx);
+   return compile_back(nir, out, MESA_SHADER_COMPUTE, NULL, 0, false, mem_ctx);
 }
 
 /*
@@ -2668,7 +2782,11 @@ g9p_compile_vertex(nir_shader *nir, const struct g9p_vertex_attrib *attribs,
    lower_io(nir);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_attrib_format,
             nir_metadata_control_flow, (void *)attribs);
-   return compile_back(nir, out, MESA_SHADER_VERTEX, attribs, 0, mem_ctx);
+   /* out of registers: again with a value's loads repeated, not kept live */
+   nir_shader *copy = nir_shader_clone(mem_ctx, nir);
+
+   return compile_back(nir, out, MESA_SHADER_VERTEX, attribs, 0, false, mem_ctx) ||
+          compile_back(copy, out, MESA_SHADER_VERTEX, attribs, 0, true, mem_ctx);
 }
 
 /*
@@ -2942,5 +3060,5 @@ g9p_compile_fragment(nir_shader *nir, unsigned frag_coord_slot,
       NIR_PASS(_, nir, discards_to_select, out->native_blend);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_fb_fetch_instr, nir_metadata_control_flow,
             NULL);
-   return compile_back(nir, out, MESA_SHADER_FRAGMENT, NULL, frag_coord_slot, mem_ctx);
+   return compile_back(nir, out, MESA_SHADER_FRAGMENT, NULL, frag_coord_slot, false, mem_ctx);
 }

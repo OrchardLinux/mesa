@@ -202,6 +202,12 @@ static inline void
 g9p_add_imm(struct g9p_code *c, unsigned dst, unsigned src, unsigned imm)
 {
    assert(imm < 0x40);
+   /* this form's source reaches r15 outside fragment code: a move, then */
+   if (src >= 16 && !c->fragment) {
+      assert(imm == 0);
+      G9P_EMIT(c, g9p_w0(c, 0x3199), g9p_dst(c, dst), g9p_srcs(src, src, false), G9P_OR);
+      return;
+   }
    G9P_EMIT(c, g9p_w0(c, 0x1199), g9p_dst(c, dst), 0x0101 | imm << 1 | src << 10, 0x0120,
             0x09a1, 0x0070);
 }

@@ -563,6 +563,11 @@ PVR_PER_ARCH(g9p_graphics_pipeline_compile)(struct pvr_device *device,
    state->vs_outputs = vs.num_outputs;
    state->uses_discard = fs.uses_discard;
    state->uses_fbfetch = fs.uses_fbfetch;
+   /*
+    * Whole blocks of 4: 17 and 18 registers drew wrong values with the field
+    * in VDM_STATE5 covering them, 20 did not (dEQP vertex shaders).
+    */
+   vs.num_regs = align(vs.num_regs, 4);
    state->vs_regs = vs.num_regs;
    state->num_buffers = vs.num_buffers;
    for (unsigned i = 0; i < vs.num_buffers; i++) {
