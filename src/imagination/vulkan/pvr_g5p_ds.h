@@ -128,9 +128,10 @@ const char *pvr_g5p_ds_texture_plane(VkFormat format, VkImageAspectFlags aspect,
  * transfers (the planes are in the ZLS's Morton order). */
 VkFormatFeatureFlags2 pvr_g5p_ds_format_features(VkFormat format);
 
-/* pvr_image_init(): a depth/stencil image of a ZLS format takes the ZLS
- * planes' size (pvr_g5p_ds_layout()), at least; other images are left as
- * they are (pvr_g5p_image.c) */
+/* pvr_image_init(): a depth/stencil image of a ZLS format takes exactly the
+ * ZLS planes' size (pvr_g5p_ds_layout()), not upstream's larger D32F_S8
+ * layout; a 4-sample colour image at least the PBE's surface; other images
+ * are left as they are (pvr_g5p_image.c) */
 struct pvr_image;
 void pvr_g5p_ds_image_layout(struct pvr_image *image);
 

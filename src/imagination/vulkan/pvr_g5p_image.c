@@ -32,7 +32,7 @@
  * Depth/stencil and 4-sample images (lane c): the ZLS stores each
  * depth/stencil plane in its twiddled order over a power-of-two square of
  * 32-pixel tiles, and the stencil plane after the depth plane
- * (pvr_g5p_ds_layout()), so a depth/stencil image takes at least that; a
+ * (pvr_g5p_ds_layout()), so a depth/stencil image takes exactly that; a
  * 4-sample colour image is the PBE's 2D-multisample surface, 16 bytes a pixel
  * over power-of-two sides (pvr_g5p_msaa_layout()). pvr_image_init()'s G5P hook
  * calls pvr_g5p_ds_image_layout() after upstream's own layout.
@@ -125,15 +125,27 @@ pvr_g5p_ds_image_layout(struct pvr_image *image)
 
    if (image->vk.tiling != VK_IMAGE_TILING_OPTIMAL || image->plane_count != 1 || image->vk.mip_levels != 1)
       return;
+   struct pvr_image_plane *plane = &image->planes[0];
    if (pvr_g5p_ds_layout(image->vk.format, image->vk.extent.width, image->vk.extent.height, image->vk.samples,
-                         &zls))
-      layer = zls.size;
-   else if (image->vk.samples == VK_SAMPLE_COUNT_4_BIT && vk_format_is_color(image->vk.format))
+                         &zls)) {
+      /* The ZLS planes are the image's whole memory: the ZLS loads and
+       * stores them, the texture state samples them in place
+       * (pvr_g5p_ds_texture_plane()), and the formats have no transfer
+       * features (pvr_g5p_ds_format_features()), so nothing addresses
+       * upstream's layout. That layout takes D32F_S8 as 8 bytes a texel
+       * over each side's power of two: 32 MiB for a 2048x1536 panel, where
+       * the depth and stencil planes take 16 + 4 MiB (Hyprland's per-monitor
+       * GL DEPTH24_STENCIL8 texture, which Zink makes D32F_S8). */
+      plane->layer_size = zls.size;
+      plane->size = zls.size * image->vk.array_layers;
+      image->total_size = align64(plane->offset + plane->size, image->alignment);
+      return;
+   }
+   if (image->vk.samples == VK_SAMPLE_COUNT_4_BIT && vk_format_is_color(image->vk.format))
       layer = pvr_g5p_msaa_layout(image->vk.extent.width, image->vk.extent.height,
                                   vk_format_get_blocksize(image->vk.format));
    if (!layer)
       return;
-   struct pvr_image_plane *plane = &image->planes[0];
    plane->layer_size = MAX2(plane->layer_size, layer);
    plane->size = MAX2(plane->size, plane->layer_size * image->vk.array_layers);
    image->total_size = MAX2(image->total_size, align64(plane->offset + plane->size, image->alignment));
