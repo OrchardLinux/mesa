@@ -163,8 +163,9 @@ static const struct pvr_g5p_format pvr_g5p_format_table[] = {
    G5P_FMT(R5G6B5_UNORM_PACK16, 2, false, G5P_SF, G5P1B, 0x0b, 2, 1, 0, G5P_ONE),
    G5P_FMT(B4G4R4A4_UNORM_PACK16, 2, false, G5P_SF, G5P1B, 0x0c, 1, 2, 3, 0),
    /* integer (g3b-sample-b t5-t18, fmt-rgba8ui; textypes int-fetch and
-    * int-sample on the device). Rendering integers needs integer outputs
-    * (not the two f16 words): not built. */
+    * int-sample on the device). RGBA32 UINT/SINT clear/draw/LOAD/masks
+    * passed the integer-r4 core/compat device rungs. Narrow integer render
+    * targets remain absent or probe-only; integer blending is not exposed. */
    G5P_FMT(R8_UINT, 1, false, G5P_SI, G5P1B, 0x100, G5P_SEL_R001),
    G5P_FMT(R8G8_UINT, 2, false, G5P_SI, G5P1B, 0x10a, G5P_SEL_RG01),
    G5P_FMT(R8G8B8A8_UINT, 4, false, G5P_SI, G5P1B, 0x128, G5P_SEL_RGBA),
@@ -174,7 +175,7 @@ static const struct pvr_g5p_format pvr_g5p_format_table[] = {
    G5P_FMT(R16G16B16A16_UINT, 8, false, G5P_SI | PVR_G5P_FMT_RENDER | PVR_G5P_FMT_PROBE_RENDER, G5P1B, 0x132, G5P_SEL_RGBA),
    G5P_FMT(R32_UINT, 4, false, G5P_SI, G5P1B, 0x121, G5P_SEL_R001),
    G5P_FMT(R32G32_UINT, 8, false, G5P_SI | PVR_G5P_FMT_RENDER | PVR_G5P_FMT_PROBE_RENDER, G5P1B, 0x131, G5P_SEL_RG01),
-   G5P_FMT(R32G32B32A32_UINT, 16, false, G5P_SI | PVR_G5P_FMT_RENDER | PVR_G5P_FMT_PROBE_RENDER, G5P1B, 0x138, G5P_SEL_RGBA),
+   G5P_FMT(R32G32B32A32_UINT, 16, false, G5P_SI | PVR_G5P_FMT_RENDER, G5P1B, 0x138, G5P_SEL_RGBA),
    G5P_FMT(R8_SINT, 1, false, G5P_SI, G5P1B, 0x180, G5P_SEL_R001),
    G5P_FMT(R8G8_SINT, 2, false, G5P_SI, G5P1B, 0x18a, G5P_SEL_RG01),
    G5P_FMT(R8G8B8A8_SINT, 4, false, G5P_SI, G5P1B, 0x1a8, G5P_SEL_RGBA),
@@ -184,7 +185,7 @@ static const struct pvr_g5p_format pvr_g5p_format_table[] = {
    G5P_FMT(R16G16B16A16_SINT, 8, false, G5P_SI, G5P1B, 0x1b2, G5P_SEL_RGBA),
    G5P_FMT(R32_SINT, 4, false, G5P_SI, G5P1B, 0x1a1, G5P_SEL_R001),
    G5P_FMT(R32G32_SINT, 8, false, G5P_SI | PVR_G5P_FMT_RENDER | PVR_G5P_FMT_PROBE_RENDER, G5P1B, 0x1b1, G5P_SEL_RG01),
-   G5P_FMT(R32G32B32A32_SINT, 16, false, G5P_SI | PVR_G5P_FMT_RENDER | PVR_G5P_FMT_PROBE_RENDER, G5P1B, 0x1b8, G5P_SEL_RGBA),
+   G5P_FMT(R32G32B32A32_SINT, 16, false, G5P_SI | PVR_G5P_FMT_RENDER, G5P1B, 0x1b8, G5P_SEL_RGBA),
    /* ETC2/EAC (g3b-compressed t0-t7; textypes etc2, etc2-8x8 and eac exact
     * on the device), twiddled 4x4 blocks; sRGB is q1 bit 45 as everywhere.
     * Uploads are upstream's block-unit copies through the CPU twiddle; blits
