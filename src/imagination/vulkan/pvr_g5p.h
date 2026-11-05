@@ -90,11 +90,13 @@ struct pvr_g5p_device {
    struct pvr_g5p_programs programs;
    /* vkCmdClearAttachments' clear quad (pvr_arch_g5p_gfx.c): its pipeline
     * layout (fragment push constants 0..15) and a pipeline per colour
-    * format, made at first use */
+    * format and colour write mask (0xf, or 0 for a depth/stencil-only
+    * clear), made at first use */
    simple_mtx_t clear_lock;
    VkPipelineLayout clear_layout;
    struct {
       VkFormat format;
+      uint8_t write_mask;
       VkPipeline pipeline;
    } clear[8];
    unsigned clear_count;

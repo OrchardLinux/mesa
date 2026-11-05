@@ -952,14 +952,18 @@ PVR_PER_ARCH(g5p_graphics_pipeline_compile)(struct pvr_device *device,
 
 /* ---- vkCmdClearAttachments: the clear quad ---- */
 
-/* The clear quad's pipeline for a colour format (pvr_g5p.h: made at first
- * use, kept per device): the G5P stages built with nir_builder
- * (pvr_g5p_clear_nir()), one vec4 position per vertex (binding 0, stride
- * 16), a triangle list, the colour from fragment push constants 0..15, no
- * blending, viewport and scissor dynamic, dynamic rendering of the one
- * colour format. */
+/* The clear quad's pipeline for a colour format and colour write mask
+ * (pvr_g5p.h: made at first use, kept per device): the G5P stages built with
+ * nir_builder (pvr_g5p_clear_nir()), one vec4 position per vertex (binding
+ * 0, stride 16), a triangle list, the colour from fragment push constants
+ * 0..15, no blending, viewport and scissor dynamic, dynamic rendering of the
+ * one colour format. Write mask 0 (a depth/stencil-only clear) compiles the
+ * colour output away, and the draw takes the no-colour ISP form (tag writes
+ * disabled, user pass 0: depth/stencil updates only, pvr_g5p_blend.h). The
+ * depth/stencil tests and writes are the draw's dynamic state. */
 static VkResult
-g5p_clear_pipeline(struct pvr_cmd_buffer *cmd_buffer, VkFormat format, const struct pvr_graphics_pipeline **out)
+g5p_clear_pipeline(struct pvr_cmd_buffer *cmd_buffer, VkFormat format, uint8_t write_mask,
+                   const struct pvr_graphics_pipeline **out)
 {
    struct pvr_device *device = cmd_buffer->device;
    struct pvr_g5p_device *gd = device->g5p;
@@ -969,12 +973,12 @@ g5p_clear_pipeline(struct pvr_cmd_buffer *cmd_buffer, VkFormat format, const str
 
    simple_mtx_lock(&gd->clear_lock);
    for (unsigned i = 0; i < gd->clear_count; i++)
-      if (gd->clear[i].format == format)
+      if (gd->clear[i].format == format && gd->clear[i].write_mask == write_mask)
          pipe = gd->clear[i].pipeline;
    if (pipe)
       goto done;
    if (gd->clear_count == ARRAY_SIZE(gd->clear)) {
-      result = G5P_REFUSE(cmd_buffer, "a clear quad of a %u-th colour format", gd->clear_count + 1);
+      result = G5P_REFUSE(cmd_buffer, "a clear quad of a %u-th colour format and write mask", gd->clear_count + 1);
       goto done;
    }
    if (!gd->clear_layout) {
@@ -1009,7 +1013,7 @@ g5p_clear_pipeline(struct pvr_cmd_buffer *cmd_buffer, VkFormat format, const str
    const VkPipelineMultisampleStateCreateInfo ms = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
       .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
-   const VkPipelineColorBlendAttachmentState cba = { .colorWriteMask = 0xf };
+   const VkPipelineColorBlendAttachmentState cba = { .colorWriteMask = write_mask };
    const VkPipelineColorBlendStateCreateInfo cb = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = 1,
       .pAttachments = &cba };
@@ -1032,6 +1036,7 @@ g5p_clear_pipeline(struct pvr_cmd_buffer *cmd_buffer, VkFormat format, const str
       goto done;
    }
    gd->clear[gd->clear_count].format = format;
+   gd->clear[gd->clear_count].write_mask = write_mask;
    gd->clear[gd->clear_count++].pipeline = pipe;
 done:
    simple_mtx_unlock(&gd->clear_lock);
@@ -1048,9 +1053,15 @@ done:
  * quad's pipeline in the current render, with its own state: the viewport
  * the whole attachment, one triangle covering it, the scissor the
  * rectangle within the render area (the ISP scissor table, as any clipped
- * draw), no depth/stencil test, the colour from push constants. The
- * application's bound state is put back afterwards. One colour target, one
- * sample, layer 0; depth/stencil rectangles are refused by name. */
+ * draw), the colour from push constants. Depth and stencil go through the
+ * ISP like any draw's: the depth aspect as a depth test ALWAYS with writes
+ * on and the triangle at the clear depth (the viewport's depth range is
+ * [0, 1], so the window depth is the vertex depth), the stencil aspect as a
+ * stencil test ALWAYS whose pass op REPLACEs with the clear value as its reference
+ * under a full write mask, on both faces. An aspect not cleared keeps its
+ * test off and its writes off; colour not cleared takes write mask 0 (the
+ * no-colour ISP form). The application's bound state is put back
+ * afterwards. One colour target, one sample, layer 0. */
 VkResult
 PVR_PER_ARCH(g5p_clear_attachments)(struct pvr_cmd_buffer *cmd_buffer, uint32_t attachment_count,
                                     const VkClearAttachment *attachments, uint32_t rect_count,
@@ -1073,30 +1084,48 @@ PVR_PER_ARCH(g5p_clear_attachments)(struct pvr_cmd_buffer *cmd_buffer, uint32_t 
       return G5P_REFUSE(cmd_buffer, "vkCmdClearAttachments at %u samples (one is built)", hw_render->sample_count);
    const struct pvr_image_view *iview = info->attachments[hw_render->eot_surfaces[0].attachment_idx];
    const VkFormat format = iview->vk.format;
-   if (vk_format_is_int(format))
-      return G5P_REFUSE(cmd_buffer, "vkCmdClearAttachments of an integer target (%s)", vk_Format_to_str(format));
 
-   const VkClearColorValue *colour = NULL;
-   for (uint32_t i = 0; i < attachment_count; i++) {
-      if (attachments[i].aspectMask & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))
-         return G5P_REFUSE(cmd_buffer, "vkCmdClearAttachments of depth/stencil rectangles (aspects %#x)",
-                           attachments[i].aspectMask);
-      if ((attachments[i].aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) && attachments[i].colorAttachment == 0)
-         colour = &attachments[i].clearValue.color;
+   /* what is cleared: the colour target, and the aspects of the render's depth/stencil attachment */
+   VkImageAspectFlags ds_present = 0;
+   if (hw_render->ds_attach_idx != VK_ATTACHMENT_UNUSED) {
+      const VkFormat f = info->attachments[hw_render->ds_attach_idx]->vk.format;
+      ds_present = (vk_format_has_depth(f) ? VK_IMAGE_ASPECT_DEPTH_BIT : 0) |
+                   (vk_format_has_stencil(f) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
    }
-   if (!colour)
+   const VkClearColorValue *colour = NULL;
+   VkImageAspectFlags ds_clear = 0;
+   float depth = 0.0f;
+   uint32_t stencil = 0;
+   for (uint32_t i = 0; i < attachment_count; i++) {
+      const VkImageAspectFlags a = attachments[i].aspectMask;
+      if ((a & VK_IMAGE_ASPECT_COLOR_BIT) && attachments[i].colorAttachment == 0)
+         colour = &attachments[i].clearValue.color;
+      if (a & ds_present & VK_IMAGE_ASPECT_DEPTH_BIT)
+         depth = attachments[i].clearValue.depthStencil.depth;
+      if (a & ds_present & VK_IMAGE_ASPECT_STENCIL_BIT)
+         stencil = attachments[i].clearValue.depthStencil.stencil;
+      ds_clear |= a & ds_present & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
+   }
+   if (!colour && !ds_clear)
       return VK_SUCCESS;
+   if (colour && vk_format_is_int(format))
+      return G5P_REFUSE(cmd_buffer, "vkCmdClearAttachments of an integer target (%s)", vk_Format_to_str(format));
+   /* the triangle's depth is the clear depth: inside the viewport's [0, 1] (VK_EXT_depth_range_unrestricted
+    * is not exposed, so a valid clear depth is too) */
+   if (!(depth >= 0.0f && depth <= 1.0f))
+      return G5P_REFUSE(cmd_buffer, "vkCmdClearAttachments of depth %f outside [0, 1]", depth);
    for (uint32_t r = 0; r < rect_count; r++)
       if (rects[r].baseArrayLayer || rects[r].layerCount != 1)
          return G5P_REFUSE(cmd_buffer, "vkCmdClearAttachments of layers %u..%u (layer 0 is built)",
                            rects[r].baseArrayLayer, rects[r].baseArrayLayer + rects[r].layerCount - 1);
 
    const struct pvr_graphics_pipeline *pipeline;
-   VkResult result = g5p_clear_pipeline(cmd_buffer, format, &pipeline);
+   VkResult result = g5p_clear_pipeline(cmd_buffer, format, colour ? 0xf : 0, &pipeline);
    if (result != VK_SUCCESS)
       return result;
-   /* one triangle covering the viewport (the whole attachment): each rectangle is its scissor */
-   static const float cover[12] = { -1, -1, 0, 1, 3, -1, 0, 1, -1, 3, 0, 1 };
+   /* one triangle covering the viewport (the whole attachment) at the clear depth: each rectangle is its scissor */
+   const float z = (ds_clear & VK_IMAGE_ASPECT_DEPTH_BIT) ? depth : 0.0f;
+   const float cover[12] = { -1, -1, z, 1, 3, -1, z, 1, -1, 3, z, 1 };
    struct pvr_suballoc_bo *verts;
    result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, cover, sizeof(cover), &verts);
    if (result != VK_SUCCESS)
@@ -1119,7 +1148,10 @@ PVR_PER_ARCH(g5p_clear_attachments)(struct pvr_cmd_buffer *cmd_buffer, uint32_t 
 
    cs->gfx_pipeline = pipeline;
    cs->vertex_bindings[0] = (struct pvr_vertex_binding){ .buffer = &vbuf, .offset = 0, .size = sizeof(cover) };
-   memcpy(push->data, colour->float32, 16);
+   if (colour)
+      memcpy(push->data, colour->float32, 16);
+   else
+      memset(push->data, 0, 16);
    push->bytes_updated = MAX2(push->bytes_updated, 16);
    push->dirty = true;
    dyn->vi_binding_strides[0] = 16;
@@ -1128,10 +1160,21 @@ PVR_PER_ARCH(g5p_clear_attachments)(struct pvr_cmd_buffer *cmd_buffer, uint32_t 
    dyn->rs.rasterizer_discard_enable = false;
    dyn->rs.cull_mode = VK_CULL_MODE_NONE;
    dyn->rs.depth_bias.enable = false;
-   dyn->ds.depth.test_enable = false;
-   dyn->ds.depth.write_enable = false;
+   dyn->rs.depth_clamp_enable = false;
+   const bool clear_depth = ds_clear & VK_IMAGE_ASPECT_DEPTH_BIT, clear_stencil = ds_clear & VK_IMAGE_ASPECT_STENCIL_BIT;
+   dyn->ds.depth.test_enable = clear_depth;
+   dyn->ds.depth.write_enable = clear_depth;
+   dyn->ds.depth.compare_op = VK_COMPARE_OP_ALWAYS;
    dyn->ds.depth.bounds_test.enable = false;
-   dyn->ds.stencil.test_enable = false;
+   dyn->ds.stencil.test_enable = clear_stencil;
+   const struct vk_stencil_test_face_state face = {
+      /* under ALWAYS (and a depth test that is ALWAYS or off) only the pass op is reachable */
+      .op = { .fail = VK_STENCIL_OP_KEEP, .pass = VK_STENCIL_OP_REPLACE, .depth_fail = VK_STENCIL_OP_KEEP,
+              .compare = VK_COMPARE_OP_ALWAYS },
+      .compare_mask = 0xff, .write_mask = 0xff, .reference = (uint8_t)stencil,
+   };
+   dyn->ds.stencil.front = face;
+   dyn->ds.stencil.back = face;
    dyn->vp.viewport_count = 1;
    dyn->vp.scissor_count = 1;
    dyn->vp.viewports[0] = (VkViewport){ 0, 0, info->rstate->width, info->rstate->height, 0, 1 };
