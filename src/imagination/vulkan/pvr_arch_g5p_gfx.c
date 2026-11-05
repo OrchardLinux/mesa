@@ -640,7 +640,8 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
    g->fs_discard_select = fs->discard_select;
    if (g->punch_variant && (fs->discard_tokens != 1 || fs->discard_select))
       return G5P_REFUSE(device, "punch-through variant needs exactly one real discard token");
-   g->fs_side_effects = (fs->evidence & PCO_G5P_EV_FS_STORE) != 0;
+   g->fs_side_effects = fs->side_effects;
+   g->vs_side_effects = vs->side_effects;
    g->fs_blend_mode = fs->blend_mode;
    g->fs_write_mask = key.write_mask;
    g->color_targets = key.color_targets;
@@ -1115,6 +1116,7 @@ g5p_scissor_index(struct pvr_cmd_buffer *cmd_buffer, int32_t x0, int32_t y0, int
       w1.scw1_ymin = y0;
       w1.scw1_ymax = y1;
    }
+   g5p_dump("draw", "isp scissor", 0, (const uint32_t[2]){ s.w0, s.w1 }, 2);
    const unsigned n = util_dynarray_num_elements(&cmd_buffer->scissor_array, struct pvr_scissor_words);
    if (n && !memcmp(util_dynarray_top_ptr(&cmd_buffer->scissor_array, struct pvr_scissor_words), &s, sizeof(s))) {
       *index = n - 1;
@@ -1373,7 +1375,7 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
     * fragment is shaded or tested (pvr_g5p_xfb.h; the ISP words below); a
     * pipeline that discards has no viewport state: the render area stands
     * in for its viewport and scissor (our A9 driver's form) */
-   const bool discard = dyn->rs.rasterizer_discard_enable;
+   bool discard = dyn->rs.rasterizer_discard_enable;
    if (!discard && (dyn->vp.viewport_count != 1 || dyn->vp.scissor_count != 1))
       return G5P_REFUSE(cmd_buffer, "%u viewports, %u scissors (one of each)", dyn->vp.viewport_count,
                         dyn->vp.scissor_count);
@@ -1417,33 +1419,59 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
    /* what the draw can read outside the arena, for the job's resource list (pvr_g5p_perf.h) */
    pvr_arch_g5p_perf_draw(cmd_buffer, draw->indexed);
 
-   /* the clip: the scissor within the render area and the attachment; a
-    * fully clipped draw emits nothing. A clip smaller than the attachment is
-    * the A9 ICD's (g5p_job_draw()): the TA region clip in whole tiles, and
-    * the ISP scissor table entry the pixels are cut to. The tiles outside a
-    * partial render area keep the LOAD background (pvr_arch_g5p.c), so they
-    * are stored back unchanged. */
+   /* the clip: the render area within the attachment, cut to the scissor
+    * and to the viewport. A clip smaller than the attachment is the A9 ICD's
+    * (g5p_job_draw()): the TA region clip in whole tiles, and the ISP scissor
+    * table entry the pixels are cut to. The tiles outside a partial render
+    * area keep the LOAD background (pvr_arch_g5p.c), so they are stored back
+    * unchanged. The PPP clips to a guard band, not to the viewport, so the
+    * viewport bounds the pixels here: Apple's ClipRectContext::setViewports()
+    * and updateClipRegions() (AGXMetalA9) take the floor of its low edge and
+    * the ceiling of its high edge, for either sign of its extent, and
+    * intersect it with the scissor; Rogue's driver intersects them too. */
    const uint32_t width = info->rstate->width, height = info->rstate->height;
-   const VkRect2D *ra = &info->render_area, *sc = discard ? ra : &dyn->vp.scissors[0];
-   const int32_t x0 = MAX3(sc->offset.x, ra->offset.x, 0), y0 = MAX3(sc->offset.y, ra->offset.y, 0);
-   const int32_t x1 = MIN3((int64_t)sc->offset.x + sc->extent.width, (int64_t)ra->offset.x + ra->extent.width,
-                           (int64_t)width);
-   const int32_t y1 = MIN3((int64_t)sc->offset.y + sc->extent.height, (int64_t)ra->offset.y + ra->extent.height,
-                           (int64_t)height);
-   if (x1 <= x0 || y1 <= y0)
-      return VK_SUCCESS;
+   const VkRect2D *ra = &info->render_area;
+   const int64_t ra_x0 = MAX2(ra->offset.x, 0), ra_y0 = MAX2(ra->offset.y, 0);
+   const int64_t ra_x1 = MIN2((int64_t)ra->offset.x + ra->extent.width, (int64_t)width);
+   const int64_t ra_y1 = MIN2((int64_t)ra->offset.y + ra->extent.height, (int64_t)height);
+   int64_t cx0 = ra_x0, cy0 = ra_y0, cx1 = ra_x1, cy1 = ra_y1;
+   if (!discard) {
+      const VkRect2D *sc = &dyn->vp.scissors[0];
+      const VkViewport *vp = &dyn->vp.viewports[0];
+      const double vx0 = MIN2((double)vp->x, (double)vp->x + vp->width);
+      const double vx1 = MAX2((double)vp->x, (double)vp->x + vp->width);
+      const double vy0 = MIN2((double)vp->y, (double)vp->y + vp->height);
+      const double vy1 = MAX2((double)vp->y, (double)vp->y + vp->height);
+      cx0 = MAX3(cx0, (int64_t)sc->offset.x, (int64_t)CLAMP(floor(vx0), -1.0, (double)width));
+      cy0 = MAX3(cy0, (int64_t)sc->offset.y, (int64_t)CLAMP(floor(vy0), -1.0, (double)height));
+      cx1 = MIN3(cx1, (int64_t)sc->offset.x + sc->extent.width, (int64_t)CLAMP(ceil(vx1), -1.0, (double)width));
+      cy1 = MIN3(cy1, (int64_t)sc->offset.y + sc->extent.height, (int64_t)CLAMP(ceil(vy1), -1.0, (double)height));
+   }
+   if (cx1 <= cx0 || cy1 <= cy0) {
+      /* No pixel is left. Vulkan still runs the vertex program once per
+       * vertex: when it writes memory or captures transform feedback, the
+       * draw takes the rasterizer-discard form (no fragment is shaded or
+       * tested; pvr_g5p_xfb.h) over the render area, else it emits nothing. */
+      if (discard || !(xfb || g->vs_side_effects) || ra_x1 <= ra_x0 || ra_y1 <= ra_y0)
+         return VK_SUCCESS;
+      discard = true;
+      cx0 = ra_x0, cy0 = ra_y0, cx1 = ra_x1, cy1 = ra_y1;
+   }
+   const int32_t x0 = cx0, y0 = cy0, x1 = cx1, y1 = cy1;
    /* The ISP shades whole 32-pixel tiles: without a scissor, the pixels of
     * an edge tile past the attachment (a 31x29 target's column 31 and rows
     * 29..31) run the fragment program as covered pixels. The PBE cuts their
     * colour to the attachment, so colour-only programs need no scissor
-    * (Apple's AGXMetalA9 ClipRectContext::updateClipRegions() enables it
-    * only for a clip inside the attachment, as above). Their memory stores
-    * are not cut (hardware, zink-fs-store: 116 such words, every one past
-    * the 31x29 attachment), and Vulkan's scissor test removes those
-    * fragments before shading: a program with side effects takes the ISP
-    * scissor unless the clip ends on tile edges, as Rogue's driver scissors
-    * every draw (pvr_arch_cmd_buffer.c). */
-   const bool side_effects_past_clip = g->fs_side_effects && ((x1 % G5P_TILE) || (y1 % G5P_TILE));
+    * (Apple's updateClipRegions() enables it only for a clip inside the
+    * attachment, as above). Their memory stores are not cut (hardware,
+    * zink-fs-store: 116 such words, every one past the 31x29 attachment),
+    * and Vulkan's scissor test removes those fragments before shading: a
+    * program with side effects takes the ISP scissor unless the clip ends on
+    * tile edges, as Rogue's driver scissors every draw
+    * (pvr_arch_cmd_buffer.c). Under rasterizer discard no fragment runs: no
+    * scissor (Rogue's scenable = !rasterizer_discard). */
+   const bool side_effects_past_clip =
+      !discard && g->fs_side_effects && ((x1 % G5P_TILE) || (y1 % G5P_TILE));
    const bool scissor = x0 || y0 || x1 != (int32_t)width || y1 != (int32_t)height || side_effects_past_clip;
    uint32_t scissor_index = 0;
    if (scissor) {

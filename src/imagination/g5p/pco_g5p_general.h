@@ -197,6 +197,12 @@ struct pco_g5p_program {
    uint8_t id_mask;
    uint8_t id_reg[2];
    uint8_t xfb_buffers; /* VS: transform feedback buffers stored to */
+   /* the program writes memory: a store or atomic to a buffer, image or
+    * global address (has_side_effects()), transform feedback included.
+    * A fragment program's draws bound the shaded pixels with the ISP
+    * scissor; a vertex program's draws run their vertices even when no
+    * pixel is left (pvr_arch_g5p_gfx.c). */
+   bool side_effects;
    char refusal[512];
 };
 

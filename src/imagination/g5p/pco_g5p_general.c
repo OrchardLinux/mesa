@@ -4654,6 +4654,17 @@ static bool has_side_effects(nir_intrinsic_instr *in)
    }
 }
 
+static bool impl_has_side_effects(nir_function_impl *impl)
+{
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(ins, block) {
+         if (ins->type == nir_instr_type_intrinsic && has_side_effects(nir_instr_as_intrinsic(ins)))
+            return true;
+      }
+   }
+   return false;
+}
+
 static bool discards_to_select(nir_shader *nir)
 {
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
@@ -5319,6 +5330,7 @@ static bool codegen(struct gctx *c)
       out->varyings = out->num_varyings;
    if (out->varyings > 1)
       out->evidence |= PCO_G5P_EV_VARYINGS;
+   out->side_effects = impl_has_side_effects(c->impl);
    out->refusal[0] = 0;
    return true;
 }
