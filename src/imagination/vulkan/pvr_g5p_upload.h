@@ -48,6 +48,7 @@ struct pvr_g5p_stage_upload {
 
 /* A pipeline's vertex uploads and their loader */
 struct pvr_g5p_stage_uploads {
+   struct pvr_g5p_vtex_uploads *vtex; /* NULL for the unchanged legacy loader */
    unsigned count, common_dwords;
    struct pvr_g5p_stage_upload u[PVR_G5P_MAX_STAGE_UPLOADS];
    struct pvr_pds_upload loader; /* the DOUTD loader's code */

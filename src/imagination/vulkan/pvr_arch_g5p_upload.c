@@ -31,6 +31,7 @@
 #include "pvr_descriptor_set.h"
 #include "pvr_device.h"
 #include "pvr_g5p_upload.h"
+#include "pvr_g5p_vtex.h"
 
 /* A refusal, by name, on stderr too (vk_errorf() is silent in release builds) */
 #define G5P_UP_REFUSE(obj, ...)                                                                                    \
@@ -112,6 +113,11 @@ PVR_PER_ARCH(g5p_vs_uploads_create)(struct pvr_device *device, const struct pco_
    *out = NULL;
    if (!vs->num_uploads)
       return VK_SUCCESS;
+   if (g5p_vtex_probe()) {
+      for (unsigned i = 0; i < vs->num_uploads; i++)
+         if (vs->uploads[i].kind == PCO_G5P_UPLOAD_IMAGE || vs->uploads[i].kind == PCO_G5P_UPLOAD_IMAGE_SIZE)
+            return pvr_arch_g5p_vtex_create(device, vs, out);
+   }
    if (vs->num_uploads > PVR_G5P_MAX_STAGE_UPLOADS)
       return G5P_UP_REFUSE(device, "%u vertex-stage uploads (at most %u)", vs->num_uploads,
                            PVR_G5P_MAX_STAGE_UPLOADS);
@@ -165,6 +171,7 @@ PVR_PER_ARCH(g5p_vs_uploads_destroy)(struct pvr_device *device, struct pvr_g5p_s
 {
    if (!up)
       return;
+   if (up->vtex) { pvr_arch_g5p_vtex_destroy(device, up); return; }
    pvr_bo_suballoc_free(up->loader.pvr_bo);
    vk_free(&device->vk.alloc, up);
 }
@@ -223,6 +230,7 @@ VkResult
 PVR_PER_ARCH(g5p_vs_uploads_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_stage_uploads *up,
                                   struct pvr_g5p_vs_upload_draw *out)
 {
+   if (up->vtex) return pvr_arch_g5p_vtex_draw(cmd_buffer, up, out);
    const struct pvr_push_constants *push = &cmd_buffer->state.push_consts[PVR_STAGE_ALLOCATION_VERTEX_GEOMETRY];
    const unsigned n = up->count;
    uint64_t src[PVR_G5P_MAX_STAGE_UPLOADS];

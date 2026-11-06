@@ -174,6 +174,7 @@ unsigned g5p_usc_half_immediate(uint8_t *out, unsigned dst_half, uint16_t value)
  * iterator unit: `08 7d DH SH 00 80`, SH = source half << 1 | 1 (Apple's
  * f_cube_alu, f_cube_hi; a cube sample of raw directions reads them as 2D on
  * face 0, device 2026-11-02). */
+unsigned g5p_usc_vertex_texture_level(uint8_t *out, unsigned dst_half, unsigned src_half, unsigned group);
 unsigned g5p_usc_cube_coords(uint8_t *out, unsigned dst_half, unsigned src_half);
 /* f32 -> u16 (truncating) into one half: Apple's array-layer conversion
  * `89 01 DH 01 09 SS 20 01 60 06`. */

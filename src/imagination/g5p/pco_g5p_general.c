@@ -29,6 +29,7 @@
  */
 #include "pco_g5p_general.h"
 #include "../vulkan/pvr_g5p_dgl.h"
+#include "g5p_vtex.h"
 #include "g5p_usc.h"
 #include "g5p_mrt_out.h"
 
@@ -185,7 +186,7 @@ struct gctx {
    unsigned nput;      /* instructions emitted so far */
    int *lastput;       /* per value: index of the last instruction reading its register */
    int klast[3];       /* the same for the persistent 1.0 / 0 / 1 registers */
-   uint32_t scratch;   /* registers of re-read values, free after the instruction */
+   uint64_t scratch;   /* registers of re-read values, free after the instruction */
    struct {            /* VS: store record bases, one address pair each */
       unsigned buffer;
       struct ref off;
@@ -204,7 +205,9 @@ struct gctx {
    bool *sat_folded; /* per def: fsat folded into its producer */
    bool *saturate;   /* per def: producer emitted with saturate */
    int *rh_half;     /* per def: emitted with result_half into this output half */
-   uint32_t busy, reserved;
+   uint64_t busy, reserved;
+   unsigned max_bank0;
+   bool tex_bank0; /* only the ordinary texture instruction uses this bank */
    unsigned max_dword, max_written;
    int now;
    int one_reg;
@@ -367,8 +370,19 @@ static void vs_bank1_only(struct gctx *c, const char *what, int r0, int r1, int 
 /* ---- registers (dwords) ---- */
 static unsigned alloc_run(struct gctx *c, unsigned n, const char *why)
 {
+   if (c->vs && c->tex_bank0) {
+      for (unsigned r = VS_BANK0; r + n <= VS_BANK0 + NUM_DWORDS; r++) {
+         uint64_t mask = BITFIELD64_RANGE(r, n);
+         if (!((c->busy | c->reserved) & mask)) {
+            c->busy |= mask;
+            c->max_bank0 = MAX2(c->max_bank0, r - VS_BANK0 + n);
+            return r;
+         }
+      }
+      refuse(c, "vertex texture bank0 register pressure: %s needs %u dwords", why, n);
+   }
    for (unsigned r = 0; r + n <= NUM_DWORDS; r++) {
-      uint32_t mask = BITFIELD_RANGE(r, n);
+      uint64_t mask = BITFIELD64_RANGE(r, n);
       if (!((c->busy | c->reserved) & mask)) {
          c->busy |= mask;
          c->max_dword = MAX2(c->max_dword, r + n);
@@ -377,7 +391,7 @@ static unsigned alloc_run(struct gctx *c, unsigned n, const char *why)
       }
    }
    refuse(c, "register pressure: %s needs %u dword(s), %u of %u in use", why, n,
-          util_bitcount(c->busy | c->reserved), NUM_DWORDS);
+          util_bitcount64(c->busy | c->reserved), NUM_DWORDS);
 }
 
 /* The flown VS temps (g5p_gfx.h G5P_VS_TEMPS_FLOWN). A VS whose inputs
@@ -390,10 +404,16 @@ static unsigned alloc_reg(struct gctx *c, int prefer)
 {
    /* A dying input above them is not reused in place while a lower register
     * is free. Every VS within the flown temps uses no register this high. */
-   if (c->vs && prefer >= VS_WRITE_REGS && (~(c->busy | c->reserved) & BITFIELD_MASK(prefer)))
+   if (c->vs && prefer >= (int)VS_BANK0 && !c->tex_bank0)
+      prefer = -1; /* normal ALU outputs retain the qualified bank1 allocation */
+   if (c->vs && prefer >= VS_WRITE_REGS && prefer < (int)VS_BANK0 && (~(c->busy | c->reserved) & BITFIELD64_MASK(prefer)))
       prefer = -1;
-   if (prefer >= 0 && !((c->busy | c->reserved) & BITFIELD_BIT(prefer))) {
-      c->busy |= BITFIELD_BIT(prefer);
+   if (prefer >= 0 && !((c->busy | c->reserved) & BITFIELD64_BIT(prefer))) {
+      c->busy |= BITFIELD64_BIT(prefer);
+      if (c->vs && prefer >= (int)VS_BANK0) {
+         c->max_bank0 = MAX2(c->max_bank0, (unsigned)prefer - VS_BANK0 + 1);
+         return prefer;
+      }
       c->max_dword = MAX2(c->max_dword, (unsigned)prefer + 1);
       c->max_written = MAX2(c->max_written, (unsigned)prefer + 1);
       return prefer;
@@ -409,7 +429,11 @@ static void hold(struct gctx *c, struct val *v, unsigned reg)
 {
    v->reg = reg;
    v->held = true;
-   c->busy |= BITFIELD_BIT(reg);
+   c->busy |= BITFIELD64_BIT(reg);
+   if (c->vs && reg >= VS_BANK0) {
+      c->max_bank0 = MAX2(c->max_bank0, reg - VS_BANK0 + 1);
+      return;
+   }
    c->max_dword = MAX2(c->max_dword, reg + 1);
    if (!v->input)
       c->max_written = MAX2(c->max_written, reg + 1);
@@ -418,7 +442,7 @@ static void hold(struct gctx *c, struct val *v, unsigned reg)
 static void drop(struct gctx *c, struct val *v)
 {
    if (v->held) {
-      c->busy &= ~BITFIELD_BIT(v->reg);
+      c->busy &= ~BITFIELD64_BIT(v->reg);
       v->held = false;
    }
 }
@@ -777,6 +801,23 @@ static const char *tex_shape_refusal(const nir_tex_instr *t)
 /* Transform feedback record base from nir_lower_xfb_to_stores:
  * iadd(load_xfb_address(b), u2u64(off)), one 64-bit address add of a
  * shared pointer pair and a 32-bit offset (v_st_xfb, v_st_bytes). */
+/* Ordinary bank0 texture forms only. No continuation is inferred from stage. */
+static const char *vs_tex_refusal(const nir_tex_instr *t)
+{
+   const char *why = tex_shape_refusal(t);
+   if (why || size_query(t)) return why;
+   if (t->op != nir_texop_tex && t->op != nir_texop_txl)
+      return "vertex fetch/bias/gradient requires separately qualified state";
+   if (t->is_array || t->is_shadow ||
+       (t->sampler_dim != GLSL_SAMPLER_DIM_2D && t->sampler_dim != GLSL_SAMPLER_DIM_CUBE))
+      return "vertex array/3D/shadow texture not qualified on the ordinary path";
+   if (nir_alu_type_get_base_type(t->dest_type) != nir_type_float)
+      return "vertex sampled integer result not qualified";
+   if (nir_tex_instr_src_index(t, nir_tex_src_offset) >= 0)
+      return "vertex texture offset not qualified";
+   return NULL;
+}
+
 static bool xfb_base(struct ref r, unsigned *buffer, struct ref *off)
 {
    nir_alu_instr *add = alu_of(r.def);
@@ -1009,7 +1050,8 @@ static void scan_cf(struct gctx *c, struct exec_list *list, struct unsupported *
          }
          case nir_instr_type_tex: {
             nir_tex_instr *t = nir_instr_as_tex(ins);
-            const char *why = c->vs ? "vertex stage" : plain_tex(t) ? NULL : tex_shape_refusal(t);
+            const char *why = c->vs ? (!g5p_vtex_probe() ? "vertex stage" : vs_tex_refusal(t)) :
+                              plain_tex(t) ? NULL : tex_shape_refusal(t);
             if (why) {
                snprintf(buf, sizeof(buf), "tex(op %u, dim %u%s%s): %s", t->op, t->sampler_dim,
                         t->is_array ? ", array" : "", t->is_shadow ? ", shadow" : "", why);
@@ -1294,7 +1336,7 @@ static void plan_varyings(struct gctx *c)
       read |= 1u << n;
       interp[n] = m;
       centroid[n] = cen;
-      mask[n] |= BITFIELD_MASK(in->def.num_components) << nir_intrinsic_component(in);
+      mask[n] |= BITFIELD64_MASK(in->def.num_components) << nir_intrinsic_component(in);
    }
    if (util_bitcount(read) > PCO_G5P_MAX_FS_VARYINGS)
       refuse(c, "%u varying locations read (%u vec4: the reported 64 components)", util_bitcount(read),
@@ -1981,7 +2023,7 @@ static int pick_home(struct gctx *c)
    for (unsigned i = 0; i < c->nvals; i++) {
       struct val *v = &c->vals[i];
       if (!v->held || v->state != VAL_REG || !v->body || v->last <= c->now || c->home[i] >= 0 ||
-          (c->reserved & BITFIELD_BIT(v->reg)))
+          (c->reserved & BITFIELD64_BIT(v->reg)))
          continue;
       if (best < 0 || v->last > c->vals[best].last)
          best = i;
@@ -2006,7 +2048,7 @@ static unsigned reg_of(struct gctx *c, struct ref r, const char *what)
       unsigned reg = alloc_reg(c, -1);
       put(c, raw, g5p_usc_immediate(raw, H(c, reg), v->imm, vbank(c, reg), -1), "movi");
       if (scratch)
-         c->scratch |= BITFIELD_BIT(reg);
+         c->scratch |= BITFIELD64_BIT(reg);
       else
          hold(c, v, reg);
       return reg;
@@ -2015,7 +2057,7 @@ static unsigned reg_of(struct gctx *c, struct ref r, const char *what)
       /* parked above r31: back into a register for this instruction */
       unsigned reg = alloc_reg(c, -1);
       put(c, raw, g5p_usc_alu2_wide(raw, G5P_OP_OR, reg, v->reg, 0, v->reg, 0), "move from a home above r31");
-      c->scratch |= BITFIELD_BIT(reg);
+      c->scratch |= BITFIELD64_BIT(reg);
       return reg;
    }
    case VAL_SHARED: {
@@ -2023,7 +2065,7 @@ static unsigned reg_of(struct gctx *c, struct ref r, const char *what)
       put(c, raw, g5p_usc_mov_shared(raw, H(c, reg), v->imm, vbank(c, reg)), "mov.shared");
       c->p->evidence |= c->vs ? PCO_G5P_EV_VS_SHARED : PCO_G5P_EV_SHARED;
       if (scratch)
-         c->scratch |= BITFIELD_BIT(reg);
+         c->scratch |= BITFIELD64_BIT(reg);
       else
          hold(c, v, reg);
       return reg;
@@ -2049,7 +2091,7 @@ static unsigned scratch_imm(struct gctx *c, uint32_t value)
    uint8_t raw[G5P_USC_MAX];
    unsigned reg = alloc_reg(c, -1);
    put(c, raw, g5p_usc_immediate(raw, H(c, reg), value, vbank(c, reg), -1), "movi");
-   c->scratch |= BITFIELD_BIT(reg);
+   c->scratch |= BITFIELD64_BIT(reg);
    return reg;
 }
 
@@ -2252,7 +2294,7 @@ static unsigned consumable(struct gctx *c, struct ref x, const char *what)
    unsigned xr = reg_of(c, x, what);
    if (dies(c, x)) {
       drop(c, V(c, x.def, x.comp));
-      c->busy |= BITFIELD_BIT(xr);
+      c->busy |= BITFIELD64_BIT(xr);
       return xr;
    }
    unsigned d = alloc_reg(c, -1);
@@ -2330,10 +2372,10 @@ static void emit_recipe(struct gctx *c, nir_alu_instr *a)
       flags |= G5P_RC_Y_LIVE;
    put_recipe(c, r, d, d, y, t, flags);
    if (scratch)
-      c->busy &= ~BITFIELD_BIT(t);
+      c->busy &= ~BITFIELD64_BIT(t);
    if (r == G5P_RC_MIN || r == G5P_RC_MAX)
       free_dying(c, &yr, 1);
-   c->busy &= ~BITFIELD_BIT(d);
+   c->busy &= ~BITFIELD64_BIT(d);
    define(c, &a->def, d);
 }
 
@@ -3021,7 +3063,7 @@ static void emit_shift(struct gctx *c, nir_alu_instr *a)
    unsigned dst = alloc_reg(c, d ? (int)xr : -1);
    put(c, raw, g5p_usc_shift(raw, a->op == nir_op_ishl, 2 * dst, 2 * xr, 2 * mask, false, 0, gx, 1, 1),
        "dynamic shift");
-   c->busy &= ~BITFIELD_BIT(mask);
+   c->busy &= ~BITFIELD64_BIT(mask);
    define(c, &a->def, dst);
 }
 
@@ -3461,13 +3503,13 @@ static void vs_store(struct gctx *c, nir_intrinsic_instr *in)
       put(c, raw, g5p_usc_address_add(raw, H(c, addr), c->xfb_common + PCO_G5P_XFB_ADDR(b), 1, H(c, oreg), og, 0),
           "address add");
       c->st_base[i].pair = addr;
-      c->reserved |= BITFIELD_RANGE(addr, 2);
+      c->reserved |= BITFIELD64_RANGE(addr, 2);
    }
    struct ref r = resolve_value(c, in->src[0].ssa, 0);
    unsigned data = reg_of(c, r, "store data");
    vs_bank1_only(c, "transform feedback store", data, -1, -1, -1);
    put(c, raw, g5p_usc_global_store(raw, 4, H(c, data), H(c, c->st_base[i].pair), k), "store");
-   c->reserved |= BITFIELD_BIT(data);
+   c->reserved |= BITFIELD64_BIT(data);
    c->p->evidence |= PCO_G5P_EV_VS_STORE;
 }
 
@@ -3622,7 +3664,7 @@ static void emit_dyn_ubo(struct gctx *c, nir_intrinsic_instr *in)
       drop(c, V(c, ix.def, ix.comp));
    unsigned pair = 0;
    for (pair = 0; pair + 2 <= NUM_DWORDS; pair += 2)
-      if (!((c->busy | c->reserved) & BITFIELD_RANGE(pair, 2)))
+      if (!((c->busy | c->reserved) & BITFIELD64_RANGE(pair, 2)))
          break;
    if (pair + 2 > NUM_DWORDS)
       refuse(c, "register pressure: an address pair");
@@ -3630,11 +3672,11 @@ static void emit_dyn_ubo(struct gctx *c, nir_intrinsic_instr *in)
    put(c, raw, g5p_usc_address_add_shift(raw, 2 * pair, common, 2 * index, shift, kill, c->vs), "addr.add_shift");
    unsigned dst = 0;
    for (dst = 0; dst + n <= NUM_DWORDS; dst += n)
-      if (!((c->busy | c->reserved) & BITFIELD_RANGE(dst, n)))
+      if (!((c->busy | c->reserved) & BITFIELD64_RANGE(dst, n)))
          break;
    if (dst + n > NUM_DWORDS)
       refuse(c, "register pressure: load_ubo needs %u aligned dword(s)", n);
-   c->busy |= BITFIELD_RANGE(dst, n);
+   c->busy |= BITFIELD64_RANGE(dst, n);
    c->max_dword = MAX2(c->max_dword, dst + n);
    if (c->vs)
       put(c, raw, g5p_usc_vertex_address_load(raw, 2 * dst, bytes, 2 * pair), "vertex address load");
@@ -3684,9 +3726,9 @@ static void stage_ssbo_store(struct gctx *c,nir_intrinsic_instr *in)
    if(c->vs)vs_bank1_only(c,"vertex SSBO store",index,data,-1,-1);
    unsigned pair;
    for(pair=0;pair+2<=NUM_DWORDS;pair+=2)
-      if(!((c->busy|c->reserved)&BITFIELD_RANGE(pair,2)))break;
+      if(!((c->busy|c->reserved)&BITFIELD64_RANGE(pair,2)))break;
    if(pair+2>NUM_DWORDS)refuse(c,"store_ssbo: register pressure for address pair");
-   c->busy|=BITFIELD_RANGE(pair,2);
+   c->busy|=BITFIELD64_RANGE(pair,2);
    c->max_dword=MAX2(c->max_dword,pair+2);c->max_written=MAX2(c->max_written,pair+2);
    uint8_t raw[G5P_USC_MAX];
    put(c,raw,g5p_usc_address_add_shift(raw,2*pair,base,2*index,0,false,c->vs),"SSBO address");
@@ -3696,7 +3738,7 @@ static void stage_ssbo_store(struct gctx *c,nir_intrinsic_instr *in)
       put(c,raw,g5p_usc_fs_store(raw,4,2*data,2*pair,1),"fragment SSBO store");
    }
    put(c,raw,g5p_usc_wait(raw,0),"SSBO store completion");
-   c->busy&=~BITFIELD_RANGE(pair,2);free_scratch(c);
+   c->busy&=~BITFIELD64_RANGE(pair,2);free_scratch(c);
    c->p->evidence|=c->vs?PCO_G5P_EV_VS_STORE:PCO_G5P_EV_FS_STORE;
 }
 
@@ -3870,7 +3912,10 @@ static void move_into(struct gctx *c, unsigned dst, nir_def *d, unsigned k, cons
    uint8_t raw[G5P_USC_MAX];
    struct ref r = resolve_value(c, d, k);
    unsigned rr = reg_of(c, r, what);
-   put(c, raw, g5p_usc_move(raw, 2 * dst, 2 * rr, 0, vgrp(c, r), 1), what);
+   if (c->vs && (r.neg || r.abs))
+      refuse(c, "vertex texture coordinate modifier not qualified");
+   put(c, raw, g5p_usc_move(raw, H(c, dst), H(c, rr), 0, vgrp(c, r),
+                           c->vs ? vhdr(c, 0x21, rr, -1, -1) : 1), what);
 }
 
 /* textypes: Apple's general sample/read (probes.metal, textypes.md §3).
@@ -3888,6 +3933,8 @@ static void move_into(struct gctx *c, unsigned dst, nir_def *d, unsigned k, cons
  * integers in the same registers (the instruction is format-blind). */
 static void emit_tex_ext(struct gctx *c, nir_tex_instr *t)
 {
+   bool saved_bank = c->tex_bank0;
+   c->tex_bank0 = c->vs;
    uint8_t raw[G5P_USC_MAX];
    struct tex_bind *b = tex_for(c, t);
    enum glsl_sampler_dim sd = t->sampler_dim;
@@ -3900,20 +3947,20 @@ static void emit_tex_ext(struct gctx *c, nir_tex_instr *t)
              array ? G5P_TEX_2D_ARRAY : G5P_TEX_2D,
       .mask = t->is_shadow ? 1 : 0xf, .compare = t->is_shadow, .offset = packed >= 0,
    };
-   uint32_t scratch = 0;
+   uint64_t scratch = 0;
    nir_def *cd = nir_get_tex_src(t, nir_tex_src_coord);
    /* a cube's block has a fourth scratch dword: the cube-coordinate op's
     * output width is not measured */
    unsigned nblock = 2 + third + (sd == GLSL_SAMPLER_DIM_CUBE);
    unsigned block = alloc_run(c, nblock, "texture coordinates");
-   scratch |= BITFIELD_RANGE(block, nblock);
-   x.coord_dword = block;
+   scratch |= BITFIELD64_RANGE(block, nblock);
+   x.coord_dword = H(c, block) / 2;
    move_into(c, block, cd, 0, "texture coordinate x");
    move_into(c, block + 1, cd, 1, "texture coordinate y");
    if (array && !read) {
       /* layer = u16(z + 0.5) */
       unsigned tmp = alloc_reg(c, -1);
-      scratch |= BITFIELD_BIT(tmp);
+      scratch |= BITFIELD64_BIT(tmp);
       move_into(c, tmp, cd, 2, "array layer");
       put(c, raw, g5p_usc_binary_literal(raw, G5P_BIN_FADD, 2 * tmp, 0x3800, 2 * tmp, 0, 1, 1, true, -1),
           "layer + 0.5");
@@ -3925,7 +3972,7 @@ static void emit_tex_ext(struct gctx *c, nir_tex_instr *t)
    int li = nir_tex_instr_src_index(t, t->op == nir_texop_txb ? nir_tex_src_bias : nir_tex_src_lod);
    if (t->op == nir_texop_txd) {
       unsigned g = alloc_run(c, 4, "texture gradients");
-      scratch |= BITFIELD_RANGE(g, 4);
+      scratch |= BITFIELD64_RANGE(g, 4);
       nir_def *dx = nir_get_tex_src(t, nir_tex_src_ddx), *dy = nir_get_tex_src(t, nir_tex_src_ddy);
       move_into(c, g, dx, 0, "dPdx.x");
       move_into(c, g + 1, dy, 0, "dPdy.x");
@@ -3941,13 +3988,44 @@ static void emit_tex_ext(struct gctx *c, nir_tex_instr *t)
       else
          kgrp(c, K_ZERO);
       x.lod = G5P_TEX_LOD_LEVEL;
+   } else if (c->vs) {
+      /* Narrow in bank1 with the native vertex literal conversion, then
+       * copy its low half to bank0 with the witnessed A-source move.
+       * No texture continuation bits or bank0-to-bank1 copy is needed. */
+      c->tex_bank0 = false;
+      unsigned l1 = alloc_reg(c, -1);
+      unsigned src = l1, group = 1;
+      if (li >= 0) {
+         struct ref r = resolve_value(c, t->src[li].src.ssa, 0);
+         struct val *v = V(c, r.def, r.comp);
+         if (v->state == VAL_CONST) {
+            put(c, raw, g5p_usc_immediate(raw, H(c, l1), apply_mods(v->imm, r), 1, -1), "vertex LOD constant");
+         } else if (v->state == VAL_SHARED && !r.neg && !r.abs) {
+            put(c, raw, g5p_usc_mov_shared(raw, H(c, l1), v->imm, 1), "vertex LOD shared");
+         } else {
+            if (r.neg || r.abs) refuse(c, "vertex texture LOD modifier not qualified");
+            src = reg_of(c, r, "vertex texture LOD");
+            vs_bank1_only(c, "vertex texture LOD source", src, -1, -1, -1);
+            group = vgrp(c, r);
+         }
+      } else {
+         put(c, raw, g5p_usc_immediate(raw, H(c, l1), 0, 1, -1), "vertex LOD zero");
+      }
+      put(c, raw, g5p_usc_vertex_texture_level(raw, H(c, l1), H(c, src), group), "vertex LOD f32 to f16");
+      c->tex_bank0 = true;
+      unsigned l0 = alloc_reg(c, -1);
+      put(c, raw, g5p_usc_move(raw, H(c, l0), H(c, l1), 0, 1, 0x21), "vertex LOD into bank0");
+      c->busy &= ~BITFIELD64_BIT(l1);
+      scratch |= BITFIELD64_BIT(l0);
+      x.lod = G5P_TEX_LOD_LEVEL;
+      x.lod_dword = H(c, l0) / 2;
    } else if (li >= 0) {
       struct ref r = resolve_value(c, t->src[li].src.ssa, 0);
       unsigned lr = reg_of(c, r, "texture level");
       unsigned one = one_reg(c);
       unsigned gl = vgrp(c, r), g1 = kgrp(c, K_ONE);
       unsigned l = alloc_reg(c, -1);
-      scratch |= BITFIELD_BIT(l);
+      scratch |= BITFIELD64_BIT(l);
       struct g5p_alu f = G5P_ALU(2 * l);
       f.result_half = true;
       f.a = gsrc(c, lr, r, gl);
@@ -3961,7 +4039,7 @@ static void emit_tex_ext(struct gctx *c, nir_tex_instr *t)
    unsigned off_half = 0;
    if (t->is_shadow) {
       unsigned e = alloc_run(c, 1 + x.offset, "compare reference");
-      scratch |= BITFIELD_RANGE(e, 1 + x.offset);
+      scratch |= BITFIELD64_RANGE(e, 1 + x.offset);
       move_into(c, e, nir_get_tex_src(t, nir_tex_src_comparator), 0, "compare reference");
       x.extras_half = 2 * e;
       off_half = 2 * (e + 1);
@@ -3969,7 +4047,7 @@ static void emit_tex_ext(struct gctx *c, nir_tex_instr *t)
       off_half = x.extras_half = 2 * (block + 2) + 1;
    } else if (x.offset) {
       unsigned e = alloc_reg(c, -1);
-      scratch |= BITFIELD_BIT(e);
+      scratch |= BITFIELD64_BIT(e);
       off_half = x.extras_half = 2 * e;
    }
    if (x.offset)
@@ -3978,10 +4056,10 @@ static void emit_tex_ext(struct gctx *c, nir_tex_instr *t)
    /* cube: the direction becomes the cube coordinates in place, right
     * before the sample (Apple's f_cube_alu, f_cube_alu_lvl, f_cmp_cube_alu) */
    if (x.dim == G5P_TEX_CUBE)
-      put(c, raw, g5p_usc_cube_coords(raw, 2 * block, 2 * block), "cube coordinates");
+      put(c, raw, g5p_usc_cube_coords(raw, H(c, block), H(c, block)), "cube coordinates");
    unsigned n = t->is_shadow ? 1 : 4;
    unsigned dst = alloc_run(c, n, "texture result");
-   x.dst_half = 2 * dst;
+   x.dst_half = H(c, dst);
    put(c, raw, g5p_usc_sample_ext(raw, &x), read ? "texel read" : "texture sample");
    put(c, raw, g5p_usc_wait(raw, 0), "wait");
    c->scratch |= scratch;
@@ -3991,6 +4069,7 @@ static void emit_tex_ext(struct gctx *c, nir_tex_instr *t)
       v->reg = dst + k;
       v->held = true;
    }
+   c->tex_bank0 = saved_bank;
    c->p->evidence |= PCO_G5P_EV_TEX_TYPES;
 }
 
@@ -4000,7 +4079,7 @@ static void emit_tex(struct gctx *c, nir_tex_instr *t)
       emit_size(c, t);
       return;
    }
-   if (!plain_tex(t)) {
+   if (c->vs || !plain_tex(t)) {
       emit_tex_ext(c, t);
       return;
    }
@@ -4027,7 +4106,7 @@ static void emit_tex(struct gctx *c, nir_tex_instr *t)
          coord = alloc_run(c, 2, "texture coordinate");
          put(c, raw, g5p_usc_move(raw, 2 * coord, 2 * xr, 0, vgrp(c, x), 1), "coordinate x");
          put(c, raw, g5p_usc_move(raw, 2 * coord + 2, 2 * yr, 0, vgrp(c, y), 1), "coordinate y");
-         c->scratch |= BITFIELD_RANGE(coord, 2);
+         c->scratch |= BITFIELD64_RANGE(coord, 2);
       }
       c->p->evidence |= PCO_G5P_EV_TEX_COMPUTED;
    }
@@ -4036,7 +4115,7 @@ static void emit_tex(struct gctx *c, nir_tex_instr *t)
    unsigned dst = 0;
    if (!narrow) {
       if (slot >= 0)
-         c->busy &= ~BITFIELD_RANGE(coord, 2);
+         c->busy &= ~BITFIELD64_RANGE(coord, 2);
       dst = alloc_run(c, 4, "texture result");
    }
    s.dst_half = 2 * dst;
@@ -4086,7 +4165,7 @@ static void vs_converts(struct gctx *c, struct vs_convert *cv, unsigned n)
          last_reg &= cv[k].reg != cv[i].reg;
       }
       if (last_reg)
-         c->busy &= ~BITFIELD_BIT(cv[i].reg); /* the dword's last read: in place */
+         c->busy &= ~BITFIELD64_BIT(cv[i].reg); /* the dword's last read: in place */
       unsigned dst = alloc_reg(c, last_reg ? (int)cv[i].reg : -1);
       unsigned m;
       if (cv[i].fmt == PCO_G5P_VSF_F16) {
@@ -4142,7 +4221,7 @@ static void setup_inputs(struct gctx *c)
             if (fmt >= PCO_G5P_VSF_COUNT || in->def.num_components != 1 ||
                 (fmt >= PCO_G5P_VSF_U16 && (byte & 1)))
                refuse(c, "vertex input location %u: converted load %#x", l, base);
-            raw_regs |= BITFIELD_BIT(4 * l + comp);
+            raw_regs |= BITFIELD64_BIT(4 * l + comp);
             if (v->uses) {
                if (ncv == ARRAY_SIZE(cv))
                   refuse(c, "more than %u converted vertex input components", (unsigned)ARRAY_SIZE(cv));
@@ -4194,7 +4273,7 @@ static void setup_inputs(struct gctx *c)
       vs_converts(c, cv, ncv);
    /* a converted dword none of whose components is read */
    for (unsigned i = 0; i < ncv; i++)
-      raw_regs &= ~BITFIELD_BIT(cv[i].reg);
+      raw_regs &= ~BITFIELD64_BIT(cv[i].reg);
    c->busy &= ~raw_regs;
 }
 
@@ -4404,7 +4483,7 @@ static void fs_discards(struct gctx *c)
       unsigned gb = k.zero_b ? vgrp(c, k.a) : 1, gz = kgrp(c, K_ZERO);
       put(c, raw, g5p_usc_discard_test(raw, G5P_FEQ, 2 * t, S(2 * b, gb), S(2 * z, gz), 0), "discard test");
       put(c, raw, g5p_usc_discard(raw, 2 * t), "discard");
-      c->busy &= ~BITFIELD_BIT(t);
+      c->busy &= ~BITFIELD64_BIT(t);
       free_scratch(c);
       c->p->evidence |= PCO_G5P_EV_DISCARD;
    }
@@ -4580,12 +4659,10 @@ static void vs_output(struct gctx *c)
    if (!n)
       refuse(c, "no final vertex output");
    util_qsort_r(order, n, sizeof(order[0]), vout_order, c);
-   /* Apple's vertex outputs read bank 1 (888 of them in the bank probes and
-    * the vertex probe sets; none reads a bank-0-only value). */
-   for (unsigned i = 0; i < n; i++)
-      vs_bank1_only(c, "vertex output", reg[order[i]], -1, -1, -1);
+   /* Native ordinary vertex samples export bank0 with the non-temp VOUT
+    * form; other values retain the bank1 form. */
    for (unsigned i = 0; i + 1 < n; i++)
-      put(c, raw, g5p_usc_vout(raw, H(c, reg[order[i]]), c->vout[order[i]].slot, true, false), "vertex output");
+      put(c, raw, g5p_usc_vout(raw, H(c, reg[order[i]]), c->vout[order[i]].slot, vbank(c, reg[order[i]]), false), "vertex output");
    /* Characterized convention: branch to the 64-byte block holding the
     * final output/end-task, padding in between. */
    unsigned target = align(c->size + 6, 64);
@@ -4593,7 +4670,7 @@ static void vs_output(struct gctx *c)
    while (c->size < target)
       put(c, raw, g5p_usc_special(raw, false), "padding");
    unsigned last = order[n - 1];
-   put(c, raw, g5p_usc_vout(raw, H(c, reg[last]), c->vout[last].slot, true, true), "last vertex output");
+   put(c, raw, g5p_usc_vout(raw, H(c, reg[last]), c->vout[last].slot, vbank(c, reg[last]), true), "last vertex output");
 }
 
 /* Eager vertex outputs whose value instruction idx just produced. */
@@ -4603,8 +4680,7 @@ static void eager_outputs(struct gctx *c, int idx)
    for (unsigned i = 0; i < c->nvout; i++)
       if (c->vout[i].at == idx) {
          unsigned r = reg_of(c, c->vout[i].r, "vertex output");
-         vs_bank1_only(c, "vertex output", r, -1, -1, -1);
-         put(c, raw, g5p_usc_vout(raw, H(c, r), c->vout[i].slot, true, false), "vertex output");
+         put(c, raw, g5p_usc_vout(raw, H(c, r), c->vout[i].slot, vbank(c, r), false), "vertex output");
       }
 }
 
@@ -5679,12 +5755,12 @@ static bool codegen(struct gctx *c)
    } else {
       plan_common(c);
       plan_fs_output(c);
-      c->reserved = BITFIELD_RANGE(0, c->mrt.words); /* packed colour halves, o0..o(2N-1) */
+      c->reserved = BITFIELD64_RANGE(0, c->mrt.words); /* packed colour halves, o0..o(2N-1) */
       if (c->cf && c->reserve_st31)
-         c->reserved |= BITFIELD_BIT(NUM_DWORDS - 1);
+         c->reserved |= BITFIELD64_BIT(NUM_DWORDS - 1);
       c->max_dword = c->mrt.words;
       if (c->cf && !c->count_pass)
-         c->reserved |= BITFIELD_BIT(c->st); /* the mask stack, above every register of the count pass */
+         c->reserved |= BITFIELD64_BIT(c->st); /* the mask stack, above every register of the count pass */
       fs_prologue(c);
       hoist_iterators(c);
       release(c, -1);
@@ -5702,7 +5778,7 @@ static bool codegen(struct gctx *c)
    out->size = c->size;
    if (c->cf)
       c->max_dword = MAX2(c->max_dword, c->st + 1);
-   out->temps = MAX2(8, align(c->max_dword, 4));
+   out->temps = MAX3(8, align(c->max_dword, 4), align(c->max_bank0, 4));
    if (c->nhomes) {
       out->temps = MAX2(out->temps, align(32 + c->nhomes, 4));
       out->evidence |= PCO_G5P_EV_HIGH_REGS;
@@ -5744,6 +5820,8 @@ static void codegen_reset(struct gctx *c)
    c->one_reg = c->zero_reg = c->ione_reg = c->fragcoord = -1;
    c->size = 0;
    c->busy = c->reserved = c->max_dword = c->max_written = 0;
+   c->max_bank0 = 0;
+   c->tex_bank0 = false;
    c->ntex = c->nranges = c->nssbo = c->common_next = 0;
    c->nvout = c->ndiscards = 0;
    c->discard_always = false;

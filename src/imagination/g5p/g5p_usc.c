@@ -638,8 +638,8 @@ unsigned g5p_usc_vout(uint8_t *out, unsigned src_half, unsigned slot, bool temp,
       uint8_t raw[6] = {0x5e, b1, src_half, 0xc1, slot, 0};
       return finish(out, raw, 6);
    }
-   if (slot == 0 && src_half == 0 && temp) {
-      uint8_t raw[2] = {0x1e, 0x14};
+   if (slot == 0 && src_half == 0) {
+      uint8_t raw[2] = {0x1e, temp ? 0x14 : 0x10};
       return finish(out, raw, 2);
    }
    if (slot == 0) {
@@ -1952,4 +1952,21 @@ unsigned g5p_usc_fs_store(uint8_t *out,unsigned bytes,unsigned data_half,unsigne
    unsigned size=bytes==4?4:bytes==8?5:7;
    const uint16_t w[]={size<<11|0x0370|slot,0x0080|data_half|addr_half<<9};
    return put_words(out,w,2);
+}
+
+unsigned g5p_usc_vertex_texture_level(uint8_t *out, unsigned dst_half, unsigned src_half,
+                                      unsigned group)
+{
+   CHECK(dst_half <= 63 && half_register(src_half, "vertex level source requires a dword"), g5p_usc_error);
+   uint8_t raw[G5P_USC_MAX];
+   /* -0.0h + source preserves signed zero and narrows to half. The named
+    * literal prefix and result-half flag reproduce v_*_sample_attribute. */
+   unsigned n = literal_prefix(raw, 0x89, dst_half, 1, 0x8000, src_half, group, 0x11, 0);
+   if (!n)
+      return 0;
+   raw[n++] = binop_code[G5P_BIN_FADD];
+   raw[n++] = 9 | 2; /* f16 literal, f16 result */
+   raw[n++] = 0x70;
+   raw[n++] = 0;
+   return finish(out, raw, n);
 }

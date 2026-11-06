@@ -155,6 +155,7 @@ if with_imagination_g5p
     'pvr_arch_g5p_mrt.c',
     'pvr_arch_g5p_vertex.c',
     'pvr_arch_g5p_upload.c',
+    'pvr_arch_g5p_vtex.c',
     'pvr_arch_g5p_xfb.c',
     'pvr_arch_g5p_perf.c',
     'pvr_arch_g5p_vdm.c',
