@@ -2102,14 +2102,14 @@ PVR_PER_ARCH(g9p_pack_image_view)(const struct pvr_image_view *iview, uint64_t w
 
    if (!fmt) {
       mesa_logw("G9P: texture format %s not decoded yet", vk_Format_to_str(iview->vk.format));
-      fmt = 0x0505;
+      fmt = g9p_image_format(VK_FORMAT_B8G8R8A8_UNORM);
    }
    /*
     * The selectors of the stored channels (bits 15, 18, 21, 24), 4 one and
     * 5 zero as in Rogue's SWIZ: the view's swizzle over the format's own
-    * order (RGBA8 0, 1, 2, 3; BGRA8 2, 1, 0, 3). L8 and A8 reach us this way.
+    * selectors (g9p_formats.h). L8 and A8 reach us this way.
     */
-   const unsigned stored[4] = { (fmt >> 7) & 7, (fmt >> 10) & 7, (fmt >> 13) & 7, 3 };
+   const unsigned stored[4] = { (fmt >> 15) & 7, (fmt >> 18) & 7, (fmt >> 21) & 7, (fmt >> 24) & 7 };
    const VkComponentSwizzle view[4] = { sw->r, sw->g, sw->b, sw->a };
    uint32_t selectors = 0;
 
@@ -2124,9 +2124,7 @@ PVR_PER_ARCH(g9p_pack_image_view)(const struct pvr_image_view *iview, uint64_t w
       }
       selectors |= sel << (15 + 3 * c);
    }
-   /* the format code starts at bit 5: RGBA16F, code 0x232, has its low bits there too */
-   d[0] = selectors | (fmt & 0x7f) << 8 | (fmt == 0x4446 ? 0x40 : 0) | (linear ? 0x02 : 0x0a) |
-          (w - 1) << 27;
+   d[0] = selectors | (fmt & 0x7fe0) | (linear ? 0x02 : 0x0a) | (w - 1) << 27;
    if (image->memlayout == PVR_MEMLAYOUT_TWIDDLED ||
        image->memlayout == PVR_MEMLAYOUT_3DTWIDDLED) {
       /*
@@ -2166,6 +2164,8 @@ PVR_PER_ARCH(g9p_pack_image_view)(const struct pvr_image_view *iview, uint64_t w
       d[3] = (uint32_t)(addr >> 33) |
              (plane->mip_levels[iview->vk.base_mip_level].pitch / 64 - 1) << 15;
    }
+   if (vk_format_is_srgb(iview->vk.format))
+      d[3] |= BITFIELD_BIT(13);
    words[0] = d[0] | (uint64_t)d[1] << 32;
    words[1] = d[2] | (uint64_t)d[3] << 32;
 }
@@ -2241,13 +2241,14 @@ static void
 pack_image_state(uint32_t *w, uint64_t addr, uint32_t width, uint32_t height,
                  bool linear, uint32_t pitch, VkFormat format)
 {
-   const uint32_t fmt = g9p_image_format(format);
+   const uint32_t key = g9p_image_format(format);
 
    memset(w, 0, 8 * 4);
-   w[0] = 0x03000000u | (fmt ? fmt : 0x0505) << 8 | (linear ? 0x02 : 0x0a) | (width - 1) << 27;
+   w[0] = (key ? key : g9p_image_format(VK_FORMAT_B8G8R8A8_UNORM)) | (linear ? 0x02 : 0x0a) |
+          (width - 1) << 27;
    w[1] = (width - 1) >> 5 | (height - 1) << 9;
    w[2] = (uint32_t)(addr >> 1);
-   w[3] = 0x80000000u | (uint32_t)(addr >> 33);
+   w[3] = 0x80000000u | (uint32_t)(addr >> 33) | (vk_format_is_srgb(format) ? BITFIELD_BIT(13) : 0);
    if (linear) {
       w[3] |= (pitch / 64 - 1) << 15;
       w[5] = 0xc0000000u;

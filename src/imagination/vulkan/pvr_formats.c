@@ -366,6 +366,15 @@ pvr_get_image_format_features2(struct pvr_physical_device *pdevice,
                     VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BLEND_BIT |
                     VK_FORMAT_FEATURE_2_BLIT_DST_BIT);
    }
+   if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g9p) && vk_format_is_color(vk_format)) {
+      if (!g9p_format_renderable(vk_format))
+         flags &= ~(VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT |
+                    VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BLEND_BIT |
+                    VK_FORMAT_FEATURE_2_BLIT_DST_BIT);
+      if (!g9p_format_filterable(vk_format))
+         flags &= ~(VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+                    VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_2D_BIT_IMG);
+   }
    /*
     * Depth/stencil: attachments (`depth` capture). The hardware stores depth
     * compressed, which is not decoded for sampling, but GLES 2 has depth
