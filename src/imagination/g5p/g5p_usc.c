@@ -650,6 +650,68 @@ unsigned g5p_usc_vout(uint8_t *out, unsigned src_half, unsigned slot, bool temp,
    return finish(out, raw, 6);
 }
 
+/* ---- device memory fence ----
+ * Apple's compiler (metal-tt -arch applegpu_g5p) emits this eight-byte
+ * memory instruction, then a wait, for threadgroup_barrier(mem_device), and
+ * at the end of every device compare-exchange. It completes after the task's
+ * earlier device stores. Its operand is a register pair holding a 64-bit
+ * value; in compiler-built kernels that is the ComputeMemFenceAddr address
+ * Apple's driver supplies.
+ *
+ *   b0      memory instruction class (0x10, as the loads and stores);
+ *           bit 5: G5P_FENCE_FLAG_B0
+ *   b1      0xc3: the fence operation of the class (the stores' b1 is the
+ *           access size, 0x0b..0x3b)
+ *   b2:b3   0x0100 | pair << 10: the operand pair r[2 pair]:r[2 pair + 1]
+ *           (checked over four register allocations)
+ *   b4:b5   0x0100; bit 11: G5P_FENCE_FLAG_W2
+ *   b6:b7   0x1000 (the same in every Apple form)
+ *
+ * Compiler-built kernels set both flags (every barrier and compare-exchange
+ * the compiler produced). The compute flush program iOS runs at the end of a
+ * compute pass (g5p_end_barrier.h) clears both. No Apple symbol names the
+ * flags, so the two forms are named after the programs that use them, and
+ * only these two are accepted. */
+#define G5P_MEM_CLASS 0x10u
+#define G5P_MEM_OP_FENCE 0xc3u
+#define G5P_FENCE_FLAG_B0 0x20u
+#define G5P_FENCE_PAIR_W1(pair) (0x0100u | (pair) << 10)
+#define G5P_FENCE_W2 0x0100u
+#define G5P_FENCE_FLAG_W2 0x0800u
+#define G5P_FENCE_W3 0x1000u
+unsigned g5p_usc_mem_fence(uint8_t *out, unsigned pair, enum g5p_fence_form form)
+{
+   CHECK(pair < 32, "fence operand pair must name r0..r63");
+   CHECK(form == G5P_FENCE_FORM_KERNEL || form == G5P_FENCE_FORM_FLUSH_PROGRAM, "unknown fence form");
+   const unsigned flags_b0 = form == G5P_FENCE_FORM_KERNEL ? G5P_FENCE_FLAG_B0 : 0;
+   const unsigned flags_w2 = form == G5P_FENCE_FORM_KERNEL ? G5P_FENCE_FLAG_W2 : 0;
+   const unsigned w1 = G5P_FENCE_PAIR_W1(pair), w2 = G5P_FENCE_W2 | flags_w2;
+   const uint8_t raw[8] = {G5P_MEM_CLASS | flags_b0, G5P_MEM_OP_FENCE,
+                           w1 & 0xff, w1 >> 8, w2 & 0xff, w2 >> 8,
+                           G5P_FENCE_W3 & 0xff, G5P_FENCE_W3 >> 8};
+   return finish(out, raw, 8);
+}
+
+/* ---- zero-word emit ----
+ * g5p_usc_emit()'s layout, `1c (words << 4)|1 source control`, with no
+ * output words. Control bit 3 (0x08) is set in every Apple emit; bits 4-7
+ * hold a code. The compute flush program uses code 0xb, the only one
+ * accepted here. iOS has two compute flush programs: the plain one (an empty
+ * @agc.flush) and one with a firmware interrupt (@agc.flush.fw_interrupt,
+ * which adds llvm.agx1.nop.dbg(i16 2)); whether this emit is that interrupt
+ * is not settled. */
+#define G5P_EMIT_OP 0x1cu
+#define G5P_EMIT_WORDS_B1(words) ((words) << 4 | 1u)
+#define G5P_EMIT_CTL_EMIT 0x08u
+#define G5P_EMIT_CODE_SHIFT 4
+unsigned g5p_usc_emit_code(uint8_t *out, enum g5p_emit_code code)
+{
+   CHECK(code == G5P_EMIT_CODE_FLUSH_PROGRAM, "only the compute flush program's code");
+   const uint8_t raw[4] = {G5P_EMIT_OP, G5P_EMIT_WORDS_B1(0), 0,
+                           (uint8_t)(code << G5P_EMIT_CODE_SHIFT | G5P_EMIT_CTL_EMIT)};
+   return finish(out, raw, 4);
+}
+
 unsigned g5p_usc_wait(uint8_t *out, unsigned control)
 {
    CHECK(control == 0 || control == 2 || control == 4, "unwitnessed wait control");

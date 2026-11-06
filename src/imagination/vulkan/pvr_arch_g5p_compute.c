@@ -2,6 +2,7 @@
 /* A9 compute. Pipeline/descriptor setup adapted from G9P's
  * pvr_arch_g9p.c; A9 CDM records are encoded independently from Rogue fields.
  * No captured USC/PDS/context window or fixture allowlist is used. */
+#include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
 #include "vk_pipeline.h"
@@ -11,9 +12,11 @@
 #include "g9p_compile.h"
 #include "g5p_cdm.h"
 #include "g5p_usc.h"
+#include "g5p_end_barrier.h"
 #include "pvr_bo.h"
 #include "pvr_cmd_buffer.h"
 #include "pvr_csb.h"
+#include "pds/pvr_rogue_pds_defs.h"
 #include "pvr_descriptor_set.h"
 #include "pvr_device.h"
 #include "pvr_physical_device.h"
@@ -314,6 +317,7 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
 
       pvr_csb_set_relocation_mark(csb);
       emit_record(csb, &bind_rec);
+      sub_cmd->g5p_kernel_since_end = true;
       if (indirect_va) {
          const struct g5p_cdm_indirect_record rec = g5p_cdm_indirect(
             kernel_rec.w[0], kernel.data_offset, kernel.code_offset,
@@ -366,21 +370,122 @@ upload_cdm_task(struct pvr_cmd_buffer *cmd, bool fenced, struct pvr_pds_upload *
    return pvr_arch_cmd_buffer_upload_pds(cmd, data, 4, 16, code, 2, 32, 64, out);
 }
 
+/* iOS's A9 compute end of pass is five records; the first is a DMA task on
+ * ALL clusters (K0 usc_target ALL, the only such record in the pass) that
+ * kicks the compute flush program (g5p_end_barrier.h). Every iOS compute job
+ * runs it after every dispatch, including between the dispatches of one CDM
+ * job (captures g3b-cs-atomic, g3b-cs-image, r19d; ios-witness-r1 w-wg-* and
+ * w-cs-*):
+ *   PDS  DOUTD: the 16-byte source -> common dwords 0..3;
+ *        DOUTU: kick the flush program (last instruction); HALT
+ *   USC  the compute flush program (g5p_end_barrier.h): r0:r1 = common
+ *        dwords 0/1, device memory fence, wait, fence, zero-word emit,
+ *        wait, branch/pad/END
+ * Without this record, image stores whose workgroup rows are partial cache
+ * lines (workgroup width < 32 for R32) lose the last workgroups' writes:
+ * they never reach memory (release9d r3diag: 384 of 4096 words for 8x8,
+ * 16x4, 8x1 and 16x1 stores). With it every shape is exact, natively and
+ * through Zink (r3c, r3d, r3e).
+ * It follows every pass that emitted a kernel record; a pass whose
+ * dispatches were all bodyless (omitted) keeps the plain tail.
+ * PVR_G5P_CDM_END_BARRIER=0 leaves it out (A/B only). */
+
+/* The fence operand the flush program loads into r0:r1 (common dwords 0
+ * and 1): the two words iOS's driver DMAs for this task. In compiler-built
+ * kernels the fence operand is the ComputeMemFenceAddr address; what the
+ * flush program's form does with it is not settled. */
+#define G5P_END_BARRIER_FENCE_OPERAND_LO 0x40u
+#define G5P_END_BARRIER_FENCE_OPERAND_HI 0x10u
+/* The DOUTD copies the whole 16-byte source, in dwords (Rogue BSIZE). */
+#define G5P_END_BARRIER_SOURCE_DWORDS 4u
+
+static VkResult
+upload_end_barrier(struct pvr_cmd_buffer *cmd, struct pvr_pds_upload *out)
+{
+   uint8_t usc[128] = {0};
+   const unsigned at = g5p_end_barrier_helper(usc);
+   if (!at)
+      return vk_errorf(cmd, VK_ERROR_UNKNOWN, "G5P end-of-pass helper: %s", g5p_usc_error);
+   struct pvr_suballoc_bo *bo, *source;
+   VkResult r = pvr_gpu_upload_usc(cmd->device, usc, ALIGN_POT(at, 64), 64, &bo);
+   if (r != VK_SUCCESS) return r;
+   list_add(&bo->link, &cmd->bo_list);
+   const uint32_t words[G5P_END_BARRIER_SOURCE_DWORDS] = {
+      G5P_END_BARRIER_FENCE_OPERAND_LO, G5P_END_BARRIER_FENCE_OPERAND_HI, 0, 0,
+   };
+   r = pvr_arch_cmd_buffer_upload_general(cmd, words, sizeof(words), &source);
+   if (r != VK_SUCCESS) return r;
+   const uint64_t va = source->dev_addr.addr;
+   assert(!(va >> PVR_ROGUE_PDSINST_DOUT_FIELDS_DOUTD_SRC0_DOFFSET_SHIFT));
+   /* q0: DOUTD source 0, the source address (SBASE), common store offset 0
+    * (DOFFSET), cached (SLCMODE). */
+   const uint64_t doutd_src0 = va << PVR_ROGUE_PDSINST_DOUT_FIELDS_DOUTD_SRC0_SBASE_SHIFT;
+   /* DOUTD source 1: the program's last DMA, into the common store, cached,
+    * at address offset 0, BSIZE dwords. */
+   const uint32_t doutd_src1 = PVR_ROGUE_PDSINST_DOUT_FIELDS_DOUTD_SRC1_LAST_EN |
+                               PVR_ROGUE_PDSINST_DOUT_FIELDS_DOUTD_SRC1_DEST_COMMON_STORE |
+                               PVR_ROGUE_PDSINST_DOUT_FIELDS_DOUTD_SRC1_CMODE_CACHED |
+                               0u << PVR_ROGUE_PDSINST_DOUT_FIELDS_DOUTD_SRC1_AO_SHIFT |
+                               G5P_END_BARRIER_SOURCE_DWORDS << PVR_ROGUE_PDSINST_DOUT_FIELDS_DOUTD_SRC1_BSIZE_SHIFT;
+   uint32_t data[8] = {(uint32_t)doutd_src0, (uint32_t)(doutd_src0 >> 32), doutd_src1, 0};
+   g9p_pds_kick_data(&data[4], usc_offset(cmd->device, bo)); /* q2: DOUTU source */
+   uint32_t code[3] = {
+      g9p_pds_dout(G9P_DOUTD, 0, G9P_PDS_DATA, 2, 0),
+      g9p_pds_dout(G9P_DOUTU, 2, G9P_PDS_DATA, 0, G9P_PDS_END),
+      g9p_pds_halt(),
+   };
+   if (getenv("PVR_G5P_WS_LOG"))
+      fprintf(stderr, "G5P-COMPUTE end_barrier usc=%#x bytes=%u source=%#" PRIx64 " pds=%08x %08x %08x\n",
+              data[4], at, va, code[0], code[1], code[2]);
+   return pvr_arch_cmd_buffer_upload_pds(cmd, data, 8, 16, code, 3, 32, 64, out);
+}
+
 VkResult
 PVR_PER_ARCH(g5p_compute_end_pass)(struct pvr_cmd_buffer *cmd,
                                   struct pvr_sub_cmd_compute *sub)
 {
    uint32_t data[4] = {0}, code[4];
-   struct pvr_pds_upload fence, fenced, kick;
+   struct pvr_pds_upload fence, fenced, kick, barrier;
+   const char *barrier_env = getenv("PVR_G5P_CDM_END_BARRIER");
+   /* after a dispatch only, as iOS: a pass whose dispatches were all
+    * bodyless (omitted) keeps the plain tail */
+   const bool end_barrier = sub->g5p_kernel_since_end && (!barrier_env || strcmp(barrier_env, "0"));
+   sub->g5p_kernel_since_end = false;
    VkResult task_result = upload_cdm_task(cmd, false, &kick);
    if (task_result == VK_SUCCESS)
       task_result = upload_cdm_task(cmd, true, &fenced);
+   if (task_result == VK_SUCCESS && end_barrier)
+      task_result = upload_end_barrier(cmd, &barrier);
    if (task_result != VK_SUCCESS) return task_result;
    g9p_pds_fence_program(code);
    VkResult r = pvr_arch_cmd_buffer_upload_pds(cmd, data, 4, 16, code, 4, 16, 16, &fence);
    if (r != VK_SUCCESS) return r;
    struct g5p_cdm_record rec;
    pvr_csb_set_relocation_mark(&sub->control_stream);
+   if (end_barrier) {
+      /* The flush task's record in Rogue's CDM kernel layout (csbgen
+       * rogue/cdm.xml), with the values iOS's driver writes. Words 3-5 (the
+       * workgroup counts minus one) stay 0: one workgroup. */
+      rec = (struct g5p_cdm_record){ 0 };
+      pvr_csb_pack (&rec.w[0], CDMCTRL_KERNEL0, k0) {
+         k0.usc_common_size = 1; /* one 64-byte unit holds the 16-byte source */
+         k0.pds_data_size = 1;   /* two 16-byte blocks, encoded minus one (G9P_CDM_DATA_BLOCKS) */
+         k0.usc_target = ROGUE_CDMCTRL_USC_TARGET_ALL; /* every cluster runs it */
+         k0.fence = false;
+      }
+      pvr_csb_pack (&rec.w[1], CDMCTRL_KERNEL1, k1) {
+         k1.data_addr = PVR_DEV_ADDR(barrier.data_offset);
+         k1.sd_type = ROGUE_CDMCTRL_SD_TYPE_USC;
+         k1.usc_common_shared = true;
+      }
+      pvr_csb_pack (&rec.w[2], CDMCTRL_KERNEL2, k2) {
+         k2.code_addr = PVR_DEV_ADDR(barrier.code_offset);
+      }
+      pvr_csb_pack (&rec.w[6], CDMCTRL_KERNEL8, k8) {
+         k8.max_instances = 8; /* workgroup 1x1x1: the sizes minus one stay 0 */
+      }
+      emit_record(&sub->control_stream, &rec);
+   }
    rec = g5p_cdm_task(G9P_CDM_ANY_CLUSTER, kick.data_offset, G9P_CDM_K1_DMA, kick.code_offset);
    emit_record(&sub->control_stream, &rec);
    rec = g5p_cdm_task(G9P_CDM_FENCE_BLOCK | G9P_CDM_ANY_CLUSTER | G9P_CDM_FENCE,

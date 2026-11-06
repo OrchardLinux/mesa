@@ -269,6 +269,11 @@ struct pvr_sub_cmd_compute {
     * queue order (no compute shaders for them here)
     */
    struct pvr_query_info *g9p_query;
+#ifdef PVR_APPLE_G5P
+   /* A kernel record was emitted since the last end of pass: the next one
+    * starts with iOS's barrier task (pvr_arch_g5p_compute.c). */
+   bool g5p_kernel_since_end;
+#endif
 };
 
 struct pvr_sub_cmd_transfer {

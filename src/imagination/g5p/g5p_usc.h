@@ -127,6 +127,18 @@ unsigned g5p_usc_emit(uint8_t *out, unsigned words, unsigned source_half);
 unsigned g5p_usc_emit_mrt(uint8_t *out, unsigned words, unsigned source_half);
 unsigned g5p_usc_vout(uint8_t *out, unsigned src_half, unsigned slot, bool temp, bool last);
 unsigned g5p_usc_wait(uint8_t *out, unsigned control);
+/* Device memory fence on the 64-bit operand in r[2 pair]:r[2 pair + 1], in
+ * the form Apple uses for each kind of program (g5p_usc.c). */
+enum g5p_fence_form {
+   G5P_FENCE_FORM_KERNEL,        /* compiler-built kernels */
+   G5P_FENCE_FORM_FLUSH_PROGRAM, /* the compute flush program */
+};
+unsigned g5p_usc_mem_fence(uint8_t *out, unsigned pair, enum g5p_fence_form form);
+/* Zero-word emit; the code is control bits 4-7. */
+enum g5p_emit_code {
+   G5P_EMIT_CODE_FLUSH_PROGRAM = 0xb,
+};
+unsigned g5p_usc_emit_code(uint8_t *out, enum g5p_emit_code code);
 
 /* Resources (g5p_usc_resources.py). bank 1 = the VS temp destination
  * (ISA round 2). */
