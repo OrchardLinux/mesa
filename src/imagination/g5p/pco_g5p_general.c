@@ -93,6 +93,7 @@ struct range {
    enum pco_g5p_upload_kind kind;
    unsigned set, binding, element, lo, hi; /* bytes */
    unsigned common;
+   bool memory; /* UBO range read through its address instead of preloaded */
 };
 
 enum { BLEND_NONE, BLEND_PREMULT, BLEND_STRAIGHT_OVER, BLEND_REPLACE, BLEND_GENERAL };
@@ -1956,8 +1957,33 @@ static void plan_common(struct gctx *c)
                  c->tsize[i].element, c->tsize[i].lod, 4, c->tsize[i].common);
    }
    unsigned limit = c->vs ? PCO_G5P_VS_COMMON_DWORDS : PCO_G5P_FS_COMMON_DWORDS;
+   unsigned preloaded = next;
+   for (unsigned i = 0; i < c->nranges; i++)
+      preloaded += (c->ranges[i].hi - c->ranges[i].lo) / 4;
+
+   /* Apple's f_u1024all stops preloading a block that would overflow the
+    * 256-dword common-store operand field. It uploads the buffer address and
+    * uses ordinary memory loads instead. Keep the small-program byte shape,
+    * but make the same choice for all UBO ranges when their combined span no
+    * longer fits. Push constants remain preloaded. */
+   if (preloaded > limit) {
+      for (unsigned i = 0; i < c->nranges; i++) {
+         struct range *r = &c->ranges[i];
+         if (r->kind != PCO_G5P_UPLOAD_UBO)
+            continue;
+         r->memory = true;
+         r->common = next = align(next, 2);
+         if (next + 2 > 32)
+            refuse(c, "uniform-buffer address beyond common dword 30");
+         add_upload(c, PCO_G5P_UPLOAD_UBO_ADDR, r->set, r->binding,
+                    r->element, r->lo, 2, next);
+         next += 2;
+      }
+   }
    for (unsigned i = 0; i < c->nranges; i++) {
       struct range *r = &c->ranges[i];
+      if (r->memory)
+         continue;
       r->common = next;
       next += (r->hi - r->lo) / 4;
       if (next > limit)
@@ -3692,6 +3718,68 @@ static void emit_dyn_ubo(struct gctx *c, nir_intrinsic_instr *in)
    c->p->evidence |= PCO_G5P_EV_DYN_UBO;
 }
 
+/* A constant-offset load from a UBO range whose contiguous span would not
+ * fit in the common store. The pointer uploaded at r->common already includes
+ * r->lo. Materialise the remaining byte offset, add it to that pointer and
+ * issue the same addressed load used by Apple's dynamic UBO programs. */
+static void emit_memory_ubo(struct gctx *c, nir_intrinsic_instr *in,
+                            const struct range *r, unsigned off)
+{
+   const unsigned n = in->def.num_components;
+   if (in->def.bit_size != 32 || !n || n > 4)
+      refuse(c, "memory UBO load: only 1..4 aligned 32-bit components");
+
+   const unsigned dst = alloc_run(c, n, "memory UBO load");
+   if (c->vs)
+      vs_bank1_only(c, "vertex memory UBO load", dst, -1, -1, -1);
+   const unsigned first = off - r->lo;
+   const bool vector = n == 4 && !(first & 15);
+   const unsigned loads = vector ? 1 : n;
+   uint8_t raw[G5P_USC_MAX];
+
+   for (unsigned i = 0; i < loads; i++) {
+      const unsigned bytes = vector ? 16 : 4;
+      const unsigned at = first + (vector ? 0 : 4 * i);
+      const unsigned index = scratch_imm(c, at);
+      unsigned pair;
+
+      for (pair = 0; pair + 2 <= NUM_DWORDS; pair += 2)
+         if (!((c->busy | c->reserved) & BITFIELD64_RANGE(pair, 2)))
+            break;
+      if (pair + 2 > NUM_DWORDS)
+         refuse(c, "memory UBO load: register pressure for address pair");
+      c->busy |= BITFIELD64_RANGE(pair, 2);
+      c->max_dword = MAX2(c->max_dword, pair + 2);
+      c->max_written = MAX2(c->max_written, pair + 2);
+
+      put(c, raw,
+          g5p_usc_address_add_shift(raw, 2 * pair, r->common, 2 * index,
+                                    0, true, c->vs),
+          "constant UBO address");
+      if (c->vs)
+         put(c, raw,
+             g5p_usc_vertex_address_load(raw, 2 * (dst + (vector ? 0 : i)),
+                                         bytes, 2 * pair),
+             "vertex constant UBO load");
+      else
+         put(c, raw,
+             g5p_usc_address_load(raw, 2 * (dst + (vector ? 0 : i)), bytes,
+                                  2 * pair, 0),
+             "fragment constant UBO load");
+      put(c, raw, g5p_usc_wait(raw, 0), "wait");
+      c->busy &= ~BITFIELD64_RANGE(pair, 2);
+      free_scratch(c);
+   }
+
+   for (unsigned k = 0; k < n; k++) {
+      struct val *v = V(c, &in->def, k);
+      v->state = VAL_REG;
+      v->reg = dst + k;
+      v->held = true;
+   }
+   c->p->evidence |= PCO_G5P_EV_DYN_UBO;
+}
+
 /* Apple's derivatives (f_ddx_*, f_ddy_*): one instruction, the unary
  * hints for a source read again. Straight-line only: under the mask stack a
  * neighbouring lane may not have run. */
@@ -3816,6 +3904,10 @@ static void emit_intrinsic(struct gctx *c, nir_intrinsic_instr *in)
          off = load_offset(c, in, 0, nir_intrinsic_base(in));
       }
       struct range *r = range_for(c, kind, set, binding, element);
+      if (r->memory) {
+         emit_memory_ubo(c, in, r, off);
+         break;
+      }
       for (unsigned k = 0; k < in->def.num_components; k++) {
          struct val *v = V(c, &in->def, k);
          v->state = VAL_SHARED;
