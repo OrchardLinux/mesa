@@ -154,7 +154,7 @@ struct g9p_ctx {
    uint64_t flushed_outputs;
    int vertex_reg, instance_reg; /* vertex shaders: r0-r1, or copies of them */
    bool reserve_st_low; /* the mask stack is r15, reserved (compile_back()) */
-   bool reserve_low;    /* r11-r14 for address work, after running out (compile_back()) */
+   unsigned reserve_low;    /* r11-r14 for address work, after running out (compile_back()) */
    unsigned ip;
 
    struct {
@@ -197,8 +197,8 @@ static int
 alloc_reg(struct g9p_ctx *ctx)
 {
    /*
-    * A vertex shader that ran out: values above r15 first, and r11-r14 stay
-    * free, for what reaches r15 only (one_src(), alloc_pair()).
+    * A vertex shader that ran out: values above r15 first, and r11-r14, then
+    * r7-r14, stay free for what reaches r15 only (one_src(), alloc_pair()).
     */
    if (ctx->reserve_low) {
       for (unsigned r = 16; r < G9P_NUM_REGS; r++) {
@@ -210,7 +210,7 @@ alloc_reg(struct g9p_ctx *ctx)
       }
    }
    for (unsigned r = 0; r < G9P_NUM_REGS; r++) {
-      if (ctx->reserve_low && r >= 11 && r <= 14)
+      if (ctx->reserve_low && r >= (ctx->reserve_low > 1 ? 7 : 11) && r <= 14)
          continue;
       if (!(ctx->busy & BITFIELD64_BIT(r))) {
          ctx->busy |= BITFIELD64_BIT(r);
@@ -3191,8 +3191,8 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
       ctx.oom = false;
       if (generate(&ctx, impl, ctx.reserve_st_low ? 15 : G9P_NUM_REGS))
          break;
-      if (ctx.oom && stage == MESA_SHADER_VERTEX && !ctx.reserve_low) {
-         ctx.reserve_low = true;
+      if (ctx.oom && stage == MESA_SHADER_VERTEX && ctx.reserve_low < 2) {
+         ctx.reserve_low++;
          ctx.reserve_st_low = true;
          continue;
       }
@@ -3206,6 +3206,13 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
             best = ctx.last_use[k];
             victim = k;
          }
+      }
+      /* else any NIR register, even past its last use: they stay pinned (dEQP tmp_array) */
+      for (unsigned d = 0; victim < 0 && d < ctx.num_decls; d++) {
+         const unsigned k = key(ctx.decls[d], 0);
+
+         if (ctx.home[k] < 0 && ctx.reg_first[ctx.decls[d]->index] <= ctx.oom_ip)
+            victim = k;
       }
       /* else the live value (not a NIR register's) with the furthest last use */
       for (unsigned k = 0, ssa_best = 0; victim < 0 && k < ctx.num_keys; k++) {
