@@ -2292,7 +2292,13 @@ emit_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state
                  * neighbouring triangle has another gradient when W varies (dEQP
                  * texture.mipmap.2d.projected). Rogue disables it for lines too.
                  */
-                (state->uses_discard || state->num_textures || state->uses_derivatives ||
+                /*
+                 * Merging off, for a helper pixel's own gradients (mip levels). Except a
+                 * shader's derivatives of what it samples: across triangles they want the
+                 * neighbour's real value (dEQP shaders.derivate.*.texture)
+                 */
+                ((state->uses_discard || state->num_textures || state->uses_derivatives) &&
+                    !(state->uses_derivatives && state->num_textures) ||
                        g9p_is_line(cmd_buffer->vk.dynamic_graphics_state.ia.primitive_topology)
                     ? BITFIELD_BIT(14)
                     : 0),
