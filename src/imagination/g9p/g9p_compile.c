@@ -1769,7 +1769,7 @@ emit_fb_fetch(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
    unsigned before = 0, total = 0;
    int pair = -1;
 
-   if (ctx->stage != MESA_SHADER_FRAGMENT || target >= G9P_MAX_TARGETS || word > 1) {
+   if (ctx->stage != MESA_SHADER_FRAGMENT || target >= G9P_MAX_TARGETS || word > 3) {
       fprintf(stderr, "g9p: only colour attachments can be read\n");
       return false;
    }
@@ -1780,7 +1780,7 @@ emit_fb_fetch(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
       if (t < target)
          before += w;
       if (t <= target)
-         total += MIN2(w, t == target ? 2 : w);
+         total += w;
    }
    release(ctx, &intr->instr);
    for (unsigned r = 0; r + total <= G9P_NUM_REGS; r += 2) {
@@ -3276,23 +3276,43 @@ zero_descriptor_offset(nir_builder *b, nir_intrinsic_instr *intr, void *data)
  * shader wrote, unclamped until it is written to memory: a blend that went
  * negative read back positive (dEQP fragment_ops).
  */
+#define G9P_RAW_TILE_READ 0x7f
+
 static bool
 lower_fb_fetch_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
    const struct g9p_shader *out = data;
    nir_def *comps[4];
 
-   if (intr->intrinsic != nir_intrinsic_load_output ||
-       nir_intrinsic_dest_type(intr) == nir_type_uint32)
+   /* range G9P_RAW_TILE_READ marks the raw word reads made here */
+   if (intr->intrinsic != nir_intrinsic_load_output || nir_intrinsic_range(intr) == G9P_RAW_TILE_READ)
       return false;
    b->cursor = nir_before_instr(&intr->instr);
+   const nir_io_semantics raw_sem = nir_intrinsic_io_semantics(intr);
+   const unsigned read_target = raw_sem.location == FRAG_RESULT_COLOR ? 0 : raw_sem.location - FRAG_RESULT_DATA0;
+   const enum g9p_output read_output = out->targets[read_target].output;
+   const bool whole_words = read_output >= G9P_OUTPUT_RAW1;
+   const bool sint = nir_alu_type_get_base_type(nir_intrinsic_dest_type(intr)) == nir_type_int;
+
    for (unsigned i = 0; i < intr->def.num_components; i++) {
       const unsigned k = nir_intrinsic_component(intr) + i;
       nir_def *word = nir_load_output(b, 1, 32, nir_imm_int(b, 0),
-                                      .base = nir_intrinsic_base(intr), .component = k / 2,
-                                      .dest_type = nir_type_uint32,
-                                      .io_semantics = nir_intrinsic_io_semantics(intr));
+                                      .base = nir_intrinsic_base(intr), .component = whole_words ? k : k / 2,
+                                      .range = G9P_RAW_TILE_READ, .dest_type = nir_type_uint32,
+                                      .io_semantics = raw_sem);
+
+      /* 32-bit channels are their own words */
+      if (whole_words) {
+         comps[i] = word;
+         continue;
+      }
       nir_def *h = k & 1 ? nir_ushr_imm(b, word, 16) : nir_iand_imm(b, word, 0xffff);
+
+      /* integers: the tile's half is the value */
+      if (out->targets[read_target].integer) {
+         comps[i] = sint ? nir_ishr_imm(b, nir_ishl_imm(b, h, 16), 16) : h;
+         continue;
+      }
       nir_def *bits = nir_iadd_imm(b, nir_ishl_imm(b, nir_iand_imm(b, h, 0x7fff), 13),
                                    0x38000000);
 
