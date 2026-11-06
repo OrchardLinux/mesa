@@ -5378,8 +5378,9 @@ static bool lower(nir_shader *nir)
     * No packed texture-offset field or new USC recipe is selected. */
    const nir_lower_tex_options txp = {
       .lower_txp = ~0u, .lower_txp_array = true,
-      .lower_txf_offset = nir->info.stage == MESA_SHADER_VERTEX &&
-                          g5p_vtex_qualified() && g5p_vtex_fetch_offset_probe(),
+      .lower_txf_offset = nir->info.stage == MESA_SHADER_FRAGMENT ||
+                          (nir->info.stage == MESA_SHADER_VERTEX &&
+                           g5p_vtex_qualified() && g5p_vtex_fetch_offset_probe()),
       /* Size queries use CPU-uploaded view dimensions. Minify them with
        * the qualified integer ALU; NIR preserves an array's layer count.
        * This adds no TPU instruction or shadow-sampling recipe. */
