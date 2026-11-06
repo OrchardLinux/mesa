@@ -864,6 +864,29 @@ static bool xfb_base(struct ref r, unsigned *buffer, struct ref *off)
    return false;
 }
 
+/* nir_lower_xfb_to_stores adds each output's byte offset to the 32-bit
+ * index * stride before the 64-bit address add: an output at +4/+8/+12 has
+ * the offset iadd(index * stride, k). Its record base is index * stride and
+ * k the store's immediate dword offset, so the dwords of one buffer's record
+ * share one address add (Apple folds +4/+8/+12 the same way: v_st_off12),
+ * also when the varyings are packed one component per output. */
+static void xfb_peel(struct ref *off, unsigned *dword)
+{
+   nir_alu_instr *add = alu_of(off->def);
+   if (!add || add->op != nir_op_iadd || add->def.bit_size != 32)
+      return;
+   for (unsigned i = 0; i < 2; i++) {
+      if (!nir_src_is_const(add->src[i].src))
+         continue;
+      uint64_t k = nir_src_comp_as_uint(add->src[i].src, add->src[i].swizzle[off->comp]);
+      if (k % 4 || *dword + k / 4 > 3)
+         return;
+      *off = resolve_plain(add->src[1 - i].src.ssa, add->src[1 - i].swizzle[off->comp]);
+      *dword += k / 4;
+      return;
+   }
+}
+
 /* A store address: the record base, or the base plus 4/8/12 for the later
  * dwords nir_lower_mem_access_bit_sizes split off. The constant becomes the
  * store's immediate dword offset, so a record needs one address add. */
@@ -871,8 +894,10 @@ static bool xfb_address(nir_def *addr, unsigned *buffer, struct ref *off, unsign
 {
    struct ref r = resolve_plain(addr, 0);
    *dword = 0;
-   if (xfb_base(r, buffer, off))
+   if (xfb_base(r, buffer, off)) {
+      xfb_peel(off, dword);
       return true;
+   }
    nir_alu_instr *add = alu_of(r.def);
    if (!add || add->op != nir_op_iadd || add->def.bit_size != 64)
       return false;
@@ -884,6 +909,7 @@ static bool xfb_address(nir_def *addr, unsigned *buffer, struct ref *off, unsign
       if (k % 4 || k > 12 || !xfb_base(b, buffer, off))
          return false;
       *dword = k / 4;
+      xfb_peel(off, dword);
       return true;
    }
    return false;
