@@ -96,6 +96,14 @@ struct g9p_vertex_attrib {
    enum pipe_format format;
 };
 
+/* A colour attachment of the pipeline, as the fragment shader writes it */
+#define G9P_MAX_TARGETS 4
+struct g9p_target {
+   bool present;
+   enum g9p_output output;
+   bool integer, is_float;
+};
+
 struct g9p_shader {
    mesa_shader_stage stage;
 
@@ -129,10 +137,11 @@ struct g9p_shader {
    unsigned num_varyings;
    bool varying_perspective[G9P_MAX_VARYINGS];
    bool varying_flat[G9P_MAX_VARYINGS];
-   /* Fragment: what the render target takes; integers its low 16 bits */
+   /* Fragment: what the first render target takes; integers its low 16 bits */
    enum g9p_output output;
    bool output_int;
    bool output_float;
+   struct g9p_target targets[G9P_MAX_TARGETS];
    /* Vertex: output dwords (4 + 4 x num_varyings) */
    unsigned num_outputs;
 
@@ -194,8 +203,8 @@ bool g9p_compile_vertex(nir_shader *nir, const struct g9p_vertex_attrib *attribs
  * pipeline to mark its draws translucent.
  */
 bool g9p_compile_fragment(nir_shader *nir, unsigned frag_coord_slot,
-                          const nir_lower_blend_options *blend, enum g9p_output output,
-                          bool output_int, bool output_float, struct g9p_shader *out,
+                          const nir_lower_blend_options *blend,
+                          const struct g9p_target targets[G9P_MAX_TARGETS], struct g9p_shader *out,
                           void *mem_ctx);
 
 #endif /* G9P_COMPILE_H */

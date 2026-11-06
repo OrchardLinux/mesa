@@ -118,7 +118,7 @@ struct g9p_ctx {
       unsigned slot;
    } outputs[4 + 4 * G9P_MAX_VARYINGS];
    unsigned num_outputs;
-   int colour[4];
+   int colour[4 * G9P_MAX_TARGETS];
 
    /* Per SSA scalar (def index * 4 + component) */
    int8_t *reg;
@@ -1445,61 +1445,84 @@ emit_point_coord(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
    return true;
 }
 
+/* A register above the outputs that nothing uses */
+static int
+free_high(struct g9p_ctx *ctx, uint64_t *taken, unsigned words)
+{
+   for (unsigned r = MAX2(words, 2); r < 32; r++) {
+      if (!(*taken & BITFIELD64_BIT(r))) {
+         *taken |= BITFIELD64_BIT(r);
+         ctx->max_reg = MAX2(ctx->max_reg, r);
+         return r;
+      }
+   }
+   return -1;
+}
+
 /*
- * The colour components, f32 or integers in their registers (above r1, which
- * stay free until here, or anywhere for 32-bit channels), into what the render
- * target takes from r0 on: g9p_formats.h, enum g9p_output.
+ * The colour components, f32 or integers in their registers, into what the
+ * render targets take from r0 on, target after target: g9p_formats.h, enum
+ * g9p_output. Components in the outputs' registers move out of the way first
+ * (r0-r1 stay free until here).
  */
 static bool
 emit_colour(struct g9p_ctx *ctx)
 {
-   const enum g9p_output output = ctx->out->output;
-
-   if (output == G9P_OUTPUT_HALF2 || output == G9P_OUTPUT_HALF1) {
-      const unsigned words = g9p_output_words(output);
-
-      if (!ctx->out->output_int) {
-         for (unsigned i = 0; i < 2 * words; i++)
-            g9p_to_half(ctx->c, i, ctx->colour[i]);
-         return true;
-      }
-      const int shift = const_reg(ctx, 16);
-      const int t = alloc_temp(ctx), lo = alloc_temp(ctx);
-
-      if (shift < 0 || t < 0 || lo < 0)
-         return false;
-      for (unsigned w = 0; w < words; w++) {
-         /* (a << 16 >> 16) | b << 16; the output register written once, last */
-         g9p_shift(ctx->c, t, ctx->colour[2 * w], shift, false);
-         g9p_shift(ctx->c, lo, t, shift, true);
-         g9p_shift(ctx->c, t, ctx->colour[2 * w + 1], shift, false);
-         g9p_alu2(ctx->c, G9P_OR, w, lo, t, false);
-      }
-      return true;
-   }
-
-   /* in two steps: a component may be in the register of another's destination */
-   const unsigned words = g9p_output_words(output);
-   int t[4];
+   unsigned words = 0, base = 0;
    uint64_t taken = ctx->busy;
+   int shift = -1;
 
-   for (unsigned i = 0; i < words; i++) {
-      t[i] = -1;
-      for (unsigned r = 4; r < 32; r++) {
-         if (!(taken & BITFIELD64_BIT(r))) {
-            t[i] = r;
-            taken |= BITFIELD64_BIT(r);
-            break;
+   for (unsigned t = 0; t < G9P_MAX_TARGETS; t++)
+      words += ctx->out->targets[t].present ? g9p_output_words(ctx->out->targets[t].output) : 0;
+   if (words > 8) {
+      fprintf(stderr, "g9p: %u output words\n", words);
+      return false;
+   }
+   for (unsigned i = 0; i < 4 * G9P_MAX_TARGETS; i++) {
+      if (ctx->colour[i] >= 0 && ctx->colour[i] < (int)words) {
+         const int r = free_high(ctx, &taken, words);
+
+         if (r < 0)
+            return false;
+         g9p_alu2(ctx->c, G9P_OR, r, ctx->colour[i], ctx->colour[i], false);
+         ctx->colour[i] = r;
+      }
+   }
+   for (unsigned t = 0; t < G9P_MAX_TARGETS; t++) {
+      const struct g9p_target *target = &ctx->out->targets[t];
+      const int *colour = &ctx->colour[4 * t];
+
+      if (!target->present)
+         continue;
+      const unsigned n = g9p_output_words(target->output);
+
+      if (target->output >= G9P_OUTPUT_RAW1) {
+         for (unsigned i = 0; i < n; i++)
+            g9p_alu2(ctx->c, G9P_OR, base + i, colour[i], colour[i], false);
+      } else if (!target->integer) {
+         for (unsigned i = 0; i < 2 * n; i++)
+            g9p_to_half(ctx->c, 2 * base + i, colour[i]);
+      } else {
+         /* (a << 16 >> 16) | b << 16; the output register written once, last */
+         const int a = free_high(ctx, &taken, words), b = free_high(ctx, &taken, words);
+
+         if (shift < 0) {
+            shift = free_high(ctx, &taken, words);
+            if (shift >= 0)
+               g9p_mov_imm(ctx->c, shift, 16);
+         }
+         if (a < 0 || b < 0 || shift < 0)
+            return false;
+         for (unsigned w = 0; w < n; w++) {
+            g9p_shift(ctx->c, a, colour[2 * w], shift, false);
+            g9p_shift(ctx->c, b, a, shift, true);
+            g9p_shift(ctx->c, a, colour[2 * w + 1], shift, false);
+            g9p_alu2(ctx->c, G9P_OR, base + w, b, a, false);
          }
       }
-      if (t[i] < 0)
-         return false;
-      g9p_alu2(ctx->c, G9P_OR, t[i], ctx->colour[i], ctx->colour[i], false);
-      ctx->max_reg = MAX2(ctx->max_reg, t[i]);
+      base += n;
    }
-   for (unsigned i = 0; i < words; i++)
-      g9p_alu2(ctx->c, G9P_OR, i, t[i], t[i], false);
-   ctx->max_reg = MAX2(ctx->max_reg, words - 1);
+   ctx->max_reg = MAX2(ctx->max_reg, (int)words - 1);
    return true;
 }
 
@@ -1512,6 +1535,7 @@ emit_output(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
    unsigned comp = nir_intrinsic_component(intr);
    nir_scalar v = nir_get_scalar(intr->src[0].ssa, 0);
    int slot = -1, r;
+   unsigned target = 0;
 
    if (nir_src_num_components(intr->src[0]) != 1 || nir_src_bit_size(intr->src[0]) != 32 ||
        !nir_src_is_const(*offset) || nir_src_as_uint(*offset)) {
@@ -1548,11 +1572,14 @@ emit_output(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
          release(ctx, &intr->instr);
          return true;
       }
-   } else if (sem.location > FRAG_RESULT_DATA0 && sem.location < FRAG_RESULT_DATA0 + 8) {
-      /* one colour attachment so far: the others' outputs are dropped */
-      release(ctx, &intr->instr);
-      return true;
-   } else if (sem.location != FRAG_RESULT_DATA0 && sem.location != FRAG_RESULT_COLOR) {
+   } else if (sem.location >= FRAG_RESULT_DATA0 && sem.location < FRAG_RESULT_DATA0 + 8) {
+      /* locations without an attachment are dropped */
+      target = sem.location - FRAG_RESULT_DATA0;
+      if (target >= G9P_MAX_TARGETS || !ctx->out->targets[target].present) {
+         release(ctx, &intr->instr);
+         return true;
+      }
+   } else if (sem.location != FRAG_RESULT_COLOR) {
       fprintf(stderr, "g9p: fragment output %u not supported yet\n", sem.location);
       return false;
    }
@@ -1594,7 +1621,7 @@ emit_output(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
       ctx->outputs[ctx->num_outputs].slot = slot;
       ctx->num_outputs++;
    } else {
-      ctx->colour[comp] = r;
+      ctx->colour[4 * target + comp] = r;
    }
    release(ctx, &intr->instr);
    return true;
@@ -2661,7 +2688,7 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
    ctx->num_exit_jumps = 0;
    ctx->num_outputs = 0;
    ctx->psize_reg = -1;
-   for (unsigned i = 0; i < 4; i++)
+   for (unsigned i = 0; i < 4 * G9P_MAX_TARGETS; i++)
       ctx->colour[i] = -1;
 
    /*
@@ -2753,12 +2780,16 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
    case MESA_SHADER_FRAGMENT: {
       bool colour = false;
 
-      for (unsigned i = 0; i < 4; i++)
+      unsigned words = 0;
+
+      for (unsigned i = 0; i < 4 * G9P_MAX_TARGETS; i++)
          colour |= ctx->colour[i] >= 0;
+      for (unsigned t = 0; t < G9P_MAX_TARGETS; t++)
+         words += ctx->out->targets[t].present ? g9p_output_words(ctx->out->targets[t].output) : 0;
       if (colour) {
          /* unwritten components: 0 */
-         for (unsigned i = 0; i < 4; i++) {
-            if (ctx->colour[i] < 0) {
+         for (unsigned i = 0; i < 4 * G9P_MAX_TARGETS; i++) {
+            if (ctx->out->targets[i / 4].present && ctx->colour[i] < 0) {
                ctx->colour[i] = alloc_reg(ctx);
                if (ctx->colour[i] < 0)
                   return false;
@@ -2770,7 +2801,7 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
          if (ctx->out->native_blend)
             g9p_blend_src_over(ctx->c);
       }
-      g9p_end_fragment(ctx->c, colour ? g9p_output_words(ctx->out->output) : 0);
+      g9p_end_fragment(ctx->c, colour ? words : 0);
       break;
    }
    default:
@@ -3803,14 +3834,15 @@ find_flat_varyings(nir_shader *nir, struct g9p_shader *out)
 
 bool
 g9p_compile_fragment(nir_shader *nir, unsigned frag_coord_slot,
-                     const nir_lower_blend_options *blend, enum g9p_output output,
-                     bool output_int, bool output_float, struct g9p_shader *out,
+                     const nir_lower_blend_options *blend,
+                     const struct g9p_target targets[G9P_MAX_TARGETS], struct g9p_shader *out,
                      void *mem_ctx)
 {
    memset(out, 0, sizeof(*out));
-   out->output = output;
-   out->output_int = output_int;
-   out->output_float = output_float;
+   memcpy(out->targets, targets, sizeof(out->targets));
+   out->output = targets[0].output;
+   out->output_int = targets[0].integer;
+   out->output_float = targets[0].is_float;
    lower_front(nir);
    NIR_PASS(_, nir, discards_to_if);
    NIR_PASS(_, nir, discards_to_flag);
@@ -3819,7 +3851,8 @@ g9p_compile_fragment(nir_shader *nir, unsigned frag_coord_slot,
    find_flat_varyings(nir, out);
    lower_io(nir);
    out->native_blend = blend && is_src_over(blend) && out->output == G9P_OUTPUT_HALF2 &&
-                       !out->output_float && !getenv("G9P_NO_NATIVE_BLEND");
+                       !out->output_float && !targets[1].present && !targets[2].present &&
+                       !targets[3].present && !getenv("G9P_NO_NATIVE_BLEND");
    if (blend && !out->native_blend) {
       NIR_PASS(_, nir, nir_lower_blend, blend);
       NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_blend_constant,

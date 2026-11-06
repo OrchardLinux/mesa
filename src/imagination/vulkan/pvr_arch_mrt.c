@@ -256,7 +256,8 @@ pvr_arch_init_usc_mrt_setup(struct pvr_device *device,
       assert(att_format != VK_FORMAT_UNDEFINED);
 
       result = pvr_alloc_mrt(dev_info, &alloc, setup, i, att_format);
-      if (result != VK_SUCCESS) {
+      /* G9P's outputs are its own (enum g9p_output): no tile buffers */
+      if (result != VK_SUCCESS && !PVR_HAS_FEATURE(dev_info, apple_g9p)) {
          result = vk_error(NULL, VK_ERROR_OUT_OF_DEVICE_MEMORY);
          goto fail;
       }

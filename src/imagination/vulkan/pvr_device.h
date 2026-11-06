@@ -111,6 +111,15 @@ struct pvr_device {
          /* clears of other outputs: the words from the common store, packed by the CPU */
          struct pvr_suballoc_bo *clear_raw_usc[G9P_OUTPUT_COUNT];
          struct pvr_pds_upload clear_raw_kick[G9P_OUTPUT_COUNT];
+         /* several targets: end of tile by their count, others made when first used */
+         struct pvr_suballoc_bo *eot_mrt_usc[5];
+         simple_mtx_t cached_lock;
+         struct g9p_cached_program {
+            uint64_t key;
+            struct pvr_suballoc_bo *usc;
+            struct pvr_pds_upload kick;
+         } cached[128];
+         unsigned num_cached;
          /* kick bundles (data, code at +0x20) */
          struct pvr_pds_upload clear_kick, vdm_end;
          /* code only: HALT, one DMA (data per use), the end of tile */

@@ -145,6 +145,7 @@ struct pvr_render_job {
       bool enabled;
       /* end-of-tile PDS code; its data is the view's pds_pixel_event_data_offset */
       uint32_t eot_code;
+      uint32_t eot_info;
       /* PDS_BGRND0-3 in the Apple layout */
       uint64_t bgnd[4];
       uint32_t width, height;

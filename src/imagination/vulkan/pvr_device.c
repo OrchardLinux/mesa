@@ -111,6 +111,10 @@ static uint32_t pvr_get_tile_buffer_size(const struct pvr_device *device)
 VkResult pvr_device_tile_buffer_ensure_cap(struct pvr_device *device,
                                            uint32_t capacity)
 {
+   /* G9P's outputs are its own (enum g9p_output): no tile buffers */
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p))
+      return VK_SUCCESS;
+
    uint32_t size_in_bytes = pvr_get_tile_buffer_size(device);
    struct pvr_device_tile_buffer_state *tile_buffer_state =
       &device->tile_buffer_state;

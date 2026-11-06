@@ -207,6 +207,7 @@ PVR_PER_ARCH(g9p_gfx_device_init)(struct pvr_device *device)
 
    if (!c)
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+   simple_mtx_init(&p->cached_lock, mtx_plain);
 
    /* Clear: half h of the output = f16 of the f32 uniform h */
    c->fragment = true;
@@ -248,6 +249,37 @@ PVR_PER_ARCH(g9p_gfx_device_init)(struct pvr_device *device)
       g9p_wait(c);
       g9p_end_fragment(c, words);
       result = upload_usc(device, c, &p->keep_usc[o]);
+      if (result != VK_SUCCESS)
+         goto out;
+   }
+
+   /*
+    * End of tile with several targets (PR #6's g5p_mrt_programs.h, Apple's own passes):
+    * each target's output-half offset from its block in the common store, then one PBE
+    * emit per target, a branch to the next 64-byte boundary and the end
+    */
+   for (unsigned n = 2; n <= G9P_MAX_TARGETS; n++) {
+      c->n = 0;
+      c->fragment = false;
+      for (unsigned k = 0; k < n; k++)
+         G9P_EMIT(c, 0x0188, 0x0100 | 2 * (n - 1 - k), 0x0100 | (0x99 + 0x20 * k), 0x4100, 0x0128,
+                  0x0039);
+      for (unsigned k = 0; k < n; k++) {
+         const bool last = k + 1 == n;
+
+         G9P_EMIT(c, 0x051c, (last ? 0x5100 : 0x7100) | 2 * (n - 1 - k), 0x0800 | 2 * k);
+         if (!last)
+            G9P_EMIT(c, 0x044c);
+      }
+      const unsigned end = ALIGN_POT(2 * c->n + 6, 64);
+
+      G9P_EMIT(c, 0x0100, 0x0100 | (end - 2 * c->n), 0x0000);
+      while (2 * c->n < end)
+         G9P_EMIT(c, 0xc000);
+      G9P_EMIT(c, 0x8000);
+      while (c->n % 32)
+         G9P_EMIT(c, 0x0000);
+      result = upload_usc(device, c, &p->eot_mrt_usc[n]);
       if (result != VK_SUCCESS)
          goto out;
    }
@@ -384,6 +416,13 @@ PVR_PER_ARCH(g9p_gfx_device_finish)(struct pvr_device *device)
    pvr_bo_suballoc_free(p->eot_usc);
    pvr_bo_suballoc_free(p->clear_usc);
    pvr_bo_suballoc_free(p->clear_vs_usc);
+   for (unsigned n = 2; n <= G9P_MAX_TARGETS; n++)
+      pvr_bo_suballoc_free(p->eot_mrt_usc[n]);
+   for (unsigned i = 0; i < p->num_cached; i++) {
+      pvr_bo_suballoc_free(p->cached[i].usc);
+      pvr_bo_suballoc_free(p->cached[i].kick.pvr_bo);
+   }
+   simple_mtx_destroy(&p->cached_lock);
    for (unsigned o = 0; o < G9P_OUTPUT_COUNT; o++) {
       pvr_bo_suballoc_free(p->load_usc[o]);
       pvr_bo_suballoc_free(p->keep_usc[o]);
@@ -393,6 +432,98 @@ PVR_PER_ARCH(g9p_gfx_device_finish)(struct pvr_device *device)
       pvr_bo_suballoc_free(p->clear_raw_kick[o].pvr_bo);
    }
    pvr_bo_suballoc_free(p->clear_vs_kick.pvr_bo);
+}
+
+/*
+ * Programs for several render targets, made when first used: one per combination
+ * of outputs and load ops. The build function writes its code into @c.
+ */
+enum g9p_cached_kind { G9P_CACHED_KEEP = 1, G9P_CACHED_CLEAR_ONE, G9P_CACHED_BACKGROUND };
+
+static VkResult
+g9p_cached_kick(struct pvr_device *device, uint64_t key, struct g9p_code *c, unsigned regs,
+                struct pvr_pds_upload *out)
+{
+   struct pvr_g9p_gfx_programs *p = &device->g9p.gfx;
+   struct g9p_cached_program *e;
+   VkResult result = VK_SUCCESS;
+
+   simple_mtx_lock(&p->cached_lock);
+   for (unsigned i = 0; i < p->num_cached; i++) {
+      if (p->cached[i].key == key) {
+         *out = p->cached[i].kick;
+         simple_mtx_unlock(&p->cached_lock);
+         return VK_SUCCESS;
+      }
+   }
+   if (p->num_cached == ARRAY_SIZE(p->cached)) {
+      simple_mtx_unlock(&p->cached_lock);
+      return vk_errorf(device, VK_ERROR_OUT_OF_DEVICE_MEMORY, "G9P: too many multi-target programs");
+   }
+   e = &p->cached[p->num_cached];
+   e->key = key;
+   result = upload_usc(device, c, &e->usc);
+   if (result == VK_SUCCESS)
+      result = upload_kick(device, e->usc, regs, 0, &e->kick);
+   if (result == VK_SUCCESS) {
+      *out = e->kick;
+      p->num_cached++;
+   }
+   simple_mtx_unlock(&p->cached_lock);
+   return result;
+}
+
+/* The tile's colour back, all its words: a colour mask of 0 */
+static VkResult
+g9p_keep_kick(struct pvr_device *device, unsigned words, struct pvr_pds_upload *out)
+{
+   struct g9p_code *c = calloc(1, sizeof(*c));
+   VkResult result;
+
+   if (!c)
+      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+   c->fragment = true;
+   g9p_tile_read(c, 0, words);
+   g9p_wait(c);
+   g9p_end_fragment(c, words);
+   result = g9p_cached_kick(device, (uint64_t)G9P_CACHED_KEEP << 60 | words, c, 16, out);
+   free(c);
+   return result;
+}
+
+/* The words before a render's target @first, and all of its targets' words */
+static unsigned
+g9p_render_words(const struct pvr_render_pass_info *info,
+                 const struct pvr_renderpass_hwsetup_render *hw, unsigned first)
+{
+   unsigned words = 0;
+
+   for (unsigned t = 0; hw && t < MIN2(hw->eot_surface_count, first); t++)
+      words += g9p_output_words(g9p_format_output(info->attachments[hw->eot_surfaces[t].attachment_idx]->vk.format));
+   return words;
+}
+
+/* Target @t's words from the common store, the others as they are in the tile */
+static VkResult
+g9p_clear_one_kick(struct pvr_device *device, unsigned words, unsigned base, unsigned n,
+                   struct pvr_pds_upload *out)
+{
+   struct g9p_code *c = calloc(1, sizeof(*c));
+   VkResult result;
+
+   if (!c)
+      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+   c->fragment = true;
+   g9p_tile_read(c, 0, words);
+   g9p_wait(c);
+   for (unsigned k = 0; k < n; k++)
+      G9P_EMIT(c, 0x0198, 0x0100 | 2 * (base + k), 0x0181 | k << 2, 0x4100, 0x0154, 0x0038);
+   g9p_end_fragment(c, words);
+   result = g9p_cached_kick(device,
+                            (uint64_t)G9P_CACHED_CLEAR_ONE << 60 | words << 8 | base << 4 | n, c, 16,
+                            out);
+   free(c);
+   return result;
 }
 
 /* --- Pipelines ------------------------------------------------------------ */
@@ -486,8 +617,8 @@ static VkResult
 compile_stage(struct pvr_device *device, nir_shader *nir,
               const VkPipelineShaderStageCreateInfo *stage,
               const struct g9p_vertex_attrib *attribs, int frag_coord_slot, bool point_coord,
-              const nir_lower_blend_options *blend, VkFormat target, struct g9p_shader *out,
-              bool point_size, void *mem_ctx)
+              const nir_lower_blend_options *blend, const struct g9p_target *targets,
+              struct g9p_shader *out, bool point_size, void *mem_ctx)
 {
    bool ok;
 
@@ -495,8 +626,7 @@ compile_stage(struct pvr_device *device, nir_shader *nir,
       ok = g9p_compile_vertex(nir, attribs, frag_coord_slot, point_coord, out, point_size,
                               mem_ctx);
    else
-      ok = g9p_compile_fragment(nir, frag_coord_slot, blend, g9p_format_output(target),
-                                vk_format_is_int(target), vk_format_is_float(target), out, mem_ctx);
+      ok = g9p_compile_fragment(nir, frag_coord_slot, blend, targets, out, mem_ctx);
    if (!ok)
       return g9p_error(device,
                        "G9P: %s shader not supported by the backend yet",
@@ -652,16 +782,25 @@ g9p_compile_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo 
                                nir_instr_as_tex(instr)->sampler_dim == GLSL_SAMPLER_DIM_CUBE;
       }
       slot = g9p_frag_coord_slot(vs_nir);
+      struct g9p_target targets[G9P_MAX_TARGETS] = { 0 };
+
+      for (unsigned t = 0; vk_state->rp && t < MIN2(vk_state->rp->color_attachment_count, G9P_MAX_TARGETS); t++) {
+         const VkFormat f = vk_state->rp->color_attachment_formats[t];
+
+         if (f != VK_FORMAT_UNDEFINED)
+            targets[t] = (struct g9p_target){ true, g9p_format_output(f), vk_format_is_int(f),
+                                              vk_format_is_float(f) };
+      }
+      /* no attachment: as for BGRA8, the first target's programs stay valid */
+      if (!targets[0].present && !targets[1].present && !targets[2].present && !targets[3].present)
+         targets[0] = (struct g9p_target){ true, G9P_OUTPUT_HALF2, false, false };
       result = compile_stage(device, fs_nir, fs_info, NULL, slot, false,
-                             blend_options(vk_state, &blend) ? &blend : NULL,
-                             vk_state->rp && vk_state->rp->color_attachment_count
-                                ? vk_state->rp->color_attachment_formats[0]
-                                : VK_FORMAT_B8G8R8A8_UNORM,
-                             &fs, false, mem_ctx);
+                             blend_options(vk_state, &blend) ? &blend : NULL, targets, &fs, false,
+                             mem_ctx);
       if (result == VK_SUCCESS)
          result = compile_stage(device, vs_nir, vs_info, attribs,
-                                fs.uses_frag_coord ? (int)slot : -1, fs.uses_point_coord, NULL,
-                                VK_FORMAT_UNDEFINED, &vs, point_size, mem_ctx);
+                                fs.uses_frag_coord ? (int)slot : -1, fs.uses_point_coord, NULL, NULL, &vs,
+                                point_size, mem_ctx);
    }
    if (result != VK_SUCCESS)
       goto out;
@@ -1980,6 +2119,7 @@ g9p_ds_clear(struct pvr_cmd_buffer *cmd_buffer, const VkClearAttachment *att,
    const float h = info->render_area.offset.y + info->render_area.extent.height;
    const bool depth = att->aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT;
    const bool stencil = att->aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT;
+   const unsigned targets = hw ? hw->eot_surface_count : 0;
    struct pvr_g9p_graphics_state state = {
       .vs_kick = p->clear_vs_kick,
       .fs_kick = p->keep_kick[hw && hw->eot_surface_count
@@ -1999,6 +2139,13 @@ g9p_ds_clear(struct pvr_cmd_buffer *cmd_buffer, const VkClearAttachment *att,
       .dbias = -1,
       .isp_set = true,
    };
+
+   if (targets > 1) {
+      VkResult keep = g9p_keep_kick(cmd_buffer->device, g9p_render_words(info, hw, targets), &state.fs_kick);
+
+      if (keep != VK_SUCCESS)
+         return keep;
+   }
    struct pvr_suballoc_bo *verts_bo, *table_bo;
    float *verts;
    VkResult result;
@@ -2109,9 +2256,17 @@ PVR_PER_ARCH(g9p_clear_attachments)(struct pvr_cmd_buffer *cmd_buffer, uint32_t 
    VkResult result;
 
    for (uint32_t i = 0; i < attachment_count; i++) {
-      if ((attachments[i].aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) &&
-          attachments[i].colorAttachment == 0)
-         colour = &attachments[i];
+      if (attachments[i].aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) {
+         /* one colour attachment at a time */
+         if (colour) {
+            result = PVR_PER_ARCH(g9p_clear_attachments)(cmd_buffer, 1, &attachments[i], rect_count,
+                                                         rects);
+            if (result != VK_SUCCESS)
+               return result;
+         } else {
+            colour = &attachments[i];
+         }
+      }
       if (attachments[i].aspectMask &
           (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) {
          result = g9p_ds_clear(cmd_buffer, &attachments[i], rect_count, rects);
@@ -2165,10 +2320,21 @@ PVR_PER_ARCH(g9p_clear_attachments)(struct pvr_cmd_buffer *cmd_buffer, uint32_t 
    {
       const struct pvr_renderpass_hwsetup_render *hw = g9p_current_hw_render(info);
 
-      if (hw && hw->eot_surface_count) {
-         const VkFormat format = info->attachments[hw->eot_surfaces[0].attachment_idx]->vk.format;
+      if (hw && colour->colorAttachment < hw->eot_surface_count) {
+         const unsigned t = colour->colorAttachment;
+         const VkFormat format = info->attachments[hw->eot_surfaces[t].attachment_idx]->vk.format;
 
-         if (g9p_clear_is_raw(format)) {
+         if (hw->eot_surface_count > 1) {
+            g9p_pack_clear(format, colour->clearValue.color.float32, packed);
+            colour_data = packed;
+            result = g9p_clear_one_kick(cmd_buffer->device,
+                                        g9p_render_words(info, hw, hw->eot_surface_count),
+                                        g9p_render_words(info, hw, t),
+                                        g9p_output_words(g9p_format_output(format)), &state.fs_kick);
+            if (result != VK_SUCCESS)
+               return result;
+            state.uses_fbfetch = true;
+         } else if (g9p_clear_is_raw(format)) {
             g9p_pack_clear(format, colour->clearValue.color.float32, packed);
             colour_data = packed;
             state.fs_kick = p->clear_raw_kick[g9p_format_output(format)];
@@ -2421,6 +2587,121 @@ g9p_ds_check(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_renderpass_hwse
    return VK_SUCCESS;
 }
 
+/*
+ * The background of several targets: for each, its load (the old target
+ * sampled, into temporaries) or its clear words, then the outputs. In the
+ * common store target t's texture state or clear words at dword 8t, the
+ * nearest sampler behind them; the coordinate scale is in the program.
+ */
+static VkResult
+g9p_background_mrt(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_render_pass_info *info,
+                   const struct pvr_renderpass_hwsetup_render *hw, unsigned n,
+                   struct pvr_render_job *job, struct pvr_pds_upload *up)
+{
+   struct pvr_device *device = cmd_buffer->device;
+   const struct pvr_g9p_gfx_programs *p = &device->g9p.gfx;
+   uint32_t data[8 * G9P_MAX_TARGETS + 2] = { 0 };
+   struct g9p_code *c = calloc(1, sizeof(*c));
+   struct pvr_suballoc_bo *bo;
+   struct pvr_pds_upload kick;
+   uint64_t key = (uint64_t)G9P_CACHED_BACKGROUND << 60;
+   unsigned tmp = 8, words = 0, loads = 0;
+   unsigned at[G9P_MAX_TARGETS];
+   VkResult result;
+
+   if (!c)
+      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+   c->fragment = true;
+   for (unsigned t = 0; t < n; t++) {
+      const uint32_t idx = hw->eot_surfaces[t].attachment_idx;
+
+      for (unsigned j = 0; j < hw->color_init_count; j++)
+         loads |= (hw->color_init[j].index == idx && hw->color_init[j].op == VK_ATTACHMENT_LOAD_OP_LOAD) << t;
+   }
+   if (loads) {
+      const struct pvr_image_view *v = info->attachments[hw->eot_surfaces[0].attachment_idx];
+
+      key |= (uint64_t)v->vk.extent.width << 40 | (uint64_t)v->vk.extent.height << 26;
+      G9P_EMIT(c, 0x211c, 0x6800);
+      g9p_wait(c);
+      g9p_convert(c, 2, 0, G9P_U2F);
+      g9p_convert(c, 3, 1, G9P_U2F);
+      g9p_mov_imm(c, 4, fui(1.0f / (16 * v->vk.extent.width)));
+      g9p_mov_imm(c, 5, fui(1.0f / (16 * v->vk.extent.height)));
+      g9p_alu2(c, G9P_FMUL, 0, 2, 4, false);
+      g9p_alu2(c, G9P_FMUL, 1, 3, 5, false);
+   }
+   for (unsigned t = 0; t < n; t++) {
+      const uint32_t idx = hw->eot_surfaces[t].attachment_idx;
+      const struct pvr_image_view *v = info->attachments[idx];
+      const enum g9p_output o = g9p_format_output(v->vk.format);
+      const unsigned w = g9p_output_words(o);
+
+      key |= (uint64_t)(o | (loads >> t & 1) << 3) << (4 * t);
+      at[t] = tmp;
+      if (loads >> t & 1) {
+         uint64_t tex[2];
+
+         PVR_PER_ARCH(g9p_pack_image_view)(v, tex);
+         memcpy(&data[8 * t], tex, sizeof(tex));
+         G9P_EMIT(c, o >= G9P_OUTPUT_RAW1 ? 0xf51a : 0xf518, g9p_sample_w1(tmp, 8 * t),
+                  0x8100 | 8 * n, 0x0700, 0x0200);
+         tmp += 4;
+      } else {
+         float clear[4] = { 0 };
+
+         for (unsigned j = 0; j < hw->color_init_count; j++) {
+            if (hw->color_init[j].index == idx && hw->color_init[j].op == VK_ATTACHMENT_LOAD_OP_CLEAR &&
+                idx < info->clear_value_count)
+               memcpy(clear, info->clear_values[idx].color.float32, sizeof(clear));
+         }
+         g9p_pack_clear(v->vk.format, clear, &data[8 * t]);
+         for (unsigned k = 0; k < w; k++)
+            G9P_EMIT(c, 0x0198, 0x0100 | 2 * (tmp + k), 0x0181 | (8 * t + k) << 2, 0x4100, 0x0154, 0x0038);
+         tmp += w;
+      }
+      words += w;
+   }
+   if (loads)
+      g9p_wait(c);
+   data[8 * n] = 0x000e0000;
+   data[8 * n + 1] = 0x00c00780;
+   {
+      unsigned base = 0;
+
+      for (unsigned t = 0; t < n; t++) {
+         const unsigned w = g9p_output_words(g9p_format_output(info->attachments[hw->eot_surfaces[t].attachment_idx]->vk.format));
+
+         for (unsigned k = 0; k < w; k++)
+            g9p_alu2(c, G9P_OR, base + k, at[t] + k, at[t] + k, false);
+         base += w;
+      }
+   }
+   g9p_end_fragment(c, words);
+   result = g9p_cached_kick(device, key, c, 28, &kick);
+   free(c);
+   if (result != VK_SUCCESS)
+      return result;
+   result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, data, 4 * (8 * n + 2), &bo);
+   if (result != VK_SUCCESS)
+      return result;
+   {
+      const uint32_t pds[4] = { bo->dev_addr.addr, bo->dev_addr.addr >> 32,
+                                doutd_ctrl(0, 8 * n + 2, true), 0 };
+
+      result = pvr_arch_cmd_buffer_upload_pds(cmd_buffer, pds, ARRAY_SIZE(pds), 16, NULL, 0, 0, 64, up);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+   const uint64_t units = DIV_ROUND_UP(8 * n + 2, 16);
+
+   job->g9p.bgnd[0] = (uint64_t)p->dma.code_offset << 32 | kick.data_offset;
+   job->g9p.bgnd[1] = 0;
+   job->g9p.bgnd[2] = up->data_offset;
+   job->g9p.bgnd[3] = units * 0x0080000000800000ull;
+   return VK_SUCCESS;
+}
+
 VkResult
 PVR_PER_ARCH(g9p_job_init)(struct pvr_cmd_buffer *cmd_buffer,
                            const struct pvr_renderpass_hwsetup_render *hw_render,
@@ -2432,7 +2713,8 @@ PVR_PER_ARCH(g9p_job_init)(struct pvr_cmd_buffer *cmd_buffer,
    float clear[4] = { 0, 0, 0, 0 };
    struct pvr_suballoc_bo *bo;
    struct pvr_pds_upload up;
-   uint32_t image[8];
+   uint32_t image[8 * G9P_MAX_TARGETS];
+   const unsigned eot_targets = MIN2(hw_render->eot_surface_count, G9P_MAX_TARGETS);
    VkResult result;
 
    result = g9p_ds_check(cmd_buffer, hw_render);
@@ -2464,17 +2746,35 @@ PVR_PER_ARCH(g9p_job_init)(struct pvr_cmd_buffer *cmd_buffer,
       job->g9p.target_linear = linear;
       pack_image_state(image, addr, iview->vk.extent.width, iview->vk.extent.height, linear,
                        pitch, iview->vk.format);
+      /* the other targets' blocks: their state, their output-half offset (PR #6) */
+      for (unsigned t = 1; t < eot_targets; t++) {
+         const struct pvr_image_view *v = info->attachments[hw_render->eot_surfaces[t].attachment_idx];
+         const struct pvr_image *im = pvr_image_view_get_image(v);
+         const struct pvr_image_plane *pl = pvr_single_plane_const(im);
+
+         pack_image_state(&image[8 * t],
+                          im->dev_addr.addr + pl->offset + pl->mip_levels[v->vk.base_mip_level].offset +
+                             v->vk.base_array_layer * pl->layer_size,
+                          v->vk.extent.width, v->vk.extent.height,
+                          im->memlayout == PVR_MEMLAYOUT_LINEAR,
+                          pl->mip_levels[v->vk.base_mip_level].pitch, v->vk.format);
+         image[8 * t + 6] = 2 * g9p_render_words(info, hw_render, t);
+         image[8 * t - 1] = 0xffffffff;
+      }
       job->g9p.width = iview->vk.extent.width;
       job->g9p.height = iview->vk.extent.height;
    } else {
       memset(image, 0, sizeof(image));
    }
-   result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, image, 7 * 4, &bo);
+   const unsigned eot_dwords = 8 * MAX2(eot_targets, 1) - 1;
+
+   result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, image, 4 * eot_dwords, &bo);
    if (result != VK_SUCCESS)
       return result;
    {
       const uint32_t data[8] = { bo->dev_addr.addr, bo->dev_addr.addr >> 32,
-                                 doutd_ctrl(0, 7, true), 0, usc_offset(device, p->eot_usc),
+                                 doutd_ctrl(0, eot_dwords, true), 0,
+                                 usc_offset(device, eot_targets > 1 ? p->eot_mrt_usc[eot_targets] : p->eot_usc),
                                  usc_temps(8), 0, 0 };
 
       result = pvr_arch_cmd_buffer_upload_pds(cmd_buffer, data, ARRAY_SIZE(data), 16, NULL,
@@ -2484,6 +2784,8 @@ PVR_PER_ARCH(g9p_job_init)(struct pvr_cmd_buffer *cmd_buffer,
    }
    job->view_state.view[0].pds_pixel_event_data_offset = up.data_offset;
    job->g9p.eot_code = p->eot.code_offset;
+   /* twice DIV_ROUND_UP(dwords, 16) at bit 9 (Apple's 0x402, 0x402, 0x802) */
+   job->g9p.eot_info = eot_targets > 2 ? 0x802 : 0x402;
 
    /*
     * Background object. Load op load: the load shader with the target's own
@@ -2541,6 +2843,11 @@ PVR_PER_ARCH(g9p_job_init)(struct pvr_cmd_buffer *cmd_buffer,
       if (result != VK_SUCCESS)
          return result;
    }
+   if (eot_targets > 1) {
+      result = g9p_background_mrt(cmd_buffer, info, hw_render, eot_targets, job, &up);
+      if (result != VK_SUCCESS)
+         return result;
+   } else {
    job->g9p.bgnd[0] = (uint64_t)p->dma.code_offset << 32 |
                       (load     ? p->load_kick[bg_output].data_offset
                        : bg_raw ? p->clear_raw_kick[bg_output].data_offset
@@ -2548,6 +2855,7 @@ PVR_PER_ARCH(g9p_job_init)(struct pvr_cmd_buffer *cmd_buffer,
    job->g9p.bgnd[1] = 0;
    job->g9p.bgnd[2] = up.data_offset;
    job->g9p.bgnd[3] = 0x0080000000800000ull;
+   }
    dump32("image state", 0, image, 8);
    dump_pds("clear dma", &up);
    return VK_SUCCESS;
@@ -2822,7 +3130,7 @@ PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
    put32(&s, (job->g9p.load || job->g9p.load_op == G9P_LOAD_OP_NONE) && !getenv("G9P_ALL_TILES")
                 ? 0x21000f
                 : 0x23000f);
-   put32(&s, 0x402);    /* EVENT_PIXEL_PDS_INFO */
+   put32(&s, job->g9p.eot_info); /* EVENT_PIXEL_PDS_INFO */
    put32(&s, 0);
    put32(&s, job->view_state.view[0].pds_pixel_event_data_offset);
    put32(&s, 0);

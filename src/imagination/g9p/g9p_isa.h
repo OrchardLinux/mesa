@@ -571,7 +571,7 @@ g9p_to_half(struct g9p_code *c, unsigned h, unsigned src)
 static inline void
 g9p_tile_read(struct g9p_code *c, unsigned dst, unsigned words)
 {
-   G9P_EMIT(c, words << 12 | 0x011c, 0x2800 | 2 * dst);
+   G9P_EMIT(c, (words & 7) << 12 | 0x011c, 0x2800 | 2 * dst);
 }
 
 /*
@@ -626,7 +626,7 @@ static inline void
 g9p_end_fragment(struct g9p_code *c, unsigned words)
 {
    if (words)
-      G9P_EMIT(c, words << 12 | 0x011c, 0x0800);
+      G9P_EMIT(c, (words & 7) << 12 | 0x011c, 0x0800);
    G9P_EMIT(c, 0x8000);
    while (c->n % 32)
       G9P_EMIT(c, 0x0000);
