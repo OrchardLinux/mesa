@@ -34,15 +34,13 @@
  * output's columns, modf's two results): the raw32 output's four words each,
  * eight in one emitpix, the width of Apple's 4-target pass; each target's PBE
  * reads its four words from output half 8t (pvr_arch_g5p.c). Both halves are
- * device-proven apart (raw32 from half 0, 8-bit RGBA from half 8), the pair is
- * not: behind PVR_G5P_FORMATS=probe until a device run. 0: not such a pair,
- * 1: a pair, -1: a pair without the probe. */
+ * device-proven apart (raw32 from half 0, 8-bit RGBA from half 8), and the
+ * pair ran on the device too (docs/gpu/DEVICE-READY-int-mrt.md): rendered by
+ * default. 0: not such a pair, 1: a pair. */
 static int
 g5p_mrt_raw32_pair(unsigned n, VkFormat f0, VkFormat ft)
 {
-   if (n != 2 || !pvr_g5p_raw32_kind(f0) || ft != f0)
-      return 0;
-   return pvr_g5p_formats_probe() ? 1 : -1;
+   return n == 2 && pvr_g5p_raw32_kind(f0) && ft == f0;
 }
 
 /* Four 32-bit integer targets: 16 output words, twice what one emitpix carries */
