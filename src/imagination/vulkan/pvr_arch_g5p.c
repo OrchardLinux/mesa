@@ -693,7 +693,9 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
             pvr_g5p_packed_uint_bits(first_format) == 8 ? 6 : 5;
    /* output words per target, and of the pass: two raw32 targets of one format (admitted by
     * pvr_arch_g5p_mrt_pass_check(), behind the format probe) take four each, eight in all */
-   const bool narrow = raw >= 5 && pvr_g5p_format_find(first_format)->cpp == 2;
+   const bool narrow = raw >= 5 &&
+      (first_format == VK_FORMAT_R16_UINT || first_format == VK_FORMAT_R16_SINT ||
+       first_format == VK_FORMAT_R8G8_UINT || first_format == VK_FORMAT_R8G8_SINT);
    struct g5p_color_source_abi source = {0};
    if (raw >= 5 && !g5p_color_source_make(narrow ? 16 : 32,
          (first_format == VK_FORMAT_R16G16B16A16_UINT || first_format == VK_FORMAT_R16G16B16A16_SINT) ? 2 : 1,
