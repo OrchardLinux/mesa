@@ -231,6 +231,14 @@ static void pvr_setup_transfer_surface(struct pvr_device *device,
                        apple_g9p))
       surface->mem_layout = PVR_MEMLAYOUT_TWIDDLED;
 
+   /* G9P: depth/stencil planes are twiddled over their square (pvr_image.c) */
+   if (vk_format_is_depth_or_stencil(image->vk.format) && image->memlayout == PVR_MEMLAYOUT_TWIDDLED &&
+       PVR_HAS_FEATURE(&container_of(image->vk.base.device, struct pvr_device, vk)
+                           ->pdevice->dev_info,
+                       apple_g9p)) {
+      surface->width = surface->height = MAX2(surface->width, surface->height);
+   }
+
    /* G9P: D32F_S8's stencil is the image's second plane (g9p_ds_stencil_offset()) */
    if (image->vk.format == VK_FORMAT_D32_SFLOAT_S8_UINT && format == VK_FORMAT_S8_UINT &&
        PVR_HAS_FEATURE(&container_of(image->vk.base.device, struct pvr_device, vk)

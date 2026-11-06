@@ -109,6 +109,17 @@ static void pvr_image_plane_init_physical_extent(
          util_next_power_of_two(image->vk.extent.height);
       plane->physical_extent.depth =
          util_next_power_of_two(image->vk.extent.depth);
+      /*
+       * G9P: the ZLS keeps a plane in Morton order over a power-of-two square of tiles,
+       * whatever the sides (PR #6's D5 footprint): room for that square
+       */
+      if (vk_format_is_depth_or_stencil(image->vk.format) &&
+          PVR_HAS_FEATURE(&container_of(image->vk.base.device, struct pvr_device, vk)
+                              ->pdevice->dev_info,
+                          apple_g9p)) {
+         plane->physical_extent.width = plane->physical_extent.height =
+            MAX2(plane->physical_extent.width, plane->physical_extent.height);
+      }
    } else {
       assert(image->memlayout == PVR_MEMLAYOUT_LINEAR);
       plane->physical_extent = image->vk.extent;
