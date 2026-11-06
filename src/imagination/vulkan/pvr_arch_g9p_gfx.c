@@ -2556,9 +2556,14 @@ PVR_PER_ARCH(g9p_pack_image_view)(const struct pvr_image_view *iview, uint64_t w
    const struct pvr_image *image = pvr_image_view_get_image(iview);
    const struct pvr_image_plane *plane = pvr_single_plane_const(image);
    const VkComponentMapping *sw = &iview->vk.swizzle;
-   uint32_t fmt = g9p_image_format(iview->vk.format);
+   /* D32F_S8's stencil aspect: the plane after the depth, bytes (g9p_ds_stencil_offset()) */
+   const bool stencil_plane = image->vk.format == VK_FORMAT_D32_SFLOAT_S8_UINT &&
+                              iview->vk.aspects == VK_IMAGE_ASPECT_STENCIL_BIT;
+   const uint64_t plane_offset =
+      stencil_plane ? (uint64_t)plane->physical_extent.width * plane->physical_extent.height * 4 : 0;
+   uint32_t fmt = g9p_image_format(stencil_plane ? VK_FORMAT_R8_UINT : iview->vk.format);
    const bool linear = image->memlayout == PVR_MEMLAYOUT_LINEAR;
-   const uint64_t addr = image->dev_addr.addr + plane->offset +
+   const uint64_t addr = image->dev_addr.addr + plane->offset + plane_offset +
                          plane->mip_levels[iview->vk.base_mip_level].offset +
                          iview->vk.base_array_layer * plane->layer_size;
    const uint32_t w = iview->vk.extent.width, h = iview->vk.extent.height;
@@ -2599,7 +2604,7 @@ PVR_PER_ARCH(g9p_pack_image_view)(const struct pvr_image_view *iview, uint64_t w
        * layout in bits 0-2 (2 2D, 3 2D array, 6 cube), layers - 1 at bit 111,
        * bit 125 when the layer stride is rounded to 16 KiB rather than 64 bytes.
        */
-      const uint64_t base = image->dev_addr.addr + plane->offset +
+      const uint64_t base = image->dev_addr.addr + plane->offset + plane_offset +
                             iview->vk.base_array_layer * plane->layer_size;
       const uint32_t w0 = image->vk.extent.width, h0 = image->vk.extent.height;
 

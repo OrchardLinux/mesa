@@ -198,14 +198,14 @@ g9p_output_words(enum g9p_output output)
    return output == G9P_OUTPUT_RAW4 ? 4 : output == G9P_OUTPUT_HALF2 || output == G9P_OUTPUT_RAW2 ? 2 : 1;
 }
 
-/* Has a key, and is not snorm, shared-exponent, 565 or 4444 (Zink picks another for those) */
+/* Has a key, and is not snorm, shared-exponent or 4444 (Zink picks another for those) */
 static inline bool
 g9p_format_renderable(VkFormat format)
 {
    const uint32_t key = g9p_image_format(format);
    const uint32_t code = (key >> 5) & 0x3ff;
 
-   return key && (code == 0x28 || code == 0x26 || code == 0x00 || code == 0x0a || (code & 0x100) ||
+   return key && (code == 0x28 || code == 0x26 || code == 0x00 || code == 0x0a || code == 0x0b || (code & 0x100) ||
           code == 0x209 || code == 0x223 || code == 0x232 || code == 0x225 || code == 0x221 ||
           code == 0x231 || code == 0x238);
 }

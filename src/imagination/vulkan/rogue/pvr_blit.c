@@ -231,6 +231,17 @@ static void pvr_setup_transfer_surface(struct pvr_device *device,
                        apple_g9p))
       surface->mem_layout = PVR_MEMLAYOUT_TWIDDLED;
 
+   /* G9P: D32F_S8's stencil is the image's second plane (g9p_ds_stencil_offset()) */
+   if (image->vk.format == VK_FORMAT_D32_SFLOAT_S8_UINT && format == VK_FORMAT_S8_UINT &&
+       PVR_HAS_FEATURE(&container_of(image->vk.base.device, struct pvr_device, vk)
+                           ->pdevice->dev_info,
+                       apple_g9p)) {
+      const struct pvr_image_plane *ds_plane = pvr_single_plane_const(image);
+
+      surface->dev_addr.addr +=
+         (uint64_t)ds_plane->physical_extent.width * ds_plane->physical_extent.height * 4;
+   }
+
    if (surface->mem_layout == PVR_MEMLAYOUT_3DTWIDDLED)
       surface->z_position = fdepth;
    else

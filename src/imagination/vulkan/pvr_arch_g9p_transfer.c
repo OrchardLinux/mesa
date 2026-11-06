@@ -332,6 +332,19 @@ run(struct pvr_device *device, const struct pvr_transfer_cmd *cmd)
                            cmd->flags & PVR_TRANSFER_CMD_FLAGS_PICKD);
          continue;
       }
+      /* Both aspects of D32F_S8: each plane by itself */
+      if (src.format == PIPE_FORMAT_Z32_FLOAT_S8X24_UINT &&
+          dst.format == PIPE_FORMAT_Z32_FLOAT_S8X24_UINT && source->mapping_count) {
+         for (unsigned k = 0; k < source->mapping_count; k++) {
+            for (unsigned depth = 0; depth < 2; depth++) {
+               struct surface sp = ds_plane(&src, depth), dp = ds_plane(&dst, depth);
+
+               sp.format = dp.format = depth ? PIPE_FORMAT_Z32_FLOAT : PIPE_FORMAT_S8_UINT;
+               copy(&source->mappings[k], &sp, &dp);
+            }
+         }
+         continue;
+      }
       if (!source->mapping_count) {
          /* the whole destination scissor, 1:1 */
          const struct pvr_rect_mapping m = { .src_rect = cmd->scissor,
