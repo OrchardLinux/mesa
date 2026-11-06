@@ -684,6 +684,39 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
    }
    g->fs_num_uploads = fs->num_uploads;
    g->fs_common_dwords = fs->common_dwords;
+   /* PDS has 128 constant dwords, four per transfer. Coalesce copied
+    * descriptor intervals when the original upload list exceeds twelve.
+    * GPU-written UBOs and push snapshots retain their own source addresses. */
+   bool cpu[PCO_G5P_FS_COMMON_DWORDS] = {false};
+   for (unsigned i = 0; i < fs->num_uploads; i++) {
+      const struct pco_g5p_upload *u = &fs->uploads[i];
+      bool copy = fs->num_uploads > 12 &&
+                  (u->kind == PCO_G5P_UPLOAD_IMAGE || u->kind == PCO_G5P_UPLOAD_SAMPLER ||
+                   u->kind == PCO_G5P_UPLOAD_IMAGE_SIZE || u->kind == PCO_G5P_UPLOAD_BLEND_CONSTANTS);
+      if (u->common + u->dwords > ARRAY_SIZE(cpu))
+         return G5P_REFUSE(device, "fragment upload outside common store");
+      if (copy) {
+         for (unsigned k = u->common; k < u->common + u->dwords; k++) cpu[k] = true;
+      } else {
+         if (g->fs_num_dmas == ARRAY_SIZE(g->fs_dma))
+            return G5P_REFUSE(device, "more than 32 fragment PDS transfers");
+         unsigned j = g->fs_num_dmas++;
+         g->fs_dma[j].common = u->common;
+         g->fs_dma[j].dwords = u->dwords;
+         g->fs_dma[j].upload = i;
+      }
+   }
+   for (unsigned k = 0; k < fs->common_dwords;) {
+      if (!cpu[k]) { k++; continue; }
+      unsigned first = k++;
+      while (k < fs->common_dwords && cpu[k]) k++;
+      if (g->fs_num_dmas == ARRAY_SIZE(g->fs_dma))
+         return G5P_REFUSE(device, "more than 32 fragment PDS transfers");
+      unsigned j = g->fs_num_dmas++;
+      g->fs_dma[j].common = first;
+      g->fs_dma[j].dwords = k - first;
+      g->fs_dma[j].upload = -1;
+   }
    if (vs->xfb_buffers & ~(g->xfb_variant ? g->xfb_layout.buffers : 0))
       return G5P_REFUSE(device, "transform feedback stores to buffers %#x outside the capture layout %#x",
                         vs->xfb_buffers, g->xfb_variant ? g->xfb_layout.buffers : 0);
@@ -747,7 +780,7 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
       return result;
 
    /* PDS: vertex fetch code */
-   uint32_t code[96], data[2 * (1 + PCO_G5P_MAX_FS_VARYINGS) + 4];
+   uint32_t code[96 + 4 * PVR_G5P_MAX_FS_UPLOADS], data[2 * (1 + PCO_G5P_MAX_FS_VARYINGS) + 4];
    unsigned n = fetch_program(code, g, false, false);
    result = pvr_gpu_upload_pds(device, NULL, 0, 0, code, n, 16, 64, &g->fetch);
    if (result != VK_SUCCESS)
@@ -794,7 +827,7 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
 
    /* PDS: the uniform/texture loader (the device HALT without uploads) */
    if (g->fs_num_uploads) {
-      n = loader_program(code, g->fs_num_uploads);
+      n = loader_program(code, g->fs_num_dmas);
       result = pvr_gpu_upload_pds(device, NULL, 0, 0, code, n, 16, 64, &g->fs_loader);
       if (result != VK_SUCCESS)
          return result;
@@ -841,7 +874,7 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
          tb.addr = PVR_DEV_ADDR(g->fs_num_uploads ? g->fs_loader.code_offset : dp->halt.code_offset);
       }
       pvr_csb_pack (&w[3], TA_STATE_PDS_SIZEINFO1, s1) {
-         s1.pds_uniformsize = g->fs_num_uploads ? DIV_ROUND_UP(4 * g->fs_num_uploads,
+         s1.pds_uniformsize = g->fs_num_uploads ? DIV_ROUND_UP(4 * g->fs_num_dmas,
                                                                ROGUE_TA_STATE_PDS_SIZEINFO1_PDS_UNIFORMSIZE_UNIT_SIZE)
                                                 : 1;
          if (fs->num_varyings) {
@@ -1454,15 +1487,26 @@ fs_uploads(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_pipeline *g, 
          if (copied[i])
             src[i] = bo->dev_addr.addr + sizeof(words[0]) * i;
    }
-   for (unsigned i = 0; i < n; i++) {
-      const struct pvr_g5p_upload *u = &g->fs_uploads[i];
-
-      data[2 * i] = (uint32_t)src[i];
-      data[2 * i + 1] = (uint32_t)(src[i] >> 32);
-      data[2 * n + 2 * i] = doutd_control(u->common, u->dwords, i == n - 1);
-      data[2 * n + 2 * i + 1] = 0;
+   uint32_t staging[PCO_G5P_FS_COMMON_DWORDS] = {0};
+   uint64_t staging_va = 0;
+   if (n > 12 && any_copied) {
+      for (unsigned i = 0; i < n; i++)
+         if (copied[i])
+            memcpy(staging + g->fs_uploads[i].common, words[i], 4 * g->fs_uploads[i].dwords);
+      result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, staging, 4 * g->fs_common_dwords, &bo);
+      if (result != VK_SUCCESS) return result;
+      staging_va = bo->dev_addr.addr;
    }
-   result = pvr_arch_cmd_buffer_upload_pds(cmd_buffer, data, 4 * n, 16, NULL, 0, 0, 16, &up);
+   const unsigned dmas = g->fs_num_dmas;
+   for (unsigned i = 0; i < dmas; i++) {
+      const int upload = g->fs_dma[i].upload;
+      uint64_t va = upload < 0 ? staging_va + 4 * g->fs_dma[i].common : src[upload];
+      data[2 * i] = (uint32_t)va;
+      data[2 * i + 1] = (uint32_t)(va >> 32);
+      data[2 * dmas + 2 * i] = doutd_control(g->fs_dma[i].common, g->fs_dma[i].dwords, i == dmas - 1);
+      data[2 * dmas + 2 * i + 1] = 0;
+   }
+   result = pvr_arch_cmd_buffer_upload_pds(cmd_buffer, data, 4 * dmas, 16, NULL, 0, 0, 16, &up);
    if (result != VK_SUCCESS)
       return result;
    pvr_csb_pack (&block[0], TA_STATE_HEADER, h) {
@@ -1477,7 +1521,7 @@ fs_uploads(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_pipeline *g, 
    *block_va = bo->dev_addr.addr;
    for (unsigned i = 0; i < n; i++)
       g5p_dump("draw", "fs upload words", bo->dev_addr.addr, words[i], g->fs_uploads[i].dwords);
-   g5p_dump("draw", "uniform data", up.data_offset, data, 4 * n);
+   g5p_dump("draw", "uniform data", up.data_offset, data, 4 * dmas);
    return VK_SUCCESS;
 }
 

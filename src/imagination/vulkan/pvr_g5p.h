@@ -169,7 +169,7 @@ struct pvr_g5p_fetch {
  * pco_g5p_upload): `kind` a pco_g5p_upload_kind, read at each draw from the
  * bound descriptor (set, binding) + offset bytes (the level of an image-size
  * upload), `dwords` into common-store dword `common` */
-#define PVR_G5P_MAX_FS_UPLOADS 12
+#define PVR_G5P_MAX_FS_UPLOADS 40
 struct pvr_g5p_upload {
    uint8_t kind, set, binding, dwords;
    uint16_t element, offset, common;
@@ -252,6 +252,8 @@ struct pvr_g5p_pipeline {
     * behind UNIFORMDATABASE (no uploads: the device HALT) */
    unsigned fs_num_uploads, fs_common_dwords;
    struct pvr_g5p_upload fs_uploads[PVR_G5P_MAX_FS_UPLOADS];
+   unsigned fs_num_dmas;
+   struct { unsigned common, dwords; int upload; } fs_dma[32];
    struct pvr_pds_upload fs_loader;
    /* rasterization samples, 1 or 4: the fragment launch's sample rate and the draws' ISP user pass */
    uint32_t samples;

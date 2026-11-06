@@ -239,7 +239,7 @@ struct gctx {
    nir_intrinsic_instr *vend_store; /* eager: the output component written by the final vend */
    unsigned vend_comp;
    /* common store */
-   struct tex_bind tex[4];
+   struct tex_bind tex[16];
    unsigned ntex, fetch_sampler_common;
    struct { unsigned set, binding, element, lod, common; } tsize[4]; /* textureSize/QueryLevels */
    unsigned nsize;
@@ -1942,8 +1942,8 @@ static struct tex_bind *tex_for(struct gctx *c, nir_tex_instr *t)
          { c->tex[i].needs_sampler |= b.needs_sampler;
            c->tex[i].needs_fetch_sampler |= b.needs_fetch_sampler;
            return &c->tex[i]; }
-   if (c->ntex == ARRAY_SIZE(c->tex))
-      refuse(c, "more than %zu textures", ARRAY_SIZE(c->tex));
+   if (c->ntex == (c->vs ? 4 : ARRAY_SIZE(c->tex)))
+      refuse(c, "more than %u textures", c->vs ? 4u : (unsigned)ARRAY_SIZE(c->tex));
    c->tex[c->ntex] = b;
    return &c->tex[c->ntex++];
 }
@@ -2067,22 +2067,26 @@ static void plan_common(struct gctx *c)
    if (c->nssbo)
       next = MAX2(next, 4);
    bool qualified = c->vs && g5p_vtex_qualified();
+   /* Preserve the flown <=4-texture layout. Larger fragment programs use
+    * Apple's f16 capacity layout: all eight-dword images, then samplers.
+    * Interleaving wastes six dwords per binding and exceeds the selectors. */
+   bool compact = qualified || (!c->vs && c->ntex > 4);
    unsigned image_base = align(next, 8), sampler_base = image_base + 8 * c->ntex;
    unsigned sampler_count = 0, sampler_cursor = sampler_base;
    bool fetch_sampler = false;
-   if (qualified)
+   if (compact)
       for (unsigned i = 0; i < c->ntex; i++) {
-         sampler_count += c->tex[i].needs_sampler;
+         sampler_count += !qualified || c->tex[i].needs_sampler;
          fetch_sampler |= c->tex[i].needs_fetch_sampler;
       }
    c->fetch_sampler_common = sampler_base + 2 * sampler_count;
    for (unsigned i = 0; i < c->ntex; i++) {
       struct tex_bind *t = &c->tex[i];
-      t->image = qualified ? image_base + 8 * i : align(next, 8);
-      t->sampler = qualified ? (t->needs_sampler ? sampler_cursor : c->fetch_sampler_common) : t->image + 8;
-      sampler_cursor += qualified && t->needs_sampler ? 2 : 0;
-      next = qualified ? c->fetch_sampler_common + 2 * fetch_sampler : t->image + 10;
-      if (t->image / 2 > 28 || t->sampler / 2 > 32)
+      t->image = compact ? image_base + 8 * i : align(next, 8);
+      t->sampler = compact ? ((!qualified || t->needs_sampler) ? sampler_cursor : c->fetch_sampler_common) : t->image + 8;
+      sampler_cursor += compact && (!qualified || t->needs_sampler) ? 2 : 0;
+      next = compact ? c->fetch_sampler_common + 2 * (qualified && fetch_sampler) : t->image + 10;
+      if (t->image / 2 > (compact ? 120 : 28) || t->sampler / 2 > (compact ? 124 : 32))
          refuse(c, "texture descriptors beyond the bounded qualified selectors");
       add_upload(c, PCO_G5P_UPLOAD_IMAGE, t->set, t->binding, t->element, 0, 8, t->image);
       if (!qualified || t->needs_sampler)

@@ -901,9 +901,11 @@ unsigned g5p_usc_alu_shared_pair(uint8_t *out, enum g5p_binop op, unsigned dst_h
 static unsigned texture_base(uint8_t *raw, const struct g5p_tex *t)
 {
    CHECK(half_register(t->dst_half, "dst_half requires a measured 32-bit aligned half index"), g5p_usc_error);
-   CHECK(t->image_qword <= 28, "image_qword must be an integer in [0,28]");
+   /* A9 f16/v16 capacity programs independently reconstruct these selectors.
+    * The common-store selector is the same seven-bit field as sample_ext. */
+   CHECK(t->image_qword <= 120, "image_qword must be an integer in [0,120]");
    CHECK(!(t->image_qword & 3), "measured image descriptor bases are four-qword aligned");
-   CHECK(t->sampler_qword <= 32, "sampler_qword must be an integer in [0,32]");
+   CHECK(t->sampler_qword <= 124, "sampler_qword must be an integer in [0,124]");
    CHECK(t->coord_dword <= 31, "coord_dword must be an integer in [0,31]");
    CHECK(t->class_variant <= 1, "class_variant must be an integer in [0,1]");
    CHECK(t->dim < G5P_TEX_DIM_COUNT, "unmeasured texture dimension");
