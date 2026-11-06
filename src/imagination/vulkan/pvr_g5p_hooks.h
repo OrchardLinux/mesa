@@ -55,7 +55,9 @@
       (features).fillModeNonSolid = true; \
    (features).shaderDrawParameters = false; \
    supported_extensions.KHR_shader_draw_parameters = false; \
-   (features).drawIndirectFirstInstance = false;
+   (features).drawIndirectFirstInstance = false; \
+   (features).multiview = false; \
+   supported_extensions.KHR_multiview = false;
 
 /* pvr_arch_sampler.c, pvr_CreateSampler(): the A9's sampler words, both
  * forms (pvr_arch_g5p_pack_sampler()).
@@ -129,7 +131,11 @@
  * take it, and the blit and image-to-buffer slice loops step it by the
  * depthPitch above.
  */
-#define PVR_G5P_HOOK_transfer_slice(image, surface, info, fdepth)             \
+#define PVR_G5P_HOOK_transfer_slice(image, surface, info, fdepth, aspect)     \
+   if (PVR_HAS_FEATURE(&container_of((image)->vk.base.device, struct pvr_device, vk)->pdevice->dev_info, apple_g5p)) { \
+      (surface)->g5p_image = (image);                                      \
+      (surface)->g5p_aspect = (aspect);                                    \
+   }                                                                      \
    if (PVR_G5P_IMAGE_IS_SLICED_3D(image)) {                                  \
       (surface)->dev_addr.addr += (info)->depthPitch * (uint32_t)(fdepth);   \
       (surface)->mem_layout = PVR_MEMLAYOUT_TWIDDLED;                        \

@@ -66,6 +66,10 @@ struct pvr_transfer_cmd_surface {
    enum pvr_memlayout mem_layout;
 
    uint32_t sample_count;
+#ifdef PVR_APPLE_G5P
+   const struct pvr_image *g5p_image;
+   VkImageAspectFlags g5p_aspect;
+#endif
 };
 
 struct pvr_rect_mapping {

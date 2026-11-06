@@ -223,7 +223,7 @@ static void pvr_setup_transfer_surface(struct pvr_device *device,
    surface->vk_format = format;
    surface->mem_layout = image->memlayout;
    surface->sample_count = image->vk.samples;
-   PVR_G5P_HOOK(transfer_slice, image, surface, &info, fdepth)
+   PVR_G5P_HOOK(transfer_slice, image, surface, &info, fdepth, aspect_mask)
 
    /* G9P: a 3D image's slices are twiddled 2D layers, one depthPitch apart */
    if (image->memlayout == PVR_MEMLAYOUT_3DTWIDDLED &&

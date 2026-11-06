@@ -32,6 +32,7 @@
 #include "pvr_cmd_buffer.h"
 #include "pvr_device.h"
 #include "pvr_g5p_layout.h"
+#include "pvr_g5p_ds.h"
 #include "pvr_g9p.h"
 #include "pvr_image.h"
 #include "pvr_job_transfer.h"
@@ -41,8 +42,11 @@ struct g5p_surface {
    uint8_t *base;
    uint64_t available;
    enum pipe_format format;
-   unsigned bpp, stride, width, height;
+   unsigned bpp, cpp, component_offset, stride, width, height;
+   unsigned twiddle_width, twiddle_height;
    bool twiddled, blocks; /* blocks: a compressed surface addressed in texels */
+   const struct pvr_image *image;
+   VkImageAspectFlags aspects;
 };
 
 static bool
@@ -59,11 +63,17 @@ g5p_surface_init(struct pvr_device *device, const struct pvr_transfer_cmd_surfac
    simple_mtx_unlock(&device->g9p_vmas.lock);
    out->format = vk_format_to_pipe_format(s->vk_format);
    out->bpp = vk_format_get_blocksize(s->vk_format);
+   out->cpp = out->bpp;
+   out->component_offset = 0;
    out->stride = s->stride ? s->stride : s->width;
    out->width = s->width;
    out->height = s->height;
+   out->twiddle_width = s->width;
+   out->twiddle_height = s->height;
    out->twiddled = s->mem_layout == PVR_MEMLAYOUT_TWIDDLED;
    out->blocks = util_format_is_compressed(out->format);
+   out->image = s->g5p_image;
+   out->aspects = s->g5p_aspect;
    if (!out->base)
       mesa_loge("G5P transfer: no stable CPU mapping for %#" PRIx64, s->dev_addr.addr);
    return out->base != NULL;
@@ -90,7 +100,7 @@ static size_t
 g5p_offset(const struct g5p_surface *s, unsigned x, unsigned y)
 {
    if (s->twiddled)
-      return (size_t)g5p_twiddle2d(x, y, s->width, s->height) * s->bpp;
+      return (size_t)g5p_twiddle2d(x, y, s->twiddle_width, s->twiddle_height) * s->bpp;
    return ((size_t)y * s->stride + x) * s->bpp;
 }
 
@@ -104,15 +114,76 @@ g5p_element(struct g5p_surface *s, unsigned x, unsigned y)
 
    if (offset > s->available || s->bpp > s->available - offset)
       return NULL;
-   return s->base + offset;
+   return s->base + offset + s->component_offset;
+}
+
+/* Transfers describe a packed Rogue DS surface, but G5P's single-level
+ * optimal DS image consists of separate ZLS planes over a padded square.
+ * Keep the image/aspect contract rather than guessing from a raw-copy alias.
+ * Buffers retain their explicit row pitch and tightly packed aspect bytes. */
+static bool
+g5p_ds_plane(const struct g5p_surface *s, VkImageAspectFlagBits aspect,
+             const struct pvr_g5p_ds_format *f, struct g5p_surface *p)
+{
+   *p = *s;
+   const bool stencil = aspect == VK_IMAGE_ASPECT_STENCIL_BIT;
+   p->format = stencil ? PIPE_FORMAT_S8_UINT :
+               f->depth_bytes == 2 ? PIPE_FORMAT_Z16_UNORM : PIPE_FORMAT_Z32_FLOAT;
+   p->cpp = stencil ? 1 : f->depth_bytes;
+   if (!p->cpp)
+      return false;
+   if (!s->image) {
+      /* The buffer can have a raw integer alias or a depth/stencil format. */
+      return s->bpp == p->cpp;
+   }
+   const struct pvr_image *image = s->image;
+   const struct pvr_g5p_ds_format *own = pvr_g5p_ds_format(image->vk.format);
+   if (!own || (stencil ? !own->stencil : !own->depth) || image->vk.samples != 1)
+      return false;
+   p->format = stencil ? PIPE_FORMAT_S8_UINT :
+               own->depth_bytes == 2 ? PIPE_FORMAT_Z16_UNORM : PIPE_FORMAT_Z32_FLOAT;
+   p->cpp = stencil ? 1 : own->depth_bytes;
+   if (image->vk.tiling == VK_IMAGE_TILING_OPTIMAL && image->vk.mip_levels == 1) {
+      struct pvr_g5p_ds_plane zls;
+      if (!pvr_g5p_ds_layout(image->vk.format, s->width, s->height, 1, &zls))
+         return false;
+      uint64_t off = stencil ? zls.stencil_offset : 0;
+      if (off > p->available)
+         return false;
+      p->base += off;
+      p->available -= off;
+      p->bpp = p->cpp;
+      p->twiddled = true;
+      p->twiddle_width = p->twiddle_height = zls.side;
+   } else {
+      /* Multi-level/linear images retain upstream's packed storage. */
+      p->bpp = vk_format_get_blocksize(image->vk.format);
+      p->component_offset = stencil && own->depth ? 4 : 0;
+   }
+   return true;
 }
 
 static bool
-g5p_fill(const struct pvr_transfer_cmd *cmd, struct g5p_surface *dst)
+g5p_fill(const struct pvr_transfer_cmd *cmd, struct g5p_surface *dst, VkImageAspectFlags aspect)
 {
    const VkRect2D *r = &cmd->scissor;
    uint8_t packed[16] = { 0 };
 
+   if (aspect) {
+      for (unsigned y = 0; y < r->extent.height; y++) {
+         for (unsigned x = 0; x < r->extent.width; x++) {
+            uint8_t *to = g5p_element(dst, r->offset.x + x, r->offset.y + y);
+            if (!to) return false;
+            if (aspect == VK_IMAGE_ASPECT_DEPTH_BIT)
+               util_format_pack_z_float(dst->format, to, &cmd->clear_color[0].f, 1);
+            else {
+               uint8_t value = cmd->clear_color[1].ui;
+               util_format_pack_s_8uint(dst->format, to, &value, 1);
+            }
+         }
+      }
+      return true;
+   }
    if (util_format_is_pure_integer(dst->format))
       util_format_pack_rgba(dst->format, packed,
                             (const uint32_t[4]){ cmd->clear_color[0].ui, cmd->clear_color[1].ui,
@@ -129,7 +200,7 @@ g5p_fill(const struct pvr_transfer_cmd *cmd, struct g5p_surface *dst)
 
          if (!to)
             return false;
-         memcpy(to, packed, dst->bpp);
+         memcpy(to, packed, dst->cpp);
       }
    }
    return true;
@@ -191,6 +262,8 @@ g5p_block_texel(const struct g5p_surface *s, unsigned x, unsigned y, float out[4
    b.width = DIV_ROUND_UP(s->width, bw);
    b.height = DIV_ROUND_UP(s->height, bh);
    b.stride = DIV_ROUND_UP(s->stride, bw);
+   b.twiddle_width = b.width;
+   b.twiddle_height = b.height;
 
    const uint8_t *p = g5p_element(&b, x / bw, y / bh);
 
@@ -279,7 +352,23 @@ g5p_copy(const struct pvr_rect_mapping *mapping, struct g5p_surface *src, struct
             return false;
 
          if (same) {
-            memcpy(to, from, dst->bpp);
+            memcpy(to, from, dst->cpp);
+         } else if (util_format_is_depth_or_stencil(src->format) ||
+                    util_format_is_depth_or_stencil(dst->format)) {
+            const struct util_format_unpack_description *u = util_format_unpack_description(src->format);
+            const struct util_format_pack_description *p = util_format_pack_description(dst->format);
+            if (u->unpack_z_float && p->pack_z_float) {
+               float z;
+               util_format_unpack_z_float(src->format, &z, from, 1);
+               util_format_pack_z_float(dst->format, to, &z, 1);
+            } else if (u->unpack_s_8uint && p->pack_s_8uint) {
+               uint8_t stencil;
+               util_format_unpack_s_8uint(src->format, &stencil, from, 1);
+               util_format_pack_s_8uint(dst->format, to, &stencil, 1);
+            } else {
+               mesa_loge("G5P transfer: unsupported depth/stencil conversion %u -> %u", src->format, dst->format);
+               return false;
+            }
          } else if (integer) {
             uint32_t v[4];
 
@@ -297,6 +386,27 @@ g5p_copy(const struct pvr_rect_mapping *mapping, struct g5p_surface *src, struct
 }
 
 static bool
+g5p_copy_aspects(const struct pvr_rect_mapping *mapping, struct g5p_surface *src, struct g5p_surface *dst)
+{
+   const struct pvr_image *image = dst->image ? dst->image : src->image;
+   if (!image || !vk_format_is_depth_or_stencil(image->vk.format))
+      return g5p_copy(mapping, src, dst);
+   VkImageAspectFlags aspects = src->image ? src->aspects : dst->aspects;
+   if (src->image && dst->image) aspects &= dst->aspects;
+   const struct pvr_g5p_ds_format *f = pvr_g5p_ds_format(image->vk.format);
+   if (!f) return false;
+   for (unsigned i = 0; i < 2; i++) {
+      VkImageAspectFlagBits aspect = i ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
+      if (!(aspects & aspect)) continue;
+      struct g5p_surface s, d;
+      if (!g5p_ds_plane(src, aspect, f, &s) || !g5p_ds_plane(dst, aspect, f, &d) ||
+          !g5p_copy(mapping, &s, &d))
+         return false;
+   }
+   return aspects != 0;
+}
+
+static bool
 g5p_run(struct pvr_device *device, const struct pvr_transfer_cmd *cmd)
 {
    struct g5p_surface dst;
@@ -304,7 +414,18 @@ g5p_run(struct pvr_device *device, const struct pvr_transfer_cmd *cmd)
    if (!g5p_surface_init(device, &cmd->dst, &dst))
       return false;
    if (cmd->flags & PVR_TRANSFER_CMD_FLAGS_FILL) {
-      return g5p_fill(cmd, &dst);
+      if (dst.image && vk_format_is_depth_or_stencil(dst.image->vk.format)) {
+         const struct pvr_g5p_ds_format *f = pvr_g5p_ds_format(dst.image->vk.format);
+         if (!f) return false;
+         for (unsigned i = 0; i < 2; i++) {
+            VkImageAspectFlagBits aspect = i ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
+            struct g5p_surface p;
+            if ((dst.aspects & aspect) && (!g5p_ds_plane(&dst, aspect, f, &p) || !g5p_fill(cmd, &p, aspect)))
+               return false;
+         }
+         return true;
+      }
+      return g5p_fill(cmd, &dst, 0);
    }
    for (unsigned i = 0; i < cmd->source_count; i++) {
       const struct pvr_transfer_cmd_source *source = &cmd->sources[i];
@@ -316,11 +437,11 @@ g5p_run(struct pvr_device *device, const struct pvr_transfer_cmd *cmd)
          /* the whole destination scissor, 1:1 */
          const struct pvr_rect_mapping m = { .src_rect = cmd->scissor, .dst_rect = cmd->scissor };
 
-         if (!g5p_copy(&m, &src, &dst))
+         if (!g5p_copy_aspects(&m, &src, &dst))
             return false;
       }
       for (unsigned k = 0; k < source->mapping_count; k++)
-         if (!g5p_copy(&source->mappings[k], &src, &dst))
+         if (!g5p_copy_aspects(&source->mappings[k], &src, &dst))
             return false;
    }
    return true;
