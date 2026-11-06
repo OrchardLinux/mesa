@@ -5270,6 +5270,76 @@ static bool hoist_break_work(nir_shader *nir)
    return nir_progress(progress, impl, nir_metadata_none);
 }
 
+/* The hardware break operation removes the loop's two mask-stack levels. It
+ * cannot also cross an if level. Mesa's common loop simplifier turns every
+ * break in such a loop into a flag and one conditional break at the loop's
+ * own level, predicating the intervening work as required. Keep the ordinary
+ * Apple-shaped loops byte-identical by applying it only when a break is below
+ * more than one if. */
+static bool nested_break_in_list(struct exec_list *list, unsigned if_depth)
+{
+   foreach_list_typed(nir_cf_node, node, node, list) {
+      switch (node->type) {
+      case nir_cf_node_block: {
+         nir_instr *last = nir_block_last_instr(nir_cf_node_as_block(node));
+         if (if_depth > 1 && last && last->type == nir_instr_type_jump &&
+             nir_instr_as_jump(last)->type == nir_jump_break)
+            return true;
+         break;
+      }
+      case nir_cf_node_if: {
+         nir_if *nif = nir_cf_node_as_if(node);
+         if (nested_break_in_list(&nif->then_list, if_depth + 1) ||
+             nested_break_in_list(&nif->else_list, if_depth + 1))
+            return true;
+         break;
+      }
+      case nir_cf_node_loop:
+         /* A break in a nested loop belongs to that loop. */
+         break;
+      default:
+         UNREACHABLE("invalid control-flow node");
+      }
+   }
+   return false;
+}
+
+static bool simplify_nested_breaks_list(struct exec_list *list)
+{
+   bool progress = false;
+   foreach_list_typed(nir_cf_node, node, node, list) {
+      switch (node->type) {
+      case nir_cf_node_block:
+         break;
+      case nir_cf_node_if: {
+         nir_if *nif = nir_cf_node_as_if(node);
+         progress |= simplify_nested_breaks_list(&nif->then_list);
+         progress |= simplify_nested_breaks_list(&nif->else_list);
+         break;
+      }
+      case nir_cf_node_loop: {
+         nir_loop *loop = nir_cf_node_as_loop(node);
+         progress |= simplify_nested_breaks_list(&loop->body);
+         if (nested_break_in_list(&loop->body, 0)) {
+            nir_simplify_loop(loop, nir_jump_break);
+            progress = true;
+         }
+         break;
+      }
+      default:
+         UNREACHABLE("invalid control-flow node");
+      }
+   }
+   return progress;
+}
+
+static bool simplify_nested_breaks(nir_shader *nir)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   bool progress = simplify_nested_breaks_list(&impl->body);
+   return nir_progress(progress, impl, nir_metadata_none);
+}
+
 /* Out of SSA for the mask-stack code: phis become NIR registers
  * (G9P's order: convert_from_ssa, then trivialize_registers). */
 static void cf_out_of_ssa(nir_shader *nir)
@@ -5277,6 +5347,7 @@ static void cf_out_of_ssa(nir_shader *nir)
    NIR_PASS(_, nir, nir_lower_phis_to_scalar, NULL, NULL);
    NIR_PASS(_, nir, nir_convert_from_ssa, true, false);
    NIR_PASS(_, nir, nir_trivialize_registers);
+   NIR_PASS(_, nir, simplify_nested_breaks);
    NIR_PASS(_, nir, hoist_break_work);
    NIR_PASS(_, nir, nir_opt_dce);
 }
