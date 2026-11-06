@@ -47,6 +47,8 @@ g9p_num_regs(void)
 }
 #define G9P_NUM_REGS g9p_num_regs()
 #define G9P_MAX_LOOPS 64
+/* nir_tex_instr.backend_flags: a seamful cube's gradients, for the hardware */
+#define G9P_TEX_NATIVE_GRADIENTS 1
 
 static const struct spirv_to_nir_options spirv_options = {
    .environment = NIR_SPIRV_VULKAN,
@@ -3751,6 +3753,7 @@ lower_cube_seamful(nir_builder *b, nir_tex_instr *tex, void *data)
       nir_tex_instr_add_src(tex, nir_tex_src_ddx, grad[0]);
       nir_tex_instr_add_src(tex, nir_tex_src_ddy, grad[1]);
       tex->op = nir_texop_txd;
+      tex->backend_flags = G9P_TEX_NATIVE_GRADIENTS;
    }
 
    nir_src_rewrite(&tex->src[nir_tex_instr_src_index(tex, nir_tex_src_coord)].src,
@@ -3847,10 +3850,15 @@ lower_txf(nir_builder *b, nir_tex_instr *tex, void *data)
    return true;
 }
 
+/*
+ * Explicit gradients as an explicit level, with GL's isotropic formula (no anisotropy
+ * here): offsets and compares stay the sample's own. A seamful cube's exact gradients,
+ * which sample a 2D array face by face, go to the hardware (emit_tex_grad()).
+ */
 static bool
-lower_grad_offset(const nir_instr *instr, const void *data)
+lower_txd_to_level(const nir_tex_instr *tex, const void *data)
 {
-   return instr->type == nir_instr_type_tex && nir_instr_as_tex(instr)->op == nir_texop_txd;
+   return !(tex->backend_flags & G9P_TEX_NATIVE_GRADIENTS);
 }
 
 /*
@@ -3893,17 +3901,11 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
 
    /* texture2DProj */
    {
-      /*
-       * Gradients of 3D textures and of compare samples, all of them in
-       * vertex shaders, by an explicit level; offsets of gradients by coordinates
-       */
       const nir_lower_tex_options tex = {
          .lower_txp = ~0u,
-         .lower_offset_filter = lower_grad_offset,
          .lower_txs_lod = true,
-         .lower_txd_3d = true,
-         .lower_txd_shadow = true,
          .lower_txd = stage == MESA_SHADER_VERTEX,
+         .lower_txd_cb = lower_txd_to_level,
       };
 
       NIR_PASS(_, nir, nir_lower_tex, &tex);
