@@ -891,6 +891,12 @@ static const char *vs_qualified_tex_refusal(const nir_tex_instr *t)
       return "vertex cube/shadow recipe not device-qualified";
    if (nir_tex_instr_src_index(t, nir_tex_src_offset) >= 0 && !g5p_vtex_fetch_offset_probe())
       return "vertex texture offset not device-qualified";
+   /* Additive selectors retain baseline float cube/offset support without
+    * admitting unqualified combinations of independently gated features. */
+   if (g5p_vtex_integer_probe() && t->op != nir_texop_txf && nir_alu_type_get_base_type(t->dest_type) != nir_type_float &&
+       (t->sampler_dim == GLSL_SAMPLER_DIM_CUBE ||
+        (nir_tex_instr_src_index(t, nir_tex_src_offset) >= 0 && !g5p_vtex_xyz_offset_probe())))
+      return "vertex integer cube/offset combination not qualified in this mode";
    /* Native float/sint/uint sample programs are byte-identical; image-view
     * format state determines the result bits, not a different USC recipe. */
    if (t->op != nir_texop_txf && nir_alu_type_get_base_type(t->dest_type) != nir_type_float &&

@@ -21,16 +21,16 @@ static inline bool g5p_vtex_qualified(void)
           !strcmp(v, "qualified-offset") || !strcmp(v, "qualified-gradient") || !strcmp(v, "qualified-integer") || !strcmp(v, "qualified-xyz-offset") ||
           !strcmp(v, "qualified-size-lod");
 }
+/* Every recognized qualification mode retains the hardware-qualified default
+ * recipe. Its extension predicates below add capabilities without removing
+ * cube sampling or fetch/sample offsets. Unknown selectors remain refused. */
 static inline bool g5p_vtex_cube_probe(void)
 {
-   const char *v = getenv("PVR_G5P_VERTEX_TEXTURE");
-   return !v || !strcmp(v, "qualified") || !strcmp(v, "qualified-cube");
+   return g5p_vtex_qualified();
 }
 static inline bool g5p_vtex_fetch_offset_probe(void)
 {
-   const char *v = getenv("PVR_G5P_VERTEX_TEXTURE");
-   return !v || !strcmp(v, "qualified") || !strcmp(v, "qualified-cube") ||
-          !strcmp(v, "qualified-offset") || !strcmp(v, "qualified-gradient") || !strcmp(v, "qualified-xyz-offset");
+   return g5p_vtex_qualified();
 }
 static inline bool g5p_vtex_gradient_probe(void)
 {
