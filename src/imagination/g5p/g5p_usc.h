@@ -156,6 +156,13 @@ unsigned g5p_usc_gather(uint8_t *out, const struct g5p_tex *t);
  * source present | 0x40 extras (compare reference f32, then the offset
  * half) | first extras half. The six-byte form is the plain sample. */
 enum g5p_tex_lod { G5P_TEX_LOD_NONE, G5P_TEX_LOD_LEVEL, G5P_TEX_LOD_BIAS, G5P_TEX_LOD_GRAD };
+/* Complete native recipes only. Independent continuation-field choices
+ * are unqualified and are deliberately not exposed by this interface. */
+enum g5p_tex_tuple {
+   G5P_TEX_TUPLE_ORDINARY,
+   G5P_TEX_TUPLE_COUPLED_SHARED_LEVEL,
+   G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL,
+};
 struct g5p_tex_ext {
    unsigned dst_half, image_qword, sampler_qword, coord_dword;
    enum g5p_tex_dim dim;
@@ -165,6 +172,8 @@ struct g5p_tex_ext {
    unsigned lod_dword;
    bool compare, offset;   /* extras at half extras_half: [ref f32][offset u16] */
    unsigned extras_half;
+   enum g5p_tex_tuple tuple;
+   bool lod_shared; /* prefix level source: common store instead of register */
 };
 unsigned g5p_usc_sample_ext(uint8_t *out, const struct g5p_tex_ext *t);
 /* 16-bit immediate into one half (class 0x88, the 32-bit move's split map;
@@ -175,6 +184,7 @@ unsigned g5p_usc_half_immediate(uint8_t *out, unsigned dst_half, uint16_t value)
  * f_cube_alu, f_cube_hi; a cube sample of raw directions reads them as 2D on
  * face 0, device 2026-11-02). */
 unsigned g5p_usc_vertex_texture_level(uint8_t *out, unsigned dst_half, unsigned src_half, unsigned group);
+unsigned g5p_usc_vertex_array_layer(uint8_t *out, unsigned dst_half, unsigned src_half);
 unsigned g5p_usc_cube_coords(uint8_t *out, unsigned dst_half, unsigned src_half);
 /* f32 -> u16 (truncating) into one half: Apple's array-layer conversion
  * `89 01 DH 01 09 SS 20 01 60 06`. */

@@ -87,6 +87,7 @@ struct tex_bind {
    unsigned set, binding, sset, sbinding;
    unsigned element, selement; /* array elements of the texture / sampler binding */
    unsigned image, sampler; /* common dwords */
+   bool needs_sampler, needs_fetch_sampler;
 };
 
 struct range {
@@ -235,7 +236,7 @@ struct gctx {
    unsigned vend_comp;
    /* common store */
    struct tex_bind tex[4];
-   unsigned ntex;
+   unsigned ntex, fetch_sampler_common;
    struct { unsigned set, binding, element, lod, common; } tsize[4]; /* textureSize/QueryLevels */
    unsigned nsize;
    struct range ranges[8];
@@ -819,6 +820,22 @@ static const char *vs_tex_refusal(const nir_tex_instr *t)
    return NULL;
 }
 
+static const char *vs_qualified_tex_refusal(const nir_tex_instr *t)
+{
+   const char *why = tex_shape_refusal(t);
+   if (why || size_query(t)) return why;
+   if (t->op != nir_texop_tex && t->op != nir_texop_txl && t->op != nir_texop_txf)
+      return "vertex bias/gradient recipe not device-qualified";
+   if (t->is_shadow || (t->sampler_dim != GLSL_SAMPLER_DIM_2D &&
+                        t->sampler_dim != GLSL_SAMPLER_DIM_3D))
+      return "vertex cube/shadow recipe not device-qualified";
+   if (nir_tex_instr_src_index(t, nir_tex_src_offset) >= 0)
+      return "vertex texture offset not device-qualified";
+   if (t->op != nir_texop_txf && nir_alu_type_get_base_type(t->dest_type) != nir_type_float)
+      return "vertex sampled integer result not device-qualified";
+   return NULL;
+}
+
 static bool xfb_base(struct ref r, unsigned *buffer, struct ref *off)
 {
    nir_alu_instr *add = alu_of(r.def);
@@ -1051,7 +1068,7 @@ static void scan_cf(struct gctx *c, struct exec_list *list, struct unsupported *
          }
          case nir_instr_type_tex: {
             nir_tex_instr *t = nir_instr_as_tex(ins);
-            const char *why = c->vs ? (!g5p_vtex_probe() ? "vertex stage" : vs_tex_refusal(t)) :
+            const char *why = c->vs ? (g5p_vtex_qualified() ? vs_qualified_tex_refusal(t) : !g5p_vtex_probe() ? "vertex stage" : vs_tex_refusal(t)) :
                               plain_tex(t) ? NULL : tex_shape_refusal(t);
             if (why) {
                snprintf(buf, sizeof(buf), "tex(op %u, dim %u%s%s): %s", t->op, t->sampler_dim,
@@ -1794,6 +1811,8 @@ static void tex_bindings(struct gctx *c, nir_tex_instr *t, struct tex_bind *b)
       selement = element;
    *b = (struct tex_bind){tv->data.descriptor_set, tv->data.binding, sv->data.descriptor_set,
                           sv->data.binding, element, selement};
+   b->needs_sampler = t->op != nir_texop_txf;
+   b->needs_fetch_sampler = t->op == nir_texop_txf;
 }
 
 static struct tex_bind *tex_for(struct gctx *c, nir_tex_instr *t)
@@ -1803,7 +1822,9 @@ static struct tex_bind *tex_for(struct gctx *c, nir_tex_instr *t)
    for (unsigned i = 0; i < c->ntex; i++)
       if (c->tex[i].set == b.set && c->tex[i].binding == b.binding && c->tex[i].sset == b.sset &&
           c->tex[i].sbinding == b.sbinding && c->tex[i].element == b.element && c->tex[i].selement == b.selement)
-         return &c->tex[i];
+         { c->tex[i].needs_sampler |= b.needs_sampler;
+           c->tex[i].needs_fetch_sampler |= b.needs_fetch_sampler;
+           return &c->tex[i]; }
    if (c->ntex == ARRAY_SIZE(c->tex))
       refuse(c, "more than %zu textures", ARRAY_SIZE(c->tex));
    c->tex[c->ntex] = b;
@@ -1928,16 +1949,30 @@ static void plan_common(struct gctx *c)
       add_upload(c, PCO_G5P_UPLOAD_SSBO_ADDR, c->ssbo_set[i], c->ssbo_binding[i], 0, 0, 2, 2 * i);
    if (c->nssbo)
       next = MAX2(next, 4);
+   bool qualified = c->vs && g5p_vtex_qualified();
+   unsigned image_base = align(next, 8), sampler_base = image_base + 8 * c->ntex;
+   unsigned sampler_count = 0, sampler_cursor = sampler_base;
+   bool fetch_sampler = false;
+   if (qualified)
+      for (unsigned i = 0; i < c->ntex; i++) {
+         sampler_count += c->tex[i].needs_sampler;
+         fetch_sampler |= c->tex[i].needs_fetch_sampler;
+      }
+   c->fetch_sampler_common = sampler_base + 2 * sampler_count;
    for (unsigned i = 0; i < c->ntex; i++) {
       struct tex_bind *t = &c->tex[i];
-      t->image = align(next, 8);
-      t->sampler = t->image + 8;
-      next = t->image + 10;
+      t->image = qualified ? image_base + 8 * i : align(next, 8);
+      t->sampler = qualified ? (t->needs_sampler ? sampler_cursor : c->fetch_sampler_common) : t->image + 8;
+      sampler_cursor += qualified && t->needs_sampler ? 2 : 0;
+      next = qualified ? c->fetch_sampler_common + 2 * fetch_sampler : t->image + 10;
       if (t->image / 2 > 28 || t->sampler / 2 > 32)
-         refuse(c, "texture descriptors beyond the measured common-store selectors");
+         refuse(c, "texture descriptors beyond the bounded qualified selectors");
       add_upload(c, PCO_G5P_UPLOAD_IMAGE, t->set, t->binding, t->element, 0, 8, t->image);
-      add_upload(c, PCO_G5P_UPLOAD_SAMPLER, t->sset, t->sbinding, t->selement, 32, 2, t->sampler);
+      if (!qualified || t->needs_sampler)
+         add_upload(c, PCO_G5P_UPLOAD_SAMPLER, t->sset, t->sbinding, t->selement, 32, 2, t->sampler);
    }
+   if (qualified && fetch_sampler)
+      add_upload(c, PCO_G5P_UPLOAD_FETCH_SAMPLER, 0, 0, 0, 0, 2, c->fetch_sampler_common);
    /* Pointer pairs of register-indexed UBO arrays: even dwords below 32 (the
     * addr.add_shift base field, 0x81 | 4 * dword). */
    for (unsigned i = 0; i < c->nuptr; i++) {
@@ -4165,10 +4200,68 @@ static void emit_tex_ext(struct gctx *c, nir_tex_instr *t)
    c->p->evidence |= PCO_G5P_EV_TEX_TYPES;
 }
 
+static void vertex_qualified_copy(struct gctx *c, unsigned dst, nir_def *def, unsigned component)
+{
+   struct ref r = resolve_value(c, def, component);
+   if (r.neg || r.abs) refuse(c, "qualified vertex texture source modifier not witnessed");
+   unsigned src = reg_of(c, r, "qualified vertex texture source");
+   vs_bank1_only(c, "qualified vertex texture copy", dst, src, -1, -1);
+   uint8_t raw[G5P_USC_MAX];
+   put(c, raw, g5p_usc_move(raw, H(c, dst), H(c, src), 1, vgrp(c, r), 0x21), "qualified vertex texture copy");
+}
+
+static void emit_vertex_qualified_texture(struct gctx *c, nir_tex_instr *t)
+{
+   uint8_t raw[G5P_USC_MAX];
+   struct tex_bind *b = tex_for(c, t);
+   bool read = t->op == nir_texop_txf, array = t->is_array;
+   bool third = array || t->sampler_dim == GLSL_SAMPLER_DIM_3D;
+   nir_def *coord = nir_get_tex_src(t, nir_tex_src_coord);
+   unsigned block = alloc_run(c, 2 + third, "qualified vertex texture coordinates");
+   uint64_t scratch = BITFIELD64_RANGE(block, 2 + third);
+   vertex_qualified_copy(c, block, coord, 0);
+   vertex_qualified_copy(c, block + 1, coord, 1);
+   if (array && !read) {
+      unsigned tmp = alloc_reg(c, -1);
+      scratch |= BITFIELD64_BIT(tmp);
+      vertex_qualified_copy(c, tmp, coord, 2);
+      put(c, raw, g5p_usc_binary_literal(raw, G5P_BIN_FADD, H(c,tmp), 0x3800, H(c,tmp), 1, 1, 0x11, true, -1),
+          "qualified array layer + 0.5");
+      put(c, raw, g5p_usc_vertex_array_layer(raw, H(c,block+2), H(c,tmp)), "qualified array layer to u16");
+   } else if (third) vertex_qualified_copy(c, block + 2, coord, 2);
+   int li = nir_tex_instr_src_index(t, nir_tex_src_lod);
+   unsigned level = alloc_reg(c, -1);
+   scratch |= BITFIELD64_BIT(level);
+   if (li >= 0) vertex_qualified_copy(c, level, t->src[li].src.ssa, 0);
+   else put(c, raw, g5p_usc_immediate(raw, H(c,level), 0, 1, -1), "qualified vertex level zero");
+   if (!read)
+      put(c, raw, g5p_usc_vertex_texture_level(raw, H(c,level), H(c,level), 1), "qualified vertex level to f16");
+   unsigned dst = alloc_run(c, 4, "qualified vertex texture result");
+   struct g5p_tex_ext x = {
+      .dst_half=H(c,dst), .image_qword=b->image/2,
+      .sampler_qword=(read ? c->fetch_sampler_common : b->sampler)/2,
+      .coord_dword=H(c,block)/2,
+      .dim=t->sampler_dim==GLSL_SAMPLER_DIM_3D ? G5P_TEX_3D : array ? G5P_TEX_2D_ARRAY : G5P_TEX_2D,
+      .mask=15, .read=read, .lod=G5P_TEX_LOD_LEVEL, .lod_dword=H(c,level)/2,
+      .tuple=G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL,
+   };
+   put(c, raw, g5p_usc_sample_ext(raw,&x), "qualified vertex sample/read recipe");
+   put(c, raw, g5p_usc_wait(raw,0), "wait");
+   c->scratch |= scratch;
+   for (unsigned k=0;k<4;k++) {
+      struct val *v=V(c,&t->def,k);v->state=VAL_REG;v->reg=dst+k;v->held=true;
+   }
+   c->p->evidence |= PCO_G5P_EV_TEX_TYPES;
+}
+
 static void emit_tex(struct gctx *c, nir_tex_instr *t)
 {
    if (size_query(t)) {
       emit_size(c, t);
+      return;
+   }
+   if (c->vs && g5p_vtex_qualified()) {
+      emit_vertex_qualified_texture(c, t);
       return;
    }
    if (c->vs || !plain_tex(t)) {

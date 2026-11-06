@@ -122,6 +122,7 @@ enum pco_g5p_upload_kind {
    PCO_G5P_UPLOAD_IMAGE_SIZE,
    PCO_G5P_UPLOAD_XFB,       /* per-draw driver block, PCO_G5P_XFB_* dwords */
    PCO_G5P_UPLOAD_BLEND_CONSTANTS, /* 4 dwords: the dynamic blend constants (f32) */
+   PCO_G5P_UPLOAD_FETCH_SAMPLER, /* two generated samplerless-read policy words */
 };
 
 /* Varyings (docs/gpu/experiments/varyings.md). Apple's A9 compiler takes at

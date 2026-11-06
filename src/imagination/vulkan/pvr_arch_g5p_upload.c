@@ -113,7 +113,7 @@ PVR_PER_ARCH(g5p_vs_uploads_create)(struct pvr_device *device, const struct pco_
    *out = NULL;
    if (!vs->num_uploads)
       return VK_SUCCESS;
-   if (g5p_vtex_probe()) {
+   if (g5p_vtex_probe() || g5p_vtex_qualified()) {
       for (unsigned i = 0; i < vs->num_uploads; i++)
          if (vs->uploads[i].kind == PCO_G5P_UPLOAD_IMAGE || vs->uploads[i].kind == PCO_G5P_UPLOAD_IMAGE_SIZE)
             return pvr_arch_g5p_vtex_create(device, vs, out);

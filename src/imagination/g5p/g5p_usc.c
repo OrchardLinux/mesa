@@ -916,11 +916,17 @@ unsigned g5p_usc_gather(uint8_t *out, const struct g5p_tex *t)
 
 unsigned g5p_usc_sample_ext(uint8_t *out, const struct g5p_tex_ext *t)
 {
+   const bool coupled = t->tuple != G5P_TEX_TUPLE_ORDINARY;
+   CHECK(t->tuple <= G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL, "unqualified texture recipe");
+   CHECK(!coupled || t->lod_shared == (t->tuple == G5P_TEX_TUPLE_COUPLED_SHARED_LEVEL),
+         "unqualified independent texture continuation choices");
    static const uint8_t dim_low[G5P_TEX_DIM_COUNT] = {0x5, 0x7, 0xb, 0xd};
    static const uint8_t lod_mode[] = {0, 0x40, 0x20, 0x60};
    CHECK(half_register(t->dst_half, "dst_half requires a measured 32-bit aligned half index"), g5p_usc_error);
-   CHECK(t->image_qword <= 28 && !(t->image_qword & 3), "image_qword must be a four-qword base in [0,28]");
-   CHECK(t->sampler_qword <= 32, "sampler_qword must be an integer in [0,32]");
+   /* A9 Metal v_images31 and v_units16_sample witness the complete 7-bit
+    * descriptor selector, including image bit6 and sampler bits5/6. */
+   CHECK(t->image_qword <= 120 && !(t->image_qword & 3), "image_qword must be a four-qword base in [0,120]");
+   CHECK(t->sampler_qword <= 124, "sampler_qword must be an integer in [0,124]");
    CHECK(t->coord_dword <= 31 && t->lod_dword <= 31 && t->extras_half <= 63, "operand beyond r31");
    CHECK(t->dim < G5P_TEX_DIM_COUNT, "unmeasured texture dimension");
    CHECK(t->mask == 0xf || (t->mask == 1 && t->compare), "only rgba and compare results are measured");
@@ -929,17 +935,39 @@ unsigned g5p_usc_sample_ext(uint8_t *out, const struct g5p_tex_ext *t)
    CHECK(t->lod != G5P_TEX_LOD_GRAD || t->dim == G5P_TEX_2D || t->dim == G5P_TEX_2D_ARRAY,
          "gradients are measured on 2D and 2D arrays only");
    CHECK(!t->offset || t->dim != G5P_TEX_CUBE, "cube offsets do not exist");
-   uint8_t raw[10] = {0x1a, (t->mask << 4) | dim_low[t->dim], t->dst_half | (t->read ? 0x40 : 0),
+   CHECK(!coupled || (!t->compare && !t->offset && t->lod == G5P_TEX_LOD_LEVEL),
+         "vertex texture tuple requires explicit level, no compare or offset");
+   CHECK(!(t->tuple == G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL) || (coupled && !t->lod_shared),
+         "vertex level bank requires the vertex tuple and a temporary level");
+   uint8_t raw[14] = {0x1a, (t->mask << 4) | dim_low[t->dim], t->dst_half | (t->read ? 0x40 : 0),
                       (t->image_qword << 1) | 1, t->sampler_qword << 1,
                       (t->coord_dword << 1) | 0x80 | (t->offset ? 0x40 : 0)};
    bool extras = t->compare || t->offset;
    if (t->lod == G5P_TEX_LOD_NONE && !extras)
       return finish(out, raw, 6);
    raw[5] |= 1;
-   raw[6] = t->lod ? 0x80 | lod_mode[t->lod] | t->lod_dword : 0;
+   /* Metal native-buffer and manual-fold reads in both stages use
+    * common bank1 for level0. Existing register levels keep bank3. */
+   raw[6] = t->lod ? (t->lod_shared ? 0 : 0x80) | lod_mode[t->lod] | t->lod_dword : 0;
    raw[7] = 1 | (t->compare ? 0x80 : 0);
    raw[8] = (t->lod ? 0x80 : 0) | (extras ? 0x40 | t->extras_half : 0);
    raw[9] = 0;
+   if (coupled) {
+      /* Complete native operand/result recipe, reconstructed against the
+       * paired Metal programs and exact in r1c's non-cube device rungs.
+       * Individual destination/coordinate continuation bits are unknown;
+       * keep this suffix indivisible rather than guessing mixed forms. */
+      raw[9] = (1u << 7) | 1u;
+      raw[10] = 1u << 3;
+      if ((t->tuple == G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL)) {
+         /* The level producer writes a bank-1 temp. A common-store level
+          * (native buffer/manual fold) has no level-bank extension. */
+         raw[11] = 1;
+         raw[12] = 1u << 4;
+         return finish(out, raw, 14);
+      }
+      return finish(out, raw, 12);
+   }
    return finish(out, raw, 10);
 }
 
@@ -1969,4 +1997,14 @@ unsigned g5p_usc_vertex_texture_level(uint8_t *out, unsigned dst_half, unsigned 
    raw[n++] = 0x70;
    raw[n++] = 0;
    return finish(out, raw, n);
+}
+
+unsigned g5p_usc_vertex_array_layer(uint8_t *out, unsigned dst_half, unsigned src_half)
+{
+   unsigned n = g5p_usc_f2u16_half(out, dst_half, src_half, 1);
+   if (n) {
+      out[1] |= 1u << 4; /* vertex source routing */
+      out[3] |= 1u << 1; /* bank-1 destination */
+   }
+   return n;
 }

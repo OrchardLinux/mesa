@@ -148,6 +148,12 @@ PVR_PER_ARCH(g5p_vtex_draw)(struct pvr_cmd_buffer *cmd, const struct pvr_g5p_sta
          result = vtex_descriptor(cmd, u, dst);
          if (result != VK_SUCCESS) return result;
          break;
+      case PCO_G5P_UPLOAD_FETCH_SAMPLER: {
+         if (u->dwords != 2) return VTEX_REFUSE(cmd, "invalid samplerless read policy size");
+         uint64_t policy = pvr_g5p_fetch_sampler_word();
+         memcpy(dst, &policy, sizeof(policy));
+         break;
+      }
       case PCO_G5P_UPLOAD_PUSH:
          if (u->offset > PVR_MAX_PUSH_CONSTANTS_SIZE || bytes > PVR_MAX_PUSH_CONSTANTS_SIZE - u->offset)
             return VTEX_REFUSE(cmd, "push constant interval outside the device limit");

@@ -184,6 +184,20 @@ pvr_g5p_smp_lod(float lod)
    return x <= 0.0f ? 0 : x >= (float)PVR_G5P_SMP_LOD_MAX ? PVR_G5P_SMP_LOD_MAX : (unsigned)x;
 }
 
+/* Samplerless integer-coordinate reads: API sampler clamps/filtering must
+ * not affect the fetch. Use the understood nearest-mip, nearest-texel,
+ * clamp-edge fields and the full A9 0..14 LOD interval. Kind7's reserved
+ * two-dword slot is witnessed in both native VS and FS metadata; this
+ * runtime policy is generated, not copied from compiler metadata bytes.
+ */
+static inline uint64_t
+pvr_g5p_fetch_sampler_word(void)
+{
+   return PVR_G5P_SMP_BASE |
+          ((uint64_t)PVR_G5P_SMP_LOD_MAX << PVR_G5P_SMP_MAXLOD_SHIFT) |
+          (UINT64_C(1) << PVR_G5P_SMP_MIP_NEAREST_BIT);
+}
+
 static inline int
 pvr_g5p_smp_address(VkSamplerAddressMode m, VkBorderColor border)
 {
