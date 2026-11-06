@@ -294,8 +294,9 @@ g9p_mem_at(struct g9p_code *c, bool store, unsigned size, unsigned reg,
 static inline void
 g9p_mov_uniform(struct g9p_code *c, unsigned dst, unsigned u, unsigned zero)
 {
-   G9P_EMIT(c, g9p_w0(c, 0x3199), g9p_dst(c, dst), 0x0181 | (u & 31) << 2 | zero << 10,
-            0x4100 | (u >> 5) << 1, G9P_IADD);
+   /* vertex shaders: 1199, the shared operand form of Apple's vertex iadd (PR #6, v_iadd_k) */
+   G9P_EMIT(c, c->fragment ? g9p_w0(c, 0x3199) : 0x1199, g9p_dst(c, dst),
+            0x0181 | (u & 31) << 2 | zero << 10, 0x4100 | (u >> 5) << 1, G9P_IADD);
 }
 
 /*
