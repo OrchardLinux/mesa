@@ -6133,7 +6133,12 @@ static void cf_out_of_ssa(nir_shader *nir)
       nir_divergence_analysis(nir);
    NIR_PASS(_, nir, nir_convert_from_ssa, true, derivatives);
    NIR_PASS(_, nir, nir_trivialize_registers);
-   NIR_PASS(_, nir, simplify_nested_breaks);
+   /* The common nested-break simplifier creates an unannotated flag
+    * register after SSA divergence was recorded. Until its divergence is
+    * propagated, derivative shaders retain the named nested-break boundary
+    * instead of treating that new flag as a uniform control condition. */
+   if (!derivatives)
+      NIR_PASS(_, nir, simplify_nested_breaks);
    NIR_PASS(_, nir, hoist_break_work);
    NIR_PASS(_, nir, nir_opt_dce);
    if (derivatives)
