@@ -169,7 +169,12 @@ g5p_ds_plane(const struct g5p_surface *s, VkImageAspectFlagBits aspect,
       p->available -= off;
       p->bpp = p->cpp;
       p->twiddled = true;
-      p->twiddle_width = p->twiddle_height = zls.side;
+      /* The allocation pads to a square, but ZLS stores rectangular
+       * Morton order over independently 32-pixel-aligned sides (R17's
+       * device-proven unequal-side sampling). Match that order in CPU
+       * clears/copies too; the unused allocation tail remains padding. */
+      p->twiddle_width = util_next_power_of_two(align(s->width, 32));
+      p->twiddle_height = util_next_power_of_two(align(s->height, 32));
    } else {
       /* Multi-level/linear images retain upstream's packed storage. */
       p->bpp = vk_format_get_blocksize(image->vk.format);
