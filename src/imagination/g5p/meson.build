@@ -64,3 +64,12 @@ g5p_vsalu_test = executable(
   install : false,
 )
 test('g5p-vsalu-encodings', g5p_vsalu_test, timeout : 60)
+
+g5p_dynamic_shift_test = executable(
+  'g5p-dynamic-shift-test',
+  files('tests/dynamic-shift.c', 'g5p_usc.c'),
+  include_directories : [inc_powervr_g5p],
+  dependencies : [dep_m],
+  install : false,
+)
+test('g5p-dynamic-shifts', g5p_dynamic_shift_test, timeout : 60)

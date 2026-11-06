@@ -3153,49 +3153,70 @@ static void emit_shift(struct gctx *c, nir_alu_instr *a)
       unsigned ar = reg_of(c, amt, "shift amount");
       unsigned ga = vgrp(c, amt);
       unsigned m = alloc_reg(c, -1);
-      vs_bank1_only(c, "dynamic shift amount", m, ar, xr, -1);
-      put(c, raw, g5p_usc_binary_literal2(raw, G5P_BIN_AND, 2 * m, 31, 2 * ar, 1, ga, 0x11, G5P_LIT_U32, -1, 0, 0,
-                                          false), "vertex amount & 31");
+      put(c, raw, g5p_usc_binary_literal2(raw, G5P_BIN_AND, H(c, m), 31, H(c, ar), vbank(c, m), ga,
+                                          vhdr(c, 0x11, -1, ar, -1), G5P_LIT_U32, -1, 0, 0, false),
+          "vertex amount & 31");
       struct ref both[2] = {x, amt};
       bool d = dies(c, x);
       unsigned gx = vgrp(c, x);
       free_dying(c, both, 2);
       unsigned dst = alloc_reg(c, d ? (int)xr : -1);
-      vs_bank1_only(c, "dynamic shift", dst, xr, m, -1);
       if (a->op == nir_op_ishr) {
-         struct g5p_alu f = G5P_ALU(2 * dst);
-         f.bank = 1;
-         f.header = 0x31;
-         f.a = (struct g5p_src){.half = 2 * xr, .group = gx};
-         f.b = (struct g5p_src){.half = 2 * m, .group = 1};
+         struct g5p_alu f = G5P_ALU(H(c, dst));
+         f.bank = vbank(c, dst);
+         f.header = vhdr(c, 0x31, xr, m, -1);
+         f.a = (struct g5p_src){.half = H(c, xr), .group = gx};
+         f.b = (struct g5p_src){.half = H(c, m), .group = 1};
          put(c, raw, g5p_usc_binary(raw, G5P_BIN_ISHR, &f), "vertex dynamic ishr");
       } else {
-         put(c, raw, g5p_usc_shift(raw, a->op == nir_op_ishl, 2 * dst, 2 * xr, 2 * m, false, 1, gx, 1, 0x19),
+         put(c, raw, g5p_usc_shift(raw, a->op == nir_op_ishl, H(c, dst), H(c, xr), H(c, m), false, vbank(c, dst), gx,
+                                   1, vhdr(c, 0x19, -1, xr, m)),
              "vertex dynamic shift");
       }
-      c->busy &= ~BITFIELD_BIT(m);
+      c->busy &= ~BITFIELD64_BIT(m);
       c->p->evidence |= PCO_G5P_EV_VS_ALU;
       define(c, &a->def, dst);
       return;
    }
-   if (a->op == nir_op_ishr)
-      refuse(c, "ishr with a dynamic amount (only the literal-amount form is witnessed)");
-   /* The probes mask dynamic amounts to 31 before the shift. */
+   /* Apple's f_ishl_dyn, f_ushr_dyn and f_ishr_dyn
+    * (tools/g5p-1b-dgl/vs-canary/vsalu-probes.py) first mask the amount
+    * with a u32 literal 31.  Signed right shift then uses the ordinary
+    * two-register ishr; the other two use the register-amount shift form. */
    unsigned ar = reg_of(c, amt, "shift amount");
+   unsigned ga = vgrp(c, amt);
    unsigned mask = alloc_reg(c, -1);
-   put(c, raw, g5p_usc_immediate(raw, 2 * mask, 31, 0, -1), "movi 31");
-   struct g5p_alu f = G5P_ALU(2 * mask);
-   f.a = (struct g5p_src){.half = 2 * ar, .group = vgrp(c, amt)};
-   f.b = (struct g5p_src){.half = 2 * mask, .group = 1};
-   put(c, raw, g5p_usc_binary(raw, G5P_BIN_AND, &f), "amount & 31");
+   put(c,
+       raw,
+       g5p_usc_binary_literal2(raw,
+                               G5P_BIN_AND,
+                               2 * mask,
+                               31,
+                               2 * ar,
+                               0,
+                               ga,
+                               1,
+                               G5P_LIT_U32,
+                               -1,
+                               0,
+                               0,
+                               false),
+       "amount & 31");
    struct ref both[2] = {x, amt};
    bool d = dies(c, x);
    unsigned gx = vgrp(c, x);
    free_dying(c, both, 2);
    unsigned dst = alloc_reg(c, d ? (int)xr : -1);
-   put(c, raw, g5p_usc_shift(raw, a->op == nir_op_ishl, 2 * dst, 2 * xr, 2 * mask, false, 0, gx, 1, 1),
-       "dynamic shift");
+   if (a->op == nir_op_ishr) {
+      struct g5p_alu f = G5P_ALU(2 * dst);
+      f.a = (struct g5p_src){.half = 2 * xr, .group = gx};
+      f.b = (struct g5p_src){.half = 2 * mask, .group = 1};
+      put(c, raw, g5p_usc_binary(raw, G5P_BIN_ISHR, &f), "dynamic ishr");
+   } else {
+      put(c, raw, g5p_usc_shift(raw, a->op == nir_op_ishl, 2 * dst, 2 * xr, 2 * mask, false, 0, gx, 1, 1),
+          "dynamic shift");
+   }
    c->busy &= ~BITFIELD64_BIT(mask);
+   c->p->evidence |= PCO_G5P_EV_FS_ALU;
    define(c, &a->def, dst);
 }
 
