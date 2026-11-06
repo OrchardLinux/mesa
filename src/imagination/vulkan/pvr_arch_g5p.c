@@ -331,7 +331,7 @@ g5p_raw_variant(unsigned words)
 /* Called only for an integer pass; qualification uses FORMATS=probe.
  * words: the pass's total output words; targets: 1, or 2 raw32 targets. */
 static VkResult
-g5p_raw_programs_unlocked(struct pvr_device *device, unsigned raw, unsigned words, unsigned targets, bool narrow)
+g5p_raw_programs_unlocked(struct pvr_device *device, unsigned raw, unsigned words, unsigned targets, unsigned source_bits)
 {
    struct pvr_g5p_programs *p = &device->g5p->programs;
    VkResult result;
@@ -352,11 +352,12 @@ g5p_raw_programs_unlocked(struct pvr_device *device, unsigned raw, unsigned word
    }
    /* witness-r16: R16UI/I EOT bit4 is clear; R32UI sets it. Cache
     * by source layout so a preceding raw32 pass cannot poison this choice. */
+   const bool narrow=source_bits<32;
    struct pvr_suballoc_bo **eot = narrow ? &p->narrow_eot_usc : &p->raw_eot_usc[targets - 1];
    if (!*eot) {
       uint8_t code[G5P_MRT_EOT_USC_MAX];
       struct g5p_color_source_abi source;
-      if (!g5p_color_source_make(narrow ? 16 : 32,1,G5P_COLOR_SOURCE_UINT,&source))
+      if (!g5p_color_source_make(source_bits,1,G5P_COLOR_SOURCE_UINT,&source))
          return vk_error(device,VK_ERROR_INITIALIZATION_FAILED);
       const unsigned size = narrow ? g5p_color_source_eot(code,&source)
                                     : g5p_mrt_eot_usc_mode(code,targets,true);
@@ -376,10 +377,10 @@ g5p_raw_programs_unlocked(struct pvr_device *device, unsigned raw, unsigned word
 }
 
 static VkResult
-g5p_raw_programs(struct pvr_device *device, unsigned raw, unsigned words, unsigned targets, bool narrow)
+g5p_raw_programs(struct pvr_device *device, unsigned raw, unsigned words, unsigned targets, unsigned source_bits)
 {
    simple_mtx_lock(&device->g5p->clear_lock);
-   VkResult result = g5p_raw_programs_unlocked(device, raw, words, targets, narrow);
+   VkResult result = g5p_raw_programs_unlocked(device, raw, words, targets, source_bits);
    simple_mtx_unlock(&device->g5p->clear_lock);
    return result;
 }
@@ -693,11 +694,12 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
             pvr_g5p_packed_uint_bits(first_format) == 8 ? 6 : 5;
    /* output words per target, and of the pass: two raw32 targets of one format (admitted by
     * pvr_arch_g5p_mrt_pass_check(), behind the format probe) take four each, eight in all */
+   const bool byte_source = first_format == VK_FORMAT_R8_UINT || first_format == VK_FORMAT_R8_SINT;
    const bool narrow = raw >= 5 &&
-      (first_format == VK_FORMAT_R16_UINT || first_format == VK_FORMAT_R16_SINT ||
+      (byte_source || first_format == VK_FORMAT_R16_UINT || first_format == VK_FORMAT_R16_SINT ||
        first_format == VK_FORMAT_R8G8_UINT || first_format == VK_FORMAT_R8G8_SINT);
    struct g5p_color_source_abi source = {0};
-   if (raw >= 5 && !g5p_color_source_make(narrow ? 16 : 32,
+   if (raw >= 5 && !g5p_color_source_make(byte_source ? 8 : narrow ? 16 : 32,
          (first_format == VK_FORMAT_R16G16B16A16_UINT || first_format == VK_FORMAT_R16G16B16A16_SINT) ? 2 : 1,
          G5P_COLOR_SOURCE_UINT,&source))
       return G5P_REFUSE(cmd_buffer,"unqualified physical colour source ABI");
@@ -707,7 +709,7 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
       if (!(n == 1 || (n == 2 && raw <= 2)) || g->samples != 1)
          return G5P_REFUSE(cmd_buffer, "integer pass requires one single-sample target, or two 32-bit integer "
                            "targets of one format");
-      VkResult result = g5p_raw_programs(device, raw, raw_total, n, narrow);
+      VkResult result = g5p_raw_programs(device, raw, raw_total, n, raw >= 5 ? source.channel_bits : 32);
       if (result != VK_SUCCESS)
          return result;
       g->raw_words = raw_total;
@@ -755,7 +757,7 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
          /* Equal-size raw physical view; logical sampling stays typed.
           * Native witness-r16 supplies the narrow16-bit source layout. */
          bool physical_srgb;
-         VkFormat physical = narrow ? VK_FORMAT_R16_UINT :
+         VkFormat physical = byte_source ? VK_FORMAT_R8_UINT : narrow ? VK_FORMAT_R16_UINT :
             (first_format == VK_FORMAT_R16G16B16A16_UINT || first_format == VK_FORMAT_R16G16B16A16_SINT)
                ? VK_FORMAT_R32G32_UINT : VK_FORMAT_R32_UINT;
          if (!g5p_pbe_key(physical, &store_key, &physical_srgb))
