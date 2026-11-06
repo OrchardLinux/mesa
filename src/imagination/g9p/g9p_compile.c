@@ -1827,14 +1827,22 @@ emit_txs(struct g9p_ctx *ctx, nir_tex_instr *tex)
    const unsigned u = tex_state_dword(ctx, MAX2(slot, 0));
    int w, h, d0, d1, t, zero;
 
-   if (ctx->stage != MESA_SHADER_FRAGMENT || tex->sampler_dim != GLSL_SAMPLER_DIM_2D ||
-       tex->is_array || slot < 0) {
-      fprintf(stderr, "g9p: only sizes of 2D combined image samplers so far\n");
+   /* layers and depth: bits 15-28 of the state's last word, minus one */
+   const bool third = tex->is_array || tex->sampler_dim == GLSL_SAMPLER_DIM_3D;
+   int z = -1;
+
+   if (slot < 0) {
+      fprintf(stderr, "g9p: sizes of combined image samplers only\n");
       return false;
    }
    release(ctx, &tex->instr);
    w = alloc_reg(ctx);
    h = alloc_reg(ctx);
+   if (third) {
+      z = alloc_reg(ctx);
+      if (z < 0)
+         return false;
+   }
    zero = const_reg(ctx, 0);
    d0 = alloc_temp(ctx);
    d1 = alloc_temp(ctx);
@@ -1859,6 +1867,43 @@ emit_txs(struct g9p_ctx *ctx, nir_tex_instr *tex)
    g9p_mov_imm(ctx->c, t, 1);
    g9p_alu2(ctx->c, G9P_IADD, w, w, t, false);
    g9p_alu2(ctx->c, G9P_IADD, h, h, t, false);
+   /* the view's base level is the state's: bits 25-28 of d1 */
+   {
+      const int one = alloc_temp(ctx), base = alloc_temp(ctx);
+
+      if (one < 0 || base < 0)
+         return false;
+      g9p_mov_imm(ctx->c, one, 1);
+      g9p_mov_imm(ctx->c, t, 25);
+      g9p_shift(ctx->c, base, d1, t, true);
+      g9p_mov_imm(ctx->c, t, 15);
+      g9p_alu2(ctx->c, G9P_AND, base, base, t, false);
+      g9p_shift(ctx->c, w, w, base, true);
+      g9p_shift(ctx->c, h, h, base, true);
+      emit_select(ctx, G9P_ULT, false, w, one, one, w, w);
+      emit_select(ctx, G9P_ULT, false, h, one, one, h, h);
+      if (third && tex->sampler_dim == GLSL_SAMPLER_DIM_3D) {
+         g9p_mov_uniform(ctx->c, d0, u + 3, zero);
+         g9p_mov_imm(ctx->c, t, 15);
+         g9p_shift(ctx->c, z, d0, t, true);
+         g9p_mov_imm(ctx->c, t, 0x3fff);
+         g9p_alu2(ctx->c, G9P_AND, z, z, t, false);
+         g9p_alu2(ctx->c, G9P_IADD, z, z, one, false);
+         g9p_shift(ctx->c, z, z, base, true);
+         emit_select(ctx, G9P_ULT, false, z, one, one, z, z);
+         ctx->reg[key(&tex->def, 2)] = z;
+      }
+   }
+   if (third && tex->sampler_dim != GLSL_SAMPLER_DIM_3D) {
+      g9p_mov_uniform(ctx->c, d0, u + 3, zero);
+      g9p_mov_imm(ctx->c, t, 15);
+      g9p_shift(ctx->c, z, d0, t, true);
+      g9p_mov_imm(ctx->c, t, 0x3fff);
+      g9p_alu2(ctx->c, G9P_AND, z, z, t, false);
+      g9p_mov_imm(ctx->c, t, 1);
+      g9p_alu2(ctx->c, G9P_IADD, z, z, t, false);
+      ctx->reg[key(&tex->def, 2)] = z;
+   }
    ctx->busy &= ~ctx->temps;
    ctx->temps = 0;
    ctx->reg[key(&tex->def, 0)] = w;
@@ -1984,38 +2029,69 @@ emit_tex_grad(struct g9p_ctx *ctx, nir_tex_instr *tex)
 }
 
 /*
- * A compare sample: the reference in a register below r32, in the sample's
- * W4, and bit 15 of W3 (Apple's sample_compare, sc1-sc7.metal); -2 on failure
+ * What a sample reads besides its coordinates (Apple's sample_compare and
+ * offset forms, sc1-sc7, off*.metal): W4 names a half; a compare reference in
+ * its register, then the packed offset (x | y << 4, z in W0 of the move) in
+ * the next register's low half, or at that half alone without a reference.
+ * Bit 15 of W3 is the compare, bit 14 of W2 the offset.
  */
-static int
-shadow_reference(struct g9p_ctx *ctx, nir_tex_instr *tex)
+struct tex_extras {
+   int half; /* -1: none */
+   bool compare, offset;
+};
+
+static bool
+tex_extras(struct g9p_ctx *ctx, nir_tex_instr *tex, struct tex_extras *out)
 {
-   const int i = nir_tex_instr_src_index(tex, nir_tex_src_comparator);
+   const int ri = nir_tex_instr_src_index(tex, nir_tex_src_comparator);
+   const int oi = nir_tex_instr_src_index(tex, nir_tex_src_offset);
+   int t;
 
-   if (!tex->is_shadow)
-      return -1;
-   if (i < 0)
-      return -2;
-   const int r = src_reg(ctx, nir_get_scalar(tex->src[i].src.ssa, 0));
-   if (r < 0)
-      return -2;
-   if (r < 32)
-      return r;
-   const int t = alloc_temp(ctx);
+   *out = (struct tex_extras){ .half = -1 };
+   if (tex->is_shadow && ri < 0)
+      return false;
+   if (oi >= 0 && !nir_src_is_const(tex->src[oi].src))
+      return false;
+   if (!tex->is_shadow && oi < 0)
+      return true;
+   t = alloc_low_range(ctx, 2);
+   if (t < 0)
+      return false;
+   ctx->temps |= BITFIELD64_RANGE(t, 2);
+   out->half = 2 * t;
+   if (tex->is_shadow) {
+      const int r = src_reg(ctx, nir_get_scalar(tex->src[ri].src.ssa, 0));
 
-   if (t < 0 || t >= 32)
-      return -2;
-   g9p_alu2(ctx->c, G9P_OR, t, r, r, false);
-   return t;
+      if (r < 0)
+         return false;
+      g9p_alu2(ctx->c, G9P_OR, t, r, r, false);
+      out->compare = true;
+   }
+   if (oi >= 0) {
+      const nir_src *o = &tex->src[oi].src;
+      const unsigned n = o->ssa->num_components;
+      const unsigned v = (nir_src_comp_as_int(*o, 0) & 15) |
+                         (n > 1 ? (nir_src_comp_as_int(*o, 1) & 15) << 4 : 0);
+      const unsigned z = n > 2 ? nir_src_comp_as_int(*o, 2) & 15 : 0;
+      const unsigned half = out->compare ? 2 * (t + 1) : 2 * t;
+
+      G9P_EMIT(ctx->c, 0x0188 | z << 12, 0x0100 | half, 0x0101 | (v & 0x3f) << 1,
+               0x0120 | (v >> 6) << 1, 0x0128, 0x0039);
+      out->offset = true;
+   }
+   return true;
 }
 
 static void
-shadow_patch(struct g9p_ctx *ctx, unsigned at, int ref)
+extras_patch(struct g9p_ctx *ctx, unsigned at, const struct tex_extras *e)
 {
-   if (ref >= 0) {
+   if (e->half < 0)
+      return;
+   ctx->c->w[at + 4] |= 0x40 | e->half;
+   if (e->compare)
       ctx->c->w[at + 3] |= 0x8000;
-      ctx->c->w[at + 4] |= 0x40 | 2 * ref;
-   }
+   if (e->offset)
+      ctx->c->w[at + 2] |= 0x4000;
 }
 
 /*
@@ -2040,15 +2116,14 @@ emit_tex_layered(struct g9p_ctx *ctx, nir_tex_instr *tex)
       return emit_tex_grad(ctx, tex);
    if (ctx->stage != MESA_SHADER_FRAGMENT || ci < 0 || slot < 0 || (cube && tex->is_array) ||
        (!cube && !is3d && tex->sampler_dim != GLSL_SAMPLER_DIM_2D) ||
-       (tex->op != nir_texop_tex && tex->op != nir_texop_txl && tex->op != nir_texop_txb) ||
-       nir_tex_instr_src_index(tex, nir_tex_src_offset) >= 0) {
+       (tex->op != nir_texop_tex && tex->op != nir_texop_txl && tex->op != nir_texop_txb)) {
       fprintf(stderr, "g9p: only plain samples of 2D arrays, cubes and 3D textures\n");
       return false;
    }
    lod = lod_source(ctx, tex);
-   const int ref = shadow_reference(ctx, tex);
+   struct tex_extras extras;
 
-   if (lod == -2 || ref == -2)
+   if (lod == -2 || !tex_extras(ctx, tex, &extras))
       return false;
    for (unsigned c = 0; c < 3; c++) {
       const int r = src_reg(ctx, nir_get_scalar(tex->src[ci].src.ssa, c));
@@ -2077,7 +2152,7 @@ emit_tex_layered(struct g9p_ctx *ctx, nir_tex_instr *tex)
    ctx->c->w[at] = (ctx->c->w[at] & ~0x0f00) |
                    (cube ? G9P_TEX_CUBE : is3d ? G9P_TEX_3D : G9P_TEX_2D_ARRAY) << 8;
    sample_lod(ctx, tex, at, lod);
-   shadow_patch(ctx, at, ref);
+   extras_patch(ctx, at, &extras);
    g9p_wait(ctx->c);
    for (unsigned c = 0; c < 4; c++) {
       ctx->reg[key(&tex->def, c)] = dst + c;
@@ -2102,10 +2177,9 @@ emit_tex_vertex(struct g9p_ctx *ctx, nir_tex_instr *tex)
    int lod = -1, coord, dst;
    unsigned at;
 
-   if (ci < 0 || slot < 0 || tex->is_shadow || (tex->is_array && cube) ||
+   if (ci < 0 || slot < 0 || (tex->is_array && cube) ||
        (!cube && !is3d && tex->sampler_dim != GLSL_SAMPLER_DIM_2D) ||
-       (tex->op != nir_texop_tex && tex->op != nir_texop_txl) ||
-       nir_tex_instr_src_index(tex, nir_tex_src_offset) >= 0) {
+       (tex->op != nir_texop_tex && tex->op != nir_texop_txl)) {
       fprintf(stderr, "g9p: only 2D and cube samples with a level in vertex shaders\n");
       return false;
    }
@@ -2119,6 +2193,10 @@ emit_tex_vertex(struct g9p_ctx *ctx, nir_tex_instr *tex)
       if (lod < 0)
          return false;
    }
+   struct tex_extras extras;
+
+   if (!tex_extras(ctx, tex, &extras))
+      return false;
    coord = alloc_low_range(ctx, 4);
    if (coord < 0)
       return false;
@@ -2167,6 +2245,7 @@ emit_tex_vertex(struct g9p_ctx *ctx, nir_tex_instr *tex)
       ctx->c->w[at] = (ctx->c->w[at] & ~0x0f00) | G9P_TEX_2D_ARRAY << 8;
       ctx->c->w[at + 2] |= 0x8000;
    }
+   extras_patch(ctx, at, &extras);
    g9p_wait(ctx->c);
    release(ctx, &tex->instr);
    for (unsigned c = 0; c < 4; c++) {
@@ -2200,17 +2279,16 @@ emit_tex(struct g9p_ctx *ctx, nir_tex_instr *tex)
       return emit_tex_layered(ctx, tex);
    if (ctx->stage != MESA_SHADER_FRAGMENT || tex->sampler_dim != GLSL_SAMPLER_DIM_2D ||
        tex->is_array || ci < 0 || slot < 0 ||
-       (tex->op != nir_texop_tex && tex->op != nir_texop_txl && tex->op != nir_texop_txb) ||
-       nir_tex_instr_src_index(tex, nir_tex_src_offset) >= 0) {
+       (tex->op != nir_texop_tex && tex->op != nir_texop_txl && tex->op != nir_texop_txb)) {
       fprintf(stderr, "g9p: only plain 2D samples of combined image samplers so far\n");
       return false;
    }
    first = varying_component(ctx, nir_get_scalar(tex->src[ci].src.ssa, 0));
    second = varying_component(ctx, nir_get_scalar(tex->src[ci].src.ssa, 1));
    if (tex->op == nir_texop_tex && first >= 0 && second == first + 1) {
-      const int ref = shadow_reference(ctx, tex);
+      struct tex_extras extras;
 
-      if (ref == -2)
+      if (!tex_extras(ctx, tex, &extras))
          return false;
       release(ctx, &tex->instr);
       dst = alloc_range(ctx, 4);
@@ -2219,13 +2297,13 @@ emit_tex(struct g9p_ctx *ctx, nir_tex_instr *tex)
       g9p_sample_varying(ctx->c, dst, first, 2, tex_state_dword(ctx, slot),
                          tex_sampler_dword(ctx, slot));
       /* the sample is its last five words */
-      shadow_patch(ctx, ctx->c->n - 5, ref);
+      extras_patch(ctx, ctx->c->n - 5, &extras);
       ctx->out->num_varyings = MAX2(ctx->out->num_varyings, first / 4 + 1);
    } else {
       const int lod = lod_source(ctx, tex);
-      const int ref = shadow_reference(ctx, tex);
+      struct tex_extras extras;
 
-      if (lod == -2 || ref == -2)
+      if (lod == -2 || !tex_extras(ctx, tex, &extras))
          return false;
       for (unsigned c = 0; c < 2; c++) {
          const int r = src_reg(ctx, nir_get_scalar(tex->src[ci].src.ssa, c));
@@ -2243,7 +2321,7 @@ emit_tex(struct g9p_ctx *ctx, nir_tex_instr *tex)
 
          g9p_sample_regs(ctx->c, dst, tex_state_dword(ctx, slot), tex_sampler_dword(ctx, slot));
          sample_lod(ctx, tex, at, lod);
-         shadow_patch(ctx, at, ref);
+         extras_patch(ctx, at, &extras);
       }
    }
    g9p_wait(ctx->c);
@@ -3308,6 +3386,47 @@ g9p_lower_cubes_seamful(nir_shader *nir, bool mag_at_half)
 }
 
 /* Optimization, out of SSA, then code for @ctx->stage */
+/*
+ * texelFetch as a sample of the texel's centre at its level (in float
+ * coordinates; the layer of an array stays a layer index)
+ */
+static bool
+lower_txf(nir_builder *b, nir_tex_instr *tex, void *data)
+{
+   const int ci = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   const int li = nir_tex_instr_src_index(tex, nir_tex_src_lod);
+   const unsigned n = tex->coord_components - tex->is_array;
+   nir_def *lod, *size, *coord, *comps[4];
+
+   if (tex->op != nir_texop_txf || tex->sampler_dim == GLSL_SAMPLER_DIM_MS || ci < 0)
+      return false;
+   b->cursor = nir_before_instr(&tex->instr);
+   lod = li >= 0 ? tex->src[li].src.ssa : nir_imm_int(b, 0);
+   size = nir_get_texture_size(b, tex);
+   coord = nir_i2f32(b, tex->src[ci].src.ssa);
+   for (unsigned c = 0; c < n; c++) {
+      nir_def *level_size = nir_imax_imm(b, nir_ishr(b, nir_channel(b, size, c), lod), 1);
+
+      comps[c] = nir_fdiv(b, nir_fadd_imm(b, nir_channel(b, coord, c), 0.5),
+                          nir_i2f32(b, level_size));
+   }
+   if (tex->is_array)
+      comps[n] = nir_channel(b, coord, n);
+   nir_src_rewrite(&tex->src[ci].src, nir_vec(b, comps, tex->coord_components));
+   if (li >= 0)
+      nir_src_rewrite(&tex->src[li].src, nir_i2f32(b, lod));
+   else
+      nir_tex_instr_add_src(tex, nir_tex_src_lod, nir_imm_float(b, 0.0f));
+   tex->op = nir_texop_txl;
+   return true;
+}
+
+static bool
+lower_grad_offset(const nir_instr *instr, const void *data)
+{
+   return instr->type == nir_instr_type_tex && nir_instr_as_tex(instr)->op == nir_texop_txd;
+}
+
 static bool
 compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
              const struct g9p_vertex_attrib *attribs, unsigned frag_coord_slot,
@@ -3319,9 +3438,21 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
 
    /* texture2DProj */
    {
-      const nir_lower_tex_options tex = { .lower_txp = ~0u };
+      /*
+       * Gradients of 3D textures and of compare samples, all of them in
+       * vertex shaders, by an explicit level; offsets of gradients by coordinates
+       */
+      const nir_lower_tex_options tex = {
+         .lower_txp = ~0u,
+         .lower_offset_filter = lower_grad_offset,
+         .lower_txs_lod = true,
+         .lower_txd_3d = true,
+         .lower_txd_shadow = true,
+         .lower_txd = stage == MESA_SHADER_VERTEX,
+      };
 
       NIR_PASS(_, nir, nir_lower_tex, &tex);
+      NIR_PASS(_, nir, nir_shader_tex_pass, lower_txf, nir_metadata_control_flow, NULL);
    }
    /* integer division through floats: no such instruction (GLSL ES 1.00 int and ivec /) */
    {
@@ -3962,27 +4093,6 @@ is_src_over(const nir_lower_blend_options *blend)
  * nearest and linear filtering. The size is the base level's (txs), right
  * for the single-level views blits read.
  */
-static bool
-lower_txf(nir_builder *b, nir_tex_instr *tex, void *data)
-{
-   const int ci = nir_tex_instr_src_index(tex, nir_tex_src_coord);
-   const int li = nir_tex_instr_src_index(tex, nir_tex_src_lod);
-   nir_def *size, *coord;
-
-   if (tex->op != nir_texop_txf || tex->sampler_dim != GLSL_SAMPLER_DIM_2D || tex->is_array ||
-       ci < 0)
-      return false;
-   size = nir_i2f32(b, nir_get_texture_size(b, tex));
-   coord = nir_fdiv(b, nir_fadd_imm(b, nir_i2f32(b, tex->src[ci].src.ssa), 0.5), size);
-   nir_src_rewrite(&tex->src[ci].src, coord);
-   if (li >= 0)
-      nir_src_rewrite(&tex->src[li].src, nir_i2f32(b, tex->src[li].src.ssa));
-   else
-      nir_tex_instr_add_src(tex, nir_tex_src_lod, nir_imm_float(b, 0.0f));
-   tex->op = nir_texop_txl;
-   return true;
-}
-
 /* Centroid: renders have one sample, at the pixel's centre */
 static bool
 lower_centroid(nir_builder *b, nir_intrinsic_instr *intr, void *data)
@@ -4023,7 +4133,6 @@ g9p_compile_fragment(nir_shader *nir, unsigned frag_coord_slot,
    lower_front(nir);
    NIR_PASS(_, nir, discards_to_if);
    NIR_PASS(_, nir, discards_to_flag);
-   NIR_PASS(_, nir, nir_shader_tex_pass, lower_txf, nir_metadata_control_flow, NULL);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_centroid, nir_metadata_control_flow, NULL);
    find_flat_varyings(nir, out);
    lower_io(nir);
