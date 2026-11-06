@@ -1922,10 +1922,28 @@ emit_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state
    for (unsigned i = 1; i < nb; i++)
       emit_ppp(csb, ppp_bo->dev_addr.addr + 4 * blocks[i][0], blocks[i][1]);
 
-   /* INDEX_LIST: count, instances - 1, index offset, [address], split count */
+   /*
+    * INDEX_LIST: count, instances - 1, index offset, [address], split count;
+    * primitive restart before it as the A9's (PR #6, Apple's g3b-idx16-restart): a VDM
+    * state update with the cut index, all ones of the index size
+    */
    {
-      uint32_t w[7], n = 0;
+      uint32_t w[9], n = 0;
 
+      if (draw->indexed && cmd_buffer->vk.dynamic_graphics_state.ia.primitive_restart_enable) {
+         const unsigned vector = state->vs_outputs + 5;
+
+         pvr_csb_pack (&w[n++], VDMCTRL_VDM_STATE0, v0) {
+            v0.cut_index_present = true;
+            v0.cut_index_enable = true;
+            v0.cam_size = vector <= 32 ? 95 : vector <= 48 ? 63 : vector <= 64 ? 31 : 15;
+         }
+         pvr_csb_pack (&w[n++], VDMCTRL_VDM_STATE1, v1) {
+            v1.cut_index = draw->index_size == 1   ? 0xff
+                           : draw->index_size == 2 ? 0xffff
+                                                   : 0xffffffff;
+         }
+      }
       w[n++] = 3u << 29 | BITFIELD_BIT(27) | BITFIELD_BIT(26) | BITFIELD_BIT(25) |
                BITFIELD_BIT(22) | hw_topology(topology) << 8 |
                (draw->indexed ? BITFIELD_BIT(28) | (uint32_t)(draw->index_addr >> 32) : 0) |
