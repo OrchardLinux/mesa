@@ -601,7 +601,8 @@ static bool is_cmp(nir_op op)
 static bool vs_recipe(nir_op op)
 {
    return op == nir_op_frcp || op == nir_op_frsq || op == nir_op_fmin || op == nir_op_fmax || op == nir_op_fsin ||
-          op == nir_op_fcos || op == nir_op_ftrunc;
+          op == nir_op_fcos || op == nir_op_ftrunc || op == nir_op_fround_even || op == nir_op_fsign ||
+          op == nir_op_fceil;
 }
 
 /* Ops with a measured complete Apple lowering (isa-g5p.md ISA round 2 §3). */
@@ -657,7 +658,7 @@ static bool alu_supported(struct gctx *c, nir_alu_instr *a)
    case nir_op_iadd: case nir_op_imul:
       return bits == 32; /* VS: the XFB probe forms (vs_int) */
    case nir_op_ishl:
-      return bits == 32 && (!c->vs || nir_src_is_const(a->src[1].src));
+      return bits == 32; /* vertex, a dynamic amount: v_ishl_dyn (emit_shift) */
    case nir_op_imin: case nir_op_imax: case nir_op_umin:
    case nir_op_umax: case nir_op_ushr: case nir_op_ishr: case nir_op_isub:
    case nir_op_ineg:
@@ -2680,6 +2681,34 @@ static void vs_fbin(struct gctx *c, nir_alu_instr *a)
       define(c, &a->def, dst);
       return;
    }
+   if (op == G5P_BIN_FMUL && (r[0].neg || r[0].abs || r[1].neg || r[1].abs) && vkind(c, r[0]) == VK_REG &&
+       vkind(c, r[1]) == VK_REG && !is_const(c, r[0]) && !is_const(c, r[1])) {
+      /* vsalu-probes.py v_fmul_neg(_rr), v_fmul_abs(_b), v_fmul_negabs: the two-register fmul {h31 x0},
+       * operands' groups their last reads. Apple puts an operand with abs in A and the product's sign on A,
+       * or on B when A has abs (-|x| * y: abs A, negate B). Both abs and a sign has no witnessed form. */
+      unsigned ia = !r[0].abs && r[1].abs ? 1 : 0, ib = 1 - ia;
+      struct ref ra = r[ia], rb = r[ib];
+      bool neg = ra.neg != rb.neg;
+      ra.neg = rb.neg = false;
+      if (neg && !ra.abs)
+         ra.neg = true;
+      else if (neg && !rb.abs)
+         rb.neg = true;
+      else if (neg)
+         refuse(c, "fmul of two absolute operands with a sign (no witnessed vertex form)");
+      unsigned rega = reg_of(c, r[ia], "fmul"), regb = reg_of(c, r[ib], "fmul");
+      struct g5p_alu f = G5P_ALU(0);
+      f.header = vhdr(c, 0x31, rega, regb, -1);
+      f.a = gsrc(c, rega, ra, vgrp(c, r[ia]));
+      f.b = gsrc(c, regb, rb, vgrp(c, r[ib]));
+      unsigned dst = vs_dst(c, r, 2);
+      f.bank = vbank(c, dst);
+      f.dst_half = H(c, dst);
+      put(c, raw, g5p_usc_binary(raw, op, &f), "fmul with source modifiers");
+      c->p->evidence |= PCO_G5P_EV_VS_ALU;
+      define(c, &a->def, dst);
+      return;
+   }
    if (r[0].neg || r[0].abs || r[1].neg || r[1].abs) {
       if (op != G5P_BIN_FADD)
          refuse(c, "%s with a source modifier (no witnessed vertex form)", nir_op_infos[a->op].name);
@@ -2834,17 +2863,26 @@ static void vs_ffma(struct gctx *c, nir_alu_instr *a)
       /* v_uniform_live_*: {h39 x0 ag1 bg1 cg1} or {h79 x4 ag1 bg0 cg1} */
       unsigned reg[3] = {reg_of(c, r[0], "ffma"), reg_of(c, r[1], "ffma"), reg_of(c, r[2], "ffma")};
       bool d[3] = {dies(c, r[0]), dies(c, r[1]), dies(c, r[2])};
-      if ((!d[0] && !d[1]) || !d[2])
-         refuse(c, "ffma of registers read again (no witnessed vertex control tuple)");
-      unsigned ia = d[0] ? 0 : 1, ib = 1 - ia;
       struct g5p_alu f = G5P_ALU(0);
-      f.source_extension = d[ib] ? 0 : 4;
-      f.a = gsrc(c, reg[ia], r[ia], 1);
-      f.b = gsrc(c, reg[ib], r[ib], d[ib]);
-      f.c = gsrc(c, reg[2], r[2], 1);
+      unsigned ia = 0, ib = 1;
+      if ((!d[0] && !d[1]) || !d[2]) {
+         /* vsalu-probes.py v_ffma_rr..rr4: operands in order, each group its last read, {h39 x0} */
+         f.header = 0x39;
+         f.a = gsrc(c, reg[0], r[0], d[0]);
+         f.b = gsrc(c, reg[1], r[1], d[1]);
+         f.c = gsrc(c, reg[2], r[2], d[2]);
+      } else {
+         ia = d[0] ? 0 : 1;
+         ib = 1 - ia;
+         f.header = d[ib] ? 0x39 : 0x79;
+         f.source_extension = d[ib] ? 0 : 4;
+         f.a = gsrc(c, reg[ia], r[ia], 1);
+         f.b = gsrc(c, reg[ib], r[ib], d[ib]);
+         f.c = gsrc(c, reg[2], r[2], 1);
+      }
       dst = vs_dst(c, r, 3);
       f.bank = vbank(c, dst);
-      f.header = vhdr(c, d[ib] ? 0x39 : 0x79, reg[ia], reg[ib], reg[2]);
+      f.header = vhdr(c, f.header, reg[ia], reg[ib], reg[2]);
       f.dst_half = H(c, dst);
       put(c, raw, g5p_usc_fma(raw, &f), "ffma");
       c->p->evidence |= PCO_G5P_EV_VS_ALU;
@@ -3107,8 +3145,39 @@ static void emit_shift(struct gctx *c, nir_alu_instr *a)
       define(c, &a->def, dst);
       return;
    }
-   if (c->vs)
-      refuse(c, "vertex %s with a dynamic amount (no vertex probe)", nir_op_infos[a->op].name);
+   if (c->vs) {
+      /* Apple's v_ishl_dyn(_rr), v_ushr_dyn, v_ishr_dyn (tools/g5p-1b-dgl/vs-canary/vsalu-probes.py): the
+       * amount & 31 (the u32 binary literal, the amount in B, header 0x11), then the register-amount shift
+       * (value in B, the masked amount in C: header 0x19, bank 1) or, for ishr, the two-register binary (value
+       * in A, amount in B: header 0x31). Each source group is 1 on its last read. */
+      unsigned ar = reg_of(c, amt, "shift amount");
+      unsigned ga = vgrp(c, amt);
+      unsigned m = alloc_reg(c, -1);
+      vs_bank1_only(c, "dynamic shift amount", m, ar, xr, -1);
+      put(c, raw, g5p_usc_binary_literal2(raw, G5P_BIN_AND, 2 * m, 31, 2 * ar, 1, ga, 0x11, G5P_LIT_U32, -1, 0, 0,
+                                          false), "vertex amount & 31");
+      struct ref both[2] = {x, amt};
+      bool d = dies(c, x);
+      unsigned gx = vgrp(c, x);
+      free_dying(c, both, 2);
+      unsigned dst = alloc_reg(c, d ? (int)xr : -1);
+      vs_bank1_only(c, "dynamic shift", dst, xr, m, -1);
+      if (a->op == nir_op_ishr) {
+         struct g5p_alu f = G5P_ALU(2 * dst);
+         f.bank = 1;
+         f.header = 0x31;
+         f.a = (struct g5p_src){.half = 2 * xr, .group = gx};
+         f.b = (struct g5p_src){.half = 2 * m, .group = 1};
+         put(c, raw, g5p_usc_binary(raw, G5P_BIN_ISHR, &f), "vertex dynamic ishr");
+      } else {
+         put(c, raw, g5p_usc_shift(raw, a->op == nir_op_ishl, 2 * dst, 2 * xr, 2 * m, false, 1, gx, 1, 0x19),
+             "vertex dynamic shift");
+      }
+      c->busy &= ~BITFIELD_BIT(m);
+      c->p->evidence |= PCO_G5P_EV_VS_ALU;
+      define(c, &a->def, dst);
+      return;
+   }
    if (a->op == nir_op_ishr)
       refuse(c, "ishr with a dynamic amount (only the literal-amount form is witnessed)");
    /* The probes mask dynamic amounts to 31 before the shift. */
@@ -3212,8 +3281,8 @@ static void emit_alu(struct gctx *c, nir_alu_instr *a)
       vs_bitwise(c, a);
       return;
    }
-   if (c->vs && (a->op == nir_op_iadd || a->op == nir_op_imul || a->op == nir_op_ishl ||
-                 a->op == nir_op_inot)) {
+   if (c->vs && (a->op == nir_op_iadd || a->op == nir_op_imul ||
+                 (a->op == nir_op_ishl && nir_src_is_const(a->src[1].src)) || a->op == nir_op_inot)) {
       vs_int(c, a);
       return;
    }

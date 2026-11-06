@@ -66,8 +66,9 @@ static void recipe(struct rbuf *b, enum g5p_recipe r, unsigned d, unsigned x, un
    const bool vs = flags & G5P_RC_VERTEX;
    const unsigned bank = vs;
    /* sin and cos: v_sin, v_cos (bench-gaps.md), every temp in bank 1. */
+   /* rint, sign and ceil: v_rint(_rr), v_sign(_rr), v_ceil(_rr) (tools/g5p-1b-dgl/vs-canary/vsalu-probes.py) */
    if (vs && r != G5P_RC_RCP && r != G5P_RC_RSQ && r != G5P_RC_MIN && r != G5P_RC_MAX && r != G5P_RC_SIN &&
-       r != G5P_RC_COS && r != G5P_RC_TRUNC) {
+       r != G5P_RC_COS && r != G5P_RC_TRUNC && r != G5P_RC_RINT && r != G5P_RC_SIGN && r != G5P_RC_CEIL) {
       b->err = "no measured vertex form";
       return;
    }
@@ -106,11 +107,11 @@ static void recipe(struct rbuf *b, enum g5p_recipe r, unsigned d, unsigned x, un
       R("sqrt multiply", g5p_usc_binary(_r, G5P_BIN_FMUL, &f));
       break;
    case G5P_RC_SIGN: /* f_math_sign_0 */
-      l = lit3(0x5d, t, 0x80000000, x, 0, K(0x41, 4, 0), 0, 0x70);
+      l = lit3(0x5d, t, 0x80000000, x, 0, KV(0x41, 0x10, 4, 0), 0, 0x70);
       l.c_literal = true;
       l.c_value = 0x3f800000;
       R("sign test", g5p_usc_literal_ternary(_r, &l));
-      l = lit3(0x58, x, 0xbf800000, x, 1, K(1, 0, 0), 0, 0x2058);
+      l = lit3(0x58, x, 0xbf800000, x, 1, KV(1, 0x18, 0, 0), 0, 0x2058);
       l.c_half = t;
       l.c_group = 1;
       R("sign select", g5p_usc_literal_ternary(_r, &l));
@@ -125,9 +126,9 @@ static void recipe(struct rbuf *b, enum g5p_recipe r, unsigned d, unsigned x, un
                                              : g5p_usc_predicated_move(_r, x, S(y, 1), KV(1, 0x20, 0, 0)));
       break;
    case G5P_RC_CEIL: /* f_math_ceil_0: -floor(-x) */
-      R("ceil floor", g5p_usc_unary2(_r, G5P_FLOOR, x, x, 0, 1, 1, true, 0, 0, false));
-      R("ceil negate", g5p_usc_binary_literal2(_r, G5P_BIN_FADD, x, 0x8000, x, 0, 1, 1, G5P_LIT_F16, -1, 0, 0,
-                                               true));
+      R("ceil floor", g5p_usc_unary2(_r, G5P_FLOOR, x, x, bank, 1, VB(1, 0x20), true, 0, 0, false));
+      R("ceil negate", g5p_usc_binary_literal2(_r, G5P_BIN_FADD, x, 0x8000, x, bank, 1, VB(1, 0x10), G5P_LIT_F16, -1,
+                                               0, 0, true));
       break;
    case G5P_RC_TRUNC:
       if (vs) {
@@ -144,9 +145,10 @@ static void recipe(struct rbuf *b, enum g5p_recipe r, unsigned d, unsigned x, un
       }
       __attribute__((fallthrough));
    case G5P_RC_RINT: /* f_math_trunc_0 / f_math_rint_0: int round trip, |x| >= 2^23 keeps x */
-      R("round convert", g5p_usc_convert2(_r, r == G5P_RC_TRUNC ? G5P_F2I32 : G5P_F2I32_RTE, t, x, 0, 0, 0x41, 4, 0));
-      R("round back", g5p_usc_convert2(_r, G5P_I2F32, t, t, 0, 1, 1, 0, 0));
-      l = lit3(0x5c, x, 0x4b000000, x, 1, K(1, 0, 0), 0x40, 0x4000);
+      R("round convert", g5p_usc_convert2(_r, r == G5P_RC_TRUNC ? G5P_F2I32 : G5P_F2I32_RTE, t, x, bank, 0,
+                                          VB(0x41, 0x10), 4, 0));
+      R("round back", g5p_usc_convert2(_r, G5P_I2F32, t, t, bank, 1, VB(1, 0x10), 0, 0));
+      l = lit3(0x5c, x, 0x4b000000, x, 1, KV(1, 0x18, 0, 0), 0x40, 0x4000);
       l.c_half = t;
       l.c_group = 1;
       R("round select", g5p_usc_literal_ternary(_r, &l));

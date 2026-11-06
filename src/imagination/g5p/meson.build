@@ -55,3 +55,12 @@ g5p_vsops_test = executable(
   install : false,
 )
 test('g5p-vsops-encodings', g5p_vsops_test, timeout : 60)
+
+g5p_vsalu_test = executable(
+  'g5p-vsalu-test',
+  files('tests/vsalu.c', 'g5p_usc.c', 'g5p_recipes.c'),
+  include_directories : [inc_powervr_g5p],
+  dependencies : [dep_m],
+  install : false,
+)
+test('g5p-vsalu-encodings', g5p_vsalu_test, timeout : 60)
