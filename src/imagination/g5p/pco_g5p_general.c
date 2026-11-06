@@ -5047,7 +5047,14 @@ static bool lower(nir_shader *nir)
     * Apple's GPU has no projected sample, Metal divides in the program, so
     * the coordinate (and a compare reference) is divided by the projector
     * before the sample, as AGX does (nir_lower_tex lower_txp). */
-   const nir_lower_tex_options txp = {.lower_txp = ~0u, .lower_txp_array = true};
+   /* texelFetchOffset is integer coordinate addition before the qualified
+    * fetch. NIR preserves an array layer instead of adding the offset to it.
+    * No packed texture-offset field or new USC recipe is selected. */
+   const nir_lower_tex_options txp = {
+      .lower_txp = ~0u, .lower_txp_array = true,
+      .lower_txf_offset = nir->info.stage == MESA_SHADER_VERTEX &&
+                          g5p_vtex_qualified() && g5p_vtex_fetch_offset_probe(),
+   };
    NIR_PASS(_, nir, nir_lower_tex, &txp);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const, nir_address_format_32bit_offset);
    NIR_PASS(_, nir, nir_lower_flrp, 32, false);

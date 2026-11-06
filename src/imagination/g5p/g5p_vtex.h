@@ -17,11 +17,16 @@ static inline bool g5p_vtex_probe(void)
 static inline bool g5p_vtex_qualified(void)
 {
    const char *v = getenv("PVR_G5P_VERTEX_TEXTURE");
-   return !v || !strcmp(v, "qualified") || !strcmp(v, "qualified-cube");
+   return !v || !strcmp(v, "qualified") || !strcmp(v, "qualified-cube") || !strcmp(v, "qualified-offset");
 }
 static inline bool g5p_vtex_cube_probe(void)
 {
    const char *v = getenv("PVR_G5P_VERTEX_TEXTURE");
    return v && !strcmp(v, "qualified-cube");
+}
+static inline bool g5p_vtex_fetch_offset_probe(void)
+{
+   const char *v = getenv("PVR_G5P_VERTEX_TEXTURE");
+   return v && !strcmp(v, "qualified-offset");
 }
 #endif
