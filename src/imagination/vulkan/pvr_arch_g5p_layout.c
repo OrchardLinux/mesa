@@ -293,8 +293,66 @@ g5p_normalize_axis(int32_t *offset, uint32_t *extent, bool *flip)
    return *offset >= 0;
 }
 
+/* Texel (x, y) of the source as floats: a decoded block texel or an unpacked element */
 static bool
-g5p_copy(const struct pvr_rect_mapping *mapping, struct g5p_surface *src, struct g5p_surface *dst)
+g5p_texel(struct g5p_surface *s, unsigned x, unsigned y, float out[4], const uint8_t **last, float block[16][4])
+{
+   if (s->blocks)
+      return g5p_block_texel(s, x, y, out, last, block);
+
+   const uint8_t *from = g5p_element(s, x, y);
+
+   if (!from)
+      return false;
+   util_format_unpack_rgba(s->format, out, from, 1);
+   return true;
+}
+
+/* VK_FILTER_LINEAR blit sample (Vulkan's vkCmdBlitImage rules): destination pixel centre i + 0.5 maps to
+ * source coordinate u = src0 + (i + 0.5) * scale (mirrored inside the source rect for a flip), the
+ * 2x2 texels around u - 0.5 are weighted bilinearly, and the sampler clamps to the edge of the
+ * source level (not of the region). A 2:1 reduction is the 2x2 box average, which is what
+ * glGenerateMipmap through Zink's blit expects. */
+static bool
+g5p_linear_sample(struct g5p_surface *src, const struct pvr_rect_mapping *m, unsigned x, unsigned y, float out[4],
+                  const uint8_t **last, float block[16][4])
+{
+   const double sw = m->src_rect.extent.width, sh = m->src_rect.extent.height;
+   const double dw = m->dst_rect.extent.width, dh = m->dst_rect.extent.height;
+   double fu = (x + 0.5) * sw / dw, fv = (y + 0.5) * sh / dh;
+
+   if (m->flip_x)
+      fu = sw - fu;
+   if (m->flip_y)
+      fv = sh - fv;
+   fu += m->src_rect.offset.x - 0.5;
+   fv += m->src_rect.offset.y - 0.5;
+
+   const double u0f = floor(fu), v0f = floor(fv);
+   const float a = fu - u0f, b = fv - v0f;
+   const int64_t u0 = u0f, v0 = v0f;
+   const int64_t maxu = (int64_t)src->width - 1, maxv = (int64_t)src->height - 1;
+   const unsigned us[2] = { CLAMP(u0, 0, maxu), CLAMP(u0 + 1, 0, maxu) };
+   const unsigned vs[2] = { CLAMP(v0, 0, maxv), CLAMP(v0 + 1, 0, maxv) };
+   const float w[4] = { (1 - a) * (1 - b), a * (1 - b), (1 - a) * b, a * b };
+
+   if (maxu < 0 || maxv < 0)
+      return false;
+   for (unsigned c = 0; c < 4; c++)
+      out[c] = 0.0f;
+   for (unsigned t = 0; t < 4; t++) {
+      float v[4];
+
+      if (!g5p_texel(src, us[t & 1], vs[t >> 1], v, last, block))
+         return false;
+      for (unsigned c = 0; c < 4; c++)
+         out[c] += w[t] * v[c];
+   }
+   return true;
+}
+
+static bool
+g5p_copy(const struct pvr_rect_mapping *mapping, struct g5p_surface *src, struct g5p_surface *dst, bool linear)
 {
    /* Rogue's blit builder keeps signed source deltas in VkExtent2D's
     * unsigned fields, while destination reversal is usually in flip_x/y.
@@ -318,6 +376,22 @@ g5p_copy(const struct pvr_rect_mapping *mapping, struct g5p_surface *src, struct
 
    if (!dw || !dh || !sw || !sh)
       return true;
+
+   /* A scaled linear blit filters. Integer and depth/stencil formats have no linear filter in
+    * Vulkan, and an unscaled blit samples exactly at texel centres: both stay element copies. */
+   if (linear && !integer && !util_format_is_depth_or_stencil(src->format) && (sw != dw || sh != dh)) {
+      for (unsigned y = 0; y < dh; y++) {
+         for (unsigned x = 0; x < dw; x++) {
+            uint8_t *to = g5p_element(dst, m->dst_rect.offset.x + x, m->dst_rect.offset.y + y);
+            float v[4];
+
+            if (!to || !g5p_linear_sample(src, m, x, y, v, &last, block))
+               return false;
+            util_format_pack_rgba(dst->format, to, v, 1);
+         }
+      }
+      return true;
+   }
 
    for (unsigned y = 0; y < dh; y++) {
       unsigned sy = sh == dh ? y : (uint64_t)y * sh / dh;
@@ -386,11 +460,11 @@ g5p_copy(const struct pvr_rect_mapping *mapping, struct g5p_surface *src, struct
 }
 
 static bool
-g5p_copy_aspects(const struct pvr_rect_mapping *mapping, struct g5p_surface *src, struct g5p_surface *dst)
+g5p_copy_aspects(const struct pvr_rect_mapping *mapping, struct g5p_surface *src, struct g5p_surface *dst, bool linear)
 {
    const struct pvr_image *image = dst->image ? dst->image : src->image;
    if (!image || !vk_format_is_depth_or_stencil(image->vk.format))
-      return g5p_copy(mapping, src, dst);
+      return g5p_copy(mapping, src, dst, linear);
    VkImageAspectFlags aspects = src->image ? src->aspects : dst->aspects;
    if (src->image && dst->image) aspects &= dst->aspects;
    const struct pvr_g5p_ds_format *f = pvr_g5p_ds_format(image->vk.format);
@@ -400,7 +474,7 @@ g5p_copy_aspects(const struct pvr_rect_mapping *mapping, struct g5p_surface *src
       if (!(aspects & aspect)) continue;
       struct g5p_surface s, d;
       if (!g5p_ds_plane(src, aspect, f, &s) || !g5p_ds_plane(dst, aspect, f, &d) ||
-          !g5p_copy(mapping, &s, &d))
+          !g5p_copy(mapping, &s, &d, false))
          return false;
    }
    return aspects != 0;
@@ -437,11 +511,11 @@ g5p_run(struct pvr_device *device, const struct pvr_transfer_cmd *cmd)
          /* the whole destination scissor, 1:1 */
          const struct pvr_rect_mapping m = { .src_rect = cmd->scissor, .dst_rect = cmd->scissor };
 
-         if (!g5p_copy_aspects(&m, &src, &dst))
+         if (!g5p_copy_aspects(&m, &src, &dst, false))
             return false;
       }
       for (unsigned k = 0; k < source->mapping_count; k++)
-         if (!g5p_copy_aspects(&source->mappings[k], &src, &dst))
+         if (!g5p_copy_aspects(&source->mappings[k], &src, &dst, source->filter == PVR_FILTER_LINEAR))
             return false;
    }
    return true;
