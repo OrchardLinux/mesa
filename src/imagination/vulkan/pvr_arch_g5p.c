@@ -749,7 +749,8 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
          if(!probe || strcmp(probe,"probe"))
             return G5P_REFUSE(cmd_buffer,"a non-linear colour target (twiddled PBE is step 7)");
          if(image->memlayout!=PVR_MEMLAYOUT_TWIDDLED || image->vk.image_type!=VK_IMAGE_TYPE_2D ||
-            iview->vk.layer_count!=1 || iview->vk.view_type!=VK_IMAGE_VIEW_TYPE_2D)
+            iview->vk.layer_count!=1 || (iview->vk.view_type!=VK_IMAGE_VIEW_TYPE_2D &&
+                                       iview->vk.view_type!=VK_IMAGE_VIEW_TYPE_2D_ARRAY))
             return G5P_REFUSE(cmd_buffer,"twiddled PBE needs a single 2D layer (3D brick slices are not qualified)");
       }
       if (!g5p_pbe_key(iview->vk.format, &key, &srgb))
@@ -793,7 +794,12 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
       if (!t) {
          if(twiddled) {
             struct pvr_image_descriptor desc;
-            const char *why=pvr_arch_g5p_pack_image_view(iview,&desc);
+            /* A one-layer array attachment is still a 2D store/restore
+             * surface. Bake its base-layer offset into a 2D LOAD view;
+             * the background uses a two-coordinate texelFetch. */
+            struct pvr_image_view load_view=*iview;
+            load_view.vk.view_type=VK_IMAGE_VIEW_TYPE_2D;
+            const char *why=pvr_arch_g5p_pack_image_view(&load_view,&desc);
             if(why)return G5P_REFUSE(cmd_buffer,"twiddled LOAD view: %s",why);
             load_state[0]=desc.words[0];load_state[1]=desc.words[1];
             load_state[2]=(uint64_t)desc.meta[0]|(uint64_t)desc.meta[1]<<32;
