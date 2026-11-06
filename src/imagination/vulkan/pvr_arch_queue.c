@@ -51,6 +51,9 @@
 #include "pvr_limits.h"
 #include "pvr_macros.h"
 #include "pvr_physical_device.h"
+#include "pvr_query.h"
+#include "pvr_buffer.h"
+#include "pvr_bo.h"
 #include "pvr_pipeline.h"
 
 #include "util/macros.h"
@@ -558,6 +561,8 @@ static VkResult pvr_process_graphics_cmd(struct pvr_device *device,
       PVR_PER_ARCH(g9p_realign_vertex_bindings)(sub_cmd);
    }
 
+   sub_cmd->job.g9p.oclqry_base = sub_cmd->query_pool ? sub_cmd->query_pool->result_buffer->dev_addr.addr : 0;
+
    {
       VkResult result = PVR_PER_ARCH(g9p_xfb_before_job)(device, cmd_buffer, sub_cmd);
 
@@ -658,12 +663,89 @@ static VkResult pvr_process_transfer_cmds(struct pvr_device *device,
    return result;
 }
 
+/*
+ * G9P: a query's reset, availability write or copy on the CPU, once every job
+ * submitted before it has retired: the fragment job writes the counters.
+ */
+static VkResult
+g9p_process_query(struct pvr_device *device, struct pvr_queue *queue, const struct pvr_query_info *info)
+{
+   for (unsigned t = 0; t < ARRAY_SIZE(queue->last_job_signal_sync); t++) {
+      struct vk_sync *s[2] = { queue->last_job_signal_sync[t], queue->next_job_wait_sync[t] };
+
+      for (unsigned i = 0; i < 2; i++) {
+         if (!s[i])
+            continue;
+         VkResult result = vk_sync_wait(&device->vk, s[i], 0, VK_SYNC_WAIT_COMPLETE, UINT64_MAX);
+
+         if (result != VK_SUCCESS)
+            return result;
+      }
+   }
+
+   switch (info->type) {
+   case PVR_QUERY_TYPE_AVAILABILITY_WRITE: {
+      const uint32_t *index = pvr_bo_suballoc_get_map_addr(info->availability_write.index_bo);
+      uint32_t *available = pvr_bo_suballoc_get_map_addr(info->availability_write.availability_bo);
+
+      for (uint32_t i = 0; i < info->availability_write.num_query_indices; i++)
+         available[index[i]] = 1;
+      break;
+   }
+   case PVR_QUERY_TYPE_RESET_QUERY_POOL: {
+      VK_FROM_HANDLE(pvr_query_pool, pool, info->reset_query_pool.query_pool);
+      uint32_t *available = pvr_bo_suballoc_get_map_addr(pool->availability_buffer);
+      uint32_t *results = pvr_bo_suballoc_get_map_addr(pool->result_buffer);
+
+      memset(available + info->reset_query_pool.first_query, 0,
+             info->reset_query_pool.query_count * sizeof(uint32_t));
+      memset(results + info->reset_query_pool.first_query, 0,
+             info->reset_query_pool.query_count * sizeof(uint32_t));
+      break;
+   }
+   case PVR_QUERY_TYPE_COPY_QUERY_RESULTS: {
+      VK_FROM_HANDLE(pvr_query_pool, pool, info->copy_query_results.query_pool);
+      VK_FROM_HANDLE(pvr_buffer, buffer, info->copy_query_results.dst_buffer);
+      const VkQueryResultFlags flags = info->copy_query_results.flags;
+      const uint32_t *available = pvr_bo_suballoc_get_map_addr(pool->availability_buffer);
+      const uint32_t *results = pvr_bo_suballoc_get_map_addr(pool->result_buffer);
+      uint8_t *dst = PVR_PER_ARCH(g9p_cpu_addr)(device, buffer->dev_addr.addr + info->copy_query_results.dst_offset);
+
+      if (!dst)
+         return vk_error(device, VK_ERROR_DEVICE_LOST);
+      for (uint32_t i = 0; i < info->copy_query_results.query_count; i++, dst += info->copy_query_results.stride) {
+         const uint32_t q = info->copy_query_results.first_query + i;
+         const uint64_t v[2] = { results[q], available[q] };
+         const bool has_value = v[1] || (flags & VK_QUERY_RESULT_PARTIAL_BIT);
+
+         for (unsigned w = 0; w < 2; w++) {
+            if (w == 0 ? !has_value : !(flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT))
+               continue;
+            if (flags & VK_QUERY_RESULT_64_BIT)
+               memcpy(dst + 8 * w, &v[w], 8);
+            else {
+               const uint32_t low = v[w];
+               memcpy(dst + 4 * w, &low, 4);
+            }
+         }
+      }
+      break;
+   }
+   default:
+      UNREACHABLE("Invalid query type");
+   }
+   return VK_SUCCESS;
+}
+
 static VkResult pvr_process_query_cmd(struct pvr_device *device,
                                       struct pvr_queue *queue,
                                       struct pvr_sub_cmd_compute *sub_cmd)
 {
    struct vk_sync *sync;
    VkResult result;
+
+   if (sub_cmd->g9p_query)
+      return g9p_process_query(device, queue, sub_cmd->g9p_query);
 
    /* TODO: Currently we add barrier event sub commands to handle the sync
     * necessary for the different query types. Would we get any speed

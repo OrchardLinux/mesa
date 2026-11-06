@@ -2155,6 +2155,10 @@ emit_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state
       memcpy(&ppp[blocks[nb - 1][0] + 1], dp->isp, sizeof(dp->isp));
    else
       g9p_ds_draw_isp(cmd_buffer, state, dp->scissor >= 0, &ppp[blocks[nb - 1][0]]);
+   /* An occlusion query counts draws; never the clears (isp_set) */
+   if (cmd_buffer->state.vis_test_enabled && !dp->isp_set && !dp->discard) {
+      ppp[blocks[nb - 1][0] + 1] |= BITFIELD_BIT(15) | cmd_buffer->state.vis_reg;
+   }
    /*
     * 4: region clip (32-pixel tiles, inclusive; mode OUTSIDE drops what lies
     * outside) and the viewport (a0 m0 a1 m1 a2 m2). The clip is the draw's
@@ -3276,7 +3280,7 @@ PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
     */
    put64(&s, job->scissor_table_addr.addr);
    put64(&s, job->depth_bias_table_addr.addr);
-   put64(&s, 0);
+   put64(&s, job->g9p.oclqry_base);
    uint64_t zlsctl = g9p_zlsctl(job), stencil_base = 0;
    uint32_t bgobjdepth = job->has_depth_attachment ? fui(job->ds_clear_value.depth) : 0x3f800000;
    uint32_t bgobjvals = 0x300;

@@ -420,6 +420,17 @@ VkResult pvr_arch_add_query_program(struct pvr_cmd_buffer *cmd_buffer,
       query_info->is_dynamic_render;
    cmd_buffer->state.current_sub_cmd->is_suspend = query_info->is_suspend;
 
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p)) {
+      struct pvr_sub_cmd_compute *sub = &cmd_buffer->state.current_sub_cmd->compute;
+
+      sub->g9p_query = vk_alloc(&cmd_buffer->vk.pool->alloc, sizeof(*query_info), 8,
+                                VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
+      if (!sub->g9p_query)
+         return vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      *sub->g9p_query = *query_info;
+      return pvr_arch_cmd_buffer_end_sub_cmd(cmd_buffer);
+   }
+
    switch (query_info->type) {
    case PVR_QUERY_TYPE_AVAILABILITY_WRITE:
       /* Adds a compute shader (fenced on the last 3D) that writes a non-zero

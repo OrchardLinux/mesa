@@ -247,6 +247,11 @@ struct pvr_sub_cmd_compute {
    bool uses_barrier;
 
    bool pds_sw_barrier_requires_clearing;
+
+   /* G9P: a query's reset, availability write or copy, which the CPU runs in
+    * queue order (no compute shaders for them here)
+    */
+   struct pvr_query_info *g9p_query;
 };
 
 struct pvr_sub_cmd_transfer {

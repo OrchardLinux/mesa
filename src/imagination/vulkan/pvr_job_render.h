@@ -151,6 +151,8 @@ struct pvr_render_job {
       /* PDS_BGRND0-3 in the Apple layout */
       uint64_t bgnd[4];
       uint32_t width, height;
+      /* ISP_OCLQRY_BASE: the occlusion query pool's counters */
+      uint64_t oclqry_base;
       /* the colour target (G9P_GRAB writes it out after the render) */
       uint64_t target_addr;
       uint32_t target_pitch;

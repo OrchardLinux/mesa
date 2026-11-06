@@ -314,6 +314,12 @@ pvr_occlusion_query_pool_get_result(struct pvr_device *device,
    const uint32_t core_count = device->pdevice->dev_runtime_info.core_count;
    uint64_t count = 0;
 
+   /* G9P: the kernel gives every pipe the same base */
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p)) {
+      *count_out = query_results[query_idx];
+      return;
+   }
+
    for (uint32_t i = 0; i < core_count; i++)
       count += query_results[pool->result_stride * i + query_idx];
 

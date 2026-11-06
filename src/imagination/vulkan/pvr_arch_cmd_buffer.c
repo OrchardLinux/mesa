@@ -159,6 +159,7 @@ static void pvr_cmd_buffer_free_sub_cmd(struct pvr_cmd_buffer *cmd_buffer,
 
       case PVR_SUB_CMD_TYPE_COMPUTE:
       case PVR_SUB_CMD_TYPE_QUERY:
+         vk_free(&cmd_buffer->vk.pool->alloc, sub_cmd->compute.g9p_query);
          pvr_csb_finish(&sub_cmd->compute.control_stream);
          break;
 
