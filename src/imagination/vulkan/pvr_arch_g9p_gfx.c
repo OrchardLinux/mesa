@@ -2939,6 +2939,11 @@ PVR_PER_ARCH(g9p_job_init)(struct pvr_cmd_buffer *cmd_buffer,
    job->g9p.eot_code = p->eot.code_offset;
    /* twice DIV_ROUND_UP(dwords, 16) at bit 9 (Apple's 0x402, 0x402, 0x802) */
    job->g9p.eot_info = eot_targets > 2 ? 0x802 : 0x402;
+   {
+      const unsigned words = g9p_render_words(info, hw_render, hw_render->eot_surface_count);
+
+      job->g9p.pixel_width = words > 4 ? 8 : words > 2 ? 4 : 2;
+   }
 
    /*
     * Background object. Load op load: the load shader with the target's own
@@ -3296,8 +3301,16 @@ PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
       put64(&s, job->g9p.bgnd[i]);
    for (unsigned i = 0; i < 6; i++)
       put64(&s, 0);     /* cluster 0 */
+   /*
+    * Pixel output: partitions from the output width, the same in 0xfd8 (without
+    * a depth buffer), 0x4070 and each core's word (PR #74's g5p_ru_fill_3d_width(),
+    * Apple's table by width; iOS record +0x6ec): 0x1d3 is width 4
+    */
+   const unsigned output_count = 0x4000 / (job->g9p.pixel_width << 10);
+   const unsigned output_code = job->g9p.pixel_width == 8 ? 0x20 : job->g9p.pixel_width == 4 ? 0x10 : 0;
+
    for (unsigned i = 0; i < 6; i++)
-      put64(&s, 0x1d3); /* cluster 1 */
+      put64(&s, output_code | (output_count - 1) << 7 | 0x43); /* cluster 1 */
    put64(&s, 0);        /* 0xfd0 */
    put32(&s, job->g9p.eot_code);
    /*
@@ -3323,8 +3336,8 @@ PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
     */
    put32(&s, job->has_depth_attachment || job->has_stencil_attachment
                 ? (job->ds.physical_extent.width - 1) | (job->ds.physical_extent.height - 1) << 15
-                : 4);
-   put32(&s, 0xf9);
+                : output_count);
+   put32(&s, output_code >> 4 | 0xf8);
    /* line rasterization (iOS 10): tan 15° / size, tan 60° / size, 16 x width */
    put32(&s, fui(t15 / w));
    put32(&s, fui(t15 / h));
