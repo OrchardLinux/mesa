@@ -295,6 +295,26 @@ bool pvr_g5p_compile_load_raw(struct pco_g5p_program *out, bool is_signed);
 struct nir_shader;
 struct nir_shader *pvr_g5p_clear_nir(bool vertex);
 struct nir_shader *pvr_g5p_clear_nir_raw(bool vertex, bool is_signed);
+
+/* The 32-bit integer colour targets the raw32 output renders (pco_g5p's PCO_G5P_COLOR_UINT32/SINT32: four raw
+ * output words, no f16 conversion): 1 unsigned, 2 signed, 0 any other format. The PBE stores the target's own
+ * channels (one, two or four 32-bit words of a pixel) from the first output words. */
+static inline unsigned
+pvr_g5p_raw32_kind(VkFormat format)
+{
+   switch (format) {
+   case VK_FORMAT_R32_UINT:
+   case VK_FORMAT_R32G32_UINT:
+   case VK_FORMAT_R32G32B32A32_UINT:
+      return 1;
+   case VK_FORMAT_R32_SINT:
+   case VK_FORMAT_R32G32_SINT:
+   case VK_FORMAT_R32G32B32A32_SINT:
+      return 2;
+   default:
+      return 0;
+   }
+}
 void pvr_g5p_clear_nir_free(struct nir_shader *nir);
 /* A vertex stage whose SPIR-V declares ExecutionMode Xfb */
 bool pvr_g5p_stage_has_xfb(const VkPipelineShaderStageCreateInfo *stage_info);
