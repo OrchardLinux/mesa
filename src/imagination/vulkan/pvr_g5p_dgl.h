@@ -23,6 +23,8 @@ size_t pvr_g5p_dgl_output(uint8_t *output, size_t capacity,
                          const struct pvr_g5p_dgl_source sources[4], unsigned write_mask);
 /* Background clear: raw common-store dwords, no float conversion. */
 size_t pvr_g5p_dgl_clear(uint8_t *output, size_t capacity);
+size_t pvr_g5p_dgl_output_words(uint8_t *output, size_t capacity, const struct pvr_g5p_dgl_source *sources,
+                                unsigned words, unsigned write_mask);
 size_t pvr_g5p_dgl_clear_words(uint8_t *output, size_t capacity, unsigned words);
 void pvr_g5p_dgl_clear_pack(uint32_t output[4], const uint32_t input[4], bool uint16);
 #endif

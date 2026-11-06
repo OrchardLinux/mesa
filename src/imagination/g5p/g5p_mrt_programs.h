@@ -69,8 +69,11 @@ static inline uint32_t g5p_mrt_restore1(unsigned n)
 }
 
 /* The PBE block: target t's three qwords at dword 8t, its output-half offset
- * at dword 8t + 6, 0xffffffff at dword 8t + 7 except after the last. */
-static inline unsigned g5p_mrt_pbe_block(uint32_t *out, unsigned n, const uint64_t pbe[][3])
+ * at dword 8t + 6, 0xffffffff at dword 8t + 7 except after the last.
+ * halves: output halves per target, 4 for an 8-bit RGBA target (two packed
+ * f16x2 dwords), 8 for a 32-bit integer target of the raw32 output (four
+ * raw words, so target 1 starts at output dword 4). */
+static inline unsigned g5p_mrt_pbe_block_halves(uint32_t *out, unsigned n, const uint64_t pbe[][3], unsigned halves)
 {
    for (unsigned t = 0; t < n; t++) {
       uint32_t *w = out + G5P_MRT_PBE_STRIDE * t;
@@ -78,11 +81,15 @@ static inline unsigned g5p_mrt_pbe_block(uint32_t *out, unsigned n, const uint64
          w[2 * q] = (uint32_t)pbe[t][q];
          w[2 * q + 1] = (uint32_t)(pbe[t][q] >> 32);
       }
-      w[6] = 4 * t;
+      w[6] = halves * t;
       if (t + 1 < n)
          w[7] = 0xffffffff;
    }
    return g5p_mrt_pbe_dwords(n);
+}
+static inline unsigned g5p_mrt_pbe_block(uint32_t *out, unsigned n, const uint64_t pbe[][3])
+{
+   return g5p_mrt_pbe_block_halves(out, n, pbe, 4);
 }
 
 /* The clear program. Returns its size, 16 * 4N + 6. */

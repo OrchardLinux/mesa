@@ -224,11 +224,12 @@ g5p_free_programs(struct pvr_device *device, struct pvr_g5p_programs *p)
          vk_free(&device->vk.alloc, p->raw_load[i]);
       }
    }
-   for (unsigned i = 0; i < 2; i++) {
+   for (unsigned i = 0; i < ARRAY_SIZE(p->raw_clear_usc); i++) {
       pvr_bo_suballoc_free(p->raw_clear_usc[i]);
       pvr_bo_suballoc_free(p->raw_clear_kick[i].pvr_bo);
    }
-   pvr_bo_suballoc_free(p->raw_eot_usc);
+   for (unsigned i = 0; i < ARRAY_SIZE(p->raw_eot_usc); i++)
+      pvr_bo_suballoc_free(p->raw_eot_usc[i]);
    pvr_bo_suballoc_free(p->halt.pvr_bo);
    pvr_bo_suballoc_free(p->clear_dma.pvr_bo);
    pvr_bo_suballoc_free(p->eot.pvr_bo);
@@ -315,13 +316,21 @@ g5p_upload_zeroed(struct pvr_device *device, uint32_t size, struct pvr_suballoc_
 /* The programs of pvr_g5p_programs, uploaded into the device's PDS and USC
  * heaps (64-byte aligned USC code, as the end-of-tile program's branch to the
  * next 64-byte boundary assumes). */
-/* Called only for an integer pass; qualification uses FORMATS=probe. */
+/* The raw clear program's variant: total output words 2, 4 or 8 */
+static unsigned
+g5p_raw_variant(unsigned words)
+{
+   return words == 8 ? 2 : words == 4;
+}
+
+/* Called only for an integer pass; qualification uses FORMATS=probe.
+ * words: the pass's total output words; targets: 1, or 2 raw32 targets. */
 static VkResult
-g5p_raw_programs_unlocked(struct pvr_device *device, unsigned raw, unsigned words)
+g5p_raw_programs_unlocked(struct pvr_device *device, unsigned raw, unsigned words, unsigned targets)
 {
    struct pvr_g5p_programs *p = &device->g5p->programs;
    VkResult result;
-   const unsigned variant = words == 4;
+   const unsigned variant = g5p_raw_variant(words);
    if (!p->raw_clear_usc[variant]) {
       uint8_t code[6 * G5P_USC_MAX];
       size_t size = pvr_g5p_dgl_clear_words(code, sizeof(code), words);
@@ -336,10 +345,10 @@ g5p_raw_programs_unlocked(struct pvr_device *device, unsigned raw, unsigned word
       if (result != VK_SUCCESS)
          return result;
    }
-   if (!p->raw_eot_usc) {
+   if (!p->raw_eot_usc[targets - 1]) {
       uint8_t code[G5P_MRT_EOT_USC_MAX];
-      const unsigned size = g5p_mrt_eot_usc_mode(code, 1, true);
-      result = pvr_gpu_upload_usc(device, code, size, 64, &p->raw_eot_usc);
+      const unsigned size = g5p_mrt_eot_usc_mode(code, targets, true);
+      result = pvr_gpu_upload_usc(device, code, size, 64, &p->raw_eot_usc[targets - 1]);
       if (result != VK_SUCCESS)
          return result;
    }
@@ -355,10 +364,10 @@ g5p_raw_programs_unlocked(struct pvr_device *device, unsigned raw, unsigned word
 }
 
 static VkResult
-g5p_raw_programs(struct pvr_device *device, unsigned raw, unsigned words)
+g5p_raw_programs(struct pvr_device *device, unsigned raw, unsigned words, unsigned targets)
 {
    simple_mtx_lock(&device->g5p->clear_lock);
-   VkResult result = g5p_raw_programs_unlocked(device, raw, words);
+   VkResult result = g5p_raw_programs_unlocked(device, raw, words, targets);
    simple_mtx_unlock(&device->g5p->clear_lock);
    return result;
 }
@@ -664,14 +673,18 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
     * target's channels (pvr_g5p_raw32_kind()); RGBA16UI clears: five (below) */
    raw = pvr_g5p_raw32_kind(first_format);
    if (first_format == VK_FORMAT_R16G16B16A16_UINT) raw = 5;
+   /* output words per target, and of the pass: two raw32 targets of one format (admitted by
+    * pvr_arch_g5p_mrt_pass_check(), behind the format probe) take four each, eight in all */
    const unsigned raw_words = raw <= 2 ? 4 : 2;
+   const unsigned raw_total = raw_words * n;
    if (raw) {
-      if (n != 1 || g->samples != 1)
-         return G5P_REFUSE(cmd_buffer, "integer pass requires one single-sample target");
-      VkResult result = g5p_raw_programs(device, raw, raw_words);
+      if (!(n == 1 || (n == 2 && raw <= 2)) || g->samples != 1)
+         return G5P_REFUSE(cmd_buffer, "integer pass requires one single-sample target, or two 32-bit integer "
+                           "targets of one format");
+      VkResult result = g5p_raw_programs(device, raw, raw_total, n);
       if (result != VK_SUCCESS)
          return result;
-      g->raw_words = raw_words;
+      g->raw_words = raw_total;
    }
    float clear[4][4] = { { 0 } };
    /* a loaded target: its texture state (q0, q1, q2, 0), the load program's image upload */
@@ -732,8 +745,9 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
          }
       }
       if (raw && getenv("PVR_G5P_DGL_LOG"))
-         fprintf(stderr, "DGL-PBE words=%u source=uint-raw key=%08x store_key=%08x state=%016" PRIx64 ",%016" PRIx64 ",%016" PRIx64 "\n",
-                 raw_words, key, store_key, pbe[t][0], pbe[t][1], pbe[t][2]);
+         fprintf(stderr, "DGL-PBE target=%u/%u words=%u total=%u source_half=%u source=uint-raw key=%08x store_key=%08x "
+                 "state=%016" PRIx64 ",%016" PRIx64 ",%016" PRIx64 "\n",
+                 t, n, raw_words, raw_total, 2 * raw_words * t, key, store_key, pbe[t][0], pbe[t][1], pbe[t][2]);
       if (!t)
          pvr_g5p_tex_linear(load_state, key, srgb, addr, iview->vk.extent.width, iview->vk.extent.height,
                             level->pitch);
@@ -787,7 +801,9 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
    }
    struct pvr_suballoc_bo *floats, *block;
    uint32_t pbe_words[G5P_MRT_PBE_STRIDE * G5P_MRT_MAX];
-   const unsigned pbe_dwords = g5p_mrt_pbe_block(pbe_words, n, (const uint64_t(*)[3])pbe);
+   /* each target's source: output half 4t (8-bit RGBA, two dwords), 8t (raw32, four words) */
+   const unsigned pbe_dwords = g5p_mrt_pbe_block_halves(pbe_words, n, (const uint64_t(*)[3])pbe,
+                                                        raw ? 2 * raw_words : 4);
    VkResult result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, clear, 16 * n, &floats);
    if (result != VK_SUCCESS)
       return result;
@@ -798,7 +814,7 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
    struct pvr_pds_upload clear_data, eot_data;
    {
       const uint32_t data[4] = { (uint32_t)floats->dev_addr.addr, (uint32_t)(floats->dev_addr.addr >> 32),
-                                 raw ? g5p_doutd_control_at(0, raw_words, true) : g5p_doutd_control(G5P_MRT_CLEAR_DWORDS * n), 0 };
+                                 raw ? g5p_doutd_control_at(0, raw_total, true) : g5p_doutd_control(G5P_MRT_CLEAR_DWORDS * n), 0 };
       result = pvr_arch_cmd_buffer_upload_pds(cmd_buffer, data, ARRAY_SIZE(data), 16, NULL, 0, 0, 16,
                                               &clear_data);
       if (result != VK_SUCCESS)
@@ -806,7 +822,7 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
    }
    {
       /* a 4x store's end of tile emits per sample (pvr_g5p_msaa_eot_usc()); a resolve keeps the 1x one */
-      const struct pvr_suballoc_bo *eot_usc = raw ? p->raw_eot_usc : g->samples == 4 && !g->msaa_resolve ? p->eot_usc_ms : p->eot_usc[v];
+      const struct pvr_suballoc_bo *eot_usc = raw ? p->raw_eot_usc[n - 1] : g->samples == 4 && !g->msaa_resolve ? p->eot_usc_ms : p->eot_usc[v];
       const uint64_t doutu = g5p_doutu_src0(g5p_usc_off(device, eot_usc), G5P_TEMPS);
       const uint32_t data[8] = { (uint32_t)block->dev_addr.addr, (uint32_t)(block->dev_addr.addr >> 32),
                                  g5p_doutd_control(pbe_dwords), 0, (uint32_t)doutu, (uint32_t)(doutu >> 32),
@@ -825,7 +841,7 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
          return result;
    } else {
       pvr_csb_pack (&bgnd[0], CR_PDS_BGRND0_BASE, b0) {
-         b0.shader_addr = PVR_DEV_ADDR(raw ? p->raw_clear_kick[raw_words == 4].data_offset : g->samples == 4 ? p->clear_kick_ms.data_offset
+         b0.shader_addr = PVR_DEV_ADDR(raw ? p->raw_clear_kick[g5p_raw_variant(raw_total)].data_offset : g->samples == 4 ? p->clear_kick_ms.data_offset
                                                      : p->clear_kick[v].data_offset);
          b0.texunicode_addr = PVR_DEV_ADDR(p->clear_dma.code_offset);
       }
@@ -834,7 +850,7 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
       }
       pvr_csb_pack (&bgnd[3], CR_PDS_BGRND3_SIZEINFO, b3) {
          b3.pds_uniformsize = DIV_ROUND_UP(4, ROGUE_CR_PDS_BGRND3_SIZEINFO_PDS_UNIFORMSIZE_UNIT_SIZE);
-         b3.usc_sharedsize = DIV_ROUND_UP(raw ? raw_words : G5P_MRT_CLEAR_DWORDS * n,
+         b3.usc_sharedsize = DIV_ROUND_UP(raw ? raw_total : G5P_MRT_CLEAR_DWORDS * n,
                                           ROGUE_CR_PDS_BGRND3_SIZEINFO_USC_SHAREDSIZE_UNIT_SIZE);
       }
    }

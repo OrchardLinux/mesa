@@ -4566,7 +4566,14 @@ static bool out_const(struct gctx *c, unsigned k, uint16_t *h)
 static void plan_fs_output(struct gctx *c)
 {
    if (c->key->color_output != PCO_G5P_COLOR_F16) {
-      c->mrt.words = c->mrt.emit_field = c->mrt.pixel_output_width = 4;
+      /* four raw words per target: 4, or 8 for two targets (emitpix field 0, Apple's 4-target width) */
+      if (c->mrt.targets > 1) { /* one emitpix writes both targets: both need their stores */
+         enum g5p_mrt_refusal mr = g5p_mrt_check_writes(&c->mrt, c->slot_written);
+         if (mr != G5P_MRT_OK)
+            refuse(c, "%s", g5p_mrt_refusal_str(mr));
+      }
+      c->mrt.words = c->mrt.pixel_output_width = 4 * c->mrt.targets;
+      c->mrt.emit_field = g5p_mrt_emit_field(c->mrt.words);
       return; /* No narrow f16 loads, output ALU fusion, or f16 constants. */
    }
    enum g5p_mrt_refusal mr = g5p_mrt_check_writes(&c->mrt, c->slot_written);
@@ -4693,9 +4700,11 @@ static void fs_output(struct gctx *c)
    fs_discards(c);
    c->now = LAST_END;
    if (c->key->color_output != PCO_G5P_COLOR_F16) {
-      struct pvr_g5p_dgl_source sources[4] = {0};
-      for (unsigned k = 0; k < 4; k++) {
-         if (!(c->key->write_mask & (1u << k)) || !c->out_written[k]) {
+      /* target t's channels: output words 4t..4t+3 (c->out[] is indexed 4 * slot + component) */
+      const unsigned words = 4 * c->mrt.targets;
+      struct pvr_g5p_dgl_source sources[8] = {0};
+      for (unsigned k = 0; k < words; k++) {
+         if (!(c->key->write_mask & (1u << (k % 4))) || !c->out_written[k]) {
             sources[k].immediate = true; /* undefined component: choose zero */
             continue;
          }
@@ -4708,16 +4717,16 @@ static void fs_output(struct gctx *c)
             sources[k].value = reg_of(c, r, "raw integer output");
             sources[k].group = vgrp(c, r);
             /* A repeated component must survive earlier output moves. */
-            for (unsigned j = k + 1; j < 4; j++)
+            for (unsigned j = k + 1; j < words; j++)
                if (c->out_written[j] && c->out[j].def == r.def && c->out[j].comp == r.comp)
                   sources[k].group = 0;
          }
       }
-      uint8_t code[6 * G5P_USC_MAX];
-      size_t size = pvr_g5p_dgl_output(code, sizeof(code), sources, c->key->write_mask);
+      uint8_t code[10 * G5P_USC_MAX];
+      size_t size = pvr_g5p_dgl_output_words(code, sizeof(code), sources, words, c->key->write_mask);
       if (!size)
          refuse(c, "raw integer output source cannot be encoded");
-      put(c, code, size, "raw integer output and emitpix4");
+      put(c, code, size, "raw integer output and emitpix");
       free_scratch(c);
       return;
    }
@@ -6119,8 +6128,9 @@ bool pco_g5p_compile_general_link(nir_shader *nir, bool half_output, const uint8
          if (c->key->color_output != PCO_G5P_COLOR_UINT32 &&
              c->key->color_output != PCO_G5P_COLOR_SINT32)
             refuse(c, "unknown colour output format");
-         if (c->mrt.targets != 1 || c->key->blend)
-            refuse(c, "raw32 output needs one unblended target");
+         /* two targets: eight output words, the most one emitpix carries */
+         if (c->mrt.targets > 2 || c->key->blend)
+            refuse(c, "raw32 output needs one or two unblended targets (four words each, at most eight)");
       } else {
          apply_fs_key(c, nir, c->key);
       }

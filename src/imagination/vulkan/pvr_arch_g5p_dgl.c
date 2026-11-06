@@ -10,13 +10,16 @@
 #include "g5p_usc.h"
 #include <string.h>
 
+/* words: 4 for one 32-bit integer target, 8 for two (target t's channels in
+ * output words 4t..4t+3, one emitpix of all eight: the width of Apple's
+ * 4-target pass). Two targets take the full write mask only. */
 size_t
-pvr_g5p_dgl_output(uint8_t *output, size_t capacity,
-                    const struct pvr_g5p_dgl_source sources[4], unsigned write_mask)
+pvr_g5p_dgl_output_words(uint8_t *output, size_t capacity, const struct pvr_g5p_dgl_source *sources,
+                         unsigned words, unsigned write_mask)
 {
-   uint8_t code[6 * G5P_USC_MAX];
+   uint8_t code[10 * G5P_USC_MAX];
    size_t size = 0;
-   if (!output || !sources || write_mask > 0xf)
+   if (!output || !sources || write_mask > 0xf || (words != 4 && words != 8) || (words == 8 && write_mask != 0xf))
       return 0;
    if (write_mask != 0xf) {
       /* RGBA32 tile storage is four words. Preserve unmasked raw channels;
@@ -25,8 +28,8 @@ pvr_g5p_dgl_output(uint8_t *output, size_t capacity,
       size += g5p_usc_tile_read(code + size, 0, 4);
       size += g5p_usc_wait(code + size, 0);
    }
-   for (unsigned c = 0; c < 4; c++) {
-      if (!(write_mask & (1u << c)))
+   for (unsigned c = 0; c < words; c++) {
+      if (!(write_mask & (1u << (c % 4))))
          continue;
       const struct pvr_g5p_dgl_source *s = &sources[c];
       unsigned n;
@@ -43,7 +46,7 @@ pvr_g5p_dgl_output(uint8_t *output, size_t capacity,
          return 0;
       size += n;
    }
-   unsigned n = g5p_usc_emit_mrt(code + size, 4, 0);
+   unsigned n = g5p_usc_emit_mrt(code + size, words, 0);
    if (!n)
       return 0;
    size += n;
@@ -54,6 +57,13 @@ pvr_g5p_dgl_output(uint8_t *output, size_t capacity,
    return size;
 }
 
+size_t
+pvr_g5p_dgl_output(uint8_t *output, size_t capacity,
+                    const struct pvr_g5p_dgl_source sources[4], unsigned write_mask)
+{
+   return pvr_g5p_dgl_output_words(output, capacity, sources, 4, write_mask);
+}
+
 /* Background objects have a distinct ABI from ordinary fragment uniforms:
  * their DOUTD supplies common0 onward. Apple A9 builtin compiler witnesses
  * use descending common3..0 for RGBA32 and common1..0 for RG32.
@@ -61,9 +71,10 @@ pvr_g5p_dgl_output(uint8_t *output, size_t capacity,
 size_t
 pvr_g5p_dgl_clear_words(uint8_t *output, size_t capacity, unsigned words)
 {
-   uint8_t code[6 * G5P_USC_MAX];
+   uint8_t code[10 * G5P_USC_MAX];
    size_t size = 0;
-   if (words != 2 && words != 4)
+   /* 8: two 32-bit integer targets, common 7..0 into output words 7..0 */
+   if (words != 2 && words != 4 && words != 8)
       return 0;
    for (int c = words - 1; c >= 0; c--)
       size += g5p_usc_mov_shared(code + size, 2 * c, c, 0);

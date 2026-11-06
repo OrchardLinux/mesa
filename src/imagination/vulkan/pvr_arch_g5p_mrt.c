@@ -19,6 +19,8 @@
 #include "g5p_mrt_out.h"
 #include "pvr_cmd_buffer.h"
 #include "pvr_device.h"
+#include "pvr_g5p.h"
+#include "pvr_g5p_formats.h"
 #include "pvr_g5p_mrt.h"
 #include "pvr_hw_pass.h"
 #include "pvr_image.h"
@@ -27,6 +29,28 @@
 #define G5P_MRT_REFUSE(obj, ...)                                                                                   \
    (fprintf(stderr, "G5P refuses: " __VA_ARGS__), fprintf(stderr, "\n"),                                          \
     vk_errorf((obj), VK_ERROR_FEATURE_NOT_PRESENT, "G5P: " __VA_ARGS__))
+
+/* Two 32-bit integer targets of one format (dEQP's ShaderExecutor: a mat2xN
+ * output's columns, modf's two results): the raw32 output's four words each,
+ * eight in one emitpix, the width of Apple's 4-target pass; each target's PBE
+ * reads its four words from output half 8t (pvr_arch_g5p.c). Both halves are
+ * device-proven apart (raw32 from half 0, 8-bit RGBA from half 8), the pair is
+ * not: behind PVR_G5P_FORMATS=probe until a device run. 0: not such a pair,
+ * 1: a pair, -1: a pair without the probe. */
+static int
+g5p_mrt_raw32_pair(unsigned n, VkFormat f0, VkFormat ft)
+{
+   if (n != 2 || !pvr_g5p_raw32_kind(f0) || ft != f0)
+      return 0;
+   return pvr_g5p_formats_probe() ? 1 : -1;
+}
+
+/* Four 32-bit integer targets: 16 output words, twice what one emitpix carries */
+#define G5P_MRT_RAW32_WIDE "32-bit integer targets take four output words each and one emitpix carries at most eight " \
+                           "(two targets)"
+
+#define G5P_MRT_RAW32_PROBE "two 32-bit integer targets render only behind PVR_G5P_FORMATS=probe (not yet run on " \
+                            "the device)"
 
 VkResult
 PVR_PER_ARCH(g5p_mrt_pipeline_check)(struct pvr_device *device, unsigned n, const VkFormat *formats)
@@ -40,6 +64,15 @@ PVR_PER_ARCH(g5p_mrt_pipeline_check)(struct pvr_device *device, unsigned n, cons
    if (r != G5P_MRT_OK)
       return G5P_MRT_REFUSE(device, "%u colour attachments: %s", n, g5p_mrt_refusal_str(r));
    for (unsigned i = 0; i < n; i++) {
+      const int pair = g5p_mrt_raw32_pair(n, formats[0], formats[i]);
+      if (pair < 0)
+         return G5P_MRT_REFUSE(device, "colour attachment %u of %u is %s: %s", i, n, vk_Format_to_str(formats[i]),
+                               G5P_MRT_RAW32_PROBE);
+      if (pair)
+         continue;
+      if (n > 2 && pvr_g5p_raw32_kind(formats[i]))
+         return G5P_MRT_REFUSE(device, "%u colour attachments of %s: %s", n, vk_Format_to_str(formats[i]),
+                               G5P_MRT_RAW32_WIDE);
       if (!pvr_g5p_mrt_format_ok(formats[i]) || formats[i] != formats[0])
          return G5P_MRT_REFUSE(device, "colour attachment %u of %u is %s, attachment 0 %s: %s", i, n,
                                vk_Format_to_str(formats[i]), vk_Format_to_str(formats[0]),
@@ -81,7 +114,14 @@ PVR_PER_ARCH(g5p_mrt_pass_check)(struct pvr_cmd_buffer *cmd_buffer,
       iview[t] = info->attachments[idx];
       const struct pvr_image *image = pvr_image_view_get_image(iview[t]);
 
-      if (!pvr_g5p_mrt_format_ok(iview[t]->vk.format) || iview[t]->vk.format != iview[0]->vk.format)
+      const int pair = g5p_mrt_raw32_pair(n, iview[0]->vk.format, iview[t]->vk.format);
+      if (pair < 0)
+         return G5P_MRT_REFUSE(cmd_buffer, "colour target %u of %u is %s: %s", t, n,
+                               vk_Format_to_str(iview[t]->vk.format), G5P_MRT_RAW32_PROBE);
+      if (!pair && n > 2 && pvr_g5p_raw32_kind(iview[t]->vk.format))
+         return G5P_MRT_REFUSE(cmd_buffer, "%u colour targets of %s: %s", n, vk_Format_to_str(iview[t]->vk.format),
+                               G5P_MRT_RAW32_WIDE);
+      if (!pair && (!pvr_g5p_mrt_format_ok(iview[t]->vk.format) || iview[t]->vk.format != iview[0]->vk.format))
          return G5P_MRT_REFUSE(cmd_buffer, "colour target %u of %u is %s, target 0 %s: %s", t, n,
                                vk_Format_to_str(iview[t]->vk.format), vk_Format_to_str(iview[0]->vk.format),
                                g5p_mrt_refusal_str(G5P_MRT_MIXED_FORMATS));
