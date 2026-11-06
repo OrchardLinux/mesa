@@ -124,6 +124,7 @@ struct g9p_shader {
     */
    unsigned num_varyings;
    bool varying_perspective[G9P_MAX_VARYINGS];
+   bool varying_flat[G9P_MAX_VARYINGS];
    /* Vertex: output dwords (4 + 4 x num_varyings) */
    unsigned num_outputs;
 

@@ -463,22 +463,34 @@ upload_varyings(struct pvr_device *device, struct pvr_g9p_graphics_state *state,
    if (!n)
       return VK_SUCCESS;
 
-   for (unsigned v = 0; v < n; v++) {
-      const bool persp = v >= fs->num_varyings || fs->varying_perspective[v];
-      const unsigned loc = 2 + 8 * v;
-
-      data[2 + 2 * v] = 0x03000000 | (3u << 2 | persp) << 16 | loc << 8 | loc |
-                        (fs->uses_point_coord && v == fs->point_coord_slot ? BITFIELD_BIT(23) : 0);
-      data[3 + 2 * v] = (persp ? BITFIELD_BIT(22) : 0) | (2 * v) << 23 |
-                        (v + 1 == n ? BITFIELD_BIT(31) : 0);
-   }
+   for (unsigned v = 0; v < MIN2(n, fs->num_varyings); v++)
+      state->flat_varyings |= fs->varying_flat[v];
    for (unsigned v = 0; v <= n; v++)
       code[nc++] = g9p_pds_dout(G9P_DOUTI, v, G9P_PDS_DATA, 0, v == n ? G9P_PDS_END : 0);
    code[nc++] = g9p_pds_halt();
-
    state->varying_units = DIV_ROUND_UP(8 * (n + 1), 16);
-   return pvr_gpu_upload_pds(device, data, 2 * (n + 1), 16, code, nc, 16, 64,
-                             &state->varyings);
+
+   for (unsigned pv = 0; pv < (state->flat_varyings ? 3 : 1); pv++) {
+      VkResult result;
+
+      for (unsigned v = 0; v < n; v++) {
+         const bool read = v < fs->num_varyings;
+         const bool flat = read && fs->varying_flat[v];
+         const bool persp = !read || (fs->varying_perspective[v] && !flat);
+         const unsigned loc = 2 + 8 * v;
+
+         /* top byte: the shade model, 3 Gouraud or the flat colour's vertex */
+         data[2 + 2 * v] = (flat ? pv : 3u) << 24 | (3u << 2 | persp) << 16 | loc << 8 | loc |
+                           (fs->uses_point_coord && v == fs->point_coord_slot ? BITFIELD_BIT(23) : 0);
+         data[3 + 2 * v] = (persp ? BITFIELD_BIT(22) : 0) | (2 * v) << 23 |
+                           (v + 1 == n ? BITFIELD_BIT(31) : 0);
+      }
+      result = pvr_gpu_upload_pds(device, data, 2 * (n + 1), 16, code, nc, 16, 64,
+                                  &state->varyings[pv]);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+   return VK_SUCCESS;
 }
 
 static VkResult
@@ -661,7 +673,7 @@ g9p_compile_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo 
       dump16("fs usc", usc_offset(device, state->fs_bo), fs.code, fs.code_size / 2);
       dump_pds("vs kick", &state->vs_kick);
       dump_pds("fs kick", &state->fs_kick);
-      dump_pds("varyings", &state->varyings);
+      dump_pds("varyings", &state->varyings[0]);
    }
 
 out:
@@ -701,8 +713,10 @@ PVR_PER_ARCH(g9p_graphics_pipeline_compile)(struct pvr_device *device,
 static void
 g9p_state_destroy(struct pvr_g9p_graphics_state *state)
 {
-   if (state->varyings.pvr_bo)
-      pvr_bo_suballoc_free(state->varyings.pvr_bo);
+   for (unsigned i = 0; i < ARRAY_SIZE(state->varyings); i++) {
+      if (state->varyings[i].pvr_bo)
+         pvr_bo_suballoc_free(state->varyings[i].pvr_bo);
+   }
    if (state->fs_kick.pvr_bo)
       pvr_bo_suballoc_free(state->fs_kick.pvr_bo);
    if (state->vs_kick.pvr_bo)
@@ -1649,6 +1663,22 @@ vs_max_instances(unsigned regs)
    return n >= 32 ? 0 : n;
 }
 
+/* The DOUTI program whose flat varyings take the draw's provoking vertex (as Rogue's) */
+static const struct pvr_pds_upload *
+varyings_for_draw(const struct pvr_cmd_buffer *cmd_buffer,
+                  const struct pvr_g9p_graphics_state *state)
+{
+   const struct vk_dynamic_graphics_state *dyn = &cmd_buffer->vk.dynamic_graphics_state;
+
+   if (!state->flat_varyings)
+      return &state->varyings[0];
+   if (dyn->rs.provoking_vertex == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT)
+      return &state->varyings[2];
+   if (dyn->ia.primitive_topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN)
+      return &state->varyings[1];
+   return &state->varyings[0];
+}
+
 static VkResult
 emit_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state *state,
           const struct g9p_draw_programs *dp, const struct pvr_g9p_draw *draw,
@@ -1701,7 +1731,8 @@ emit_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state
                        g9p_is_line(cmd_buffer->vk.dynamic_graphics_state.ia.primitive_topology)
                     ? BITFIELD_BIT(14)
                     : 0),
-             state->num_varyings ? state->varyings.data_offset : p->halt.code_offset);
+             state->num_varyings ? varyings_for_draw(cmd_buffer, state)->data_offset
+                                 : p->halt.code_offset);
    /* 1b: PDS state pointer 3: the texture/buffer program's data */
    if (tex)
       PPP_BLOCK(0x200, tex->data_offset);

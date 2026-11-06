@@ -223,6 +223,18 @@ g9p_tg_load(struct g9p_code *c, unsigned dst, unsigned word)
             0x0200 | (word >> 8));
 }
 
+/*
+ * dst = flat varying component @comp (4 per varying in the DOUTI program's
+ * order), the provoking vertex's value bit for bit; follow with g9p_wait().
+ */
+static inline void
+g9p_flat_load(struct g9p_code *c, unsigned dst, unsigned comp)
+{
+   const unsigned at = 4 * comp + 2;
+
+   G9P_EMIT(c, 0x2314, 0x0100 | 2 * dst, 0x0100 | (at & 0xff), 0x0200 | (at >> 8));
+}
+
 /* Wait for outstanding loads */
 static inline void
 g9p_wait(struct g9p_code *c)

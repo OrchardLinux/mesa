@@ -736,7 +736,7 @@ only_tex_uses(nir_def *def)
    return true;
 }
 
-static int varying_component(nir_scalar s);
+static int varying_component(const struct g9p_ctx *ctx, nir_scalar s);
 
 /*
  * vecN: no code when only texture coordinates read straight from two
@@ -755,9 +755,9 @@ emit_vec(struct g9p_ctx *ctx, nir_alu_instr *alu)
         nir_def_as_intrinsic(s0.def)->intrinsic == nir_intrinsic_vulkan_resource_index))
       return true;
    if (only_tex_uses(&alu->def) && alu->def.num_components >= 2 &&
-       varying_component(nir_get_scalar(&alu->def, 0)) >= 0 &&
-       varying_component(nir_get_scalar(&alu->def, 1)) ==
-          varying_component(nir_get_scalar(&alu->def, 0)) + 1) {
+       varying_component(ctx, nir_get_scalar(&alu->def, 0)) >= 0 &&
+       varying_component(ctx, nir_get_scalar(&alu->def, 1)) ==
+          varying_component(ctx, nir_get_scalar(&alu->def, 0)) + 1) {
       release(ctx, &alu->instr);
       return true;
    }
@@ -1350,11 +1350,12 @@ emit_varying_load(struct g9p_ctx *ctx, nir_intrinsic_instr *intr, bool persp)
               gl_varying_slot_name_for_stage(sem.location, MESA_SHADER_FRAGMENT));
       return false;
    }
+   persp = persp && !ctx->out->varying_flat[n];
    ctx->out->num_varyings = MAX2(ctx->out->num_varyings, n + 1);
    ctx->out->varying_perspective[n] = persp;
    /* read only as a sample's coordinates: those are iterated straight to the sampler */
    {
-      bool straight = !nir_def_is_unused(&intr->def);
+      bool straight = !nir_def_is_unused(&intr->def) && !ctx->out->varying_flat[n];
 
       nir_foreach_use_including_if(src, &intr->def) {
          nir_alu_instr *alu;
@@ -1365,9 +1366,9 @@ emit_varying_load(struct g9p_ctx *ctx, nir_intrinsic_instr *intr, bool persp)
          }
          alu = nir_instr_as_alu(nir_src_use_instr(src));
          if (!nir_op_is_vec(alu->op) || alu->def.num_components < 2 ||
-             !only_tex_uses(&alu->def) || varying_component(nir_get_scalar(&alu->def, 0)) < 0 ||
-             varying_component(nir_get_scalar(&alu->def, 1)) !=
-                varying_component(nir_get_scalar(&alu->def, 0)) + 1) {
+             !only_tex_uses(&alu->def) || varying_component(ctx, nir_get_scalar(&alu->def, 0)) < 0 ||
+             varying_component(ctx, nir_get_scalar(&alu->def, 1)) !=
+                varying_component(ctx, nir_get_scalar(&alu->def, 0)) + 1) {
             straight = false;
             break;
          }
@@ -1378,7 +1379,10 @@ emit_varying_load(struct g9p_ctx *ctx, nir_intrinsic_instr *intr, bool persp)
    r = alloc_reg(ctx);
    if (r < 0)
       return false;
-   g9p_iterate(ctx->c, r, 4 * n + nir_intrinsic_component(intr), 1, persp);
+   if (ctx->out->varying_flat[n])
+      g9p_flat_load(ctx->c, r, 4 * n + nir_intrinsic_component(intr));
+   else
+      g9p_iterate(ctx->c, r, 4 * n + nir_intrinsic_component(intr), 1, persp);
    g9p_wait(ctx->c);
    ctx->reg[key(&intr->def, 0)] = r;
    return true;
@@ -1665,7 +1669,7 @@ tex_sampler_dword(const struct g9p_ctx *ctx, unsigned slot)
 
 /* The varying component an SSA scalar is a plain load of, or -1 */
 static int
-varying_component(nir_scalar s)
+varying_component(const struct g9p_ctx *ctx, nir_scalar s)
 {
    nir_intrinsic_instr *intr;
    nir_io_semantics sem;
@@ -1678,7 +1682,8 @@ varying_component(nir_scalar s)
        intr->intrinsic != nir_intrinsic_load_input)
       return -1;
    sem = nir_intrinsic_io_semantics(intr);
-   if (sem.location < VARYING_SLOT_VAR0 || sem.location >= VARYING_SLOT_VAR0 + G9P_MAX_VARYINGS)
+   if (sem.location < VARYING_SLOT_VAR0 || sem.location >= VARYING_SLOT_VAR0 + G9P_MAX_VARYINGS ||
+       ctx->out->varying_flat[sem.location - VARYING_SLOT_VAR0])
       return -1;
    return 4 * (sem.location - VARYING_SLOT_VAR0) + nir_intrinsic_component(intr) + s.comp;
 }
@@ -2036,8 +2041,8 @@ emit_tex(struct g9p_ctx *ctx, nir_tex_instr *tex)
       fprintf(stderr, "g9p: only plain 2D samples of combined image samplers so far\n");
       return false;
    }
-   first = varying_component(nir_get_scalar(tex->src[ci].src.ssa, 0));
-   second = varying_component(nir_get_scalar(tex->src[ci].src.ssa, 1));
+   first = varying_component(ctx, nir_get_scalar(tex->src[ci].src.ssa, 0));
+   second = varying_component(ctx, nir_get_scalar(tex->src[ci].src.ssa, 1));
    if (tex->op == nir_texop_tex && first >= 0 && second == first + 1) {
       release(ctx, &tex->instr);
       dst = alloc_range(ctx, 4);
@@ -3700,6 +3705,21 @@ lower_txf(nir_builder *b, nir_tex_instr *tex, void *data)
    return true;
 }
 
+/* Flat inputs, by varying: NIR's loads do not say */
+static void
+find_flat_varyings(nir_shader *nir, struct g9p_shader *out)
+{
+   nir_foreach_variable_with_modes(var, nir, nir_var_shader_in) {
+      if (var->data.interpolation != INTERP_MODE_FLAT || var->data.location < VARYING_SLOT_VAR0)
+         continue;
+      const unsigned first = var->data.location - VARYING_SLOT_VAR0;
+      const unsigned slots = glsl_count_attribute_slots(var->type, false);
+
+      for (unsigned i = first; i < MIN2(first + slots, G9P_MAX_VARYINGS); i++)
+         out->varying_flat[i] = true;
+   }
+}
+
 bool
 g9p_compile_fragment(nir_shader *nir, unsigned frag_coord_slot,
                      const nir_lower_blend_options *blend, struct g9p_shader *out,
@@ -3710,6 +3730,7 @@ g9p_compile_fragment(nir_shader *nir, unsigned frag_coord_slot,
    NIR_PASS(_, nir, discards_to_if);
    NIR_PASS(_, nir, discards_to_flag);
    NIR_PASS(_, nir, nir_shader_tex_pass, lower_txf, nir_metadata_control_flow, NULL);
+   find_flat_varyings(nir, out);
    lower_io(nir);
    out->native_blend = blend && is_src_over(blend) && !getenv("G9P_NO_NATIVE_BLEND");
    if (blend && !out->native_blend) {

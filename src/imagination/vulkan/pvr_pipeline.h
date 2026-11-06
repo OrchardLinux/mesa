@@ -143,7 +143,10 @@ struct pvr_g9p_graphics_state {
    bool is_seamful;
    struct pvr_suballoc_bo *vs_bo, *fs_bo;
    /* vertex kick (code and data), fragment kick bundle, DOUTI program */
-   struct pvr_pds_upload vs_kick, fs_kick, varyings;
+   struct pvr_pds_upload vs_kick, fs_kick;
+   /* The DOUTI program by provoking vertex; only [0] without flat varyings */
+   struct pvr_pds_upload varyings[3];
+   bool flat_varyings;
    /* the DOUTI data in 16-byte units */
    unsigned varying_units;
    unsigned num_varyings;
