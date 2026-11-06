@@ -2860,6 +2860,8 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
    ctx->c->n = 0;
    ctx->c->uses_stack = false;
    ctx->busy = ctx->pinned = ctx->temps = 0;
+   /* a retry starts over: the stores of the attempt that ran out of registers are gone */
+   ctx->num_vs_stores = 0;
    ctx->max_reg = 0;
    ctx->st = st;
    for (unsigned k = 0; k < G9P_MAX_BUFFERS; k++)
@@ -2958,28 +2960,54 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
          ctx->outputs[ctx->num_outputs].slot = 4 + 4 * ctx->out->num_varyings;
          ctx->num_outputs++;
       }
-      for (unsigned i = 0; i + (ctx->num_vs_stores ? 0 : 1) < ctx->num_outputs; i++)
-         g9p_vs_output(ctx->c, ctx->outputs[i].reg, ctx->outputs[i].slot);
-      if (ctx->num_vs_stores) {
-         int pair = alloc_pair(ctx), last_slot = -1, last_off = -1;
+      /*
+       * Stores as Apple's: their addresses ahead of the outputs, the stores after
+       * them, and nothing rewrites either (xfb1, xfb4.metal, iOS `store`; PR #6's notes)
+       */
+      struct { int slot, off, pair; } addrs[16];
+      unsigned num_addrs = 0;
+
+      /* what the outputs and stores still read: not for the address registers */
+      for (unsigned i = 0; i < ctx->num_vs_stores; i++)
+         ctx->busy |= BITFIELD64_BIT(ctx->vs_stores[i].data) | BITFIELD64_BIT(ctx->vs_stores[i].off);
+      for (unsigned i = 0; i < ctx->num_outputs; i++)
+         ctx->busy |= BITFIELD64_BIT(ctx->outputs[i].reg);
+
+      for (unsigned i = 0; i < ctx->num_vs_stores; i++) {
+         const struct g9p_vs_store *st = &ctx->vs_stores[i];
+         unsigned k;
+
+         for (k = 0; k < num_addrs; k++) {
+            if (addrs[k].slot == st->slot && addrs[k].off == st->off)
+               break;
+         }
+         if (k < num_addrs)
+            continue;
+         if (num_addrs == ARRAY_SIZE(addrs))
+            return false;
+
+         const int low = low_reg(ctx, st->off);
+         const int pair = low < 0 ? -1 : alloc_pair(ctx);
 
          if (pair < 0)
             return false;
+         g9p_addr(ctx->c, pair, 2 * st->slot, low, 0, false);
+         ctx->busy &= ~ctx->temps;
+         ctx->temps = 0;
+         addrs[num_addrs].slot = st->slot;
+         addrs[num_addrs].off = st->off;
+         addrs[num_addrs++].pair = pair;
+      }
+      for (unsigned i = 0; i + (ctx->num_vs_stores ? 0 : 1) < ctx->num_outputs; i++)
+         g9p_vs_output(ctx->c, ctx->outputs[i].reg, ctx->outputs[i].slot);
+      if (ctx->num_vs_stores) {
          for (unsigned i = 0; i < ctx->num_vs_stores; i++) {
             const struct g9p_vs_store *st = &ctx->vs_stores[i];
+            unsigned k = 0;
 
-            if (st->slot != last_slot || st->off != last_off) {
-               const int low = low_reg(ctx, st->off);
-
-               if (low < 0)
-                  return false;
-               g9p_addr(ctx->c, pair, 2 * st->slot, low, 0, false);
-               ctx->busy &= ~ctx->temps;
-               ctx->temps = 0;
-               last_slot = st->slot;
-               last_off = st->off;
-            }
-            g9p_mem_at(ctx->c, true, G9P_SIZE_U32, st->data, pair);
+            while (addrs[k].slot != st->slot || addrs[k].off != st->off)
+               k++;
+            g9p_mem_at(ctx->c, true, G9P_SIZE_U32, st->data, addrs[k].pair);
             ctx->c->w[ctx->c->n - 1] |= st->dword;
          }
          g9p_end_vertex_stores(ctx->c);
