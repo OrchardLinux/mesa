@@ -658,7 +658,8 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
    /* targets: PBE words and clear colours */
    uint64_t pbe[4][3];
    unsigned raw = 0;
-   const VkFormat first_format = info->attachments[hw_render->eot_surfaces[0].attachment_idx]->vk.format;
+   const VkFormat first_format = null_target ? VK_FORMAT_UNDEFINED
+      : info->attachments[hw_render->eot_surfaces[0].attachment_idx]->vk.format;
    /* 32-bit integer targets (R, RG, RGBA; unsigned 1, signed 2): the four-word raw program, the PBE storing the
     * target's channels (pvr_g5p_raw32_kind()); RGBA16UI clears: five (below) */
    raw = pvr_g5p_raw32_kind(first_format);
