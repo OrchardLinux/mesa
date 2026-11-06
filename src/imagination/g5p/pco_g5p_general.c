@@ -884,7 +884,8 @@ static const char *vs_qualified_tex_refusal(const nir_tex_instr *t)
    if (why || size_query(t)) return why;
    if (t->op != nir_texop_tex && t->op != nir_texop_txl && t->op != nir_texop_txf && !gradient)
       return "vertex bias/gradient recipe not device-qualified";
-   if (t->is_shadow || (t->sampler_dim == GLSL_SAMPLER_DIM_CUBE &&
+   if ((t->is_shadow && (!g5p_vtex_shadow_probe() || t->sampler_dim != GLSL_SAMPLER_DIM_2D || t->is_array)) ||
+       (t->sampler_dim == GLSL_SAMPLER_DIM_CUBE &&
                         (!g5p_vtex_cube_probe() || t->is_array)) ||
        (t->sampler_dim != GLSL_SAMPLER_DIM_2D && t->sampler_dim != GLSL_SAMPLER_DIM_3D &&
         t->sampler_dim != GLSL_SAMPLER_DIM_CUBE))
@@ -4470,6 +4471,7 @@ static void emit_vertex_qualified_texture(struct gctx *c, nir_tex_instr *t)
    uint8_t raw[G5P_USC_MAX];
    struct tex_bind *b = tex_for(c, t);
    bool read = t->op == nir_texop_txf, array = t->is_array;
+   bool compare = t->is_shadow;
    bool cube = t->sampler_dim == GLSL_SAMPLER_DIM_CUBE;
    bool third = array || t->sampler_dim == GLSL_SAMPLER_DIM_3D || cube;
    bool buffer = t->sampler_dim == GLSL_SAMPLER_DIM_BUF;
@@ -4527,25 +4529,37 @@ static void emit_vertex_qualified_texture(struct gctx *c, nir_tex_instr *t)
    /* Match the native producers: an array's offset uses the layer's high
     * half; a 2D offset uses the f16 level's high half. The low half survives. */
    unsigned extras = H(c,array ? block + 2 : level) + 1;
+   unsigned offset_half = extras;
+   if (compare) {
+      unsigned e = alloc_run(c, 1 + (packed >= 0), "qualified vertex compare reference/offset");
+      scratch |= BITFIELD64_RANGE(e, 1 + (packed >= 0));
+      vertex_qualified_copy(c, e, nir_get_tex_src(t, nir_tex_src_comparator), 0);
+      extras = H(c,e);
+      offset_half = extras + 2;
+   }
    if (packed >= 0 && gradient && !array) {
       /* Derivatives occupy full dwords; their high halves are not spare. */
       unsigned e = alloc_reg(c, -1);
       scratch |= BITFIELD64_BIT(e);
       extras = H(c,e);
+      offset_half = extras;
    }
    if (packed >= 0)
-      put(c, raw, xyz ? g5p_usc_half_immediate_xyz(raw, extras, packed, 1) :
-                       g5p_usc_vertex_half_immediate(raw, extras, packed), "qualified vertex packed offset");
-   unsigned dst = alloc_run(c, 4, "qualified vertex texture result");
+      put(c, raw, xyz ? g5p_usc_half_immediate_xyz(raw, offset_half, packed, 1) :
+                       g5p_usc_vertex_half_immediate(raw, offset_half, packed), "qualified vertex packed offset");
+   unsigned nresult = compare ? 1 : 4;
+   unsigned dst = alloc_run(c, nresult, "qualified vertex texture result");
    struct g5p_tex_ext x = {
       .dst_half=H(c,dst), .image_qword=b->image/2,
       .sampler_qword=(read ? c->fetch_sampler_common : b->sampler)/2,
       .coord_dword=H(c,block)/2,
       .dim=cube ? G5P_TEX_CUBE : t->sampler_dim==GLSL_SAMPLER_DIM_3D ? G5P_TEX_3D : array ? G5P_TEX_2D_ARRAY : G5P_TEX_2D,
-      .mask=15, .read=read, .lod=gradient ? G5P_TEX_LOD_GRAD : G5P_TEX_LOD_LEVEL,
+      .mask=compare ? 1 : 15, .read=read, .compare=compare,
+      .lod=gradient ? G5P_TEX_LOD_GRAD : G5P_TEX_LOD_LEVEL,
       .lod_dword=buffer ? c->tsize[size_for(c,t)].common + 1 : H(c,level)/2, .lod_shared=buffer,
-      .offset=packed >= 0, .extras_half=packed >= 0 ? extras : 0,
+      .offset=packed >= 0, .extras_half=compare || packed >= 0 ? extras : 0,
       .tuple=buffer ? G5P_TEX_TUPLE_COUPLED_SHARED_LEVEL :
+             compare ? (packed >= 0 ? G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL_COMPARE_OFFSET : G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL_COMPARE) :
              xyz && packed >= 0 ? G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL_OFFSET_3D :
              gradient ? (packed >= 0 ? G5P_TEX_TUPLE_COUPLED_GRAD_OFFSET : G5P_TEX_TUPLE_COUPLED_GRAD) :
              packed >= 0 ? G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL_OFFSET : G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL,
@@ -4553,7 +4567,7 @@ static void emit_vertex_qualified_texture(struct gctx *c, nir_tex_instr *t)
    put(c, raw, g5p_usc_sample_ext(raw,&x), "qualified vertex sample/read recipe");
    put(c, raw, g5p_usc_wait(raw,0), "wait");
    c->scratch |= scratch;
-   for (unsigned k=0;k<4;k++) {
+   for (unsigned k=0;k<nresult;k++) {
       struct val *v=V(c,&t->def,k);v->state=VAL_REG;v->reg=dst+k;v->held=true;
    }
    c->p->evidence |= PCO_G5P_EV_TEX_TYPES;

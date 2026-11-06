@@ -166,6 +166,8 @@ enum g5p_tex_tuple {
    G5P_TEX_TUPLE_COUPLED_GRAD,
    G5P_TEX_TUPLE_COUPLED_GRAD_OFFSET,
    G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL_OFFSET_3D,
+   G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL_COMPARE,
+   G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL_COMPARE_OFFSET,
 };
 struct g5p_tex_ext {
    unsigned dst_half, image_qword, sampler_qword, coord_dword;
