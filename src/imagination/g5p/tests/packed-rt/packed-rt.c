@@ -53,6 +53,8 @@ int main(int argc, char **argv)
       { "rgba8i", GL_RGBA8I, 4, 1 },
       { "rg16i", GL_RG16I, 2, 1 },
       { "rgba16i", GL_RGBA16I, 4, 1 },
+      { "r16ui", GL_R16UI, 1, 0 }, { "r16i", GL_R16I, 1, 1 },
+      { "rg8ui", GL_RG8UI, 2, 0 }, { "rg8i", GL_RG8I, 2, 1 },
       { "r32ui", GL_R32UI, 1, 0 },    { "rg32ui", GL_RG32UI, 2, 0 }, { "rgba32ui", GL_RGBA32UI, 4, 0 },
       { "r32i", GL_R32I, 1, 1 },      { "rg32i", GL_RG32I, 2, 1 },   { "rgba32i", GL_RGBA32I, 4, 1 },
    };
@@ -143,11 +145,11 @@ int main(int argc, char **argv)
       unsigned bad=0;
       for(unsigned x=0;x<W;x++)for(unsigned k=0;k<4;k++) {
          uint32_t w=k<C?(phase==0?zero[k]:want(x+(phase==2&&x<W/2?W:0),k)):(k==3?1:0);
-         if((F[f].fmt==GL_RGBA16UI || F[f].fmt==GL_RG16UI) && w>65535 && k<C)w=65535;
-         if(F[f].fmt==GL_RGBA8UI && w>255)w=255;
+         if((F[f].fmt==GL_RGBA16UI || F[f].fmt==GL_RG16UI || F[f].fmt==GL_R16UI) && w>65535 && k<C)w=65535;
+         if((F[f].fmt==GL_RGBA8UI || F[f].fmt==GL_RG8UI) && k<C && w>255)w=255;
          if(F[f].fmt==GL_RGB10_A2UI && w>(k==3?3u:1023u))w=k==3?3u:1023u;
-         if((F[f].fmt==GL_RGBA8I || F[f].fmt==GL_RG16I || F[f].fmt==GL_RGBA16I) && k<C) {
-            int lo=F[f].fmt==GL_RGBA8I?-128:-32768, hi=F[f].fmt==GL_RGBA8I?127:32767;
+         if((F[f].fmt==GL_RGBA8I || F[f].fmt==GL_RG8I || F[f].fmt==GL_R16I || F[f].fmt==GL_RG16I || F[f].fmt==GL_RGBA16I) && k<C) {
+            int lo=(F[f].fmt==GL_RGBA8I || F[f].fmt==GL_RG8I)?-128:-32768, hi=(F[f].fmt==GL_RGBA8I || F[f].fmt==GL_RG8I)?127:32767;
             int32_t signed_w=(int32_t)w;
             w=(uint32_t)(signed_w<lo?lo:signed_w>hi?hi:signed_w);
          }

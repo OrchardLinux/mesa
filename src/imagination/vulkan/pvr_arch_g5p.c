@@ -26,6 +26,7 @@
 #include "util/u_math.h"
 
 #include "g5p_mrt_programs.h"
+#include "g5p_color_source.h"
 #include "pco_g5p_general.h"
 #include "g5p_usc.h"
 #include "pdsc.h"
@@ -233,6 +234,7 @@ g5p_free_programs(struct pvr_device *device, struct pvr_g5p_programs *p)
    }
    for (unsigned i = 0; i < ARRAY_SIZE(p->raw_eot_usc); i++)
       pvr_bo_suballoc_free(p->raw_eot_usc[i]);
+   pvr_bo_suballoc_free(p->narrow_eot_usc);
    pvr_bo_suballoc_free(p->halt.pvr_bo);
    pvr_bo_suballoc_free(p->clear_dma.pvr_bo);
    pvr_bo_suballoc_free(p->eot.pvr_bo);
@@ -329,7 +331,7 @@ g5p_raw_variant(unsigned words)
 /* Called only for an integer pass; qualification uses FORMATS=probe.
  * words: the pass's total output words; targets: 1, or 2 raw32 targets. */
 static VkResult
-g5p_raw_programs_unlocked(struct pvr_device *device, unsigned raw, unsigned words, unsigned targets)
+g5p_raw_programs_unlocked(struct pvr_device *device, unsigned raw, unsigned words, unsigned targets, bool narrow)
 {
    struct pvr_g5p_programs *p = &device->g5p->programs;
    VkResult result;
@@ -348,10 +350,17 @@ g5p_raw_programs_unlocked(struct pvr_device *device, unsigned raw, unsigned word
       if (result != VK_SUCCESS)
          return result;
    }
-   if (!p->raw_eot_usc[targets - 1]) {
+   /* witness-r16: R16UI/I EOT bit4 is clear; R32UI sets it. Cache
+    * by source layout so a preceding raw32 pass cannot poison this choice. */
+   struct pvr_suballoc_bo **eot = narrow ? &p->narrow_eot_usc : &p->raw_eot_usc[targets - 1];
+   if (!*eot) {
       uint8_t code[G5P_MRT_EOT_USC_MAX];
-      const unsigned size = g5p_mrt_eot_usc_mode(code, targets, true);
-      result = pvr_gpu_upload_usc(device, code, size, 64, &p->raw_eot_usc[targets - 1]);
+      struct g5p_color_source_abi source;
+      if (!g5p_color_source_make(narrow ? 16 : 32,1,G5P_COLOR_SOURCE_UINT,&source))
+         return vk_error(device,VK_ERROR_INITIALIZATION_FAILED);
+      const unsigned size = narrow ? g5p_color_source_eot(code,&source)
+                                    : g5p_mrt_eot_usc_mode(code,targets,true);
+      result = pvr_gpu_upload_usc(device, code, size, 64, eot);
       if (result != VK_SUCCESS)
          return result;
    }
@@ -367,10 +376,10 @@ g5p_raw_programs_unlocked(struct pvr_device *device, unsigned raw, unsigned word
 }
 
 static VkResult
-g5p_raw_programs(struct pvr_device *device, unsigned raw, unsigned words, unsigned targets)
+g5p_raw_programs(struct pvr_device *device, unsigned raw, unsigned words, unsigned targets, bool narrow)
 {
    simple_mtx_lock(&device->g5p->clear_lock);
-   VkResult result = g5p_raw_programs_unlocked(device, raw, words, targets);
+   VkResult result = g5p_raw_programs_unlocked(device, raw, words, targets, narrow);
    simple_mtx_unlock(&device->g5p->clear_lock);
    return result;
 }
@@ -684,13 +693,19 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
             pvr_g5p_packed_uint_bits(first_format) == 8 ? 6 : 5;
    /* output words per target, and of the pass: two raw32 targets of one format (admitted by
     * pvr_arch_g5p_mrt_pass_check(), behind the format probe) take four each, eight in all */
-   const unsigned raw_words = raw <= 2 ? 4 : 2;
+   const bool narrow = raw >= 5 && pvr_g5p_format_find(first_format)->cpp == 2;
+   struct g5p_color_source_abi source = {0};
+   if (raw >= 5 && !g5p_color_source_make(narrow ? 16 : 32,
+         (first_format == VK_FORMAT_R16G16B16A16_UINT || first_format == VK_FORMAT_R16G16B16A16_SINT) ? 2 : 1,
+         G5P_COLOR_SOURCE_UINT,&source))
+      return G5P_REFUSE(cmd_buffer,"unqualified physical colour source ABI");
+   const unsigned raw_words = raw <= 2 ? 4 : source.output_words;
    const unsigned raw_total = raw_words * n;
    if (raw) {
       if (!(n == 1 || (n == 2 && raw <= 2)) || g->samples != 1)
          return G5P_REFUSE(cmd_buffer, "integer pass requires one single-sample target, or two 32-bit integer "
                            "targets of one format");
-      VkResult result = g5p_raw_programs(device, raw, raw_total, n);
+      VkResult result = g5p_raw_programs(device, raw, raw_total, n, narrow);
       if (result != VK_SUCCESS)
          return result;
       g->raw_words = raw_total;
@@ -735,13 +750,17 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
        */
       uint32_t store_key = raw ? key & ~(0x80u << 5) : key;
       if (raw >= 5 && raw <= 9) {
-         /* Clear-only RGBA16UI: CPU clamps and packs RG/BA into two
-          * uint32 words. Store those exact eight bytes through RG32UI,
-          * whose two-word raw PBE path is device-proven. The logical
-          * image/view key stays RGBA16UI; no draw/LOAD admission follows. */
+         /* Equal-size raw physical view; logical sampling stays typed.
+          * Native witness-r16 supplies the narrow16-bit source layout. */
          bool physical_srgb;
-         if (!g5p_pbe_key((first_format == VK_FORMAT_R16G16B16A16_UINT || first_format == VK_FORMAT_R16G16B16A16_SINT) ? VK_FORMAT_R32G32_UINT : VK_FORMAT_R32_UINT, &store_key, &physical_srgb))
+         VkFormat physical = narrow ? VK_FORMAT_R16_UINT :
+            (first_format == VK_FORMAT_R16G16B16A16_UINT || first_format == VK_FORMAT_R16G16B16A16_SINT)
+               ? VK_FORMAT_R32G32_UINT : VK_FORMAT_R32_UINT;
+         if (!g5p_pbe_key(physical, &store_key, &physical_srgb))
             return G5P_REFUSE(cmd_buffer, "RGBA16UI clear needs the RG32UI physical store");
+         /* Native write selectors are RRRR/RGRR, not sampled R001/RG01.
+          * Keep the logical sampling key untouched for integer LOAD. */
+         store_key = source.write_key;
       }
       if (ms_store) {
          pvr_g5p_msaa_pbe_store(pbe[t], key, addr, iview->vk.extent.width, iview->vk.extent.height,
@@ -855,7 +874,7 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
    }
    {
       /* a 4x store's end of tile emits per sample (pvr_g5p_msaa_eot_usc()); a resolve keeps the 1x one */
-      const struct pvr_suballoc_bo *eot_usc = raw ? p->raw_eot_usc[n - 1] : g->samples == 4 && !g->msaa_resolve ? p->eot_usc_ms : p->eot_usc[v];
+      const struct pvr_suballoc_bo *eot_usc = raw ? (narrow ? p->narrow_eot_usc : p->raw_eot_usc[n - 1]) : g->samples == 4 && !g->msaa_resolve ? p->eot_usc_ms : p->eot_usc[v];
       const uint64_t doutu = g5p_doutu_src0(g5p_usc_off(device, eot_usc), G5P_TEMPS);
       const uint32_t data[8] = { (uint32_t)block->dev_addr.addr, (uint32_t)(block->dev_addr.addr >> 32),
                                  g5p_doutd_control(pbe_dwords), 0, (uint32_t)doutu, (uint32_t)(doutu >> 32),

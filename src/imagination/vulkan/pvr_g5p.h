@@ -92,6 +92,7 @@ struct pvr_g5p_programs {
    struct pvr_suballoc_bo *raw_clear_usc[3];
    /* raw end-of-tile programs by target count: 1, 2 */
    struct pvr_suballoc_bo *raw_eot_usc[2];
+   struct pvr_suballoc_bo *narrow_eot_usc; /* native16-bit source layout */
    struct pvr_pds_upload raw_clear_kick[3];
 };
 
@@ -313,14 +314,17 @@ struct nir_shader *pvr_g5p_clear_nir_raw(bool vertex, bool is_signed);
 static inline unsigned pvr_g5p_packed_uint_bits(VkFormat format)
 {
    return format == VK_FORMAT_A2B10G10R10_UINT_PACK32 ? 10 :
-          (format == VK_FORMAT_R8G8B8A8_UINT || format == VK_FORMAT_R8G8B8A8_SINT) ? 8 :
-          (format == VK_FORMAT_R16G16_UINT || format == VK_FORMAT_R16G16B16A16_UINT ||
+          (format == VK_FORMAT_R8G8B8A8_UINT || format == VK_FORMAT_R8G8B8A8_SINT ||
+           format == VK_FORMAT_R8G8_UINT || format == VK_FORMAT_R8G8_SINT) ? 8 :
+          (format == VK_FORMAT_R16_UINT || format == VK_FORMAT_R16_SINT ||
+           format == VK_FORMAT_R16G16_UINT || format == VK_FORMAT_R16G16B16A16_UINT ||
            format == VK_FORMAT_R16G16_SINT || format == VK_FORMAT_R16G16B16A16_SINT) ? 16 : 0;
 }
 
 static inline bool pvr_g5p_packed_is_signed(VkFormat format)
 {
-   return format == VK_FORMAT_R8G8B8A8_SINT || format == VK_FORMAT_R16G16_SINT ||
+   return format == VK_FORMAT_R8G8B8A8_SINT || format == VK_FORMAT_R8G8_SINT ||
+          format == VK_FORMAT_R16_SINT || format == VK_FORMAT_R16G16_SINT ||
           format == VK_FORMAT_R16G16B16A16_SINT;
 }
 
