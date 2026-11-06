@@ -5783,7 +5783,7 @@ static bool codegen(struct gctx *c)
       out->temps = MAX2(out->temps, align(32 + c->nhomes, 4));
       out->evidence |= PCO_G5P_EV_HIGH_REGS;
    }
-   out->written_temps = c->vs ? MAX2(8, align(c->max_written, 4)) : out->temps;
+   out->written_temps = c->vs ? MAX3(8, align(c->max_written, 4), align(c->max_bank0, 4)) : out->temps;
    out->common_dwords = c->common_next;
    if (!c->vs)
       out->varyings = out->num_varyings;
