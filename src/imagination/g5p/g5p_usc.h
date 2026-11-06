@@ -211,6 +211,9 @@ unsigned g5p_usc_vertex_array_layer(uint8_t *out, unsigned dst_half, unsigned sr
  * bit2 is the output-bank selector, not a direction-bank selector. */
 unsigned g5p_usc_cube_coords_bank1(uint8_t *out, unsigned dst_half, unsigned src_half);
 unsigned g5p_usc_cube_coords(uint8_t *out, unsigned dst_half, unsigned src_half);
+/* Fixed bank0 r0..5 gradients + r6..8 direction -> r0..2 coordinates,
+ * r3..8 projected gradients. No independent relocation is qualified. */
+unsigned g5p_usc_cube_gradient_tuple(uint8_t *out);
 /* f32 -> u16 (truncating) into one half: Apple's array-layer conversion
  * `89 01 DH 01 09 SS 20 01 60 06`. */
 unsigned g5p_usc_f2u16_half(uint8_t *out, unsigned dst_half, unsigned src_half, unsigned group);

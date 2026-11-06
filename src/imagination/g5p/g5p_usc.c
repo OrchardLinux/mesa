@@ -996,8 +996,8 @@ unsigned g5p_usc_sample_ext(uint8_t *out, const struct g5p_tex_ext *t)
    CHECK(t->mask == 0xf || (t->mask == 1 && t->compare), "only rgba and compare results are measured");
    CHECK(!t->read || (!t->compare && !t->offset && t->lod == G5P_TEX_LOD_LEVEL && t->dim != G5P_TEX_CUBE),
          "read takes a level and no compare/offset (cube reads are refused by Apple)");
-   CHECK(t->lod != G5P_TEX_LOD_GRAD || t->dim == G5P_TEX_2D || t->dim == G5P_TEX_2D_ARRAY || t->dim == G5P_TEX_3D,
-         "gradients are measured on 2D, 2D arrays and 3D only");
+   CHECK(t->lod != G5P_TEX_LOD_GRAD || t->dim == G5P_TEX_2D || t->dim == G5P_TEX_2D_ARRAY || t->dim == G5P_TEX_3D || t->dim == G5P_TEX_CUBE,
+         "unmeasured gradient dimension");
    CHECK(!t->offset || t->dim != G5P_TEX_CUBE, "cube offsets do not exist");
    const bool xyz_tuple = t->tuple == G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL_OFFSET_3D;
    const bool compare_tuple = t->tuple == G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL_COMPARE ||
@@ -1100,6 +1100,16 @@ unsigned g5p_usc_cube_coords(uint8_t *out, unsigned dst_half, unsigned src_half)
          half_register(src_half, "src_half requires a measured 32-bit aligned half index"), g5p_usc_error);
    uint8_t raw[6] = {0x08, 0x7d, dst_half, (src_half << 1) | 1, 0x00, 0x80};
    return finish(out, raw, 6);
+}
+
+unsigned g5p_usc_cube_gradient_tuple(uint8_t *out)
+{
+   /* Native f_cube_grad_{float,int,uint} and cube0..3 controls: the
+    * gradient form of the cube operation has an indivisible r0..r8 ABI.
+    * Do not infer independent source/destination relocation fields. */
+   unsigned n = g5p_usc_cube_coords(out, 0, 12);
+   if (n) out[1] |= 2;
+   return n;
 }
 
 unsigned g5p_usc_cube_coords_bank1(uint8_t *out, unsigned dst_half, unsigned src_half)

@@ -241,6 +241,7 @@ struct gctx {
    /* common store */
    struct tex_bind tex[16];
    unsigned ntex, fetch_sampler_common;
+   bool cube_gradient; /* fixed native bank0 r0..r8 operand tuple */
    struct { unsigned set, binding, element, lod, common; } tsize[4]; /* textureSize/QueryLevels */
    unsigned nsize;
    struct range ranges[8];
@@ -803,7 +804,7 @@ static const char *tex_shape_refusal(const nir_tex_instr *t, bool vertex_gradien
    }
    if (t->def.num_components != (t->is_shadow ? 1u : 4u))
       return "result width (rgba, or one compare result)";
-   if (t->op == nir_texop_txd && d != GLSL_SAMPLER_DIM_2D && !(fragment && d == GLSL_SAMPLER_DIM_3D))
+   if (t->op == nir_texop_txd && d != GLSL_SAMPLER_DIM_2D && !(fragment && (d == GLSL_SAMPLER_DIM_3D || d == GLSL_SAMPLER_DIM_CUBE)))
       return "gradients on 3D or cube (Apple's gradient layout is measured on 2D/arrays)";
    if (t->op == nir_texop_txf && (d == GLSL_SAMPLER_DIM_CUBE || t->is_shadow))
       return "texelFetch on a cube or shadow texture";
@@ -4313,8 +4314,46 @@ static void move_into(struct gctx *c, unsigned dst, nir_def *d, unsigned k, cons
  *  - extras: the compare reference f32, then the packed offset half.
  * One result for a compare, four otherwise; integer formats return their
  * integers in the same registers (the instruction is format-blind). */
+/* Apple's cube gradient conversion has a coupled register interface, not
+ * independently relocatable derivative operands. Every native uniform and
+ * mixed-texture control uses r0..5 derivatives, r6..8 direction; conversion
+ * produces coordinates r0..2 and gradients r3..8. Reserve this exact tuple
+ * for the shader, and keep all SSA values outside it. */
+static void emit_fragment_cube_gradient(struct gctx *c, nir_tex_instr *t)
+{
+   uint8_t raw[G5P_USC_MAX];
+   struct tex_bind *b = tex_for(c, t);
+   nir_def *dx = nir_get_tex_src(t, nir_tex_src_ddx);
+   nir_def *dy = nir_get_tex_src(t, nir_tex_src_ddy);
+   nir_def *coord = nir_get_tex_src(t, nir_tex_src_coord);
+   for (unsigned k = 0; k < 3; k++) {
+      move_into(c, 2*k, dx, k, "cube dPdx");
+      move_into(c, 2*k + 1, dy, k, "cube dPdy");
+      move_into(c, 6 + k, coord, k, "cube direction");
+   }
+   put(c, raw, g5p_usc_cube_gradient_tuple(raw), "cube gradient conversion r0..8");
+   unsigned dst = alloc_run(c, 4, "cube gradient result");
+   struct g5p_tex_ext x = {
+      .dst_half = 2 * dst, .image_qword = b->image / 2,
+      .sampler_qword = b->sampler / 2, .coord_dword = 0,
+      .dim = G5P_TEX_CUBE, .mask = 15, .lod = G5P_TEX_LOD_GRAD,
+      .lod_dword = 3,
+   };
+   put(c, raw, g5p_usc_sample_ext(raw, &x), "cube gradient sample");
+   put(c, raw, g5p_usc_wait(raw, 0), "wait");
+   for (unsigned k = 0; k < 4; k++) {
+      struct val *v = V(c, &t->def, k);
+      v->state = VAL_REG; v->reg = dst + k; v->held = true;
+   }
+   c->p->evidence |= PCO_G5P_EV_TEX_TYPES;
+}
+
 static void emit_tex_ext(struct gctx *c, nir_tex_instr *t)
 {
+   if (!c->vs && t->op == nir_texop_txd && t->sampler_dim == GLSL_SAMPLER_DIM_CUBE) {
+      emit_fragment_cube_gradient(c, t);
+      return;
+   }
    bool saved_bank = c->tex_bank0;
    c->tex_bank0 = c->vs;
    uint8_t raw[G5P_USC_MAX];
@@ -6343,10 +6382,20 @@ static bool codegen(struct gctx *c)
       c->reserved = BITFIELD64_RANGE(0, c->mrt.words); /* packed colour halves, o0..o(2N-1) */
       if (c->cf && c->reserve_st31)
          c->reserved |= BITFIELD64_BIT(NUM_DWORDS - 1);
-      c->max_dword = c->mrt.words;
+      c->cube_gradient = false;
+      foreach_instr_all(ins, c) {
+         if (ins->type == nir_instr_type_tex) {
+            nir_tex_instr *t = nir_instr_as_tex(ins);
+            c->cube_gradient |= t->op == nir_texop_txd && t->sampler_dim == GLSL_SAMPLER_DIM_CUBE;
+         }
+      }
+      if (c->cube_gradient)
+         c->reserved |= BITFIELD64_RANGE(0, 9);
+      c->max_dword = MAX2(c->mrt.words, c->cube_gradient ? 9 : 0);
+      c->max_written = MAX2(c->max_written, c->cube_gradient ? 9 : 0);
       if (c->cf && !c->count_pass)
          c->reserved |= BITFIELD64_BIT(c->st); /* the mask stack, above every register of the count pass */
-      fs_prologue(c);
+      if (!c->cube_gradient) fs_prologue(c);
       hoist_iterators(c);
       release(c, -1);
    }
@@ -6354,8 +6403,12 @@ static bool codegen(struct gctx *c)
    c->now = LAST_END;
    if (c->vs)
       vs_output(c);
-   else
+   else {
+      /* The fixed tuple overwrites packed-output registers. Emit constant
+       * colour halves only after its last use, before dynamic output packs. */
+      if (c->cube_gradient) fs_prologue(c);
       fs_output(c);
+   }
    out->code = malloc(c->size);
    if (!out->code)
       refuse(c, "out of memory");
