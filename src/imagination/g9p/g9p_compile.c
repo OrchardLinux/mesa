@@ -940,7 +940,7 @@ fs_buffer_base(const struct g9p_ctx *ctx, unsigned slot)
 
 /*
  * The common-store dword of a fragment shader's buffer dword, as a uniform operand.
- * Operands stop at 255 (Apple's extensions end at 410e): a shader over that takes only
+ * Operands stop at 511 (Apple's 099a and 410e): a shader over that takes only
  * the dwords it reads (fs_map, as Apple's compiler packs them).
  */
 static unsigned
@@ -3328,6 +3328,9 @@ lower_io(nir_shader *nir)
             type_size_vec4, 0);
 }
 
+/* The last attempt at a vertex shader: in program order, every load at its use */
+static _Thread_local bool g9p_no_schedule;
+
 /*
  * Loads that are cheap to repeat (uniform buffers, push constants,
  * varyings, the fragment position): a copy right before each use in another
@@ -3365,7 +3368,7 @@ rematerialize_loads(nir_shader *nir, bool every_use)
 
             if (nir_src_is_if(src) || user->type == nir_instr_type_phi)
                continue;
-            if (user->block == instr->block && (!every_use || first)) {
+            if (user->block == instr->block && (!every_use || (first && !g9p_no_schedule))) {
                first = false;
                continue;
             }
@@ -3605,8 +3608,6 @@ wrap_loop_breaks(nir_shader *nir)
    return nir_progress(progress, impl, nir_metadata_none);
 }
 
-static _Thread_local bool g9p_no_schedule;
-
 static bool
 compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
              const struct g9p_vertex_attrib *attribs, unsigned frag_coord_slot,
@@ -3662,9 +3663,10 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
    NIR_PASS(_, nir, rematerialize_loads, repeat_loads);
    NIR_PASS(_, nir, nir_opt_dce);
    /* values computed early for late uses: compute them right before */
-   NIR_PASS(_, nir, nir_opt_move, nir_move_alu | nir_move_const_undef |
-            nir_move_comparisons | nir_move_copies | nir_move_load_ubo |
-            nir_move_load_input);
+   if (!g9p_no_schedule)
+      NIR_PASS(_, nir, nir_opt_move, nir_move_alu | nir_move_const_undef |
+               nir_move_comparisons | nir_move_copies | nir_move_load_ubo |
+               nir_move_load_input);
    NIR_PASS(_, nir, nir_convert_from_ssa, true, false);
    NIR_PASS(_, nir, wrap_loop_breaks);
    /*
@@ -3799,13 +3801,13 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
    } else if (!generate(&ctx, impl, st))
       return false;
 
-   /* buffers over the uniform operands' 256 dwords: only the dwords it reads */
+   /* buffers over the uniform operands' 512 dwords: only the dwords it reads */
    if (stage == MESA_SHADER_FRAGMENT) {
       unsigned total = g9p_fs_buf_base(out->num_textures);
 
       for (unsigned k = 0; k < out->num_buffers; k++)
          total += out->buffers[k].dwords;
-      if (total > 256) {
+      if (total > 512) {
          unsigned next = g9p_fs_buf_base(out->num_textures);
 
          ctx.fs_map = rzalloc_array(mem_ctx, uint16_t, G9P_MAX_BUFFERS * G9P_FS_BUF_DWORDS);
@@ -3814,13 +3816,15 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
             unsigned d;
 
             BITSET_FOREACH_SET (d, ctx.fs_used[k], G9P_FS_BUF_DWORDS) {
-               const bool joined = out->num_fs_runs &&
-                                   out->fs_runs[out->num_fs_runs - 1].slot == k &&
-                                   out->fs_runs[out->num_fs_runs - 1].first +
-                                         out->fs_runs[out->num_fs_runs - 1].count == d;
+               /* a run spans small gaps: fewer DMAs for a few dwords nobody reads */
+               const unsigned end = out->num_fs_runs && out->fs_runs[out->num_fs_runs - 1].slot == k
+                                       ? out->fs_runs[out->num_fs_runs - 1].first +
+                                            out->fs_runs[out->num_fs_runs - 1].count
+                                       : ~0u;
 
-               if (joined) {
-                  out->fs_runs[out->num_fs_runs - 1].count++;
+               if (end != ~0u && d - end <= 3) {
+                  out->fs_runs[out->num_fs_runs - 1].count += d - end + 1;
+                  next += d - end;
                } else {
                   if (out->num_fs_runs == G9P_MAX_FS_RUNS) {
                      fprintf(stderr, "g9p: fragment buffers in too many runs\n");
@@ -3834,7 +3838,7 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
                ctx.fs_map[k * G9P_FS_BUF_DWORDS + d] = next++;
             }
          }
-         if (next > 256) {
+         if (next > 512) {
             fprintf(stderr, "g9p: fragment shader reads %u dwords of buffers\n", next);
             return false;
          }
@@ -4418,6 +4422,14 @@ g9p_compile_fragment(nir_shader *nir, unsigned frag_coord_slot,
             out);
    nir_shader *copy = nir_shader_clone(mem_ctx, nir);
 
-   return compile_back(nir, out, MESA_SHADER_FRAGMENT, NULL, frag_coord_slot, false, false, mem_ctx) ||
-          compile_back(copy, out, MESA_SHADER_FRAGMENT, NULL, frag_coord_slot, true, false, mem_ctx);
+   nir_shader *copy2 = nir_shader_clone(mem_ctx, nir);
+
+   if (compile_back(nir, out, MESA_SHADER_FRAGMENT, NULL, frag_coord_slot, false, false, mem_ctx) ||
+       compile_back(copy, out, MESA_SHADER_FRAGMENT, NULL, frag_coord_slot, true, false, mem_ctx))
+      return true;
+   g9p_no_schedule = true;
+   const bool ok = compile_back(copy2, out, MESA_SHADER_FRAGMENT, NULL, frag_coord_slot, true, false, mem_ctx);
+
+   g9p_no_schedule = false;
+   return ok;
 }
