@@ -3071,8 +3071,17 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
    ctx->c->n = 0;
    if (ctx->stage == MESA_SHADER_COMPUTE)
       g9p_prologue(ctx->c, 4 * ctx->out->num_buffers);
-   if (stack)
-      g9p_push_init(ctx->c, st);
+   if (stack) {
+      /*
+       * Fragment code: the stack at level 0, all lanes on, as Apple's first level starts
+       * from. A pushed level here would leave helper pixels off, and derivatives wrong at
+       * primitive edges.
+       */
+      if (ctx->c->fragment)
+         G9P_EMIT(ctx->c, 0x0198, g9p_st_dst(ctx->c, st), 0x0101, 0x0120, 0x0154, 0x0038);
+      else
+         g9p_push_init(ctx->c, st);
+   }
    g9p_emit(ctx->c, body, body_n);
    if (stack)
       g9p_pop(ctx->c, st);
