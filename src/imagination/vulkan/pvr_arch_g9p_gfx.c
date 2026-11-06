@@ -2470,11 +2470,16 @@ g9p_ds_zls(const struct pvr_render_job *job, uint64_t *zlsctl, uint64_t *stencil
    const struct pvr_image *img;
    const VkFormat f = iview ? iview->vk.format : VK_FORMAT_UNDEFINED;
 
-   if ((!job->has_depth_attachment && !job->has_stencil_attachment) || !iview ||
-       (f == VK_FORMAT_D32_SFLOAT && !job->has_stencil_attachment))
+   if ((!job->has_depth_attachment && !job->has_stencil_attachment) || !iview)
       return false;
    img = pvr_image_view_get_image(iview);
-   pvr_csb_pack (zlsctl, CR_ISP_ZLSCTL, z) {
+   /*
+    * Through arrays and memcpy(): the packs write dwords, and through a uint64_t *
+    * the compiler keeps the variable's old value (strict aliasing).
+    */
+   uint32_t ctl[2], base[2] = { 0, 0 };
+
+   pvr_csb_pack (&ctl, CR_ISP_ZLSCTL, z) {
       z.zloadformat = z.zstoreformat = f == VK_FORMAT_D16_UNORM
                                           ? ROGUE_CR_ZLS_FORMAT_TYPE_16BITINT
                                           : ROGUE_CR_ZLS_FORMAT_TYPE_F32Z;
@@ -2487,15 +2492,18 @@ g9p_ds_zls(const struct pvr_render_job *job, uint64_t *zlsctl, uint64_t *stencil
       z.zlsextent_x_z = DIV_ROUND_UP(job->ds.physical_extent.width, 32) - 1;
       z.zlsextent_y_z = DIV_ROUND_UP(job->ds.physical_extent.height, 32) - 1;
    }
-   *stencil_base = 0;
+   memcpy(zlsctl, ctl, sizeof(ctl));
    if (job->has_stencil_attachment) {
-      pvr_csb_pack (stencil_base, CR_ISP_STENCIL_LOAD_BASE, s) {
+      pvr_csb_pack (&base, CR_ISP_STENCIL_LOAD_BASE, s) {
          s.addr = PVR_DEV_ADDR_OFFSET(job->ds.addr, g9p_ds_stencil_offset(img));
          s.enable = true;
       }
    }
-   /* a float on every format: the ISP compares floats (D16 as 65535 failed every LESS) */
-   *bgobjdepth = fui(job->ds_clear_value.depth);
+   memcpy(stencil_base, base, sizeof(base));
+   /* The clear in the plane's format: D16 as its integer (iOS `dsreload16`: 0000ffff) */
+   *bgobjdepth = f == VK_FORMAT_D16_UNORM
+                    ? (uint32_t)lroundf(CLAMP(job->ds_clear_value.depth, 0.0f, 1.0f) * 65535.0f)
+                    : fui(job->ds_clear_value.depth);
    pvr_csb_pack (bgobjvals, CR_ISP_BGOBJVALS, v) {
       v.enablebgtag = true;
       v.mask = true;
@@ -2528,6 +2536,13 @@ g9p_zlsctl(const struct pvr_render_job *job)
    v |= (uint64_t)(DIV_ROUND_UP(job->ds.physical_extent.width, 32) - 1) << 3;
    v |= (uint64_t)(DIV_ROUND_UP(job->ds.physical_extent.height, 32) - 1) << 27;
    return v;
+}
+
+/* The render loads or stores a depth/stencil plane */
+static bool
+g9p_zls_used(const struct pvr_render_job *job)
+{
+   return job->ds.load.d || job->ds.load.s || job->ds.store.d || job->ds.store.s;
 }
 
 uint32_t
@@ -2573,7 +2588,12 @@ PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
    put32(&s, 0);
    put32(&s, bgobjdepth); /* ISP_BGOBJDEPTH: the depth clear */
    put32(&s, bgobjvals);  /* ISP_BGOBJVALS */
-   put32(&s, 0);
+   /*
+    * ISP_AA: with mode 0 the ZLS writes almost nothing (D16: 192 bytes of 8192). Mode 1
+    * stores the plane; with both its samples at the pixel centre (the sample positions
+    * below) it rasterizes as mode 0 does (dEQP fbo.render, clipping, fragment_ops.random).
+    */
+   put32(&s, g9p_zls_used(job) ? 1 : 0);
    /*
     * ISP_CTL: bit 17 (Rogue's process_empty_tiles) runs the background object
     * on tiles without geometry too; without it a render's clear reaches
@@ -2596,7 +2616,7 @@ PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
    *(uint32_t *)buf = s.len;
 
    put32(&s, G9P_EXTHDR_APPLE);
-   put64(&s, 0x88); /* 0xfa8 sample positions */
+   put64(&s, g9p_zls_used(job) ? 0x8888 : 0x88); /* 0xfa8 sample positions */
    for (unsigned i = 0; i < 4; i++)
       put64(&s, job->g9p.bgnd[i]);
    for (unsigned i = 0; i < 6; i++)
