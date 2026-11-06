@@ -37,6 +37,7 @@ g5p_blend_test = executable(
   install : false,
 )
 test('g5p-blend-equations', g5p_blend_test, timeout : 120)
+test('g5p-mrt-blend-equations', g5p_blend_test, args : ['--mrt'], timeout : 120)
 
 g5p_vs_trunc_test = executable(
   'g5p-vs-trunc-test',

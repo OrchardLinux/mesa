@@ -381,7 +381,7 @@ static void reads(struct bctx *c, unsigned i, int v)
 }
 
 static unsigned blend_build(uint8_t *out, unsigned max, const struct g5p_blend_key *k, unsigned const_base,
-                            struct g5p_blend_info *info, const char **err, bool general, unsigned write_mask)
+                            struct g5p_blend_info *info, const char **err, bool general, unsigned write_mask, unsigned target, unsigned targets)
 {
    static _Thread_local struct bctx cx;
    struct bctx *c = &cx;
@@ -578,6 +578,15 @@ static unsigned blend_build(uint8_t *out, unsigned max, const struct g5p_blend_k
       if ((unsigned)h > top)
          top = h;
    }
+   /* Map one target's virtual source0..3 and scratch4.. above the
+    * complete MRT output range. Never overwrite another target's source. */
+   if (targets > 1) {
+      for (unsigned v = 0; v < c->nn; v++) {
+         unsigned h = c->n[v].half;
+         c->n[v].half = h < 4 ? 4 * target + h : 4 * targets + h - 4;
+      }
+      top = top < 4 ? 4 * target + top : 4 * targets + top - 4;
+   }
    info->max_half = top;
    info->reads_tile = any_raw;
 
@@ -596,8 +605,13 @@ static unsigned blend_build(uint8_t *out, unsigned max, const struct g5p_blend_k
       n += _l;                                                                                                 \
    } while (0)
    if (any_raw) {
-      PUT(c->tile_alpha_only ? g5p_usc_tile_read_component(raw, 4, 1, 2) : g5p_usc_tile_read(raw, 4, 2),
-          "tile read");
+      unsigned dst = targets > 1 ? 4 * targets : 4;
+      if (targets > 1)
+         PUT(g5p_usc_tile_read_component(raw, dst, c->tile_alpha_only ? 1 : 2,
+                                        4 * target + (c->tile_alpha_only ? 2 : 0)), "MRT tile read");
+      else
+         PUT(c->tile_alpha_only ? g5p_usc_tile_read_component(raw, 4, 1, 2) : g5p_usc_tile_read(raw, 4, 2),
+             "tile read");
       PUT(g5p_usc_wait(raw, 0), "wait");
    }
    for (unsigned i = 0; i < c->ni; i++) {
@@ -723,13 +737,13 @@ static unsigned blend_build(uint8_t *out, unsigned max, const struct g5p_blend_k
 unsigned g5p_blend_general(uint8_t *out, unsigned max, const struct g5p_blend_key *k, unsigned const_base,
                            struct g5p_blend_info *info, const char **err)
 {
-   unsigned n = blend_build(out, max, k, const_base, info, err, false, 0xf);
+   unsigned n = blend_build(out, max, k, const_base, info, err, false, 0xf, 0, 1);
    if (!*err)
       return n;
    /* Retain byte identity for every existing measured equation. Other core
     * equations use the same tile read/convert/native-f16 ALU/write protocol.
     */
-   return blend_build(out, max, k, const_base, info, err, true, 0xf);
+   return blend_build(out, max, k, const_base, info, err, true, 0xf, 0, 1);
 }
 
 unsigned g5p_blend_masked(uint8_t *out, unsigned max, const struct g5p_blend_key *k, unsigned const_base,
@@ -741,5 +755,18 @@ unsigned g5p_blend_masked(uint8_t *out, unsigned max, const struct g5p_blend_key
    }
    if (write_mask == 0xf)
       return g5p_blend_general(out, max, k, const_base, info, err);
-   return blend_build(out, max, k, const_base, info, err, true, write_mask);
+   return blend_build(out, max, k, const_base, info, err, true, write_mask, 0, 1);
+}
+
+/* ios-witness-r1 mrtm-m5a/blend1/3bm: per-target tile range and
+ * independent output registers; canonical half ALU with disjoint scratch. */
+unsigned g5p_blend_target(uint8_t *out, unsigned max, const struct g5p_blend_key *k,
+                          unsigned const_base, unsigned mask, unsigned target, unsigned targets,
+                          struct g5p_blend_info *info, const char **err)
+{
+   if (targets < 2 || targets > 4 || target >= targets || (mask & ~15u)) {
+      *err = "blend: invalid MRT target or mask";
+      return 0;
+   }
+   return blend_build(out, max, k, const_base, info, err, true, mask, target, targets);
 }

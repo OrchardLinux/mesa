@@ -83,6 +83,11 @@ enum pco_g5p_color_output {
    PCO_G5P_COLOR_SINT32,
 };
 
+struct pco_g5p_rt_blend {
+   bool blend;
+   uint8_t write_mask, src_rgb, dst_rgb, src_a, dst_a, op_rgb, op_a;
+};
+
 struct pco_g5p_fs_key {
    bool blend;
    /* Real kill feedback for depth/stencil writes; merge conditions into one token. */
@@ -104,6 +109,8 @@ struct pco_g5p_fs_key {
    /* Colour attachments written by the program: 0 = 1. 1, 2 and 4 are the
     * homogeneous 8-bit RGBA sets with an Apple witness (g5p_mrt_out.h). */
    uint8_t color_targets;
+   bool mrt_blend_state;
+   struct pco_g5p_rt_blend rt[4];
    /* Per-RT format key: RGBA32 integer attachment, never inferred from SSA. */
    enum pco_g5p_color_output color_output;
 };

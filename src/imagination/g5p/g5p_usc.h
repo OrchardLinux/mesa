@@ -340,7 +340,8 @@ unsigned g5p_usc_tile_component(uint8_t *out, unsigned dst_half, unsigned src_ha
  * a common-store dword or a tile component not preceded by the -0.0 step.
  * Source modifiers (neg/abs in struct g5p_src) are refused: these forms
  * carry their negations as named arguments. Return bytes, 0 on refusal. */
-/* `1c 11 DD 29 CC 00`: one word from component CC (only 2: alpha in DD+1). */
+/* `1c (words<<4|1) DD 29 CC 00`: words from f16 component CC;
+ * ios-witness-r1 mrtm-blend1/3bm select components4/6 across MRTs. */
 unsigned g5p_usc_tile_read_component(uint8_t *out, unsigned dst_half, unsigned words,
                                      unsigned first_component);
 /* tile_component with destination control 0 or 0x80. */
@@ -430,6 +431,10 @@ unsigned g5p_blend_general(uint8_t *out, unsigned max, const struct g5p_blend_ke
 /* Disabled channels retain the destination after the blend equation. */
 unsigned g5p_blend_masked(uint8_t *out, unsigned max, const struct g5p_blend_key *k, unsigned const_base,
                         unsigned write_mask, struct g5p_blend_info *info, const char **err);
+
+unsigned g5p_blend_target(uint8_t *out, unsigned max, const struct g5p_blend_key *k,
+                          unsigned const_base, unsigned mask, unsigned target, unsigned targets,
+                          struct g5p_blend_info *info, const char **err);
 
 /* ---- Vertex-stage memory stores and integer forms (xfb.md, XFB probes) ----
  * Byte templates from Apple's applegpu_g5p vertex functions (tools/

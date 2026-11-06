@@ -1656,7 +1656,10 @@ static bool half_common(uint8_t *raw, unsigned a_dword, unsigned group)
 unsigned g5p_usc_tile_read_component(uint8_t *out, unsigned dst_half, unsigned words,
                                      unsigned first_component)
 {
-   CHECK(words == 1 && first_component == 2, "only the one-word component2 (alpha) tile read is witnessed");
+   /* ios-witness-r1 mrtm-blend1: two words from component4;
+    * mrtm-3bm: three from component6. Component indices are f16 halves. */
+   CHECK(words >= 1 && words <= 4 && !(first_component & 1) && first_component + 2 * words <= 16,
+         "tile-read range outside four RGBA targets");
    CHECK(dst_half < 256, "tile destination must be u8");
    uint8_t raw[6] = {0x1c, (words << 4) | 1, dst_half, 0x29, first_component, 0};
    return finish(out, raw, 6);

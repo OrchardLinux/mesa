@@ -16,9 +16,8 @@
  * Blending and the write mask compile into the fragment program (the
  * backend's epilogues; it refuses factor sets without one). Logic ops and
  * dynamic blend enables, equations, write masks and colour-write enables
- * have no encoding. With several colour targets, one emit writes them all
- * and the blend epilogue owns the output halves of target 1, so no target
- * may blend or mask then (no Apple N-target blend capture). `targets`: the
+ * have no encoding. Several colour targets have independent blend state,
+ * with tile reads selecting their component ranges (ios-witness-r1). `targets`: the
  * subpass's colour attachments (pvr_* hands the runtime only their aspects
  * for a render pass object, so the caller counts them). Returns the
  * refusal, or NULL with *key's blend, factor, op, write-mask and
@@ -44,11 +43,30 @@ PVR_PER_ARCH(g5p_blend_fs_key)(const struct vk_graphics_pipeline_state *state, u
        BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_CB_WRITE_MASKS) ||
        BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_CB_COLOR_WRITE_ENABLES))
       return "dynamic blend enables, equations, write masks or colour-write enables";
-   for (unsigned i = 0; targets > 1 && i < cb->attachment_count; i++) {
-      const struct vk_color_blend_attachment_state *a = &cb->attachments[i];
-
-      if (a->blend_enable || a->write_mask != 0xf || !(cb->color_write_enables & BITFIELD_BIT(i)))
-         return "blend or a write mask other than 0xf with several colour targets";
+   if (targets > 4)
+      return "more than four colour blend targets";
+   if (targets > 1) {
+      bool special = false;
+      unsigned union_mask = 0;
+      for (unsigned i = 0; i < targets; i++) {
+         const struct vk_color_blend_attachment_state *a = &cb->attachments[i];
+         const unsigned mask = (cb->color_write_enables & BITFIELD_BIT(i)) ? a->write_mask : 0;
+         key->rt[i] = (struct pco_g5p_rt_blend){
+            .blend = a->blend_enable, .write_mask = mask,
+            .src_rgb = a->src_color_blend_factor, .dst_rgb = a->dst_color_blend_factor,
+            .src_a = a->src_alpha_blend_factor, .dst_a = a->dst_alpha_blend_factor,
+            .op_rgb = a->color_blend_op, .op_a = a->alpha_blend_op };
+         special |= a->blend_enable || mask != 15;
+         union_mask |= mask;
+      }
+      if (special) {
+         key->mrt_blend_state = true;
+         key->write_mask = union_mask; /* ISP: colour exists iff any target writes */
+         /* Three targets still use the four-target null padding pass. */
+         if (targets == 3)
+            key->rt[3].write_mask = 15;
+      }
+      return NULL;
    }
    if (!cb->attachment_count)
       return NULL;

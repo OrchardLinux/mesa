@@ -15,6 +15,7 @@ static unsigned tested, evaluated, fallback;
 static double source[4], destination[4], constants[4];
 static unsigned max_bytes,max_half;
 static unsigned current_mask = 0xf;
+static unsigned current_target, current_targets = 1;
 #ifdef G5P_BLEND_BASELINE
 extern unsigned g5p_blend_baseline(uint8_t *,unsigned,const struct g5p_blend_key *,unsigned,
                                  struct g5p_blend_info *,const char **);
@@ -50,13 +51,15 @@ static void g5p_blend_test_program(const struct bctx *c,const struct g5p_blend_i
     * clamping, distinct RGB/alpha, exact0/1 and non-symmetric source/dest.
     */
    for(unsigned sample=0;sample<3;sample++) {
-      double h[32];
-      for(unsigned i=0;i<32;i++)h[i]=NAN;
+      double h[64];
+      for(unsigned i=0;i<64;i++)h[i]=NAN;
+      for(unsigned t=0;t<current_targets;t++)for(unsigned l=0;l<4;l++)
+         h[4*t+l]=0.125*(l+1);
       for(unsigned l=0;l<4;l++) {
          source[l]=sample==0?(double)(l+1)/8:sample==1?(double)(7-l)/8:(l==3?0:1);
          destination[l]=sample==0?(double)(7-l)/16:sample==1?(double)(l+2)/16:(l==3?1:0);
          constants[l]=sample==0?(double)(2*l+1)/8:sample==1?clamp((double)l-1):0.375;
-         h[l]=info->zero_lanes&(1u<<l)?0:source[l];
+         h[4*current_target+l]=info->zero_lanes&(1u<<l)?0:source[l];
       }
       for(unsigned v=0;v<c->nn;v++)if(c->n[v].op==B_RAW)h[c->n[v].half]=destination[c->n[v].lane];
       for(unsigned i=0;i<c->ni;i++) {
@@ -84,13 +87,15 @@ static void g5p_blend_test_program(const struct bctx *c,const struct g5p_blend_i
          h[n->half]=value;
       }
       for(unsigned l=0;l<4;l++) {
-         double expected=equation_ref(l),got=clamp(h[l]);
-         if(!isfinite(h[l]) || fabs(got-expected)>1e-12) {
+         double expected=equation_ref(l),got=clamp(h[4*current_target+l]);
+         if(!isfinite(h[4*current_target+l]) || fabs(got-expected)>1e-12) {
             fprintf(stderr,"BLEND MATH FAIL key=%u,%u,%u,%u,%u,%u sample=%u lane=%u got=%.17g expected=%.17g general=%u\n",
              current.src_rgb,current.dst_rgb,current.op_rgb,current.src_a,current.dst_a,current.op_a,sample,l,got,expected,c->general);
             exit(1);
          }
       }
+      for(unsigned t=0;t<current_targets;t++)if(t!=current_target)
+         for(unsigned l=0;l<4;l++)assert(h[4*t+l]==0.125*(l+1));
       evaluated++;
    }
 }
@@ -100,14 +105,27 @@ int main(int argc,char **argv)
    bool dump=argc==3&&(!strcmp(argv[1],"--dump")||maskdump);
    FILE *file=dump?fopen(argv[2],"wb"):NULL;
    if(dump&&!file)return 2;
-   unsigned stride=dump?137:1;
-   bool masks=maskdump||(argc==2&&!strcmp(argv[1],"--masks"));
+   bool mrt=argc==2&&!strcmp(argv[1],"--mrt");
+   unsigned stride=(dump||mrt)?137:1;
+   if(mrt) {
+      uint8_t bytes[8];
+      assert(g5p_usc_tile_read_component(bytes,0,2,4)==6);
+      const uint8_t witness[]={0x1c,0x21,0,0x29,4,0};
+      assert(!memcmp(bytes,witness,6)); /* mrtm-blend1 native first instruction */
+      assert(g5p_usc_tile_read_component(bytes,6,3,6)==6);
+      const uint8_t witness3[]={0x1c,0x31,6,0x29,6,0};
+      assert(!memcmp(bytes,witness3,6)); /* mrtm-3bm native first instruction */
+   }
+   bool masks=mrt||maskdump||(argc==2&&!strcmp(argv[1],"--masks"));
+   for(current_targets=mrt?2:1;current_targets<=(mrt?4:1);current_targets++)
+   for(current_target=0;current_target<current_targets;current_target++)
    for(unsigned mask=masks?0:15;mask<16;mask++) {
    current_mask=mask;
-   for(unsigned rgb=0;rgb<1125;rgb++)for(unsigned alpha=0;alpha<1125;alpha+=stride) {
+   for(unsigned rgb=0;rgb<1125;rgb+=mrt?17:1)for(unsigned alpha=0;alpha<1125;alpha+=stride) {
       current=(struct g5p_blend_key){rgb%15,(rgb/15)%15,rgb/225,alpha%15,(alpha/15)%15,alpha/225};
-      uint8_t code[512];struct g5p_blend_info info;const char *err;
-      unsigned n=g5p_blend_masked(code,sizeof(code),&current,0,current_mask,&info,&err);
+      uint8_t code[2048];struct g5p_blend_info info;const char *err;
+      unsigned n=mrt?g5p_blend_target(code,sizeof(code),&current,0,current_mask,current_target,current_targets,&info,&err)
+                    :g5p_blend_masked(code,sizeof(code),&current,0,current_mask,&info,&err);
       if(err) {
          fprintf(stderr,"BLEND BUILD FAIL key=%u,%u,%u,%u,%u,%u: %s\n",current.src_rgb,current.dst_rgb,current.op_rgb,current.src_a,current.dst_a,current.op_a,err);return 1;
       }

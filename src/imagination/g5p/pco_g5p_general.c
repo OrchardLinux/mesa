@@ -5174,7 +5174,30 @@ static void fs_output(struct gctx *c)
          c->p->evidence |= PCO_G5P_EV_PACK;
       }
    }
-   if (c->blend == 1 || c->blend == 2) {
+   if (c->key->mrt_blend_state) {
+      if (c->ndiscards || c->discard_always)
+         refuse(c, "discard in an MRT destination-reading program is not qualified");
+      for (unsigned t = 0; t < c->mrt.targets; t++) {
+         const struct pco_g5p_rt_blend *rt = &c->key->rt[t];
+         struct pco_g5p_fs_key single = PCO_G5P_FS_KEY_DEFAULT;
+         single.blend = rt->blend;
+         single.src_rgb = rt->src_rgb; single.dst_rgb = rt->dst_rgb;
+         single.src_a = rt->src_a; single.dst_a = rt->dst_a;
+         single.op_rgb = rt->op_rgb; single.op_a = rt->op_a;
+         struct g5p_blend_key bk = general_key(&single);
+         struct g5p_blend_info info;
+         const char *err;
+         uint8_t buf[2048];
+         unsigned n = g5p_blend_target(buf, sizeof(buf), &bk, G5P_BLEND_CONST_BASE,
+                                       rt->write_mask, t, c->mrt.targets, &info, &err);
+         if (err)
+            refuse(c, "MRT target %u epilogue: %s", t, err);
+         if (n)
+            put(c, buf, n, "MRT blend epilogue");
+         c->max_dword = MAX2(c->max_dword, DIV_ROUND_UP(info.max_half + 1, 2));
+      }
+      c->p->evidence |= PCO_G5P_EV_BLEND;
+   } else if (c->blend == 1 || c->blend == 2) {
       uint8_t buf[160];
       unsigned n = g5p_blend_epilogue(buf, sizeof(buf));
       if (!n)
@@ -5583,13 +5606,14 @@ struct blend_rw {
    bool drop;
    bool partial;
    bool clamp_source;
+   unsigned target;
 };
 
 static bool rewrite_output(nir_builder *b, nir_intrinsic_instr *in, void *data)
 {
    struct blend_rw *w = data;
    if (in->intrinsic != nir_intrinsic_store_output ||
-       nir_intrinsic_io_semantics(in).location != FRAG_RESULT_DATA0)
+       nir_intrinsic_io_semantics(in).location != FRAG_RESULT_DATA0 + w->target)
       return false;
    if (w->drop) {
       nir_instr_remove(&in->instr);
@@ -5619,6 +5643,37 @@ static bool rewrite_output(nir_builder *b, nir_intrinsic_instr *in, void *data)
 
 static void apply_fs_key(struct gctx *c, nir_shader *nir, const struct pco_g5p_fs_key *k)
 {
+   if (k->mrt_blend_state) {
+      c->blend = BLEND_NONE;
+      for (unsigned t = 0; t < c->mrt.targets; t++) {
+         const struct pco_g5p_rt_blend *rt = &k->rt[t];
+         struct pco_g5p_fs_key single = PCO_G5P_FS_KEY_DEFAULT;
+         single.blend = rt->blend;
+         single.src_rgb = rt->src_rgb; single.dst_rgb = rt->dst_rgb;
+         single.src_a = rt->src_a; single.dst_a = rt->dst_a;
+         single.op_rgb = rt->op_rgb; single.op_a = rt->op_a;
+         struct g5p_blend_key bk = general_key(&single);
+         struct g5p_blend_info info;
+         uint8_t buf[2048];
+         const char *err;
+         g5p_blend_target(buf, sizeof(buf), &bk, G5P_BLEND_CONST_BASE,
+                          rt->write_mask, t, c->mrt.targets, &info, &err);
+         if (err)
+            refuse(c, "MRT target %u blend: %s", t, err);
+         c->binfo.uses_constants |= info.uses_constants;
+         if (info.reads_tile && k->write_mask)
+            c->blend = BLEND_GENERAL;
+         struct blend_rw w = { .target = t, .zero = info.zero_lanes,
+                               .drop = !k->write_mask, .clamp_source = rt->blend };
+         nir_shader_intrinsics_pass(nir, rewrite_output, nir_metadata_control_flow, &w);
+         if (w.partial)
+            refuse(c, "MRT target %u has partially written colour output", t);
+      }
+      if (!k->write_mask)
+         NIR_PASS(_, nir, nir_opt_dce);
+      return;
+   }
+
    /* k->srgb: Apple's program is the linear one (ds-isa-state.md §2.2); the
     * gamma is PBE q1 bit 45 (gles3-tex.md §1.2), not a program change. */
    c->blend = blend_mode(c, k);
@@ -6660,11 +6715,13 @@ bool pco_g5p_compile_general_link(nir_shader *nir, bool half_output, const uint8
    if (!c->vs) {
       /* Colour targets: 0 means one. Several targets take no blend and only the full write mask. */
       enum g5p_mrt_refusal mr = g5p_mrt_out_plan_make(c->key->color_targets ? c->key->color_targets : 1, &c->mrt);
-      if (mr == G5P_MRT_OK)
+      if (mr == G5P_MRT_OK && !c->key->mrt_blend_state)
          mr = g5p_mrt_check_key(&c->mrt, c->key->blend, c->key->write_mask);
       if (mr != G5P_MRT_OK)
          refuse(c, "%s", g5p_mrt_refusal_str(mr));
       if (c->key->color_output != PCO_G5P_COLOR_F16) {
+         if (c->key->mrt_blend_state)
+            refuse(c, "raw32 MRT blend or masks are not qualified");
          if (c->key->color_output != PCO_G5P_COLOR_UINT32 &&
              c->key->color_output != PCO_G5P_COLOR_SINT32)
             refuse(c, "unknown colour output format");
