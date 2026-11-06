@@ -4422,6 +4422,18 @@ g9p_compile_fragment(nir_shader *nir, unsigned frag_coord_slot,
             out);
    nir_shader *copy = nir_shader_clone(mem_ctx, nir);
 
+   /* more than a pixel holds: no attempt can do it, and attempts of large shaders add up */
+   {
+      unsigned words = 0;
+
+      for (unsigned t = 0; t < G9P_MAX_TARGETS; t++)
+         words += targets[t].present ? g9p_output_words(targets[t].output) : 0;
+      if (words > 8) {
+         fprintf(stderr, "g9p: %u output words\n", words);
+         return false;
+      }
+   }
+
    nir_shader *copy2 = nir_shader_clone(mem_ctx, nir);
 
    if (compile_back(nir, out, MESA_SHADER_FRAGMENT, NULL, frag_coord_slot, false, false, mem_ctx) ||
