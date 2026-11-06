@@ -1306,6 +1306,13 @@ upload_textures(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics
       }
    }
 
+   /*
+    * Many textures: their states and samplers in one table, one DMA, which leaves the
+    * program room for a shader's uniform runs (g9p_compile_fragment())
+    */
+   uint32_t table[10 * G9P_MAX_TEXTURES] = { 0 };
+   const bool use_table = state->num_textures >= G9P_FS_TEXTURE_TABLE_FROM;
+
    for (unsigned t = 0; t < state->num_textures; t++) {
       const struct pvr_descriptor_set *set = desc->sets[state->textures[t].set];
       uint64_t addr = 0;
@@ -1332,6 +1339,24 @@ upload_textures(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics
          if (r != VK_SUCCESS)
             return r;
       }
+      if (use_table) {
+         /* a descriptor pool's memory is mapped by its set, not listed for the CPU */
+         if (set && set->mapping) {
+            const struct pvr_descriptor_set_layout_binding *b =
+               &set->layout->bindings[state->textures[t].binding];
+            const uint8_t *d = (const uint8_t *)set->mapping + b->offset + state->textures[t].index * b->stride;
+
+            memcpy(&table[g9p_tex_state(0, t)], d, 4 * 4);
+            memcpy(&table[g9p_tex_sampler(0, state->num_textures, t)], d + sizeof(struct pvr_image_descriptor),
+                   2 * 4);
+            /* a seamful draw's cube state: a 2D array of six layers (seamful_tex_state()) */
+            if (state_addr != addr) {
+               table[g9p_tex_state(0, t)] = (table[g9p_tex_state(0, t)] & ~7u) | 3;
+               table[g9p_tex_state(0, t) + 3] |= 5u << 15;
+            }
+         }
+         continue;
+      }
       for (unsigned k = 0; k < 3; k++) {
          src[n] = k == 0 ? state_addr : k == 1 ? p->zeros->dev_addr.addr
                                                : addr + sizeof(struct pvr_image_descriptor);
@@ -1339,6 +1364,17 @@ upload_textures(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics
                                        : g9p_tex_state(0, t) + 4 * k,
                                 k == 2 ? 2 : 4, false);
       }
+   }
+
+   if (use_table) {
+      struct pvr_suballoc_bo *table_bo;
+      const VkResult r = pvr_arch_cmd_buffer_upload_general(cmd_buffer, table, 4 * g9p_fs_buf_base(state->num_textures),
+                                                            &table_bo);
+
+      if (r != VK_SUCCESS)
+         return r;
+      src[n] = table_bo->dev_addr.addr;
+      ctrl[n++] = doutd_ctrl(0, g9p_fs_buf_base(state->num_textures), false);
    }
 
    /* a program needs a DMA: a zero dword when there is nothing to load */

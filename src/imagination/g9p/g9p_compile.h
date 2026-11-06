@@ -38,7 +38,10 @@
  */
 #define G9P_VS_TEX_BASE (2 * G9P_MAX_BUFFERS)
 #define G9P_FS_BUF_DWORDS 512
-#define G9P_MAX_FS_RUNS 128
+#define G9P_MAX_FS_RUNS 64
+/* The DMAs a fragment shader's textures take: three each, or one table for many */
+#define G9P_FS_TEXTURE_TABLE_FROM 9
+#define G9P_FS_TEXTURE_DMAS(n) ((n) >= G9P_FS_TEXTURE_TABLE_FROM ? 1u : 3u * (n))
 
 static inline unsigned
 g9p_tex_state(unsigned base, unsigned t)

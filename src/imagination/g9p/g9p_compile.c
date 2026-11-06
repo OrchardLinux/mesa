@@ -2036,6 +2036,21 @@ emit_txs(struct g9p_ctx *ctx, nir_tex_instr *tex)
       g9p_alu2(ctx->c, G9P_AND, z, z, t, false);
       g9p_mov_imm(ctx->c, t, 1);
       g9p_alu2(ctx->c, G9P_IADD, z, z, t, false);
+      /*
+       * A linear image viewed as an array has one layer, and those bits are its pitch
+       * (g9p_pack_image_view()): the state's layout 2 says so.
+       */
+      {
+         const int mask = alloc_temp(ctx), two = alloc_temp(ctx);
+
+         if (mask < 0 || two < 0)
+            return false;
+         g9p_mov_uniform(ctx->c, d0, u, zero);
+         g9p_mov_imm(ctx->c, mask, 7);
+         g9p_alu2(ctx->c, G9P_AND, d0, d0, mask, false);
+         g9p_mov_imm(ctx->c, two, 2);
+         emit_select(ctx, G9P_EQ, false, d0, two, t, z, z);
+      }
       ctx->reg[key(&tex->def, 2)] = z;
    }
    ctx->busy &= ~ctx->temps;
@@ -2382,9 +2397,6 @@ emit_tex_vertex(struct g9p_ctx *ctx, nir_tex_instr *tex)
       ctx->c->w[at + 2] |= 0x8000;
    }
    extras_patch(ctx, at, &extras);
-   /* Apple's vertex compare has bit 15 of W2, as its layered samples */
-   if (extras.compare)
-      ctx->c->w[at + 2] |= 0x8000;
    g9p_wait(ctx->c);
    release(ctx, &tex->instr);
    for (unsigned c = 0; c < 4; c++) {
@@ -4095,49 +4107,83 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
       return false;
 
    /*
-    * Buffers over the uniform operands' 512 dwords: only the dwords it reads. A run spans
-    * small gaps, fewer DMAs for a few dwords nobody reads, unless that doesn't fit.
+    * Buffers over the uniform operands' 512 dwords: only the dwords it reads, in as few runs
+    * as fit: one for each buffer's reads, split at its widest gaps until they fit. Each run
+    * is a DMA of the texture and uniform program, whose data is at most 63 units of 16 bytes
+    * (3 dwords a DMA; G9P_FS_TEXTURE_DMAS() for the textures): too many hang the fragment job.
     */
    if (stage == MESA_SHADER_FRAGMENT) {
+      const unsigned max_runs = MIN2(G9P_MAX_FS_RUNS, 84 - G9P_FS_TEXTURE_DMAS(out->num_textures));
       unsigned total = g9p_fs_buf_base(out->num_textures);
 
       for (unsigned k = 0; k < out->num_buffers; k++)
          total += out->buffers[k].dwords;
-      for (unsigned gap = 3, next = 513; total > 512 && next > 512; gap = gap ? 0 : ~0u) {
-         if (gap == ~0u) {
-            fprintf(stderr, "g9p: fragment shader reads more than 512 dwords of buffers\n");
+      if (total > 512) {
+         struct { uint16_t slot, at, size; } gaps[G9P_FS_BUF_DWORDS];
+         unsigned num_gaps = 0, span = g9p_fs_buf_base(out->num_textures), runs = 0;
+         BITSET_DECLARE(split, G9P_MAX_BUFFERS * G9P_FS_BUF_DWORDS) = { 0 };
+
+         for (unsigned k = 0; k < out->num_buffers; k++) {
+            unsigned d, last = ~0u;
+
+            BITSET_FOREACH_SET (d, ctx.fs_used[k], G9P_FS_BUF_DWORDS) {
+               if (last == ~0u) {
+                  runs++;
+               } else if (d != last + 1 && num_gaps < ARRAY_SIZE(gaps)) {
+                  gaps[num_gaps].slot = k;
+                  gaps[num_gaps].at = d;
+                  gaps[num_gaps++].size = d - last - 1;
+               }
+               span += last == ~0u ? 1 : d - last;
+               last = d;
+            }
+         }
+         /* the widest gaps first */
+         while (span > 512 && runs < max_runs) {
+            unsigned widest = ~0u;
+
+            for (unsigned g = 0; g < num_gaps; g++) {
+               if (gaps[g].size && (widest == ~0u || gaps[g].size > gaps[widest].size))
+                  widest = g;
+            }
+            if (widest == ~0u)
+               break;
+            BITSET_SET(split, gaps[widest].slot * G9P_FS_BUF_DWORDS + gaps[widest].at);
+            span -= gaps[widest].size;
+            gaps[widest].size = 0;
+            runs++;
+         }
+         if (span > 512) {
+            fprintf(stderr, "g9p: fragment shader reads %u dwords of buffers in %u runs\n", span, runs);
             return false;
          }
-         next = g9p_fs_buf_base(out->num_textures);
+
+         unsigned next = g9p_fs_buf_base(out->num_textures);
 
          ctx.fs_map = rzalloc_array(mem_ctx, uint16_t, G9P_MAX_BUFFERS * G9P_FS_BUF_DWORDS);
          out->num_fs_runs = 0;
          for (unsigned k = 0; k < out->num_buffers; k++) {
             unsigned d;
+            bool first = true;
 
             BITSET_FOREACH_SET (d, ctx.fs_used[k], G9P_FS_BUF_DWORDS) {
-               const unsigned end = out->num_fs_runs && out->fs_runs[out->num_fs_runs - 1].slot == k
-                                       ? out->fs_runs[out->num_fs_runs - 1].first +
-                                            out->fs_runs[out->num_fs_runs - 1].count
-                                       : ~0u;
-
-               if (end != ~0u && d - end <= gap) {
-                  out->fs_runs[out->num_fs_runs - 1].count += d - end + 1;
-                  next += d - end;
-               } else {
-                  if (out->num_fs_runs == G9P_MAX_FS_RUNS) {
-                     fprintf(stderr, "g9p: fragment buffers in too many runs\n");
-                     return false;
-                  }
+               if (first || BITSET_TEST(split, k * G9P_FS_BUF_DWORDS + d)) {
                   out->fs_runs[out->num_fs_runs].slot = k;
                   out->fs_runs[out->num_fs_runs].first = d;
                   out->fs_runs[out->num_fs_runs].count = 1;
                   out->fs_runs[out->num_fs_runs++].dest = next;
+               } else {
+                  const unsigned end = out->fs_runs[out->num_fs_runs - 1].first +
+                                       out->fs_runs[out->num_fs_runs - 1].count;
+
+                  out->fs_runs[out->num_fs_runs - 1].count += d - end + 1;
+                  next += d - end;
                }
+               first = false;
                ctx.fs_map[k * G9P_FS_BUF_DWORDS + d] = next++;
             }
          }
-         if (next <= 512 && !generate(&ctx, impl, st))
+         if (!generate(&ctx, impl, st))
             return false;
       }
    }
