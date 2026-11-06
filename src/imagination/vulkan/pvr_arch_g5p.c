@@ -261,7 +261,7 @@ g5p_upload_load(struct pvr_device *device, struct pvr_g5p_programs *p, unsigned 
    struct pco_g5p_program prog;
    VkResult result = VK_SUCCESS;
 
-   if (!((raw == 8 || raw == 9) ? pvr_g5p_compile_load_packed_sint(&prog, raw == 8 ? 8 : 16) : raw == 7 ? pvr_g5p_compile_load_rgb10a2ui(&prog) : raw == 6 ? pvr_g5p_compile_load_rgba8ui(&prog) : raw == 5 ? pvr_g5p_compile_load_rgba16ui(&prog) : raw ? pvr_g5p_compile_load_raw(&prog, raw == 2) : pvr_g5p_compile_load(&prog))) {
+   if (!(raw == 10 || raw == 11 ? pvr_g5p_compile_load_scalar8(&prog, raw == 11) : (raw == 8 || raw == 9) ? pvr_g5p_compile_load_packed_sint(&prog, raw == 8 ? 8 : 16) : raw == 7 ? pvr_g5p_compile_load_rgb10a2ui(&prog) : raw == 6 ? pvr_g5p_compile_load_rgba8ui(&prog) : raw == 5 ? pvr_g5p_compile_load_rgba16ui(&prog) : raw ? pvr_g5p_compile_load_raw(&prog, raw == 2) : pvr_g5p_compile_load(&prog))) {
       snprintf(p->load_refusal, sizeof(p->load_refusal), "%s", prog.refusal);
       free(prog.code);
       return VK_SUCCESS;
@@ -325,7 +325,7 @@ g5p_upload_zeroed(struct pvr_device *device, uint32_t size, struct pvr_suballoc_
 static unsigned
 g5p_raw_variant(unsigned words)
 {
-   return words == 8 ? 2 : words == 4;
+   return words == 1 ? 3 : words == 8 ? 2 : words == 4;
 }
 
 /* Called only for an integer pass; qualification uses FORMATS=probe.
@@ -365,7 +365,7 @@ g5p_raw_programs_unlocked(struct pvr_device *device, unsigned raw, unsigned word
       if (result != VK_SUCCESS)
          return result;
    }
-   if ((raw <= 2 || (raw >= 5 && raw <= 9)) && !p->raw_load[raw - 1]) {
+   if ((raw <= 2 || (raw >= 5 && raw <= 11)) && !p->raw_load[raw - 1]) {
       p->raw_load[raw - 1] = vk_zalloc(&device->vk.alloc, sizeof(*p), 8, VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
       if (!p->raw_load[raw - 1])
          return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
@@ -695,6 +695,8 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
    /* output words per target, and of the pass: two raw32 targets of one format (admitted by
     * pvr_arch_g5p_mrt_pass_check(), behind the format probe) take four each, eight in all */
    const bool byte_source = first_format == VK_FORMAT_R8_UINT || first_format == VK_FORMAT_R8_SINT;
+   if (byte_source)
+      raw = first_format == VK_FORMAT_R8_SINT ? 11 : 10;
    const bool narrow = raw >= 5 &&
       (byte_source || first_format == VK_FORMAT_R16_UINT || first_format == VK_FORMAT_R16_SINT ||
        first_format == VK_FORMAT_R8G8_UINT || first_format == VK_FORMAT_R8G8_SINT);
@@ -713,6 +715,7 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
       if (result != VK_SUCCESS)
          return result;
       g->raw_words = raw_total;
+      g->raw_pixel_width = raw >= 5 ? source.pixel_output_width : raw_total;
    }
    float clear[4][4] = { { 0 } };
    /* a loaded target: its texture state (q0, q1, q2, 0), the load program's image upload */
@@ -753,7 +756,7 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
        * the original signed image key. Blending is rejected for integers.
        */
       uint32_t store_key = raw ? key & ~(0x80u << 5) : key;
-      if (raw >= 5 && raw <= 9) {
+      if (raw >= 5 && raw <= 11) {
          /* Equal-size raw physical view; logical sampling stays typed.
           * Native witness-r16 supplies the narrow16-bit source layout. */
          bool physical_srgb;
@@ -822,9 +825,9 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
           hw_render->color_init[i].index < info->clear_value_count)
          memcpy(clear[t], info->clear_values[hw_render->color_init[i].index].color.float32, sizeof(clear[t]));
    }
-   if (load && raw > 2 && !(raw >= 5 && raw <= 9))
+   if (load && raw > 2 && !(raw >= 5 && raw <= 11))
       return G5P_REFUSE(cmd_buffer, "integer boundary qualification supports CLEAR only");
-   const struct pvr_g5p_programs *load_program = raw && (raw <= 2 || (raw >= 5 && raw <= 9)) ? p->raw_load[raw - 1] : p;
+   const struct pvr_g5p_programs *load_program = raw && (raw <= 2 || (raw >= 5 && raw <= 11)) ? p->raw_load[raw - 1] : p;
    if (load && !load_program->load_usc)
       return G5P_REFUSE(cmd_buffer, "LOAD of a colour attachment%s: the load program: %s",
                         partial ? " (a partial render area)" : "", load_program->load_refusal);
@@ -836,7 +839,10 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
    /* per render: the clear floats and the PBE block, then their DOUTD data */
    if (raw) {
       uint32_t value[4]; memcpy(value, clear[0], sizeof(value));
-      if (raw == 8 || raw == 9) {
+      if (raw == 10 || raw == 11) {
+         value[0] = g5p_color_source_scalar8(value[0], raw == 11);
+         value[1] = value[2] = value[3] = 0;
+      } else if (raw == 8 || raw == 9) {
          unsigned bits = raw == 8 ? 8 : 16;
          int lo = -(1 << (bits-1)), hi = (1 << (bits-1))-1;
          for (unsigned c = 0; c < 4; c++)
@@ -850,7 +856,7 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
             packed |= MIN2(value[c],max) << (bits*c);
          }
          value[0] = packed; value[1] = value[2] = value[3] = 0;
-      } else {
+      } else if (raw != 10 && raw != 11) {
          pvr_g5p_dgl_clear_pack(value, value, raw == 5 || raw == 9);
       }
       memcpy(clear[0], value, sizeof(value));
@@ -998,7 +1004,7 @@ PVR_PER_ARCH(g5p_frag_stream)(const struct pvr_device *device, const struct pvr_
       e->dbias_va = job->depth_bias_table_addr.addr;
       e->dbias_count = MIN2(g->dbias_count, DRM_G5P_RENDER_MAX_TABLE_ENTRIES);
    }
-   e->pixel_output_width = g->raw_words ? g->raw_words : g5p_mrt_pixel_width(g->targets);
+   e->pixel_output_width = g->raw_words ? g->raw_pixel_width : g5p_mrt_pixel_width(g->targets);
    if (sub_cmd->query_pool) {
       e->occlusion_query_va =
          sub_cmd->query_pool->result_buffer->dev_addr.addr;

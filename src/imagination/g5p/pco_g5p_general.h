@@ -114,7 +114,8 @@ struct pco_g5p_fs_key {
    /* Per-RT format key: RGBA32 integer attachment, never inferred from SSA. */
    enum pco_g5p_color_output color_output;
    bool packed_sint; /* saturate signed channels, then preserve low bits */
-   uint8_t packed_uint_bits; /* 8/16: raw packed words, padded to two; full mask only */
+   bool packed_scalar8; /* R8: one scalar source; never pack unused G/B/A */
+   uint8_t packed_uint_bits; /* 8/10/16: packed output, scalar8 is one word; full mask only */
 };
 #define PCO_G5P_FS_KEY_DEFAULT ((struct pco_g5p_fs_key){.write_mask = 0xf})
 

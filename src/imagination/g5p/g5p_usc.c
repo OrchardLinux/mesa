@@ -622,7 +622,7 @@ unsigned g5p_usc_emit(uint8_t *out, unsigned words, unsigned source_half)
  * replayed against the Python reference (tools/gpu-userspace/g5p_usc.py). */
 unsigned g5p_usc_emit_mrt(uint8_t *out, unsigned words, unsigned source_half)
 {
-   CHECK(g5p_mrt_emit_words_witnessed(words), "only 2/4/8 output words (1/2/4 targets) have an Apple witness");
+   CHECK(g5p_mrt_emit_words_witnessed(words), "only 1/2/4/8 terminal source words have an Apple witness");
    CHECK(source_half < 256, "output source half must be u8");
    uint8_t raw[4] = {0x1c, (g5p_mrt_emit_field(words) << 4) | 1, source_half, 8};
    return finish(out, raw, 4);

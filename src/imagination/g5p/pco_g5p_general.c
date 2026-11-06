@@ -4988,7 +4988,8 @@ static void plan_fs_output(struct gctx *c)
          if (mr != G5P_MRT_OK)
             refuse(c, "%s", g5p_mrt_refusal_str(mr));
       }
-      c->mrt.words = c->mrt.pixel_output_width = (c->key->packed_uint_bits ? 2 : 4) * c->mrt.targets;
+      c->mrt.words = (c->key->packed_scalar8 ? 1 : c->key->packed_uint_bits ? 2 : 4) * c->mrt.targets;
+      c->mrt.pixel_output_width = c->key->packed_scalar8 ? 2 : c->mrt.words;
       c->mrt.emit_field = g5p_mrt_emit_field(c->mrt.words);
       return; /* No narrow f16 loads, output ALU fusion, or f16 constants. */
    }
@@ -5117,7 +5118,7 @@ static void fs_output(struct gctx *c)
    c->now = LAST_END;
    if (c->key->color_output != PCO_G5P_COLOR_F16) {
       /* target t's channels: output words 4t..4t+3 (c->out[] is indexed 4 * slot + component) */
-      const unsigned words = (c->key->packed_uint_bits ? 2 : 4) * c->mrt.targets;
+      const unsigned words = c->mrt.words;
       struct pvr_g5p_dgl_source sources[8] = {0};
       for (unsigned k = 0; k < words; k++) {
          if (!(c->key->write_mask & (1u << (k % 4))) || !c->out_written[k]) {
@@ -5643,7 +5644,7 @@ static bool rewrite_output(nir_builder *b, nir_intrinsic_instr *in, void *data)
 
 /* fmt-rgba16u fw_val_u emits two raw words. Saturate each unsigned
  * channel before packing; never pass integer bits through float. */
-struct packed_uint_rw { unsigned bits, stores; bool partial, is_signed; };
+struct packed_uint_rw { unsigned bits, stores; bool partial, is_signed, scalar8; };
 static bool pack_uint(nir_builder *b, nir_intrinsic_instr *in, void *data)
 {
    if (in->intrinsic != nir_intrinsic_store_output ||
@@ -5669,6 +5670,9 @@ static bool pack_uint(nir_builder *b, nir_intrinsic_instr *in, void *data)
       in->num_components = 4;
    }
    unsigned bits = rw->bits;
+   if (rw->scalar8)
+      src = nir_vec4(b, nir_channel(b, src, 0), nir_imm_int(b, 0),
+                     nir_imm_int(b, 0), nir_imm_int(b, 0));
    unsigned max = bits == 8 ? 255 : bits == 10 ? 1023 : 65535;
    nir_def *v;
    if (rw->is_signed) {
@@ -6775,12 +6779,15 @@ bool pco_g5p_compile_general_link(nir_shader *nir, bool half_output, const uint8
          if (c->key->color_output != PCO_G5P_COLOR_UINT32 &&
              c->key->color_output != PCO_G5P_COLOR_SINT32)
             refuse(c, "unknown colour output format");
+         if (c->key->packed_scalar8 && c->key->packed_uint_bits != 8)
+            refuse(c, "scalar R8 output requires eight-bit channels");
          if (c->key->packed_uint_bits) {
             if (c->mrt.targets != 1 || c->key->blend || c->key->write_mask != 15)
                refuse(c, "packed unsigned RT requires one unblended full-mask target");
             if (c->key->packed_uint_bits != 8 && c->key->packed_uint_bits != 10 && c->key->packed_uint_bits != 16)
                refuse(c, "unsupported packed unsigned channel width");
-            struct packed_uint_rw rw = { .bits = c->key->packed_uint_bits, .is_signed = c->key->packed_sint };
+            struct packed_uint_rw rw = { .bits = c->key->packed_uint_bits, .is_signed = c->key->packed_sint,
+                                         .scalar8 = c->key->packed_scalar8 };
             nir_shader_intrinsics_pass(nir, pack_uint, nir_metadata_control_flow, &rw);
             if (rw.partial && rw.stores > 1)
                refuse(c, "packed unsigned RT needs merging of multiple partial output stores");

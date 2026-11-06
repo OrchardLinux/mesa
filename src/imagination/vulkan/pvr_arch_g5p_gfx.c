@@ -554,6 +554,7 @@ g5p_check_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo *c
       key->color_output = PCO_G5P_COLOR_UINT32;
       key->packed_uint_bits = pvr_g5p_packed_uint_bits(cf);
       key->packed_sint = pvr_g5p_packed_is_signed(cf);
+      key->packed_scalar8 = cf == VK_FORMAT_R8_UINT || cf == VK_FORMAT_R8_SINT;
       if (key->packed_sint)
          key->color_output = PCO_G5P_COLOR_SINT32;
    }

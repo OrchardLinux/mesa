@@ -19,7 +19,7 @@ pvr_g5p_dgl_output_words(uint8_t *output, size_t capacity, const struct pvr_g5p_
 {
    uint8_t code[10 * G5P_USC_MAX];
    size_t size = 0;
-   if (!output || !sources || write_mask > 0xf || (words != 2 && words != 4 && words != 8) || (words != 4 && write_mask != 0xf))
+   if (!output || !sources || write_mask > 0xf || (words != 1 && words != 2 && words != 4 && words != 8) || (words != 4 && write_mask != 0xf))
       return 0;
    if (write_mask != 0xf) {
       /* RGBA32 tile storage is four words. Preserve unmasked raw channels;
@@ -74,7 +74,7 @@ pvr_g5p_dgl_clear_words(uint8_t *output, size_t capacity, unsigned words)
    uint8_t code[10 * G5P_USC_MAX];
    size_t size = 0;
    /* 8: two 32-bit integer targets, common 7..0 into output words 7..0 */
-   if (words != 2 && words != 4 && words != 8)
+   if (words != 1 && words != 2 && words != 4 && words != 8)
       return 0;
    for (int c = words - 1; c >= 0; c--)
       size += g5p_usc_mov_shared(code + size, 2 * c, c, 0);

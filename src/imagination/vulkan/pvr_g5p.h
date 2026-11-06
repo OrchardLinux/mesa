@@ -87,13 +87,13 @@ struct pvr_g5p_programs {
    } load_upload[3];
    char load_refusal[128];
    /* Lazy integer variants: float device allocation order remains identical. */
-   struct pvr_g5p_programs *raw_load[9];
+   struct pvr_g5p_programs *raw_load[11]; /* scalar R8 uses10/11, separate fromRGBA8 */
    /* raw clear programs by total output words: 2, 4, 8 (two 32-bit integer targets) */
-   struct pvr_suballoc_bo *raw_clear_usc[3];
+   struct pvr_suballoc_bo *raw_clear_usc[4]; /*2/4/8 words, then scalar1 */
    /* raw end-of-tile programs by target count: 1, 2 */
    struct pvr_suballoc_bo *raw_eot_usc[2];
    struct pvr_suballoc_bo *narrow_eot_usc; /* native16-bit source layout */
-   struct pvr_pds_upload raw_clear_kick[3];
+   struct pvr_pds_upload raw_clear_kick[4];
 };
 
 /* G5P's per-device state (pvr_device::g5p), allocated by g5p_device_init() */
@@ -122,6 +122,7 @@ struct pvr_g5p_job {
    uint32_t width, height;
    unsigned targets;            /* colour targets, 1, 2 or 4 */
    unsigned raw_words;          /* integer tile storage: two or four words, eight for two raw32 targets */
+   unsigned raw_pixel_width;    /* native R8 has one source word, two tile words */
    uint32_t dbias_count;        /* entries of upstream's depth-bias table, 0 without one */
    uint32_t scissor_count;      /* entries of upstream's scissor table, 0 without one */
    uint32_t samples;            /* 1 or 4 (hw_render->sample_count) */
@@ -294,6 +295,7 @@ bool pvr_g5p_compile_stage(const VkPipelineShaderStageCreateInfo *stage_info, bo
  * pixel centre. false with out->refusal set. */
 bool pvr_g5p_compile_load(struct pco_g5p_program *out);
 bool pvr_g5p_compile_load_packed_sint(struct pco_g5p_program *out, unsigned bits);
+bool pvr_g5p_compile_load_scalar8(struct pco_g5p_program *out, bool is_signed);
 bool pvr_g5p_compile_load_rgb10a2ui(struct pco_g5p_program *out);
 bool pvr_g5p_compile_load_rgba8ui(struct pco_g5p_program *out);
 bool pvr_g5p_compile_load_rgba16ui(struct pco_g5p_program *out);

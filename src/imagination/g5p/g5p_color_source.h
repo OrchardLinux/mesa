@@ -10,7 +10,7 @@
 #include "g5p_mrt_programs.h"
 enum g5p_color_source_class { G5P_COLOR_SOURCE_UINT, G5P_COLOR_SOURCE_SINT, G5P_COLOR_SOURCE_UNORM16 };
 struct g5p_color_source_abi {
-   unsigned channel_bits, channels, output_words;
+   unsigned channel_bits, channels, output_words, pixel_output_width;
    bool word32;
    uint32_t write_key; /* native linear low PBE q0; write selectors, not sample selectors */
 };
@@ -25,9 +25,23 @@ static inline bool g5p_color_source_make(unsigned bits, unsigned channels,
    uint32_t selectors=channels>=2?1u<<18:0;
    if(channels==4)selectors|=(2u<<21)|(3u<<24);
    unsigned words=(bits*channels+31)/32;
-   *p=(struct g5p_color_source_abi){bits,channels,words<2?2:words,bits==32,
-      2u|(layout<<5)|((type==G5P_COLOR_SOURCE_SINT?3u:2u)<<12)|selectors};
+   *p=(struct g5p_color_source_abi){
+      .channel_bits=bits,.channels=channels,
+      .output_words=bits==8?1:words<2?2:words,
+      .pixel_output_width=words<2?2:words,.word32=bits==32,
+      .write_key=2u|(layout<<5)|((type==G5P_COLOR_SOURCE_SINT?3u:2u)<<12)|selectors};
    return true;
+}
+/* Scalar8 occupies one native output word; G/B/A are not adjacent bytes
+ * of that scalar source. Signed logical values use an unsigned physical
+ * byte view after clamping, preserving their two's-complement low byte. */
+static inline uint32_t g5p_color_source_scalar8(uint32_t value, bool signed_value)
+{
+   if(signed_value) {
+      int32_t v=(int32_t)value;
+      return (uint32_t)(v < -128 ? -128 : v > 127 ? 127 : v)&255;
+   }
+   return value>255?255:value;
 }
 static inline unsigned g5p_color_source_eot(uint8_t *out,const struct g5p_color_source_abi *p)
 {

@@ -106,7 +106,7 @@ static inline unsigned g5p_mrt_emit_words(unsigned field)
 /* Word counts for which an Apple A9 witness exists for a homogeneous set. */
 static inline bool g5p_mrt_emit_words_witnessed(unsigned words)
 {
-   return words == 2 || words == 4 || words == 8;
+   return words == 1 || words == 2 || words == 4 || words == 8;
 }
 
 static inline enum g5p_mrt_refusal g5p_mrt_out_plan_make(unsigned targets, struct g5p_mrt_out_plan *p)
