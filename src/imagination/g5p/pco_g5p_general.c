@@ -5356,6 +5356,10 @@ static bool lower(nir_shader *nir)
       .lower_txp = ~0u, .lower_txp_array = true,
       .lower_txf_offset = nir->info.stage == MESA_SHADER_VERTEX &&
                           g5p_vtex_qualified() && g5p_vtex_fetch_offset_probe(),
+      /* Size queries use CPU-uploaded view dimensions. Minify them with
+       * the qualified integer ALU; NIR preserves an array's layer count.
+       * This adds no TPU instruction or shadow-sampling recipe. */
+      .lower_txs_lod = nir->info.stage == MESA_SHADER_VERTEX && g5p_vtex_size_lod_probe(),
    };
    NIR_PASS(_, nir, nir_lower_tex, &txp);
    pvr_g5p_tbo_lower(nir);
