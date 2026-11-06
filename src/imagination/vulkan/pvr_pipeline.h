@@ -148,7 +148,7 @@ struct pvr_g9p_graphics_state {
    struct pvr_pds_upload varyings[3];
    bool flat_varyings;
    /* the DOUTI data in 16-byte units */
-   unsigned varying_units;
+   unsigned varying_units, varying_coeffs;
    unsigned num_varyings;
    /* vertex output dwords */
    unsigned vs_outputs;

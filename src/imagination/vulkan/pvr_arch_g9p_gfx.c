@@ -539,6 +539,8 @@ upload_varyings(struct pvr_device *device, struct pvr_g9p_graphics_state *state,
                                 v + 1 == iterates ? G9P_PDS_END : 0);
    code[nc++] = g9p_pds_halt();
    state->varying_units = DIV_ROUND_UP(8 * iterates, 16);
+   /* In vec4s, W included (iPadOS: flat or noperspective vec4 1, with W 2) */
+   state->varying_coeffs = any_persp ? 2 * n : n;
 
    for (unsigned pv = 0; pv < (state->flat_varyings ? 3 : 1); pv++) {
       VkResult result;
@@ -1793,7 +1795,7 @@ emit_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state
    PPP_BLOCK(0xc0, state->fs_kick.data_offset, tex ? tex->code_offset : p->halt.code_offset,
              (tex ? MAX2(tex->data_size / 4, 1) : 1) << 23 |
                 (state->num_varyings
-                    ? state->varying_units << 10 | (2 * state->num_varyings) << 4
+                    ? state->varying_units << 10 | state->varying_coeffs << 4
                     : 0),
              DIV_ROUND_UP(4 * dp->fs_common_dwords, 64) << 23 |
                 /*

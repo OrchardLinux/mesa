@@ -1379,8 +1379,9 @@ emit_varying_load(struct g9p_ctx *ctx, nir_intrinsic_instr *intr, bool persp)
    r = alloc_reg(ctx);
    if (r < 0)
       return false;
-   if (ctx->out->varying_flat[n])
+   if (ctx->out->varying_flat[n]) {
       g9p_flat_load(ctx->c, r, 4 * n + nir_intrinsic_component(intr));
+   }
    else
       g9p_iterate(ctx->c, r, 4 * n + nir_intrinsic_component(intr), 1, persp);
    g9p_wait(ctx->c);
@@ -1460,15 +1461,17 @@ emit_colour(struct g9p_ctx *ctx)
             g9p_to_half(ctx->c, i, ctx->colour[i]);
          return true;
       }
-      const int mask = const_reg(ctx, 0xffff), shift = const_reg(ctx, 16);
-      const int t = alloc_temp(ctx);
+      const int shift = const_reg(ctx, 16);
+      const int t = alloc_temp(ctx), lo = alloc_temp(ctx);
 
-      if (mask < 0 || shift < 0 || t < 0)
+      if (shift < 0 || t < 0 || lo < 0)
          return false;
       for (unsigned w = 0; w < words; w++) {
-         g9p_alu2(ctx->c, G9P_AND, w, ctx->colour[2 * w], mask, false);
+         /* (a << 16 >> 16) | b << 16; the output register written once, last */
+         g9p_shift(ctx->c, t, ctx->colour[2 * w], shift, false);
+         g9p_shift(ctx->c, lo, t, shift, true);
          g9p_shift(ctx->c, t, ctx->colour[2 * w + 1], shift, false);
-         g9p_alu2(ctx->c, G9P_OR, w, w, t, false);
+         g9p_alu2(ctx->c, G9P_OR, w, lo, t, false);
       }
       return true;
    }
