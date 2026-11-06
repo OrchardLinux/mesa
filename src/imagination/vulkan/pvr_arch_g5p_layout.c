@@ -47,6 +47,7 @@ struct g5p_surface {
    bool twiddled, blocks; /* blocks: a compressed surface addressed in texels */
    const struct pvr_image *image;
    VkImageAspectFlags aspects;
+   uint64_t image_offset;
 };
 
 static bool
@@ -74,6 +75,7 @@ g5p_surface_init(struct pvr_device *device, const struct pvr_transfer_cmd_surfac
    out->blocks = util_format_is_compressed(out->format);
    out->image = s->g5p_image;
    out->aspects = s->g5p_aspect;
+   out->image_offset = s->g5p_image ? s->dev_addr.addr - s->g5p_image->dev_addr.addr - pvr_single_plane_const(s->g5p_image)->offset : 0;
    if (!out->base)
       mesa_loge("G5P transfer: no stable CPU mapping for %#" PRIx64, s->dev_addr.addr);
    return out->base != NULL;
@@ -143,6 +145,19 @@ g5p_ds_plane(const struct g5p_surface *s, VkImageAspectFlagBits aspect,
    p->format = stencil ? PIPE_FORMAT_S8_UINT :
                own->depth_bytes == 2 ? PIPE_FORMAT_Z16_UNORM : PIPE_FORMAT_Z32_FLOAT;
    p->cpp = stencil ? 1 : own->depth_bytes;
+   struct pvr_g5p_ds_chain chain;
+   if (pvr_g5p_ds_sampled_chain(image, &chain)) {
+      unsigned layer=s->image_offset/chain.layer, level=0;
+      uint64_t at=s->image_offset%chain.layer;
+      while(level<image->vk.mip_levels && chain.level[level]!=at)level++;
+      if(layer>=image->vk.array_layers || level==image->vk.mip_levels)return false;
+      uint64_t target=stencil ? chain.stencil_base+layer*chain.stencil_layer+chain.stencil_level[level] : s->image_offset;
+      if(target<s->image_offset || target-s->image_offset>p->available)return false;
+      uint64_t delta=target-s->image_offset;
+      p->base+=delta;p->available-=delta;p->bpp=p->cpp;p->component_offset=0;
+      p->twiddled=true;
+      return true;
+   }
    if (image->vk.tiling == VK_IMAGE_TILING_OPTIMAL && image->vk.mip_levels == 1) {
       struct pvr_g5p_ds_plane zls;
       if (!pvr_g5p_ds_layout(image->vk.format, s->width, s->height, 1, &zls))

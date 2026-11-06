@@ -47,6 +47,10 @@ PVR_PER_ARCH(g5p_ds_admit)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_r
    if (!f)
       return G5P_DS_REFUSE(cmd_buffer, "depth/stencil format %s (the ZLS stores D16, D32F, S8, D32F_S8)",
                            vk_Format_to_str(iview->vk.format));
+   struct pvr_g5p_ds_chain chain;
+   const bool sampled_chain = pvr_g5p_ds_sampled_chain(image, &chain);
+   if (sampled_chain && f->stencil && (iview->vk.extent.width < 32 || iview->vk.extent.height < 32))
+      return G5P_DS_REFUSE(cmd_buffer, "small combined depth/stencil chain attachment needs Apple's temporary ZLS plane");
    if (iview->vk.base_mip_level || iview->vk.base_array_layer)
       return G5P_DS_REFUSE(cmd_buffer, "a depth/stencil view of level %u layer %u (level 0 layer 0 are built)",
                            iview->vk.base_mip_level, iview->vk.base_array_layer);
@@ -65,7 +69,7 @@ PVR_PER_ARCH(g5p_ds_admit)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_r
    }
    if (!pvr_g5p_ds_layout(iview->vk.format, image->vk.extent.width, image->vk.extent.height,
                           image->vk.samples, &plane) ||
-       image->total_size < plane.size)
+       image->total_size < (sampled_chain ? chain.size : plane.size))
       return G5P_DS_REFUSE(cmd_buffer, "a depth/stencil image of %" PRIu64 " bytes, the ZLS planes take %" PRIu64
                            " (pvr_g5p_ds_layout())", (uint64_t)image->total_size, plane.size);
    if (image->vk.samples == VK_SAMPLE_COUNT_4_BIT &&
@@ -84,9 +88,13 @@ PVR_PER_ARCH(g5p_ds_pass)(const struct pvr_render_job *job, struct pvr_g5p_zls_w
       return;
    }
    const struct pvr_image *image = pvr_image_view_get_image(job->ds.iview);
+   struct pvr_g5p_ds_chain chain;
+   bool sampled_chain = pvr_g5p_ds_sampled_chain(image, &chain);
    const struct pvr_g5p_ds_target t = {
       .format = job->ds.iview->vk.format,
       .va = job->ds.addr.addr,
+      .texture_chain = sampled_chain,
+      .stencil_va = sampled_chain ? image->dev_addr.addr + pvr_single_plane_const(image)->offset + chain.stencil_base : 0,
       .width = job->ds.iview->vk.extent.width,
       .height = job->ds.iview->vk.extent.height,
       .samples = image->vk.samples,
@@ -207,27 +215,38 @@ PVR_PER_ARCH(g5p_ds_view_state)(const struct pvr_image_view *iview, uint64_t q[3
    uint64_t va;
    VkFormat tf;
 
-   if (image->vk.mip_levels != 1 || image->vk.array_layers != 1 || iview->vk.base_mip_level)
-      return "a sampled depth/stencil image with mips or layers (the ZLS stores one surface)";
+   struct pvr_g5p_ds_chain chain;
+   const bool sampled_chain = pvr_g5p_ds_sampled_chain(image, &chain);
+   if (!sampled_chain && (image->vk.mip_levels != 1 || image->vk.array_layers != 1 || iview->vk.base_mip_level))
+      return "a depth/stencil mip/layer view without sampled-chain storage";
+   if (sampled_chain && iview->vk.aspects != VK_IMAGE_ASPECT_DEPTH_BIT)
+      return "a stencil aspect of sampled-chain storage (no stencil texture-state witness)";
    if (image->vk.samples != VK_SAMPLE_COUNT_1_BIT)
       return "a sampled multisample depth/stencil image";
-   if (iview->vk.view_type != VK_IMAGE_VIEW_TYPE_2D && iview->vk.view_type != VK_IMAGE_VIEW_TYPE_2D_ARRAY)
-      return "a depth/stencil view that is not 2D";
-   const char *why = pvr_g5p_ds_texture_plane(image->vk.format, iview->vk.aspects, image->vk.extent.width,
-                                              image->vk.extent.height, image->dev_addr.addr + plane->offset, &va,
-                                              &tf);
-   if (why)
-      return why;
+   if (iview->vk.view_type != VK_IMAGE_VIEW_TYPE_2D && iview->vk.view_type != VK_IMAGE_VIEW_TYPE_2D_ARRAY && (!sampled_chain || iview->vk.view_type != VK_IMAGE_VIEW_TYPE_CUBE))
+      return "a depth/stencil view that is not 2D/array/cube";
+   if (sampled_chain) {
+      va=image->dev_addr.addr+plane->offset+iview->vk.base_array_layer*chain.layer;
+      tf=image->vk.format == VK_FORMAT_D16_UNORM ? VK_FORMAT_R16_UNORM : VK_FORMAT_R32_SFLOAT;
+   } else {
+      const char *why = pvr_g5p_ds_texture_plane(image->vk.format, iview->vk.aspects,
+         image->vk.extent.width, image->vk.extent.height, image->dev_addr.addr+plane->offset, &va, &tf);
+      if (why) return why;
+   }
    if (va % 64)
       return "a ZLS plane off a 64-byte base";
    const struct pvr_g5p_tex_twiddled_view v = {
-      .key = pvr_g5p_tex_swizzle_key(tf == VK_FORMAT_R32_SFLOAT ? G5P_DS_TEX_KEY_DEPTH : G5P_DS_TEX_KEY_STENCIL,
+      .key = pvr_g5p_tex_swizzle_key(tf == VK_FORMAT_R32_SFLOAT ? G5P_DS_TEX_KEY_DEPTH : tf == VK_FORMAT_R16_UNORM ? PVR_G5P_TEX_KEY(9,0,5,5,4) : G5P_DS_TEX_KEY_STENCIL,
                                      &iview->vk.swizzle),
-      .layout = iview->vk.view_type == VK_IMAGE_VIEW_TYPE_2D ? PVR_G5P_TEX_LAYOUT_2D : PVR_G5P_TEX_LAYOUT_2D_ARRAY,
+      .layout = iview->vk.view_type == VK_IMAGE_VIEW_TYPE_2D ? PVR_G5P_TEX_LAYOUT_2D :
+                iview->vk.view_type == VK_IMAGE_VIEW_TYPE_CUBE ? PVR_G5P_TEX_LAYOUT_CUBE : PVR_G5P_TEX_LAYOUT_2D_ARRAY,
       .width = image->vk.extent.width,
       .height = image->vk.extent.height,
-      .depth = 1,
-      .level_count = 1,
+      .depth = sampled_chain ? iview->vk.layer_count : 1,
+      .base_level = iview->vk.base_mip_level,
+      .level_count = iview->vk.level_count,
+      .image_has_mips = image->vk.mip_levels > 1,
+      .big_layer = sampled_chain && chain.layer >= PVR_G5P_TEX_BIG_LAYER,
       .va = va,
    };
    pvr_g5p_tex_twiddled(q, &v);

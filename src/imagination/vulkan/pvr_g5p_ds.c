@@ -60,7 +60,7 @@ g5p_dw64(const uint32_t dw[2])
 }
 
 static const struct pvr_g5p_ds_format g5p_ds_formats[] = {
-   { VK_FORMAT_D16_UNORM, ROGUE_CR_ZLS_FORMAT_TYPE_16BITINT, 2, true, false, false },
+   { VK_FORMAT_D16_UNORM, ROGUE_CR_ZLS_FORMAT_TYPE_16BITINT, 2, true, false, true },
    /* the depth plane reads as R32F (the captured shadow-sampling scene) */
    { VK_FORMAT_D32_SFLOAT, ROGUE_CR_ZLS_FORMAT_TYPE_F32Z, 4, true, false, true },
    { VK_FORMAT_S8_UINT, ROGUE_CR_ZLS_FORMAT_TYPE_F32Z, 0, false, true, false },
@@ -158,14 +158,14 @@ pvr_g5p_ds_zls(const struct pvr_g5p_ds_target *t, struct pvr_g5p_zls_words *out)
          out->zls[1] = out->zls[2];
    }
    if (s) {
-      const struct ROGUE_CR_ISP_STENCIL_LOAD_BASE base = { .addr = t->va + plane.stencil_offset, .enable = true };
+      const struct ROGUE_CR_ISP_STENCIL_LOAD_BASE base = { .addr = t->stencil_va ? t->stencil_va : t->va + plane.stencil_offset, .enable = true };
       ROGUE_CR_ISP_STENCIL_LOAD_BASE_pack(dw, &base);
       out->zls[3] = g5p_dw64(dw);
       out->zls[4] = out->zls[3];
    }
 
    uint32_t w = t->width, h = t->height;
-   if (f->stencil || w < 32 || h < 32 || t->samples == 4) {
+   if (f->stencil || (!t->texture_chain && (w < 32 || h < 32)) || t->samples == 4) {
       w = g5p_align(w, 32);
       h = g5p_align(h, 32);
    }
@@ -313,7 +313,7 @@ pvr_g5p_ds_texture_plane(VkFormat format, VkImageAspectFlags aspect, uint32_t wi
    switch (aspect) {
    case VK_IMAGE_ASPECT_DEPTH_BIT:
       *plane_va = va;
-      *texture_format = VK_FORMAT_R32_SFLOAT;
+      *texture_format = f->depth_bytes == 2 ? VK_FORMAT_R16_UNORM : VK_FORMAT_R32_SFLOAT;
       return NULL;
    case VK_IMAGE_ASPECT_STENCIL_BIT:
       if (!f->stencil)
@@ -334,6 +334,7 @@ pvr_g5p_ds_format_features(VkFormat format)
    if (!f)
       return 0;
    return VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT |
+          VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT |
           (f->sampled ? VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT
                       : 0);
 }

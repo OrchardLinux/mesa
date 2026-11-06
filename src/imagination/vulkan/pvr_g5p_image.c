@@ -117,11 +117,39 @@ pvr_g5p_image_layout(struct pvr_image *image, unsigned stride_align)
    image->total_size = plane->size;
 }
 
+bool
+pvr_g5p_ds_sampled_chain(const struct pvr_image *image, struct pvr_g5p_ds_chain *chain)
+{
+   const struct pvr_g5p_ds_format *f = pvr_g5p_ds_format(image->vk.format);
+   return f && f->depth && image->vk.image_type == VK_IMAGE_TYPE_2D && image->vk.tiling == VK_IMAGE_TILING_OPTIMAL &&
+      image->vk.samples == 1 && (image->vk.usage & VK_IMAGE_USAGE_SAMPLED_BIT) &&
+      (image->vk.mip_levels > 1 || image->vk.array_layers > 1) &&
+      pvr_g5p_ds_chain_plan(image->vk.extent.width, image->vk.extent.height,
+         image->vk.mip_levels, image->vk.array_layers, f->depth_bytes, f->stencil, chain);
+}
+
 void
 pvr_g5p_ds_image_layout(struct pvr_image *image)
 {
    struct pvr_g5p_ds_plane zls;
    uint64_t layer = 0;
+   struct pvr_g5p_ds_chain chain;
+   if (pvr_g5p_ds_sampled_chain(image, &chain)) {
+      struct pvr_image_plane *plane = &image->planes[0];
+      const struct pvr_g5p_ds_format *f = pvr_g5p_ds_format(image->vk.format);
+      for (unsigned l=0;l<image->vk.mip_levels;l++) {
+         unsigned w=u_minify(util_next_power_of_two(image->vk.extent.width),l);
+         unsigned h=u_minify(util_next_power_of_two(image->vk.extent.height),l);
+         plane->mip_levels[l].offset=chain.level[l];
+         plane->mip_levels[l].pitch=w*f->depth_bytes;
+         plane->mip_levels[l].height_pitch=h;
+         plane->mip_levels[l].size=(uint64_t)w*h*f->depth_bytes;
+      }
+      plane->layer_size=chain.layer;
+      plane->size=chain.size;
+      image->total_size=align64(plane->offset+chain.size,image->alignment);
+      return;
+   }
 
    if (image->vk.tiling != VK_IMAGE_TILING_OPTIMAL || image->plane_count != 1 || image->vk.mip_levels != 1)
       return;

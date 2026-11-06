@@ -18,6 +18,7 @@
 #ifndef PVR_G5P_DS_H
 #define PVR_G5P_DS_H
 
+#include "pvr_g5p_ds_chain.h"
 #include <stdbool.h>
 #include <stdint.h>
 #include <vulkan/vulkan_core.h>
@@ -55,7 +56,9 @@ bool pvr_g5p_ds_layout(VkFormat format, uint32_t width, uint32_t height, uint32_
 /* The depth/stencil attachment of one render, as the ZLS sees it */
 struct pvr_g5p_ds_target {
    VkFormat format;
-   uint64_t va;             /* the image's base (the depth plane) */
+   uint64_t va;
+   uint64_t stencil_va; /* explicit planar chain address, or zero for legacy ZLS */
+   bool texture_chain;             /* the image's base (the depth plane) */
    uint32_t width, height;  /* the attachment's extent: ZLS_PIXELS */
    uint32_t samples;        /* 1 or 4 */
    bool depth, stencil;     /* the aspects the render uses */
@@ -134,6 +137,7 @@ VkFormatFeatureFlags2 pvr_g5p_ds_format_features(VkFormat format);
  * are left as they are (pvr_g5p_image.c) */
 struct pvr_image;
 void pvr_g5p_ds_image_layout(struct pvr_image *image);
+bool pvr_g5p_ds_sampled_chain(const struct pvr_image *image, struct pvr_g5p_ds_chain *chain);
 
 #endif /* PVR_G5P_DS_H */
 
