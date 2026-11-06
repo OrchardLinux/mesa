@@ -917,7 +917,7 @@ unsigned g5p_usc_gather(uint8_t *out, const struct g5p_tex *t)
 unsigned g5p_usc_sample_ext(uint8_t *out, const struct g5p_tex_ext *t)
 {
    const bool coupled = t->tuple != G5P_TEX_TUPLE_ORDINARY;
-   CHECK(t->tuple <= G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL, "unqualified texture recipe");
+   CHECK(t->tuple <= G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL_OFFSET, "unqualified texture recipe");
    CHECK(!coupled || t->lod_shared == (t->tuple == G5P_TEX_TUPLE_COUPLED_SHARED_LEVEL),
          "unqualified independent texture continuation choices");
    static const uint8_t dim_low[G5P_TEX_DIM_COUNT] = {0x5, 0x7, 0xb, 0xd};
@@ -935,8 +935,12 @@ unsigned g5p_usc_sample_ext(uint8_t *out, const struct g5p_tex_ext *t)
    CHECK(t->lod != G5P_TEX_LOD_GRAD || t->dim == G5P_TEX_2D || t->dim == G5P_TEX_2D_ARRAY,
          "gradients are measured on 2D and 2D arrays only");
    CHECK(!t->offset || t->dim != G5P_TEX_CUBE, "cube offsets do not exist");
-   CHECK(!coupled || (!t->compare && !t->offset && t->lod == G5P_TEX_LOD_LEVEL),
-         "vertex texture tuple requires explicit level, no compare or offset");
+   const bool offset_tuple = t->tuple == G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL_OFFSET;
+   CHECK(!coupled || (!t->compare && t->offset == offset_tuple && t->lod == G5P_TEX_LOD_LEVEL),
+         "vertex texture tuple requires its complete level/offset recipe");
+   CHECK(!offset_tuple || (!t->read && !t->lod_shared &&
+                          (t->dim == G5P_TEX_2D || t->dim == G5P_TEX_2D_ARRAY)),
+         "vertex offset recipe is a 2D or array sample with a temporary level");
    CHECK(!(t->tuple == G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL) || (coupled && !t->lod_shared),
          "vertex level bank requires the vertex tuple and a temporary level");
    uint8_t raw[14] = {0x1a, (t->mask << 4) | dim_low[t->dim], t->dst_half | (t->read ? 0x40 : 0),
@@ -959,11 +963,16 @@ unsigned g5p_usc_sample_ext(uint8_t *out, const struct g5p_tex_ext *t)
        * keep this suffix indivisible rather than guessing mixed forms. */
       raw[9] = (1u << 7) | 1u;
       raw[10] = 1u << 3;
-      if ((t->tuple == G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL)) {
+      if (t->tuple == G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL || offset_tuple) {
          /* The level producer writes a bank-1 temp. A common-store level
           * (native buffer/manual fold) has no level-bank extension. */
          raw[11] = 1;
          raw[12] = 1u << 4;
+         /* Complete native v_{2d,2d_array}_attribute_{pos,neg} recipe.
+          * Its coordinate, result, level and packed-offset producers all
+          * write bank1. No independent continuation choice is exposed. */
+         if (offset_tuple)
+            raw[13] = 1u << 7;
          return finish(out, raw, 14);
       }
       return finish(out, raw, 12);
@@ -980,6 +989,15 @@ unsigned g5p_usc_half_immediate(uint8_t *out, unsigned dst_half, uint16_t value)
       if (value >> b & 1)
          raw[imm_byte[b]] |= 1 << imm_bit[b];
    return finish(out, raw, 12);
+}
+
+unsigned g5p_usc_vertex_half_immediate(uint8_t *out, unsigned dst_half, uint16_t value)
+{
+   uint8_t raw[12];
+   unsigned n = g5p_usc_half_immediate(raw, dst_half, value);
+   if (!n || !destination(raw + 2, dst_half, 1))
+      return 0;
+   return finish(out, raw, n);
 }
 
 unsigned g5p_usc_cube_coords(uint8_t *out, unsigned dst_half, unsigned src_half)

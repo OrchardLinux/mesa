@@ -831,7 +831,7 @@ static const char *vs_qualified_tex_refusal(const nir_tex_instr *t)
        (t->sampler_dim != GLSL_SAMPLER_DIM_2D && t->sampler_dim != GLSL_SAMPLER_DIM_3D &&
         t->sampler_dim != GLSL_SAMPLER_DIM_CUBE))
       return "vertex cube/shadow recipe not device-qualified";
-   if (nir_tex_instr_src_index(t, nir_tex_src_offset) >= 0)
+   if (nir_tex_instr_src_index(t, nir_tex_src_offset) >= 0 && !g5p_vtex_fetch_offset_probe())
       return "vertex texture offset not device-qualified";
    if (t->op != nir_texop_txf && nir_alu_type_get_base_type(t->dest_type) != nir_type_float)
       return "vertex sampled integer result not device-qualified";
@@ -4257,6 +4257,12 @@ static void emit_vertex_qualified_texture(struct gctx *c, nir_tex_instr *t)
    if (cube)
       put(c, raw, g5p_usc_cube_coords_bank1(raw, H(c,block), H(c,direction)),
           "native bank0 direction to bank1 cube coordinates");
+   int packed = packed_offset(t);
+   /* Match the native producers: an array's offset uses the layer's high
+    * half; a 2D offset uses the f16 level's high half. The low half survives. */
+   unsigned extras = H(c,array ? block + 2 : level) + 1;
+   if (packed >= 0)
+      put(c, raw, g5p_usc_vertex_half_immediate(raw, extras, packed), "qualified vertex packed offset");
    unsigned dst = alloc_run(c, 4, "qualified vertex texture result");
    struct g5p_tex_ext x = {
       .dst_half=H(c,dst), .image_qword=b->image/2,
@@ -4264,7 +4270,8 @@ static void emit_vertex_qualified_texture(struct gctx *c, nir_tex_instr *t)
       .coord_dword=H(c,block)/2,
       .dim=cube ? G5P_TEX_CUBE : t->sampler_dim==GLSL_SAMPLER_DIM_3D ? G5P_TEX_3D : array ? G5P_TEX_2D_ARRAY : G5P_TEX_2D,
       .mask=15, .read=read, .lod=G5P_TEX_LOD_LEVEL, .lod_dword=H(c,level)/2,
-      .tuple=G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL,
+      .offset=packed >= 0, .extras_half=packed >= 0 ? extras : 0,
+      .tuple=packed >= 0 ? G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL_OFFSET : G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL,
    };
    put(c, raw, g5p_usc_sample_ext(raw,&x), "qualified vertex sample/read recipe");
    put(c, raw, g5p_usc_wait(raw,0), "wait");

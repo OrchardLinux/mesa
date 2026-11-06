@@ -162,6 +162,7 @@ enum g5p_tex_tuple {
    G5P_TEX_TUPLE_ORDINARY,
    G5P_TEX_TUPLE_COUPLED_SHARED_LEVEL,
    G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL,
+   G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL_OFFSET,
 };
 struct g5p_tex_ext {
    unsigned dst_half, image_qword, sampler_qword, coord_dword;
@@ -179,6 +180,8 @@ unsigned g5p_usc_sample_ext(uint8_t *out, const struct g5p_tex_ext *t);
 /* 16-bit immediate into one half (class 0x88, the 32-bit move's split map;
  * Apple's texel-offset probes witness bits 0-9). */
 unsigned g5p_usc_half_immediate(uint8_t *out, unsigned dst_half, uint16_t value);
+/* Native v_2d_attribute_{pos,neg}: packed offset into a bank1 half. */
+unsigned g5p_usc_vertex_half_immediate(uint8_t *out, unsigned dst_half, uint16_t value);
 /* Cube direction (x, y, z) in temps -> the cube sample's coordinates, by the
  * iterator unit: `08 7d DH SH 00 80`, SH = source half << 1 | 1 (Apple's
  * f_cube_alu, f_cube_hi; a cube sample of raw directions reads them as 2D on
