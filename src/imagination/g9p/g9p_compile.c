@@ -3705,6 +3705,17 @@ lower_txf(nir_builder *b, nir_tex_instr *tex, void *data)
    return true;
 }
 
+/* Centroid: renders have one sample, at the pixel's centre */
+static bool
+lower_centroid(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_interp_deref_at_centroid)
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def_replace(&intr->def, nir_load_deref(b, nir_src_as_deref(intr->src[0])));
+   return true;
+}
+
 /* Flat inputs, by varying: NIR's loads do not say */
 static void
 find_flat_varyings(nir_shader *nir, struct g9p_shader *out)
@@ -3730,6 +3741,7 @@ g9p_compile_fragment(nir_shader *nir, unsigned frag_coord_slot,
    NIR_PASS(_, nir, discards_to_if);
    NIR_PASS(_, nir, discards_to_flag);
    NIR_PASS(_, nir, nir_shader_tex_pass, lower_txf, nir_metadata_control_flow, NULL);
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_centroid, nir_metadata_control_flow, NULL);
    find_flat_varyings(nir, out);
    lower_io(nir);
    out->native_blend = blend && is_src_over(blend) && !getenv("G9P_NO_NATIVE_BLEND");
