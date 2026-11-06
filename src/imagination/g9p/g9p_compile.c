@@ -3053,6 +3053,17 @@ lower_cube_seamful(nir_builder *b, nir_tex_instr *tex, void *data)
    nir_src_rewrite(&tex->src[nir_tex_instr_src_index(tex, nir_tex_src_coord)].src,
                    nir_vec3(b, nir_fadd_imm(b, nir_fmul(b, sc, half_rcp), 0.5),
                             nir_fadd_imm(b, nir_fmul(b, tc, half_rcp), 0.5), face));
+   /*
+    * GL's switch to magnification at a level of 0.5 when magnification is linear
+    * and minification a nearest mipmap (the hardware's is at 0)
+    */
+   if (*(const bool *)data && tex->op == nir_texop_txl) {
+      const int li = nir_tex_instr_src_index(tex, nir_tex_src_lod);
+      nir_def *lod = tex->src[li].src.ssa;
+
+      nir_src_rewrite(&tex->src[li].src,
+                      nir_bcsel(b, nir_fge_imm(b, nir_fneg(b, lod), -0.5), nir_imm_float(b, 0), lod));
+   }
    tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
    tex->is_array = true;
    tex->coord_components = 3;
@@ -3060,11 +3071,12 @@ lower_cube_seamful(nir_builder *b, nir_tex_instr *tex, void *data)
 }
 
 bool
-g9p_lower_cubes_seamful(nir_shader *nir)
+g9p_lower_cubes_seamful(nir_shader *nir, bool mag_at_half)
 {
    bool progress = false;
 
-   NIR_PASS(progress, nir, nir_shader_tex_pass, lower_cube_seamful, nir_metadata_control_flow, NULL);
+   NIR_PASS(progress, nir, nir_shader_tex_pass, lower_cube_seamful, nir_metadata_control_flow,
+            &mag_at_half);
    return progress;
 }
 

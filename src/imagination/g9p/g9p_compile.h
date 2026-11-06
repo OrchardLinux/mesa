@@ -166,7 +166,7 @@ bool g9p_compile_compute(nir_shader *nir, struct g9p_shader *out, void *mem_ctx)
 unsigned g9p_frag_coord_slot(const nir_shader *vs);
 
 /* Cube samples as 2D array samples per face; false when the shader has none */
-bool g9p_lower_cubes_seamful(nir_shader *nir);
+bool g9p_lower_cubes_seamful(nir_shader *nir, bool mag_at_half);
 
 /*
  * Vertex shader: @attribs by attribute location (VERT_ATTRIB_GENERIC0 +

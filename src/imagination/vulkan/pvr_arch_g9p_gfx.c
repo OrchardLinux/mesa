@@ -485,7 +485,8 @@ static VkResult
 g9p_compile_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo *create_info,
                   struct pvr_graphics_pipeline *pipeline,
                   const struct vk_graphics_pipeline_state *vk_state,
-                  struct pvr_g9p_graphics_state *state, bool seamful, bool *has_cube)
+                  struct pvr_g9p_graphics_state *state, bool seamful, bool mag_at_half,
+                  bool *has_cube)
 {
    const bool point_size = vk_state->ia &&
                            vk_state->ia->primitive_topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
@@ -552,8 +553,8 @@ g9p_compile_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo 
       if (result != VK_SUCCESS)
          goto out;
       if (seamful) {
-         g9p_lower_cubes_seamful(vs_nir);
-         g9p_lower_cubes_seamful(fs_nir);
+         g9p_lower_cubes_seamful(vs_nir, mag_at_half);
+         g9p_lower_cubes_seamful(fs_nir, false);
       } else {
          nir_foreach_function_impl (impl, vs_nir)
             nir_foreach_block (block, impl)
@@ -677,18 +678,22 @@ PVR_PER_ARCH(g9p_graphics_pipeline_compile)(struct pvr_device *device,
    struct pvr_g9p_graphics_state *state = &pipeline->g9p;
    bool has_cube = false;
    VkResult result = g9p_compile_state(device, create_info, pipeline, vk_state, state, false,
-                                       &has_cube);
+                                       false, &has_cube);
 
    if (result != VK_SUCCESS || !has_cube)
       return result;
-   state->seamful = calloc(1, sizeof(*state->seamful));
-   if (!state->seamful)
-      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
    /* too much for the backend: the draws filter across faces, as seamless ones do */
-   if (g9p_compile_state(device, create_info, pipeline, vk_state, state->seamful, true,
-                         &has_cube) != VK_SUCCESS) {
-      free(state->seamful);
-      state->seamful = NULL;
+   for (unsigned i = 0; i < 2; i++) {
+      struct pvr_g9p_graphics_state **v = i ? &state->seamful_mag : &state->seamful;
+
+      *v = calloc(1, sizeof(**v));
+      if (!*v)
+         return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+      if (g9p_compile_state(device, create_info, pipeline, vk_state, *v, true, i,
+                            &has_cube) != VK_SUCCESS) {
+         free(*v);
+         *v = NULL;
+      }
    }
    return VK_SUCCESS;
 }
@@ -712,6 +717,10 @@ PVR_PER_ARCH(g9p_graphics_pipeline_destroy)(struct pvr_graphics_pipeline *pipeli
    if (pipeline->g9p.seamful) {
       g9p_state_destroy(pipeline->g9p.seamful);
       free(pipeline->g9p.seamful);
+   }
+   if (pipeline->g9p.seamful_mag) {
+      g9p_state_destroy(pipeline->g9p.seamful_mag);
+      free(pipeline->g9p.seamful_mag);
    }
    g9p_state_destroy(&pipeline->g9p);
 }
@@ -792,7 +801,7 @@ seamful_tex_state(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_descriptor
 
 static bool
 tex_wants_seamful(const struct pvr_descriptor_state *desc, unsigned set_idx, unsigned binding,
-                  unsigned index)
+                  unsigned index, bool *mag_at_half)
 {
    const struct pvr_descriptor_set *set = desc->sets[set_idx];
 
@@ -804,26 +813,35 @@ tex_wants_seamful(const struct pvr_descriptor_state *desc, unsigned set_idx, uns
    uint64_t sampler;
 
    memcpy(&sampler, d + sizeof(struct pvr_image_descriptor), sizeof(sampler));
-   return (*(const uint32_t *)d & 7) == 6 && (sampler & G9P_SAMPLER_SEAMFUL);
+   if ((*(const uint32_t *)d & 7) != 6 || !(sampler & G9P_SAMPLER_SEAMFUL))
+      return false;
+   /*
+    * g9p_pack_sampler(): magnification linear, minification nearest, mipmapped
+    * (a maximum level above Zink's 0.25, which means no mipmaps)
+    */
+   if (mag_at_half && (sampler >> 23 & 1) && !(sampler >> 25 & 1) && (sampler >> 27 & 3) &&
+       (sampler >> 10 & 0x3ff) > 16)
+      *mag_at_half = true;
+   return true;
 }
 
-static bool
-draw_wants_seamful(const struct pvr_cmd_buffer *cmd_buffer,
-                   const struct pvr_g9p_graphics_state *state)
+static const struct pvr_g9p_graphics_state *
+draw_state(const struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state *state)
 {
    const struct pvr_descriptor_state *desc = &cmd_buffer->state.gfx_desc_state;
+   bool seamful = false, mag = false;
 
+   if (!state->seamful)
+      return state;
    for (unsigned t = 0; t < state->num_textures; t++) {
-      if (tex_wants_seamful(desc, state->textures[t].set, state->textures[t].binding,
-                            state->textures[t].index))
-         return true;
+      seamful |= tex_wants_seamful(desc, state->textures[t].set, state->textures[t].binding,
+                                   state->textures[t].index, NULL);
    }
    for (unsigned t = 0; t < state->vs_num_textures; t++) {
-      if (tex_wants_seamful(desc, state->vs_textures[t].set, state->vs_textures[t].binding,
-                            state->vs_textures[t].index))
-         return true;
+      seamful |= tex_wants_seamful(desc, state->vs_textures[t].set, state->vs_textures[t].binding,
+                                   state->vs_textures[t].index, &mag);
    }
-   return false;
+   return !seamful ? state : mag && state->seamful_mag ? state->seamful_mag : state->seamful;
 }
 
 /*
@@ -1414,10 +1432,7 @@ PVR_PER_ARCH(g9p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer,
 {
    struct pvr_cmd_buffer_state *cs = &cmd_buffer->state;
    const struct pvr_graphics_pipeline *pipeline = cs->gfx_pipeline;
-   const struct pvr_g9p_graphics_state *state =
-      pipeline->g9p.seamful && draw_wants_seamful(cmd_buffer, &pipeline->g9p)
-         ? pipeline->g9p.seamful
-         : &pipeline->g9p;
+   const struct pvr_g9p_graphics_state *state = draw_state(cmd_buffer, &pipeline->g9p);
    const struct vk_dynamic_graphics_state *dyn = &cmd_buffer->vk.dynamic_graphics_state;
    const struct pvr_render_pass_info *info = &cs->render_pass_info;
    const uint32_t width = info->render_area.offset.x + info->render_area.extent.width;

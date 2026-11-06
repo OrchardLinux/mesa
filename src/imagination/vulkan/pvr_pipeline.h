@@ -138,6 +138,8 @@ struct pvr_g9p_graphics_state {
     * for draws whose sampler asks for no filtering across faces
     */
    struct pvr_g9p_graphics_state *seamful;
+   /* and with GL's magnification threshold in explicit levels */
+   struct pvr_g9p_graphics_state *seamful_mag;
    bool is_seamful;
    struct pvr_suballoc_bo *vs_bo, *fs_bo;
    /* vertex kick (code and data), fragment kick bundle, DOUTI program */
