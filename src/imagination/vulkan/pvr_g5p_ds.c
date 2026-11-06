@@ -63,7 +63,7 @@ static const struct pvr_g5p_ds_format g5p_ds_formats[] = {
    { VK_FORMAT_D16_UNORM, ROGUE_CR_ZLS_FORMAT_TYPE_16BITINT, 2, true, false, true },
    /* the depth plane reads as R32F (the captured shadow-sampling scene) */
    { VK_FORMAT_D32_SFLOAT, ROGUE_CR_ZLS_FORMAT_TYPE_F32Z, 4, true, false, true },
-   { VK_FORMAT_S8_UINT, ROGUE_CR_ZLS_FORMAT_TYPE_F32Z, 0, false, true, false },
+   { VK_FORMAT_S8_UINT, ROGUE_CR_ZLS_FORMAT_TYPE_F32Z, 0, false, true, true },
    { VK_FORMAT_D32_SFLOAT_S8_UINT, ROGUE_CR_ZLS_FORMAT_TYPE_F32Z, 4, true, true, true },
 };
 
@@ -297,7 +297,7 @@ pvr_g5p_ds_texture_plane(VkFormat format, VkImageAspectFlags aspect, uint32_t wi
    struct pvr_g5p_ds_plane plane;
 
    if (!f || !f->sampled)
-      return "a sampled depth/stencil plane without a texture key (D16, S8)";
+      return "a sampled depth/stencil plane without a texture key";
    /* the texture's padded sides tw x th, the ZLS's zw x zh (32-aligned first). Morton bit b of x sits at 2b + 1
     * and of y at 2b; past the smaller power the larger side's bits continue linearly. Wider: the extra x bits
     * agree only when both orders interleave the same number of bits (the height pads alike: zh == th). Taller:
@@ -312,6 +312,8 @@ pvr_g5p_ds_texture_plane(VkFormat format, VkImageAspectFlags aspect, uint32_t wi
       return "a sampled depth/stencil image of 0 pixels";
    switch (aspect) {
    case VK_IMAGE_ASPECT_DEPTH_BIT:
+      if (!f->depth)
+         return "the depth aspect of a format without depth";
       *plane_va = va;
       *texture_format = f->depth_bytes == 2 ? VK_FORMAT_R16_UNORM : VK_FORMAT_R32_SFLOAT;
       return NULL;
@@ -335,6 +337,6 @@ pvr_g5p_ds_format_features(VkFormat format)
       return 0;
    return VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT |
           VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT |
-          (f->sampled ? VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT
-                      : 0);
+          (f->sampled ? VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT : 0) |
+          (f->sampled && f->depth ? VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT : 0);
 }

@@ -199,9 +199,11 @@ PVR_PER_ARCH(g5p_ds_bias)(struct pvr_cmd_buffer *cmd_buffer, const struct vk_dyn
 }
 
 /* The texture keys of a ZLS plane: depth reads as R32_SFLOAT (format code
- * 0x221, the captured shadow-sampling scene's), stencil as R8_UINT (code
- * 0x100, inferred); both with Vulkan's depth/stencil selectors (D or S, 0, 0,
- * 1). The view's swizzle composes over them. */
+ * 0x221, the captured shadow-sampling scene's), stencil as the ordinary
+ * R8_UINT byte format (code 0x100, pvr_g5p_format_table.h). Their in-place
+ * texel addresses must agree with the ZLS order, checked by texture_plane().
+ * Both use Vulkan's depth/stencil selectors (D or S, 0, 0, 1), composed with
+ * the view's swizzle. */
 #define G5P_DS_TEX_KEY_DEPTH \
    PVR_G5P_TEX_KEY(0x221, 0, PVR_G5P_TEX_SEL_ZERO, PVR_G5P_TEX_SEL_ZERO, PVR_G5P_TEX_SEL_ONE)
 #define G5P_DS_TEX_KEY_STENCIL \
