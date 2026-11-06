@@ -48,6 +48,7 @@
 #include "pvr_hw_pass.h"
 #include "pvr_image.h"
 #include "pvr_job_render.h"
+#include "pvr_query.h"
 #include "pvr_rogue_pds_encode.h"
 #include "winsys/apple_g5p/apple_g5p_drm.h"
 
@@ -931,6 +932,8 @@ PVR_PER_ARCH(g5p_frag_stream)(const struct pvr_device *device, const struct pvr_
 
    /* the V2 extension: the device's tables, the background object, the output width */
    struct drm_g5p_render_pass_ext *e = &pass.ext;
+   const struct pvr_sub_cmd_gfx *sub_cmd =
+      container_of(job, const struct pvr_sub_cmd_gfx, job);
    e->scissor_va = p->scissor_pool->dev_addr.addr;
    e->scissor_count = MIN2(G5P_SCISSOR_POOL_BYTES / 8, DRM_G5P_RENDER_MAX_TABLE_ENTRIES);
    e->dbias_va = p->dbias_pool->dev_addr.addr;
@@ -954,6 +957,11 @@ PVR_PER_ARCH(g5p_frag_stream)(const struct pvr_device *device, const struct pvr_
       e->dbias_count = MIN2(g->dbias_count, DRM_G5P_RENDER_MAX_TABLE_ENTRIES);
    }
    e->pixel_output_width = g->raw_words ? g->raw_words : g5p_mrt_pixel_width(g->targets);
+   if (sub_cmd->query_pool) {
+      e->occlusion_query_va =
+         sub_cmd->query_pool->result_buffer->dev_addr.addr;
+      e->occlusion_query_size = sub_cmd->query_pool->result_buffer->size;
+   }
 
    pass.ta_program_va = device->heaps.pds_heap->base_addr.addr + p->ta_kick.data_offset;
    pass.ta_program_size = 0x40;

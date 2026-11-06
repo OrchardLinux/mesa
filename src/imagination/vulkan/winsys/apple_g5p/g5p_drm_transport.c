@@ -352,6 +352,11 @@ _Static_assert(offsetof(struct drm_g5p_render_pass, sample_positions) == 304, "p
 _Static_assert(offsetof(struct drm_g5p_render_pass_ext, dbias_va) == 16, "ext dbias_va @16");
 _Static_assert(offsetof(struct drm_g5p_render_pass_ext, bgobj_depth) == 32, "ext bgobj_depth @32");
 _Static_assert(offsetof(struct drm_g5p_render_pass_ext, zls) == 48, "ext zls @48");
+_Static_assert(offsetof(struct drm_g5p_render_pass_ext, occlusion_query_va) == 96,
+               "ext occlusion_query_va @96");
+_Static_assert(offsetof(struct drm_g5p_render_pass_ext, occlusion_query_size) == 104,
+               "ext occlusion_query_size @104");
+_Static_assert(offsetof(struct drm_g5p_render_pass_ext, reserved) == 112, "ext reserved @112");
 _Static_assert(sizeof(struct drm_g5p_render_pass_ext) == 128, "the V2 extension is 128 bytes");
 _Static_assert(offsetof(struct drm_g5p_render_pass_v3, ext) == 360, "V3 ext @360");
 _Static_assert(offsetof(struct drm_g5p_render_pass_v3, ta_program_va) == 488, "V3 ta_program_va @488");

@@ -396,6 +396,7 @@ struct drm_g5p_render_pass {
  * target, and the kernel sets the 3D's resolve words with it (ISP_CTL bit
  * 17, W86c). It needs 4 samples. */
 #define DRM_G5P_CAP_RENDER_MSAA (1ULL << 31)
+#define DRM_G5P_CAP_RENDER_OCCLUSION_QUERY (1ULL << 33)
 #define DRM_G5P_RENDER_MSAA_RESOLVE (1U << 0)
 
 /* The V2 extension (128 bytes). Non-zero selects the V2 dialect: the pools
@@ -412,7 +413,9 @@ struct drm_g5p_render_pass_ext {
 	__u32 pixel_output_width;	/* 2, 4 or 8 */
 	__u32 zls_address_mask;		/* bit i: zls[i] is an address in a listed RW range */
 	__u64 zls[DRM_G5P_RENDER_ZLS_REGS]; /* ZLSCTL, ZLOAD, ZSTORE, STENCIL_LOAD, STENCIL_STORE, ZLS_PIXELS */
-	__u64 reserved[4];
+	__u64 occlusion_query_va;	/* ISP_OCLQRY_BASE, 16-byte aligned, READ|WRITE */
+	__u64 occlusion_query_size;	/* bytes in the listed allocation */
+	__u64 reserved[2];
 };
 
 #define DRM_G5P_RENDER_PASS_SKIP_EMPTY_TILES (1U << 0)
