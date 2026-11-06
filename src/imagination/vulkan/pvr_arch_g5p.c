@@ -74,6 +74,8 @@ static const unsigned g5p_mrt_variant_targets[PVR_G5P_MRT_VARIANTS] = { 1, 2, 4 
 #define G5P_SCRATCH_BYTES 0x8000u
 #define G5P_NULL_RT_SIDE 16u  /* the null colour target: 16x16 R8, 16-byte rows (g5p_job_init()) */
 #define G5P_NULL_RT_PITCH 16u
+/* the same buffer as a 16x16 four-byte target, 64-byte rows: the padding 4th target of a 3-target pass */
+#define G5P_NULL_RT_PITCH4 64u
 static const uint32_t g5p_scratch_ptr_off[6] = { 0x20, 0x24, 0x28, 0x2c, 0x6240, 0x6040 };
 /* The default scissor and depth-bias tables of a render without tables of its
  * own. Its draws index entry 0 only (scindex/dbindex 0, scissor and bias
@@ -443,7 +445,7 @@ g5p_upload_programs(struct pvr_device *device, struct pvr_g5p_programs *p)
 
    result = g5p_upload_zeroed(device, G5P_SCRATCH_BYTES, &p->scratch);
    if (result == VK_SUCCESS)
-      result = g5p_upload_zeroed(device, G5P_NULL_RT_PITCH * G5P_NULL_RT_SIDE, &p->null_rt);
+      result = g5p_upload_zeroed(device, G5P_NULL_RT_PITCH4 * G5P_NULL_RT_SIDE, &p->null_rt);
    if (result == VK_SUCCESS)
       result = g5p_upload_zeroed(device, G5P_SCISSOR_POOL_BYTES, &p->scissor_pool);
    if (result == VK_SUCCESS)
@@ -630,11 +632,14 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
 
    /* everything but the reads the pass's draws collected (pvr_g5p_perf.h) */
    memset(g, 0, offsetof(struct pvr_g5p_job, reads));
-   switch (n) {
+   /* three targets: Apple's 4-target pass with a fourth that stores to the null target (admitted by
+    * pvr_arch_g5p_mrt_pass_check(): one 8-bit RGBA format; the program writes it zeros, pvr_g5p_nir.c) */
+   const unsigned nt = n == 3 ? 4 : n;
+   switch (nt) {
    case 1: v = 0; break;
    case 2: v = 1; break;
    case 4: v = 2; break;
-   default: return G5P_REFUSE(cmd_buffer, "%u colour targets (1, 2 or 4 are built)", n);
+   default: return G5P_REFUSE(cmd_buffer, "%u colour targets (1, 2, 3 or 4 are built)", n);
    }
    /* several targets: Apple's pass shape (pvr_g5p_mrt.h) */
    VkResult mrt = pvr_arch_g5p_mrt_pass_check(cmd_buffer, hw_render);
@@ -756,6 +761,14 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
          g->height = iview->vk.extent.height;
       }
    }
+   if (nt == 4 && n == 3) {
+      uint32_t key;
+      bool srgb;
+      if (!g5p_pbe_key(first_format, &key, &srgb))
+         return G5P_REFUSE(cmd_buffer, "the padding target's %s key", vk_Format_to_str(first_format));
+      g5p_pbe_encode(pbe[3], key, srgb, p->null_rt->dev_addr.addr, G5P_NULL_RT_SIDE, G5P_NULL_RT_SIDE,
+                     G5P_NULL_RT_PITCH4);
+   }
    /* A render area smaller than the attachment: every tile runs the
     * background and is stored, so the tiles outside the area must load what
     * they hold (the A9 ICD's rule: the LOAD background whatever the load op;
@@ -791,7 +804,7 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
    if (load && g->samples == 4)
       return G5P_REFUSE(cmd_buffer, "LOAD of a 4x colour attachment%s (the load program runs per pixel)",
                         partial ? " (a partial render area)" : "");
-   g->targets = n;
+   g->targets = nt;
 
    /* per render: the clear floats and the PBE block, then their DOUTD data */
    if (raw) {
@@ -802,9 +815,9 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
    struct pvr_suballoc_bo *floats, *block;
    uint32_t pbe_words[G5P_MRT_PBE_STRIDE * G5P_MRT_MAX];
    /* each target's source: output half 4t (8-bit RGBA, two dwords), 8t (raw32, four words) */
-   const unsigned pbe_dwords = g5p_mrt_pbe_block_halves(pbe_words, n, (const uint64_t(*)[3])pbe,
+   const unsigned pbe_dwords = g5p_mrt_pbe_block_halves(pbe_words, nt, (const uint64_t(*)[3])pbe,
                                                         raw ? 2 * raw_words : 4);
-   VkResult result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, clear, 16 * n, &floats);
+   VkResult result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, clear, 16 * nt, &floats);
    if (result != VK_SUCCESS)
       return result;
    result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, pbe_words, 4 * pbe_dwords, &block);
@@ -814,7 +827,7 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
    struct pvr_pds_upload clear_data, eot_data;
    {
       const uint32_t data[4] = { (uint32_t)floats->dev_addr.addr, (uint32_t)(floats->dev_addr.addr >> 32),
-                                 raw ? g5p_doutd_control_at(0, raw_total, true) : g5p_doutd_control(G5P_MRT_CLEAR_DWORDS * n), 0 };
+                                 raw ? g5p_doutd_control_at(0, raw_total, true) : g5p_doutd_control(G5P_MRT_CLEAR_DWORDS * nt), 0 };
       result = pvr_arch_cmd_buffer_upload_pds(cmd_buffer, data, ARRAY_SIZE(data), 16, NULL, 0, 0, 16,
                                               &clear_data);
       if (result != VK_SUCCESS)
@@ -850,14 +863,14 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
       }
       pvr_csb_pack (&bgnd[3], CR_PDS_BGRND3_SIZEINFO, b3) {
          b3.pds_uniformsize = DIV_ROUND_UP(4, ROGUE_CR_PDS_BGRND3_SIZEINFO_PDS_UNIFORMSIZE_UNIT_SIZE);
-         b3.usc_sharedsize = DIV_ROUND_UP(raw ? raw_total : G5P_MRT_CLEAR_DWORDS * n,
+         b3.usc_sharedsize = DIV_ROUND_UP(raw ? raw_total : G5P_MRT_CLEAR_DWORDS * nt,
                                           ROGUE_CR_PDS_BGRND3_SIZEINFO_USC_SHAREDSIZE_UNIT_SIZE);
       }
    }
    memcpy(g->background, bgnd, sizeof(g->background));
    g->eot[0] = eot_data.data_offset;
    g->eot[1] = p->eot.code_offset;
-   g->eot[2] = g5p_mrt_eot_info(n);
+   g->eot[2] = g5p_mrt_eot_info(nt);
    /* what the render writes, for the winsys's resource list (pvr_g5p_perf.h) */
    pvr_arch_g5p_perf_job(cmd_buffer, hw_render, &g->reads, &g->perf);
    g->enabled = true;

@@ -422,6 +422,43 @@ xfb_captures(const nir_shader *nir, gl_varying_slot slot)
    return false;
 }
 
+/* The colour slots (FRAG_RESULT_DATA0 + s) a fragment shader stores */
+static bool
+find_color_slots(nir_builder *b, nir_intrinsic_instr *in, void *data)
+{
+   (void)b;
+   if (in->intrinsic != nir_intrinsic_store_output)
+      return false;
+   const unsigned loc = nir_intrinsic_io_semantics(in).location;
+   if (loc >= FRAG_RESULT_DATA0 && loc < FRAG_RESULT_DATA0 + 8)
+      *(uint8_t *)data |= 1u << (loc - FRAG_RESULT_DATA0);
+   return false;
+}
+
+/* Several colour targets: one emitpix writes every target, so an attached slot the shader leaves unwritten
+ * (Vulkan: undefined) is written zeros, as is the padding fourth target of a 3-target pass. A shader that
+ * stores no colour at all is left as it is (it ends without emitpix). */
+static void
+pad_color_slots(nir_shader *nir, unsigned color_targets)
+{
+   uint8_t written = 0;
+   nir_shader_intrinsics_pass(nir, find_color_slots, nir_metadata_all, &written);
+   const uint8_t all = BITFIELD_MASK(color_targets);
+   if (!(written & all) || (written & all) == all)
+      return;
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_builder b = nir_builder_at(nir_after_impl(impl));
+   for (unsigned s = 0; s < color_targets; s++) {
+      if (written & (1u << s))
+         continue;
+      nir_store_output(&b, nir_imm_vec4(&b, 0.0f, 0.0f, 0.0f, 0.0f), nir_imm_int(&b, 0), .base = 0,
+                       .component = 0, .write_mask = 0xf, .src_type = nir_type_float32,
+                       .io_semantics = (nir_io_semantics){ .location = FRAG_RESULT_DATA0 + s, .num_slots = 1 });
+      nir->info.outputs_written |= BITFIELD64_BIT(FRAG_RESULT_DATA0 + s);
+   }
+   nir_index_ssa_defs(impl);
+}
+
 /* The graphics lowerings of a prepared stage (the ICD's graphics_nir()) */
 static nir_shader *
 graphics_lower(nir_shader *nir, unsigned color_targets, bool *sample_mask, bool point_size, bool *psize_dropped)
@@ -454,6 +491,8 @@ graphics_lower(nir_shader *nir, unsigned color_targets, bool *sample_mask, bool 
       nir_opt_dce(nir);
       nir_index_ssa_defs(nir_shader_get_entrypoint(nir));
    }
+   if (nir && stage == MESA_SHADER_FRAGMENT && color_targets > 1)
+      pad_color_slots(nir, color_targets);
    if (nir && stage == MESA_SHADER_FRAGMENT &&
        nir_shader_intrinsics_pass(nir, lower_sample_mask_1x, nir_metadata_control_flow, sample_mask)) {
       nir->info.outputs_written &= ~BITFIELD64_BIT(FRAG_RESULT_SAMPLE_MASK);

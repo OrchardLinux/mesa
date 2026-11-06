@@ -542,6 +542,9 @@ g5p_check_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo *c
    const char *why = pvr_arch_g5p_blend_fs_key(s, colors, key);
    if (why)
       return G5P_REFUSE(device, "colour blend state: %s", why);
+   /* three colour targets compile as four: the fourth (the pass's null target) is written zeros */
+   if (colors == 3)
+      key->color_targets = 4;
    /* 32-bit integer targets: the raw32 output (four raw words, pvr_g5p_raw32_kind()); the PBE stores the
     * target's own channels from them */
    const unsigned raw32 = colors ? pvr_g5p_raw32_kind(cf) : 0;

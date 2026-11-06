@@ -57,8 +57,9 @@ PVR_PER_ARCH(g5p_mrt_pipeline_check)(struct pvr_device *device, unsigned n, cons
 
    if (n <= 1)
       return VK_SUCCESS;
-   /* 1, 2 or 4: the counts with Apple's pass and a kernel pixel output width */
-   enum g5p_mrt_refusal r = g5p_mrt_out_plan_make(n, &plan);
+   /* 1, 2 or 4: the counts with Apple's pass and a kernel pixel output width; 3 runs as Apple's 4-target pass
+    * whose fourth target stores to the null target (pvr_arch_g5p.c, pvr_g5p_nir.c) */
+   enum g5p_mrt_refusal r = g5p_mrt_out_plan_make(n == 3 ? 4 : n, &plan);
    if (r != G5P_MRT_OK)
       return G5P_MRT_REFUSE(device, "%u colour attachments: %s", n, g5p_mrt_refusal_str(r));
    for (unsigned i = 0; i < n; i++) {
@@ -101,9 +102,9 @@ PVR_PER_ARCH(g5p_mrt_pass_check)(struct pvr_cmd_buffer *cmd_buffer,
 
    if (n <= 1)
       return VK_SUCCESS;
-   if (n > G5P_MRT_MAX_TARGETS || n == 3)
-      return G5P_MRT_REFUSE(cmd_buffer, "%u colour targets: %s", n,
-                            g5p_mrt_refusal_str(n == 3 ? G5P_MRT_THREE_TARGETS : G5P_MRT_TOO_MANY_TARGETS));
+   /* three: Apple's 4-target pass with a padding fourth target (pvr_arch_g5p.c) */
+   if (n > G5P_MRT_MAX_TARGETS)
+      return G5P_MRT_REFUSE(cmd_buffer, "%u colour targets: %s", n, g5p_mrt_refusal_str(G5P_MRT_TOO_MANY_TARGETS));
 
    for (unsigned t = 0; t < n; t++) {
       const uint32_t idx = hw_render->eot_surfaces[t].attachment_idx;
@@ -171,7 +172,8 @@ PVR_PER_ARCH(g5p_mrt_draw_check)(struct pvr_cmd_buffer *cmd_buffer, unsigned pip
    /* the render of the current subpass (dynamic rendering has one) */
    const struct pvr_renderpass_hwsetup_render *hw_render =
       pvr_arch_pass_info_get_hw_render(info, info->current_hw_subpass);
-   const unsigned rn = hw_render->eot_surface_count;
+   /* a 3-target pass runs, and its pipelines compile, as four targets */
+   const unsigned rn = hw_render->eot_surface_count == 3 ? 4 : hw_render->eot_surface_count;
    if ((rn > 1 || pn > 1) && pn != rn)
       return G5P_MRT_REFUSE(cmd_buffer, "the pipeline writes %u colour targets, the pass has %u", pn, rn);
    return VK_SUCCESS;
