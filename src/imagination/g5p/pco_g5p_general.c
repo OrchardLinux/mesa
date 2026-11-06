@@ -5643,20 +5643,34 @@ static bool rewrite_output(nir_builder *b, nir_intrinsic_instr *in, void *data)
 
 /* fmt-rgba16u fw_val_u emits two raw words. Saturate each unsigned
  * channel before packing; never pass integer bits through float. */
-struct packed_uint_rw { unsigned bits; bool partial; };
+struct packed_uint_rw { unsigned bits, stores; bool partial; };
 static bool pack_uint(nir_builder *b, nir_intrinsic_instr *in, void *data)
 {
    if (in->intrinsic != nir_intrinsic_store_output ||
        nir_intrinsic_io_semantics(in).location != FRAG_RESULT_DATA0)
       return false;
-   if (nir_intrinsic_component(in) || nir_intrinsic_write_mask(in) != 15 || in->src[0].ssa->num_components != 4) {
-      ((struct packed_uint_rw *)data)->partial = true;
-      return false;
-   }
+   struct packed_uint_rw *rw = data;
+   rw->stores++;
    b->cursor = nir_before_instr(&in->instr);
-   unsigned bits = ((struct packed_uint_rw *)data)->bits;
+   nir_def *src = in->src[0].ssa;
+   if (nir_intrinsic_component(in) || nir_intrinsic_write_mask(in) != 15 || src->num_components != 4) {
+      rw->partial = true;
+      /* A single store leaves all other output channels undefined; choose
+       * zero for those channels. Multiple partial stores need a real merge
+       * and remain refused by the caller. */
+      unsigned first = nir_intrinsic_component(in), mask = nir_intrinsic_write_mask(in);
+      nir_def *ch[4];
+      for (unsigned c = 0; c < 4; c++)
+         ch[c] = c >= first && c-first < src->num_components && (mask & (1u << (c-first)))
+                   ? nir_channel(b,src,c-first) : nir_imm_int(b,0);
+      src = nir_vec(b,ch,4);
+      nir_intrinsic_set_component(in,0);
+      nir_intrinsic_set_write_mask(in,15);
+      in->num_components = 4;
+   }
+   unsigned bits = rw->bits;
    unsigned max = bits == 8 ? 255 : 65535;
-   nir_def *v = nir_umin(b, in->src[0].ssa, nir_imm_ivec4(b,max,max,max,max));
+   nir_def *v = nir_umin(b, src, nir_imm_ivec4(b,max,max,max,max));
    nir_def *rg = nir_ior(b, nir_channel(b,v,0), nir_ishl_imm(b,nir_channel(b,v,1),bits));
    nir_def *ba;
    if (bits == 8) {
@@ -6761,8 +6775,8 @@ bool pco_g5p_compile_general_link(nir_shader *nir, bool half_output, const uint8
                refuse(c, "unsupported packed unsigned channel width");
             struct packed_uint_rw rw = { .bits = c->key->packed_uint_bits };
             nir_shader_intrinsics_pass(nir, pack_uint, nir_metadata_control_flow, &rw);
-            if (rw.partial)
-               refuse(c, "packed unsigned RT has partial output IO");
+            if (rw.partial && rw.stores > 1)
+               refuse(c, "packed unsigned RT needs merging of multiple partial output stores");
          }
          /* two targets: eight output words, the most one emitpix carries */
          if (c->mrt.targets > 2 || c->key->blend)
