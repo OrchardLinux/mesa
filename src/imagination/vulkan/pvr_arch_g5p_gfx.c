@@ -1456,6 +1456,35 @@ fs_uploads(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_pipeline *g, 
    return VK_SUCCESS;
 }
 
+/* What the render's draws do with its depth/stencil attachment, for the job's ZLS load and store decisions
+ * (pvr_arch_cmd_buffer.c, pvr_sub_cmd_gfx_job_init()): the flags Rogue's pvr_validate_draw_state() records,
+ * which a G5P draw never reaches. Vulkan's rules: a depth test reads the attachment when it is enabled and its
+ * compare is not ALWAYS, and writes only while the test is enabled; a stencil test reads it when enabled with a
+ * compare other than ALWAYS on a face, and writes it when an op of a face is not KEEP under a non-zero write mask.
+ * Without these, every render left depth_usage UNDEFINED and modifies_* false: its ZLS load always ran, and on a
+ * tile-aligned render area a LOAD pass dropped the store of depth or stencil its draws wrote. */
+static void
+g5p_record_ds_usage(struct pvr_sub_cmd_gfx *sub, const struct vk_dynamic_graphics_state *dyn)
+{
+   if (dyn->rs.rasterizer_discard_enable)
+      return; /* no fragment is tested */
+   const bool dt = dyn->ds.depth.test_enable, st = dyn->ds.stencil.test_enable;
+   if (dt && dyn->ds.depth.compare_op != VK_COMPARE_OP_ALWAYS && sub->depth_usage == PVR_DEPTH_STENCIL_USAGE_UNDEFINED)
+      sub->depth_usage = PVR_DEPTH_STENCIL_USAGE_NEEDED;
+   if (dt && dyn->ds.depth.write_enable)
+      sub->modifies_depth = true;
+   if (!st)
+      return;
+   const struct vk_stencil_test_face_state *face[2] = { &dyn->ds.stencil.front, &dyn->ds.stencil.back };
+   for (unsigned i = 0; i < 2; i++) {
+      if (face[i]->op.compare != VK_COMPARE_OP_ALWAYS && sub->stencil_usage == PVR_DEPTH_STENCIL_USAGE_UNDEFINED)
+         sub->stencil_usage = PVR_DEPTH_STENCIL_USAGE_NEEDED;
+      if (face[i]->write_mask && (face[i]->op.fail != VK_STENCIL_OP_KEEP || face[i]->op.pass != VK_STENCIL_OP_KEEP ||
+                                  face[i]->op.depth_fail != VK_STENCIL_OP_KEEP))
+         sub->modifies_stencil = true;
+   }
+}
+
 VkResult
 PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_draw *draw)
 {
@@ -1513,6 +1542,7 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
    result = pvr_arch_cmd_buffer_start_sub_cmd(cmd_buffer, PVR_SUB_CMD_TYPE_GRAPHICS);
    if (result != VK_SUCCESS)
       return result;
+   g5p_record_ds_usage(&cs->current_sub_cmd->gfx, dyn);
    /* Starting the sub-command establishes the actual DS attachment even
     * for a discarding first draw after CLEAR. Select before any shader-specific
     * vertex fetch, uploads, varyings or fragment state is emitted. */

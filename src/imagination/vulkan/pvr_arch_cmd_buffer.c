@@ -1955,7 +1955,7 @@ static VkResult pvr_sub_cmd_gfx_job_init(const struct pvr_device_info *dev_info,
                s_load = sub_cmd->barrier_load;
             }
          }
-
+         PVR_G5P_HOOK(ds_load, dev_info, sub_cmd, d_load, s_load, d_store, s_store)
          job->ds.load.d = d_load;
          job->ds.load.s = s_load;
          job->ds.store.d = d_store;

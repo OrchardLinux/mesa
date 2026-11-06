@@ -142,6 +142,20 @@
       (surface)->depth = 1;                                                  \
    }
 
+/* pvr_arch_cmd_buffer.c, the job's depth/stencil load and store: no ZLS load of an aspect the render neither
+ * stores nor tests. Its loaded values would not be read (no draw's test reads them) and not written back (no
+ * store), so the plane keeps its contents either way. A LOAD pass that stores an aspect still loads it (its
+ * untouched pixels are stored back), and a test still loads it. The draw-side flags are
+ * pvr_arch_g5p_gfx.c's g5p_record_ds_usage().
+ */
+#define PVR_G5P_HOOK_ds_load(dev_info, sub_cmd, d_load, s_load, d_store, s_store)                       \
+   if (PVR_HAS_FEATURE(dev_info, apple_g5p)) {                                                         \
+      if (!(d_store) && (sub_cmd)->depth_usage != PVR_DEPTH_STENCIL_USAGE_NEEDED)                     \
+         (d_load) = false;                                                                             \
+      if (!(s_store) && (sub_cmd)->stencil_usage != PVR_DEPTH_STENCIL_USAGE_NEEDED)                   \
+         (s_load) = false;                                                                             \
+   }
+
 /* pvr_device.c, pvr_MapMemory2(): the CPU transfer path G5P shares with G9P
  * (pvr_arch_g9p_cpu_addr()) maps a bound BO and leaves it mapped. That is the
  * driver's mapping, not the application's, so a vkMapMemory of that memory
