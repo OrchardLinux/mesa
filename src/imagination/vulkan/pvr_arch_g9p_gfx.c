@@ -2180,9 +2180,19 @@ emit_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state
     * up mid-draw (pvr_csb_buffer_extend(); ~150 draws in one render)
     */
    pvr_csb_set_relocation_mark(csb);
+   /*
+    * VDM_STATE0's vertex cache by the vertex's size (output dwords + 5), and
+    * VDM_STATE5 bit 30 above 64 (PR #6's A9 values, but its 63 up to 48 hangs here: dEQP
+    * transform_feedback.array mat3x4 at 46): a fixed 95 hangs the geometry job with large
+    * vertices
+    */
+   const unsigned vector = state->vs_outputs + 5;
+   const uint32_t cam = (vector <= 32 ? 95u : vector <= 64 ? 31u : 15u) << 7;
+
    {
-      const uint32_t w[4] = { 0x44002f80, state->vs_kick.code_offset, state->vs_outputs,
-                              vs_max_instances(state->vs_regs) << 25 |
+      const uint32_t w[4] = { 0x44000000 | cam, state->vs_kick.code_offset, state->vs_outputs,
+                              (vector > 64 ? BITFIELD_BIT(30) : 0) |
+                                 vs_max_instances(state->vs_regs) << 25 |
                                  DIV_ROUND_UP(MAX2(state->vs_regs, 8), 2) << 10 | 2 << 6 | 1 };
 
       emit_words(csb, w, 4);
@@ -2207,7 +2217,7 @@ emit_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state
       emit_words(csb, w, 2);
    }
    {
-      const uint32_t w[2] = { 0x48002f80, state->vs_kick.data_offset };
+      const uint32_t w[2] = { 0x48000000 | cam, state->vs_kick.data_offset };
 
       emit_words(csb, w, 2);
    }
@@ -2223,12 +2233,10 @@ emit_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state
       uint32_t w[9], n = 0;
 
       if (draw->indexed && cmd_buffer->vk.dynamic_graphics_state.ia.primitive_restart_enable) {
-         const unsigned vector = state->vs_outputs + 5;
-
          pvr_csb_pack (&w[n++], VDMCTRL_VDM_STATE0, v0) {
             v0.cut_index_present = true;
             v0.cut_index_enable = true;
-            v0.cam_size = vector <= 32 ? 95 : vector <= 48 ? 63 : vector <= 64 ? 31 : 15;
+            v0.cam_size = vector <= 32 ? 95 : vector <= 64 ? 31 : 15;
          }
          pvr_csb_pack (&w[n++], VDMCTRL_VDM_STATE1, v1) {
             v1.cut_index = draw->index_size == 1   ? 0xff
