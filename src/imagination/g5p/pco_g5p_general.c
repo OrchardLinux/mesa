@@ -2802,8 +2802,10 @@ static void vs_fbin(struct gctx *c, nir_alu_instr *a)
       define(c, &a->def, dst);
       return;
    }
-   if (op == G5P_BIN_FMUL && (r[0].neg || r[0].abs || r[1].neg || r[1].abs) && vkind(c, r[0]) == VK_REG &&
-       vkind(c, r[1]) == VK_REG && !is_const(c, r[0]) && !is_const(c, r[1])) {
+   /* As in the A10 developer's register-source ALU staging, shared operands
+    * are moved to registers by reg_of() below before the witnessed modifier
+    * tuple is emitted. Its source groups still describe the real last uses. */
+   if (op == G5P_BIN_FMUL && (r[0].neg || r[0].abs || r[1].neg || r[1].abs)) {
       /* vsalu-probes.py v_fmul_neg(_rr), v_fmul_abs(_b), v_fmul_negabs: the two-register fmul {h31 x0},
        * operands' groups their last reads. Apple puts an operand with abs in A and the product's sign on A,
        * or on B when A has abs (-|x| * y: abs A, negate B). Both abs and a sign has no witnessed form. */
