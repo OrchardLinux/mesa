@@ -2507,7 +2507,11 @@ emit_intrinsic(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
    case nir_intrinsic_ddy:
    case nir_intrinsic_ddy_fine:
    case nir_intrinsic_ddy_coarse: {
-      /* Apple's dfdx(), dfdy(): 0198 dst src 0144 0200, 0145 0400 */
+      /*
+       * Apple's dfdx(), dfdy(): 0198 dst src 0144 0200, 0144 0400. Bit 0 of W3 (0145) marks
+       * the program's last derivative, after which helper pixels are gone: left off, as
+       * samples after it want them too.
+       */
       const bool y = intr->intrinsic == nir_intrinsic_ddy ||
                      intr->intrinsic == nir_intrinsic_ddy_fine ||
                      intr->intrinsic == nir_intrinsic_ddy_coarse;
@@ -2528,7 +2532,7 @@ emit_intrinsic(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
          if (dst[c] < 0)
             return false;
          G9P_EMIT(ctx->c, g9p_w0(ctx->c, 0x0198), g9p_dst(ctx->c, dst[c]),
-                  0x0100 | regs[c] << 2, y ? 0x0145 : 0x0144, y ? 0x0400 : 0x0200);
+                  0x0100 | regs[c] << 2, 0x0144, y ? 0x0400 : 0x0200);
       }
       for (unsigned c = 0; c < intr->def.num_components; c++)
          ctx->temps &= ~BITFIELD64_BIT(dst[c]);
