@@ -31,6 +31,7 @@
 #include "g9p_cdm.h"
 #include "g9p_compile.h"
 #include "g9p_formats.h"
+#include "util/half_float.h"
 #include "g9p_isa.h"
 
 #include "pvr_bo.h"
@@ -152,6 +153,37 @@ upload_kick(struct pvr_device *device, const struct pvr_suballoc_bo *usc,
                              ARRAY_SIZE(code), 32, 64, out);
 }
 
+/*
+ * Clear colours: the f32 clear program does the two-word f16 formats. For the
+ * others the CPU packs the words of enum g9p_output, into dwords 0-3.
+ */
+static bool
+g9p_clear_is_raw(VkFormat format)
+{
+   return g9p_format_output(format) != G9P_OUTPUT_HALF2 || vk_format_is_int(format);
+}
+
+static void
+g9p_pack_clear(VkFormat format, const float colour[4], uint32_t *words)
+{
+   const enum g9p_output output = g9p_format_output(format);
+   uint32_t c[4];
+
+   memcpy(c, colour, sizeof(c));
+   if (output == G9P_OUTPUT_HALF2 || output == G9P_OUTPUT_HALF1) {
+      for (unsigned w = 0; w < 2; w++) {
+         const uint32_t lo = vk_format_is_int(format) ? c[2 * w] & 0xffff
+                                                      : _mesa_float_to_half(colour[2 * w]);
+         const uint32_t hi = vk_format_is_int(format) ? c[2 * w + 1] & 0xffff
+                                                      : _mesa_float_to_half(colour[2 * w + 1]);
+
+         words[w] = lo | hi << 16;
+      }
+   } else {
+      memcpy(words, c, sizeof(c));
+   }
+}
+
 /* --- Device programs ------------------------------------------------------ */
 
 VkResult
@@ -181,7 +213,7 @@ PVR_PER_ARCH(g9p_gfx_device_init)(struct pvr_device *device)
    for (unsigned h = 0; h < 4; h++)
       G9P_EMIT(c, 0x018a, 0x0100 | h, 0x0101, 0x01a0, 0x0101 | 4 * h, 0x4140, 0x0104,
                0x00b0);
-   g9p_end_fragment(c, true);
+   g9p_end_fragment(c, 2);
    result = upload_usc(device, c, &p->clear_usc);
    if (result != VK_SUCCESS)
       goto out;
@@ -195,15 +227,30 @@ PVR_PER_ARCH(g9p_gfx_device_init)(struct pvr_device *device)
    if (result != VK_SUCCESS)
       goto out;
 
-   /* Depth/stencil clear draws: the tile's own colour back, the same as a colour mask of 0 */
-   c->n = 0;
-   c->fragment = true;
-   g9p_tile_read(c, 0);
-   g9p_wait(c);
-   g9p_end_fragment(c, true);
-   result = upload_usc(device, c, &p->keep_usc);
-   if (result != VK_SUCCESS)
-      goto out;
+   /*
+    * Clears the CPU packs: common-store dword k to r[k], Apple's move for a
+    * uniform into a 32-bit target. Depth/stencil clear draws: the tile's own
+    * colour back, the same as a colour mask of 0.
+    */
+   for (unsigned o = 0; o < G9P_OUTPUT_COUNT; o++) {
+      const unsigned words = g9p_output_words(o);
+
+      c->n = 0;
+      c->fragment = true;
+      for (unsigned k = 0; k < words; k++)
+         G9P_EMIT(c, 0x0198, 0x0100 | 2 * k, 0x0181 | k << 2, 0x4100, 0x0154, 0x0038);
+      g9p_end_fragment(c, words);
+      result = upload_usc(device, c, &p->clear_raw_usc[o]);
+      if (result != VK_SUCCESS)
+         goto out;
+      c->n = 0;
+      g9p_tile_read(c, 0, words);
+      g9p_wait(c);
+      g9p_end_fragment(c, words);
+      result = upload_usc(device, c, &p->keep_usc[o]);
+      if (result != VK_SUCCESS)
+         goto out;
+   }
 
    /* Register 0x470's program: a jump to `015e a000` (as captured) */
    c->n = 0;
@@ -228,20 +275,25 @@ PVR_PER_ARCH(g9p_gfx_device_init)(struct pvr_device *device)
     * r0-r1, the texture sample with the state at dword 0 and the sampler at
     * 8 into the colour halves, output
     */
-   c->n = 0;
-   c->fragment = true;
-   G9P_EMIT(c, 0x211c, 0x6800);
-   g9p_wait(c);
-   g9p_convert(c, 2, 0, G9P_U2F);
-   g9p_convert(c, 3, 1, G9P_U2F);
-   G9P_EMIT(c, 0x0199, g9p_dst(c, 0), 0x0181 | 12 << 2 | 2 << 10, 0x4100, G9P_FMUL);
-   G9P_EMIT(c, 0x0199, g9p_dst(c, 1), 0x0181 | 13 << 2 | 3 << 10, 0x4100, G9P_FMUL);
-   G9P_EMIT(c, 0xf518, 0x0100, 0x8108, 0x0700, 0x0200);
-   g9p_wait(c);
-   g9p_end_fragment(c, true);
-   result = upload_usc(device, c, &p->load_usc);
-   if (result != VK_SUCCESS)
-      goto out;
+   for (unsigned o = 0; o < G9P_OUTPUT_COUNT; o++) {
+      const bool half = o == G9P_OUTPUT_HALF2 || o == G9P_OUTPUT_HALF1;
+
+      c->n = 0;
+      c->fragment = true;
+      G9P_EMIT(c, 0x211c, 0x6800);
+      g9p_wait(c);
+      g9p_convert(c, 2, 0, G9P_U2F);
+      g9p_convert(c, 3, 1, G9P_U2F);
+      G9P_EMIT(c, 0x0199, g9p_dst(c, 0), 0x0181 | 12 << 2 | 2 << 10, 0x4100, G9P_FMUL);
+      G9P_EMIT(c, 0x0199, g9p_dst(c, 1), 0x0181 | 13 << 2 | 3 << 10, 0x4100, G9P_FMUL);
+      /* f518: into halves; f51a: 32-bit channels */
+      G9P_EMIT(c, half ? 0xf518 : 0xf51a, 0x0100, 0x8108, 0x0700, 0x0200);
+      g9p_wait(c);
+      g9p_end_fragment(c, g9p_output_words(o));
+      result = upload_usc(device, c, &p->load_usc[o]);
+      if (result != VK_SUCCESS)
+         goto out;
+   }
 
    /*
     * Clear rectangles' vertex shader (pvr-tri's): (x, y) at common-store
@@ -276,10 +328,13 @@ PVR_PER_ARCH(g9p_gfx_device_init)(struct pvr_device *device)
    }
 
    result = upload_kick(device, p->clear_usc, 8, 0, &p->clear_kick);
-   if (result == VK_SUCCESS)
-      result = upload_kick(device, p->keep_usc, 8, 0, &p->keep_kick);
-   if (result == VK_SUCCESS)
-      result = upload_kick(device, p->load_usc, 8, 0, &p->load_kick);
+   for (unsigned o = 0; o < G9P_OUTPUT_COUNT && result == VK_SUCCESS; o++) {
+      result = upload_kick(device, p->keep_usc[o], 8, 0, &p->keep_kick[o]);
+      if (result == VK_SUCCESS)
+         result = upload_kick(device, p->load_usc[o], 8, 0, &p->load_kick[o]);
+      if (result == VK_SUCCESS)
+         result = upload_kick(device, p->clear_raw_usc[o], 8, 0, &p->clear_raw_kick[o]);
+   }
    if (result == VK_SUCCESS)
       result = upload_kick(device, p->vdm_end_usc, 8, 0, &p->vdm_end);
    if (result == VK_SUCCESS)
@@ -325,15 +380,18 @@ PVR_PER_ARCH(g9p_gfx_device_finish)(struct pvr_device *device)
       pvr_bo_suballoc_free(p->vdm_end.pvr_bo);
    if (p->clear_kick.pvr_bo)
       pvr_bo_suballoc_free(p->clear_kick.pvr_bo);
-   if (p->keep_kick.pvr_bo)
-      pvr_bo_suballoc_free(p->keep_kick.pvr_bo);
    pvr_bo_suballoc_free(p->vdm_end_usc);
    pvr_bo_suballoc_free(p->eot_usc);
    pvr_bo_suballoc_free(p->clear_usc);
    pvr_bo_suballoc_free(p->clear_vs_usc);
-   pvr_bo_suballoc_free(p->load_usc);
-   pvr_bo_suballoc_free(p->keep_usc);
-   pvr_bo_suballoc_free(p->load_kick.pvr_bo);
+   for (unsigned o = 0; o < G9P_OUTPUT_COUNT; o++) {
+      pvr_bo_suballoc_free(p->load_usc[o]);
+      pvr_bo_suballoc_free(p->keep_usc[o]);
+      pvr_bo_suballoc_free(p->clear_raw_usc[o]);
+      pvr_bo_suballoc_free(p->load_kick[o].pvr_bo);
+      pvr_bo_suballoc_free(p->keep_kick[o].pvr_bo);
+      pvr_bo_suballoc_free(p->clear_raw_kick[o].pvr_bo);
+   }
    pvr_bo_suballoc_free(p->clear_vs_kick.pvr_bo);
 }
 
@@ -428,8 +486,8 @@ static VkResult
 compile_stage(struct pvr_device *device, nir_shader *nir,
               const VkPipelineShaderStageCreateInfo *stage,
               const struct g9p_vertex_attrib *attribs, int frag_coord_slot, bool point_coord,
-              const nir_lower_blend_options *blend, struct g9p_shader *out, bool point_size,
-              void *mem_ctx)
+              const nir_lower_blend_options *blend, VkFormat target, struct g9p_shader *out,
+              bool point_size, void *mem_ctx)
 {
    bool ok;
 
@@ -437,7 +495,8 @@ compile_stage(struct pvr_device *device, nir_shader *nir,
       ok = g9p_compile_vertex(nir, attribs, frag_coord_slot, point_coord, out, point_size,
                               mem_ctx);
    else
-      ok = g9p_compile_fragment(nir, frag_coord_slot, blend, out, mem_ctx);
+      ok = g9p_compile_fragment(nir, frag_coord_slot, blend, g9p_format_output(target),
+                                vk_format_is_int(target), vk_format_is_float(target), out, mem_ctx);
    if (!ok)
       return g9p_error(device,
                        "G9P: %s shader not supported by the backend yet",
@@ -581,11 +640,15 @@ g9p_compile_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo 
       }
       slot = g9p_frag_coord_slot(vs_nir);
       result = compile_stage(device, fs_nir, fs_info, NULL, slot, false,
-                             blend_options(vk_state, &blend) ? &blend : NULL, &fs, false, mem_ctx);
+                             blend_options(vk_state, &blend) ? &blend : NULL,
+                             vk_state->rp && vk_state->rp->color_attachment_count
+                                ? vk_state->rp->color_attachment_formats[0]
+                                : VK_FORMAT_B8G8R8A8_UNORM,
+                             &fs, false, mem_ctx);
       if (result == VK_SUCCESS)
          result = compile_stage(device, vs_nir, vs_info, attribs,
-                                fs.uses_frag_coord ? (int)slot : -1, fs.uses_point_coord, NULL, &vs,
-                                point_size, mem_ctx);
+                                fs.uses_frag_coord ? (int)slot : -1, fs.uses_point_coord, NULL,
+                                VK_FORMAT_UNDEFINED, &vs, point_size, mem_ctx);
    }
    if (result != VK_SUCCESS)
       goto out;
@@ -1885,7 +1948,9 @@ g9p_ds_clear(struct pvr_cmd_buffer *cmd_buffer, const VkClearAttachment *att,
    const bool stencil = att->aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT;
    struct pvr_g9p_graphics_state state = {
       .vs_kick = p->clear_vs_kick,
-      .fs_kick = p->keep_kick,
+      .fs_kick = p->keep_kick[hw && hw->eot_surface_count
+                                 ? g9p_format_output(info->attachments[hw->eot_surfaces[0].attachment_idx]->vk.format)
+                                 : G9P_OUTPUT_HALF2],
       .vs_outputs = 4,
       .vs_regs = 8,
       .num_buffers = 1,
@@ -1985,6 +2050,8 @@ PVR_PER_ARCH(g9p_clear_attachments)(struct pvr_cmd_buffer *cmd_buffer, uint32_t 
    const float w = info->render_area.offset.x + info->render_area.extent.width;
    const float h = info->render_area.offset.y + info->render_area.extent.height;
    const VkClearAttachment *colour = NULL;
+   uint32_t packed[4] = { 0 };
+   const void *colour_data = NULL;
    struct pvr_g9p_graphics_state state = {
       .vs_kick = p->clear_vs_kick,
       .fs_kick = p->clear_kick,
@@ -2020,6 +2087,7 @@ PVR_PER_ARCH(g9p_clear_attachments)(struct pvr_cmd_buffer *cmd_buffer, uint32_t 
    }
    if (!colour || !rect_count)
       return VK_SUCCESS;
+   colour_data = colour->clearValue.color.float32;
 
    result = pvr_arch_cmd_buffer_start_sub_cmd(cmd_buffer, PVR_SUB_CMD_TYPE_GRAPHICS);
    if (result != VK_SUCCESS)
@@ -2060,7 +2128,20 @@ PVR_PER_ARCH(g9p_clear_attachments)(struct pvr_cmd_buffer *cmd_buffer, uint32_t 
    }
 
    /* the clear shader's: the colour, by the DMA program the background uses */
-   result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, colour->clearValue.color.float32,
+   {
+      const struct pvr_renderpass_hwsetup_render *hw = g9p_current_hw_render(info);
+
+      if (hw && hw->eot_surface_count) {
+         const VkFormat format = info->attachments[hw->eot_surfaces[0].attachment_idx]->vk.format;
+
+         if (g9p_clear_is_raw(format)) {
+            g9p_pack_clear(format, colour->clearValue.color.float32, packed);
+            colour_data = packed;
+            state.fs_kick = p->clear_raw_kick[g9p_format_output(format)];
+         }
+      }
+   }
+   result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, colour_data,
                                                4 * sizeof(float), &colour_bo);
    if (result != VK_SUCCESS)
       return result;
@@ -2390,6 +2471,14 @@ PVR_PER_ARCH(g9p_job_init)(struct pvr_cmd_buffer *cmd_buffer,
                                                     : G9P_LOAD_OP_NONE;
    if (!load)
       memcpy(bg, clear, sizeof(clear));
+   const VkFormat bg_format = hw_render->eot_surface_count
+                                 ? info->attachments[hw_render->eot_surfaces[0].attachment_idx]->vk.format
+                                 : VK_FORMAT_B8G8R8A8_UNORM;
+   const enum g9p_output bg_output = g9p_format_output(bg_format);
+   const bool bg_raw = !load && g9p_clear_is_raw(bg_format);
+
+   if (bg_raw)
+      g9p_pack_clear(bg_format, clear, bg);
    result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, bg, 4 * bg_dwords, &bo);
    if (result != VK_SUCCESS)
       return result;
@@ -2403,7 +2492,9 @@ PVR_PER_ARCH(g9p_job_init)(struct pvr_cmd_buffer *cmd_buffer,
          return result;
    }
    job->g9p.bgnd[0] = (uint64_t)p->dma.code_offset << 32 |
-                      (load ? p->load_kick.data_offset : p->clear_kick.data_offset);
+                      (load     ? p->load_kick[bg_output].data_offset
+                       : bg_raw ? p->clear_raw_kick[bg_output].data_offset
+                                : p->clear_kick.data_offset);
    job->g9p.bgnd[1] = 0;
    job->g9p.bgnd[2] = up.data_offset;
    job->g9p.bgnd[3] = 0x0080000000800000ull;

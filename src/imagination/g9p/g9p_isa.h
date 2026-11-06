@@ -569,9 +569,9 @@ g9p_to_half(struct g9p_code *c, unsigned h, unsigned src)
  * with Metal's [[color(0)]] input).
  */
 static inline void
-g9p_tile_read(struct g9p_code *c, unsigned dst)
+g9p_tile_read(struct g9p_code *c, unsigned dst, unsigned words)
 {
-   G9P_EMIT(c, 0x211c, 0x2800 | 2 * dst);
+   G9P_EMIT(c, words << 12 | 0x011c, 0x2800 | 2 * dst);
 }
 
 /*
@@ -623,10 +623,10 @@ g9p_blend_src_over(struct g9p_code *c)
 }
 
 static inline void
-g9p_end_fragment(struct g9p_code *c, bool colour)
+g9p_end_fragment(struct g9p_code *c, unsigned words)
 {
-   if (colour)
-      G9P_EMIT(c, 0x211c, 0x0800);
+   if (words)
+      G9P_EMIT(c, words << 12 | 0x011c, 0x0800);
    G9P_EMIT(c, 0x8000);
    while (c->n % 32)
       G9P_EMIT(c, 0x0000);

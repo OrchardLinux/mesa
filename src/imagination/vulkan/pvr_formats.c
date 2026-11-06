@@ -367,10 +367,16 @@ pvr_get_image_format_features2(struct pvr_physical_device *pdevice,
                     VK_FORMAT_FEATURE_2_BLIT_DST_BIT);
    }
    if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g9p) && vk_format_is_color(vk_format)) {
-      if (!g9p_format_renderable(vk_format))
+      if (g9p_format_renderable(vk_format))
+         flags |= VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_2_BLIT_DST_BIT;
+      else
          flags &= ~(VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT |
-                    VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BLEND_BIT |
                     VK_FORMAT_FEATURE_2_BLIT_DST_BIT);
+      /* blends read the tile as f16: not integers or 32-bit channels */
+      if (g9p_format_renderable(vk_format) && g9p_format_filterable(vk_format))
+         flags |= VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BLEND_BIT;
+      else
+         flags &= ~VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BLEND_BIT;
       if (!g9p_format_filterable(vk_format))
          flags &= ~(VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
                     VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_2D_BIT_IMG);

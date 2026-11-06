@@ -1442,6 +1442,62 @@ emit_point_coord(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
    return true;
 }
 
+/*
+ * The colour components, f32 or integers in their registers (above r1, which
+ * stay free until here, or anywhere for 32-bit channels), into what the render
+ * target takes from r0 on: g9p_formats.h, enum g9p_output.
+ */
+static bool
+emit_colour(struct g9p_ctx *ctx)
+{
+   const enum g9p_output output = ctx->out->output;
+
+   if (output == G9P_OUTPUT_HALF2 || output == G9P_OUTPUT_HALF1) {
+      const unsigned words = g9p_output_words(output);
+
+      if (!ctx->out->output_int) {
+         for (unsigned i = 0; i < 2 * words; i++)
+            g9p_to_half(ctx->c, i, ctx->colour[i]);
+         return true;
+      }
+      const int mask = const_reg(ctx, 0xffff), shift = const_reg(ctx, 16);
+      const int t = alloc_temp(ctx);
+
+      if (mask < 0 || shift < 0 || t < 0)
+         return false;
+      for (unsigned w = 0; w < words; w++) {
+         g9p_alu2(ctx->c, G9P_AND, w, ctx->colour[2 * w], mask, false);
+         g9p_shift(ctx->c, t, ctx->colour[2 * w + 1], shift, false);
+         g9p_alu2(ctx->c, G9P_OR, w, w, t, false);
+      }
+      return true;
+   }
+
+   /* in two steps: a component may be in the register of another's destination */
+   const unsigned words = g9p_output_words(output);
+   int t[4];
+   uint64_t taken = ctx->busy;
+
+   for (unsigned i = 0; i < words; i++) {
+      t[i] = -1;
+      for (unsigned r = 4; r < 32; r++) {
+         if (!(taken & BITFIELD64_BIT(r))) {
+            t[i] = r;
+            taken |= BITFIELD64_BIT(r);
+            break;
+         }
+      }
+      if (t[i] < 0)
+         return false;
+      g9p_alu2(ctx->c, G9P_OR, t[i], ctx->colour[i], ctx->colour[i], false);
+      ctx->max_reg = MAX2(ctx->max_reg, t[i]);
+   }
+   for (unsigned i = 0; i < words; i++)
+      g9p_alu2(ctx->c, G9P_OR, i, t[i], t[i], false);
+   ctx->max_reg = MAX2(ctx->max_reg, words - 1);
+   return true;
+}
+
 /* An output component: kept in its register until the end */
 static bool
 emit_output(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
@@ -1570,7 +1626,7 @@ emit_fb_fetch(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
       return false;
    }
    ctx->max_reg = MAX2(ctx->max_reg, pair + 1);
-   g9p_tile_read(ctx->c, pair);
+   g9p_tile_read(ctx->c, pair, MIN2(g9p_output_words(ctx->out->output), 2));
    g9p_wait(ctx->c);
    if (ctx->last_use[key(&intr->def, 0)]) {
       ctx->reg[key(&intr->def, 0)] = pair + word;
@@ -2704,12 +2760,12 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
                g9p_mov_imm(ctx->c, ctx->colour[i], 0);
             }
          }
-         for (unsigned i = 0; i < 4; i++)
-            g9p_to_half(ctx->c, i, ctx->colour[i]);
+         if (!emit_colour(ctx))
+            return false;
          if (ctx->out->native_blend)
             g9p_blend_src_over(ctx->c);
       }
-      g9p_end_fragment(ctx->c, colour);
+      g9p_end_fragment(ctx->c, colour ? g9p_output_words(ctx->out->output) : 0);
       break;
    }
    default:
@@ -2805,6 +2861,7 @@ zero_descriptor_offset(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 static bool
 lower_fb_fetch_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
+   const struct g9p_shader *out = data;
    nir_def *comps[4];
 
    if (intr->intrinsic != nir_intrinsic_load_output ||
@@ -2824,6 +2881,14 @@ lower_fb_fetch_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       /* h - 1 >= 0x7fff: zero or negative */
       nir_def *low = nir_uge_imm(b, nir_iand_imm(b, nir_iadd_imm(b, h, -1), 0xffff), 0x7fff);
 
+      /* a float target's tile value is its value: with its sign, not clamped */
+      if (out->output_float) {
+         nir_def *sign = nir_ishl_imm(b, nir_iand_imm(b, h, 0x8000), 16);
+         nir_def *zero = nir_ieq_imm(b, nir_iand_imm(b, h, 0x7fff), 0);
+
+         comps[i] = nir_bcsel(b, zero, sign, nir_ior(b, sign, bits));
+         continue;
+      }
       comps[i] = nir_bcsel(b, low, nir_imm_int(b, 0),
                            nir_bcsel(b, nir_uge_imm(b, h, 0x3c00),
                                      nir_imm_int(b, 0x3f800000), bits));
@@ -3733,10 +3798,14 @@ find_flat_varyings(nir_shader *nir, struct g9p_shader *out)
 
 bool
 g9p_compile_fragment(nir_shader *nir, unsigned frag_coord_slot,
-                     const nir_lower_blend_options *blend, struct g9p_shader *out,
+                     const nir_lower_blend_options *blend, enum g9p_output output,
+                     bool output_int, bool output_float, struct g9p_shader *out,
                      void *mem_ctx)
 {
    memset(out, 0, sizeof(*out));
+   out->output = output;
+   out->output_int = output_int;
+   out->output_float = output_float;
    lower_front(nir);
    NIR_PASS(_, nir, discards_to_if);
    NIR_PASS(_, nir, discards_to_flag);
@@ -3744,7 +3813,8 @@ g9p_compile_fragment(nir_shader *nir, unsigned frag_coord_slot,
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_centroid, nir_metadata_control_flow, NULL);
    find_flat_varyings(nir, out);
    lower_io(nir);
-   out->native_blend = blend && is_src_over(blend) && !getenv("G9P_NO_NATIVE_BLEND");
+   out->native_blend = blend && is_src_over(blend) && out->output == G9P_OUTPUT_HALF2 &&
+                       !out->output_float && !getenv("G9P_NO_NATIVE_BLEND");
    if (blend && !out->native_blend) {
       NIR_PASS(_, nir, nir_lower_blend, blend);
       NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_blend_constant,
@@ -3754,7 +3824,7 @@ g9p_compile_fragment(nir_shader *nir, unsigned frag_coord_slot,
    if (out->uses_fbfetch)
       NIR_PASS(_, nir, discards_to_select, out->native_blend);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_fb_fetch_instr, nir_metadata_control_flow,
-            NULL);
+            out);
    nir_shader *copy = nir_shader_clone(mem_ctx, nir);
 
    return compile_back(nir, out, MESA_SHADER_FRAGMENT, NULL, frag_coord_slot, false, false, mem_ctx) ||

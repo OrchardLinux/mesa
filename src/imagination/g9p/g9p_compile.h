@@ -15,6 +15,8 @@
 #include "compiler/nir/nir_lower_blend.h"
 #include "util/format/u_formats.h"
 
+#include "g9p_formats.h"
+
 /*
  * Common-store buffer slots per shader; a vertex binding takes two (its
  * address and stride), and Zink gives each attribute its own binding
@@ -125,6 +127,10 @@ struct g9p_shader {
    unsigned num_varyings;
    bool varying_perspective[G9P_MAX_VARYINGS];
    bool varying_flat[G9P_MAX_VARYINGS];
+   /* Fragment: what the render target takes; integers its low 16 bits */
+   enum g9p_output output;
+   bool output_int;
+   bool output_float;
    /* Vertex: output dwords (4 + 4 x num_varyings) */
    unsigned num_outputs;
 
@@ -186,7 +192,8 @@ bool g9p_compile_vertex(nir_shader *nir, const struct g9p_vertex_attrib *attribs
  * pipeline to mark its draws translucent.
  */
 bool g9p_compile_fragment(nir_shader *nir, unsigned frag_coord_slot,
-                          const nir_lower_blend_options *blend, struct g9p_shader *out,
+                          const nir_lower_blend_options *blend, enum g9p_output output,
+                          bool output_int, bool output_float, struct g9p_shader *out,
                           void *mem_ctx);
 
 #endif /* G9P_COMPILE_H */

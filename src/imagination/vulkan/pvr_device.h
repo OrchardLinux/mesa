@@ -27,6 +27,7 @@
 #include "util/u_dynarray.h"
 
 #include "ds/pvr_driver_ds.h"
+#include "g9p_formats.h"
 #include "pvr_bo.h"
 #include "pvr_common.h"
 #include "pvr_macros.h"
@@ -99,14 +100,17 @@ struct pvr_device {
       struct pvr_g9p_gfx_programs {
          struct pvr_suballoc_bo *clear_usc, *eot_usc, *vdm_end_usc;
          /* load op: the old target sampled at the pixel position, and its kick */
-         struct pvr_suballoc_bo *load_usc;
-         struct pvr_pds_upload load_kick;
+         struct pvr_suballoc_bo *load_usc[G9P_OUTPUT_COUNT];
+         struct pvr_pds_upload load_kick[G9P_OUTPUT_COUNT];
          /* depth/stencil clear draws: the tile's colour unchanged, and its kick */
-         struct pvr_suballoc_bo *keep_usc;
-         struct pvr_pds_upload keep_kick;
+         struct pvr_suballoc_bo *keep_usc[G9P_OUTPUT_COUNT];
+         struct pvr_pds_upload keep_kick[G9P_OUTPUT_COUNT];
          /* vkCmdClearAttachments: a vertex shader of (x, y) pairs and its kick */
          struct pvr_suballoc_bo *clear_vs_usc;
          struct pvr_pds_upload clear_vs_kick;
+         /* clears of other outputs: the words from the common store, packed by the CPU */
+         struct pvr_suballoc_bo *clear_raw_usc[G9P_OUTPUT_COUNT];
+         struct pvr_pds_upload clear_raw_kick[G9P_OUTPUT_COUNT];
          /* kick bundles (data, code at +0x20) */
          struct pvr_pds_upload clear_kick, vdm_end;
          /* code only: HALT, one DMA (data per use), the end of tile */

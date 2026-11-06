@@ -124,37 +124,81 @@ g9p_image_format(VkFormat format)
    }
 }
 
-/* Rendered through the fragment shader's four f16 and the PBE's packing */
-static inline bool
-g9p_format_renderable(VkFormat format)
+/*
+ * What a fragment shader writes for a render target (Apple's compiler, each
+ * format): four 16-bit halves in two words, or two in one, floats as f16 and
+ * integers as their low 16 bits; or the channels' 32 bits, a word each. The PBE
+ * packs them into the format. The tile holds these words.
+ */
+enum g9p_output {
+   G9P_OUTPUT_HALF2,
+   G9P_OUTPUT_HALF1,
+   G9P_OUTPUT_RAW1,
+   G9P_OUTPUT_RAW2,
+   G9P_OUTPUT_RAW4,
+   G9P_OUTPUT_COUNT,
+};
+
+static inline enum g9p_output
+g9p_format_output(VkFormat format)
 {
    switch (format) {
-   case VK_FORMAT_B8G8R8A8_UNORM:
-   case VK_FORMAT_B8G8R8A8_SRGB:
-   case VK_FORMAT_R8G8B8A8_UNORM:
-   case VK_FORMAT_R8G8B8A8_SRGB:
-   case VK_FORMAT_A8B8G8R8_UNORM_PACK32:
-   case VK_FORMAT_A8B8G8R8_SRGB_PACK32:
-   case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
    case VK_FORMAT_R8_UNORM:
    case VK_FORMAT_R8G8_UNORM:
    case VK_FORMAT_R16_SFLOAT:
    case VK_FORMAT_R16G16_SFLOAT:
-   case VK_FORMAT_R16G16B16A16_SFLOAT:
-   case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
-      return true;
+   case VK_FORMAT_R8_UINT:
+   case VK_FORMAT_R8_SINT:
+   case VK_FORMAT_R8G8_UINT:
+   case VK_FORMAT_R8G8_SINT:
+   case VK_FORMAT_R16_UINT:
+   case VK_FORMAT_R16_SINT:
+   case VK_FORMAT_R16G16_UINT:
+   case VK_FORMAT_R16G16_SINT:
+      return G9P_OUTPUT_HALF1;
+   case VK_FORMAT_R32_SFLOAT:
+   case VK_FORMAT_R32_UINT:
+   case VK_FORMAT_R32_SINT:
+      return G9P_OUTPUT_RAW1;
+   case VK_FORMAT_R32G32_SFLOAT:
+   case VK_FORMAT_R32G32_UINT:
+   case VK_FORMAT_R32G32_SINT:
+      return G9P_OUTPUT_RAW2;
+   case VK_FORMAT_R32G32B32A32_SFLOAT:
+   case VK_FORMAT_R32G32B32A32_UINT:
+   case VK_FORMAT_R32G32B32A32_SINT:
+      return G9P_OUTPUT_RAW4;
    default:
-      return false;
+      return G9P_OUTPUT_HALF2;
    }
+}
+
+static inline unsigned
+g9p_output_words(enum g9p_output output)
+{
+   return output == G9P_OUTPUT_RAW4 ? 4 : output == G9P_OUTPUT_HALF2 || output == G9P_OUTPUT_RAW2 ? 2 : 1;
+}
+
+/* Has a key, and is not snorm, shared-exponent, 565 or 4444 (Zink picks another for those) */
+static inline bool
+g9p_format_renderable(VkFormat format)
+{
+   const uint32_t key = g9p_image_format(format);
+   const uint32_t code = (key >> 5) & 0x3ff;
+
+   return key && (code == 0x28 || code == 0x26 || code == 0x00 || code == 0x0a || (code & 0x100) ||
+          code == 0x209 || code == 0x223 || code == 0x232 || code == 0x225 || code == 0x221 ||
+          code == 0x231 || code == 0x238);
 }
 
 /* The hardware filters it: not integers, not 32-bit float */
 static inline bool
 g9p_format_filterable(VkFormat format)
 {
-   const uint32_t code = (g9p_image_format(format) >> 5) & 0x3ff;
+   const uint32_t key = g9p_image_format(format);
+   const uint32_t code = (key >> 5) & 0x3ff;
 
-   return code && !(code & 0x100) && code != 0x221 && code != 0x231 && code != 0x238;
+   return key && !(code & 0x100) && code != 0x221 && code != 0x231 && code != 0x238;
 }
 
 #endif /* G9P_FORMATS_H */

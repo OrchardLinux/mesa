@@ -397,6 +397,11 @@ VkResult pvr_image_init(struct pvr_device *device,
    }
 
    pvr_image_init_memlayout(device, image);
+   /* G9P: a linear image's row pitch is in units of 64 bytes, whatever the texel size */
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p) &&
+       !vk_format_is_depth_or_stencil(image->vk.format) &&
+       !vk_format_is_compressed(image->vk.format))
+      pbe_stride_align = MAX2(pbe_stride_align, 64 / vk_format_get_blocksize(image->vk.format));
    pvr_image_init_physical_extent(image, pCreateInfo, pbe_stride_align);
    pvr_image_setup_mip_levels(image);
 
