@@ -542,6 +542,8 @@ struct pvr_cmd_buffer_state {
 
    const struct pvr_query_pool *query_pool;
    struct pvr_cmd_buffer_xfb_state xfb_state;
+   /* G9P's transform feedback events (pvr_arch_g9p_xfb.c) */
+   struct pvr_g9p_xfb_cmd *g9p_xfb;
 
    /* Query pool pointers indexed by query type */
    const struct pvr_query_pool *query_pools[PVR_QUERY_POOL_INDEX_COUNT];

@@ -78,6 +78,14 @@ g9p_fs_buf_base(unsigned n)
  */
 #define G9P_VERTEX_STRIDES (~3u)
 /*
+ * The set of transform feedback's slots, filled per draw: buffer b's capture
+ * address (binding b), the vertices per instance, and a mask on the record
+ * offsets (0 sends every store to one place while not capturing)
+ */
+#define G9P_XFB (~7u)
+#define G9P_XFB_NUM_VERTICES 4
+#define G9P_XFB_MASK 5
+/*
  * gl_FragCoord comes in a varying (window x, y, z, 1/w) the vertex shader
  * writes after its own (g9p_frag_coord_slot()), iterated without
  * perspective correction: the position read's 16-bit results are not

@@ -27,6 +27,7 @@
 #include "pvr_pipeline.h"
 #include "pvr_query.h"
 #include "pvr_types.h"
+#include "pvr_g9p.h"
 #include "pvr_xfb.h"
 
 #include "util/u_math.h"
@@ -769,6 +770,11 @@ void PVR_PER_ARCH(CmdBindTransformFeedbackBuffersEXT)(
    VK_FROM_HANDLE(pvr_cmd_buffer, cmd_buffer, commandBuffer);
    struct pvr_cmd_buffer_xfb_state *xfb_state = &cmd_buffer->state.xfb_state;
 
+   if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g9p)) {
+      PVR_PER_ARCH(g9p_xfb_bind)(cmd_buffer, firstBinding, bindingCount, pBuffers, pOffsets, pSizes);
+      return;
+   }
+
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
 
    for (uint32_t i = 0; i < ARRAY_SIZE(xfb_state->bindings); i++) {
@@ -808,6 +814,11 @@ void PVR_PER_ARCH(CmdBeginTransformFeedbackEXT)(
    VK_FROM_HANDLE(pvr_cmd_buffer, cmd_buffer, commandBuffer);
    struct pvr_cmd_buffer_state *state = &cmd_buffer->state;
    struct pvr_cmd_buffer_xfb_state *xfb_state = &state->xfb_state;
+
+   if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g9p)) {
+      PVR_PER_ARCH(g9p_xfb_begin)(cmd_buffer, firstCounterBuffer, counterBufferCount, pCounterBuffers, pCounterBufferOffsets);
+      return;
+   }
 
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
 
@@ -853,6 +864,11 @@ void PVR_PER_ARCH(CmdEndTransformFeedbackEXT)(
    struct pvr_cmd_buffer_xfb_state *xfb_state = &state->xfb_state;
    struct pvr_sub_cmd *prev_sub_cmd = NULL;
    VkResult result;
+
+   if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g9p)) {
+      PVR_PER_ARCH(g9p_xfb_end)(cmd_buffer, firstCounterBuffer, counterBufferCount, pCounterBuffers, pCounterBufferOffsets);
+      return;
+   }
 
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
 

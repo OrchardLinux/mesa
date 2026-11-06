@@ -42,6 +42,7 @@
 #include "pvr_macros.h"
 #include "pvr_pass.h"
 #include "pvr_physical_device.h"
+#include "pvr_g9p_xfb_core.h"
 #include "pvr_xfb.h"
 #include "util/macros.h"
 #include "util/os_time.h"
@@ -93,8 +94,11 @@ static VkResult pvr_occlusion_query_pool_setup(struct pvr_device *device,
 static VkResult pvr_xfb_query_pool_setup(struct pvr_device *device,
                                          struct pvr_query_pool *pool)
 {
+   /* G9P: two 64-bit counts the CPU keeps (pvr_g9p_xfb_core.h) */
    const uint32_t counter_size =
-      pvr_xfb_get_counter_bytes(&device->pdevice->dev_info);
+      PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p)
+         ? 8
+         : pvr_xfb_get_counter_bytes(&device->pdevice->dev_info);
    const uint32_t cache_line_size =
       pvr_get_slc_cache_line_size(&device->pdevice->dev_info);
    const uint32_t elem_size =
@@ -352,6 +356,32 @@ VkResult pvr_GetQueryPoolResults(VkDevice _device,
    const uint32_t core_count = device->pdevice->dev_runtime_info.core_count;
    uint8_t *data = (uint8_t *)pData;
    VkResult result = VK_SUCCESS;
+
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p) &&
+       pool->query_type == VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT) {
+      struct g9p_xfb_query_pool view = {
+         .count = pool->query_count,
+         .stride = pool->result_elem_stride,
+         .data = pvr_bo_suballoc_get_map_addr(pool->result_buffer),
+         .available = pvr_bo_suballoc_get_map_addr(pool->availability_buffer),
+      };
+
+      /* The End runs at submission; 10 s is far beyond any submission */
+      if (flags & VK_QUERY_RESULT_WAIT_BIT) {
+         const uint64_t deadline = os_time_get_absolute_timeout(10000000000ull);
+
+         for (uint32_t q = firstQuery; q < firstQuery + queryCount && q < view.count; q++) {
+            while (!p_atomic_read(&view.available[q])) {
+               if (os_time_get_nano() > (int64_t)deadline)
+                  return vk_error(device, VK_ERROR_DEVICE_LOST);
+               os_time_sleep(100);
+            }
+         }
+      }
+      return g9p_xfb_query_results(&view, firstQuery, queryCount, pData, stride, flags)
+                ? VK_SUCCESS
+                : VK_NOT_READY;
+   }
 
    /* TODO: Instead of making the memory defined here for valgrind, to better
     * catch out of bounds access and other memory errors we should move them

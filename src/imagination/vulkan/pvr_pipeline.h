@@ -19,6 +19,7 @@
 
 #include "pvr_common.h"
 #include "pvr_csb.h"
+#include "pvr_g9p_xfb_core.h"
 #include "pvr_pds.h"
 #include "util/shader_stats.h"
 
@@ -179,6 +180,9 @@ struct pvr_g9p_graphics_state {
    } textures[16]; /* G9P_MAX_TEXTURES */
    /* the vertex shader's, and the size of its common store in dwords */
    unsigned vs_num_textures, vs_common_dwords;
+   /* transform feedback: the vertex shader also stores what it captures */
+   bool has_xfb;
+   struct g9p_xfb_layout xfb_layout;
    bool vs_point_size;
    struct {
       unsigned set, binding, index;

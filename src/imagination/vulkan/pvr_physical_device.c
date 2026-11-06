@@ -1000,7 +1000,7 @@ static bool pvr_physical_device_get_properties(
       .maxTransformFeedbackStreamDataSize = PVR_XFB_MAX_DATA_SIZE,
       .maxTransformFeedbackBufferDataSize = PVR_XFB_MAX_DATA_SIZE,
       .maxTransformFeedbackBufferDataStride = PVR_XFB_MAX_DATA_STRIDE,
-      .transformFeedbackQueries = false,
+      .transformFeedbackQueries = PVR_HAS_FEATURE(dev_info, apple_g9p),
       .transformFeedbackStreamsLinesTriangles = false,
       .transformFeedbackRasterizationStreamSelect = false,
       .transformFeedbackDraw = true,

@@ -198,6 +198,7 @@ static void pvr_cmd_buffer_free_sub_cmds(struct pvr_cmd_buffer *cmd_buffer)
 
 static void pvr_cmd_buffer_free_resources(struct pvr_cmd_buffer *cmd_buffer)
 {
+   PVR_PER_ARCH(g9p_xfb_free)(cmd_buffer);
    vk_free(&cmd_buffer->vk.pool->alloc,
            cmd_buffer->state.gfx_desc_state.push_set);
    vk_free(&cmd_buffer->vk.pool->alloc,

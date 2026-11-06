@@ -558,6 +558,13 @@ static VkResult pvr_process_graphics_cmd(struct pvr_device *device,
       PVR_PER_ARCH(g9p_realign_vertex_bindings)(sub_cmd);
    }
 
+   {
+      VkResult result = PVR_PER_ARCH(g9p_xfb_before_job)(device, cmd_buffer, sub_cmd);
+
+      if (result != VK_SUCCESS)
+         return result;
+   }
+
    u_foreach_bit (view_idx, sub_cmd->view_mask) {
       VkResult result;
 
@@ -572,7 +579,7 @@ static VkResult pvr_process_graphics_cmd(struct pvr_device *device,
          return result;
    }
 
-   return VK_SUCCESS;
+   return PVR_PER_ARCH(g9p_xfb_after_job)(device, queue, cmd_buffer, sub_cmd);
 }
 
 static VkResult pvr_process_compute_cmd(struct pvr_device *device,
@@ -1097,7 +1104,7 @@ static VkResult pvr_process_cmd_buffer(struct pvr_device *device,
       p_atomic_inc(&device->global_cmd_buffer_submit_count);
    }
 
-   return VK_SUCCESS;
+   return PVR_PER_ARCH(g9p_xfb_end_cmd_buffer)(device, cmd_buffer);
 }
 
 static VkResult pvr_clear_last_submits_syncs(struct pvr_queue *queue)

@@ -9,6 +9,9 @@
 #include "pvr_hw_pass.h"
 #include "pvr_macros.h"
 #include "pvr_pass.h"
+#include "pvr_device.h"
+#include "pvr_g9p.h"
+#include "pvr_physical_device.h"
 #include "pvr_query.h"
 #include "pvr_xfb.h"
 
@@ -22,6 +25,16 @@ void PVR_PER_ARCH(CmdResetQueryPool)(VkCommandBuffer commandBuffer,
    VkResult result;
 
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
+
+   {
+      VK_FROM_HANDLE(pvr_query_pool, pool, queryPool);
+
+      if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g9p) &&
+          pool->query_type == VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT) {
+         PVR_PER_ARCH(g9p_xfb_query_reset)(cmd_buffer, pool, firstQuery, queryCount);
+         return;
+      }
+   }
 
    if (queryCount == 0)
       return;
@@ -84,6 +97,17 @@ void PVR_PER_ARCH(CmdCopyQueryPoolResults)(VkCommandBuffer commandBuffer,
    VkResult result;
 
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
+
+   {
+      VK_FROM_HANDLE(pvr_query_pool, pool, queryPool);
+
+      if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g9p) &&
+          pool->query_type == VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT) {
+         PVR_PER_ARCH(g9p_xfb_query_copy)(cmd_buffer, pool, firstQuery, queryCount, dstBuffer, dstOffset,
+                                        stride, flags);
+         return;
+      }
+   }
 
    if (queryCount == 0)
       return;
@@ -230,6 +254,12 @@ void PVR_PER_ARCH(CmdBeginQueryIndexedEXT)(VkCommandBuffer commandBuffer,
 
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
 
+   if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g9p) &&
+       pool->query_type == VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT) {
+      PVR_PER_ARCH(g9p_xfb_query_begin)(cmd_buffer, pool, query, index);
+      return;
+   }
+
    switch (pool->query_type) {
    case VK_QUERY_TYPE_OCCLUSION:
       pvr_occlusion_query_begin(cmd_buffer, pool, query);
@@ -254,6 +284,12 @@ void PVR_PER_ARCH(CmdEndQueryIndexedEXT)(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(pvr_query_pool, pool, queryPool);
 
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
+
+   if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g9p) &&
+       pool->query_type == VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT) {
+      PVR_PER_ARCH(g9p_xfb_query_end)(cmd_buffer, pool, query);
+      return;
+   }
 
    switch (pool->query_type) {
    case VK_QUERY_TYPE_OCCLUSION:

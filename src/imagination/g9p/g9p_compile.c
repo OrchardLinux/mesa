@@ -29,6 +29,7 @@
 
 #include "compiler/nir/nir_builder.h"
 #include "compiler/nir/nir_schedule.h"
+#include "compiler/nir/nir_xfb_info.h"
 #include "compiler/nir/nir_builtin_builder.h"
 #include "compiler/nir/nir_format_convert.h"
 #include "util/format/u_format.h"
@@ -98,7 +99,15 @@ g9p_nir_options(void)
    return &nir_options;
 }
 
+/* A vertex shader's store, emitted after its outputs */
+struct g9p_vs_store {
+   int slot, off, data;
+   unsigned dword;
+};
+
 struct g9p_ctx {
+   struct g9p_vs_store vs_stores[4 * 64];
+   unsigned num_vs_stores;
    unsigned num_keys;
    struct g9p_code *c;
    struct g9p_shader *out;
@@ -1162,6 +1171,15 @@ emit_alu_op(struct g9p_ctx *ctx, nir_alu_instr *alu, const int *r, int dst)
    }
 }
 
+/* Keep r[@r] (a store's value) until the end of the program */
+static void
+pin(struct g9p_ctx *ctx, int r)
+{
+   ctx->pinned |= BITFIELD64_BIT(r);
+   ctx->temps &= ~BITFIELD64_BIT(r);
+   ctx->busy |= BITFIELD64_BIT(r);
+}
+
 /*
  * Loads/stores through a slot address in the common store: storage buffers
  * and push constants. @base is added to the register offset.
@@ -1199,6 +1217,36 @@ emit_mem(struct g9p_ctx *ctx, nir_intrinsic_instr *intr, int slot, nir_scalar of
          return false;
       g9p_mov_uniform(ctx->c, data, fs_buffer_base(ctx, slot) + byte / 4, zero);
       ctx->reg[key(&intr->def, 0)] = data;
+      return true;
+   }
+
+   /*
+    * Vertex shaders store after their outputs, as Apple's (xfb1, xfb5.metal),
+    * with the registers kept until then; the constant part of the offset is
+    * the store's dword offset, so one record needs one address
+    */
+   if (value && ctx->stage == MESA_SHADER_VERTEX) {
+      nir_scalar at = offset;
+      unsigned dword = 0;
+
+      if (nir_scalar_is_alu(offset) && nir_scalar_alu_op(offset) == nir_op_iadd) {
+         nir_scalar k = nir_scalar_chase_alu_src(offset, 1);
+
+         if (nir_scalar_is_const(k) && !(nir_scalar_as_uint(k) & 3) &&
+             nir_scalar_as_uint(k) < 4 * 64) {
+            at = nir_scalar_chase_alu_src(offset, 0);
+            dword = nir_scalar_as_uint(k) / 4;
+         }
+      }
+      off = src_reg(ctx, at);
+      data = src_reg(ctx, nir_get_scalar(value->ssa, 0));
+      if (off < 0 || data < 0 || ctx->num_vs_stores == ARRAY_SIZE(ctx->vs_stores))
+         return false;
+      pin(ctx, off);
+      pin(ctx, data);
+      ctx->vs_stores[ctx->num_vs_stores++] =
+         (struct g9p_vs_store){ .slot = slot, .off = off, .data = data, .dword = dword };
+      release(ctx, &intr->instr);
       return true;
    }
 
@@ -1246,15 +1294,6 @@ emit_mem(struct g9p_ctx *ctx, nir_intrinsic_instr *intr, int slot, nir_scalar of
       ctx->reg[key(&intr->def, 0)] = data;
    }
    return true;
-}
-
-/* Keep r[@r] (a store's value) until the end of the program */
-static void
-pin(struct g9p_ctx *ctx, int r)
-{
-   ctx->pinned |= BITFIELD64_BIT(r);
-   ctx->temps &= ~BITFIELD64_BIT(r);
-   ctx->busy |= BITFIELD64_BIT(r);
 }
 
 /*
@@ -2277,6 +2316,19 @@ emit_intrinsic(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
       ctx->reg[key(&intr->def, 0)] = r;
       return true;
    }
+   case nir_intrinsic_load_xfb_address: {
+      const int slot = g9p_buffer_slot(ctx->out, G9P_XFB, nir_intrinsic_base(intr));
+      const int zero = const_reg(ctx, 0);
+      int r;
+
+      release(ctx, &intr->instr);
+      r = alloc_reg(ctx);
+      if (slot < 0 || zero < 0 || r < 0)
+         return false;
+      g9p_mov_uniform(ctx->c, r, 2 * slot, zero);
+      ctx->reg[key(&intr->def, 0)] = r;
+      return true;
+   }
    case nir_intrinsic_load_input:
       if (ctx->stage == MESA_SHADER_VERTEX)
          return emit_attrib_load(ctx, intr);
@@ -2771,10 +2823,34 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
          ctx->outputs[ctx->num_outputs].slot = 4 + 4 * ctx->out->num_varyings;
          ctx->num_outputs++;
       }
-      for (unsigned i = 0; i + 1 < ctx->num_outputs; i++)
+      for (unsigned i = 0; i + (ctx->num_vs_stores ? 0 : 1) < ctx->num_outputs; i++)
          g9p_vs_output(ctx->c, ctx->outputs[i].reg, ctx->outputs[i].slot);
-      g9p_end_vertex(ctx->c, ctx->outputs[ctx->num_outputs - 1].reg,
-                     ctx->outputs[ctx->num_outputs - 1].slot);
+      if (ctx->num_vs_stores) {
+         int pair = alloc_pair(ctx), last_slot = -1, last_off = -1;
+
+         if (pair < 0)
+            return false;
+         for (unsigned i = 0; i < ctx->num_vs_stores; i++) {
+            const struct g9p_vs_store *st = &ctx->vs_stores[i];
+
+            if (st->slot != last_slot || st->off != last_off) {
+               const int low = low_reg(ctx, st->off);
+
+               if (low < 0)
+                  return false;
+               g9p_addr(ctx->c, pair, 2 * st->slot, low, 0, false);
+               ctx->busy &= ~ctx->temps;
+               ctx->temps = 0;
+               last_slot = st->slot;
+               last_off = st->off;
+            }
+            g9p_mem_at(ctx->c, true, G9P_SIZE_U32, st->data, pair);
+            ctx->c->w[ctx->c->n - 1] |= st->dword;
+         }
+         g9p_end_vertex_stores(ctx->c);
+      } else
+         g9p_end_vertex(ctx->c, ctx->outputs[ctx->num_outputs - 1].reg,
+                        ctx->outputs[ctx->num_outputs - 1].slot);
       ctx->out->num_outputs = 4 + 4 * ctx->out->num_varyings + ctx->point_size;
       break;
    case MESA_SHADER_FRAGMENT: {
@@ -3538,6 +3614,60 @@ lower_attrib_format(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return true;
 }
 
+/*
+ * Transform feedback: each captured output is also stored, one word at a
+ * time (PR #6's A9 form; Apple's vertex stores are ours, offline
+ * xfb1/xfb2.metal), at the slot's address + (instance x vertices + vertex
+ * index) x stride + offset.
+ */
+struct lower_xfb_state {
+   nir_def *index, *mask;
+};
+
+static bool
+lower_xfb_store(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   const struct lower_xfb_state *st = data;
+   nir_io_xfb xfb;
+   bool progress = false;
+
+   if (intr->intrinsic != nir_intrinsic_store_output)
+      return false;
+   xfb = nir_intrinsic_io_xfb(intr);
+   b->cursor = nir_before_instr(&intr->instr);
+   for (unsigned i = 0; i < 4; i++) {
+      for (unsigned c = 0; c < xfb.out[i].num_components; c++) {
+         const unsigned buffer = xfb.out[i].buffer;
+         nir_def *record = nir_iand(
+            b, nir_imul_imm(b, st->index, b->shader->xfb_info->buffers[buffer].stride), st->mask);
+
+         nir_store_ssbo(b, nir_channel(b, intr->src[0].ssa, i + c - nir_intrinsic_component(intr)),
+                        nir_vulkan_resource_index(b, 1, 32, nir_imm_int(b, 0), .desc_set = G9P_XFB,
+                                                  .binding = buffer),
+                        nir_iadd_imm(b, record, 4 * (xfb.out[i].offset + c)), .write_mask = 1,
+                        .align_mul = 4);
+         progress = true;
+      }
+   }
+   return progress;
+}
+
+static void
+lower_xfb(nir_shader *nir)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   struct lower_xfb_state st = { 0 };
+
+   NIR_PASS(_, nir, nir_opt_constant_folding);
+   NIR_PASS(_, nir, nir_io_add_intrinsic_xfb_info);
+   st.index = nir_iadd(&b, nir_imul(&b, nir_load_instance_id(&b),
+                                    nir_load_xfb_address(&b, 32, .base = G9P_XFB_NUM_VERTICES)),
+                       nir_load_vertex_id(&b));
+   st.mask = nir_load_xfb_address(&b, 32, .base = G9P_XFB_MASK);
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_xfb_store, nir_metadata_control_flow, &st);
+}
+
 bool
 g9p_compile_vertex(nir_shader *nir, const struct g9p_vertex_attrib *attribs,
                    int frag_coord_slot, bool point_coord, struct g9p_shader *out,
@@ -3548,6 +3678,8 @@ g9p_compile_vertex(nir_shader *nir, const struct g9p_vertex_attrib *attribs,
    if (frag_coord_slot >= 0)
       add_frag_coord_output(nir, frag_coord_slot, point_coord);
    lower_io(nir);
+   if (nir->xfb_info && nir->xfb_info->buffers_written)
+      lower_xfb(nir);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_attrib_format,
             nir_metadata_control_flow, (void *)attribs);
    /* out of registers: again with a value's loads repeated, not kept live */

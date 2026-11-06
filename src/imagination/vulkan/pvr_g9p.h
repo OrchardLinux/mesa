@@ -90,6 +90,47 @@ uint32_t PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
                                        const struct pvr_render_job *job, uint8_t *buf,
                                        uint32_t size);
 
+/* Transform feedback (pvr_arch_g9p_xfb.c) */
+struct g9p_xfb_layout;
+struct pvr_query_pool;
+struct pvr_queue;
+struct pvr_sub_cmd_gfx;
+void PVR_PER_ARCH(g9p_xfb_bind)(struct pvr_cmd_buffer *cmd_buffer, uint32_t first, uint32_t count,
+                                const VkBuffer *buffers, const VkDeviceSize *offsets,
+                                const VkDeviceSize *sizes);
+void PVR_PER_ARCH(g9p_xfb_begin)(struct pvr_cmd_buffer *cmd_buffer, uint32_t first, uint32_t count,
+                                 const VkBuffer *counters, const VkDeviceSize *offsets);
+void PVR_PER_ARCH(g9p_xfb_end)(struct pvr_cmd_buffer *cmd_buffer, uint32_t first, uint32_t count,
+                               const VkBuffer *counters, const VkDeviceSize *offsets);
+bool PVR_PER_ARCH(g9p_xfb_capturing)(const struct pvr_cmd_buffer *cmd_buffer);
+VkResult PVR_PER_ARCH(g9p_xfb_draw_check)(struct pvr_cmd_buffer *cmd_buffer,
+                                          VkPrimitiveTopology topology);
+VkResult PVR_PER_ARCH(g9p_xfb_draw)(struct pvr_cmd_buffer *cmd_buffer,
+                                    const struct g9p_xfb_layout *layout, uint8_t *block,
+                                    uint32_t vertices, uint32_t instances, uint32_t first,
+                                    VkPrimitiveTopology topology);
+void PVR_PER_ARCH(g9p_xfb_query_begin)(struct pvr_cmd_buffer *cmd_buffer,
+                                       const struct pvr_query_pool *pool, uint32_t query,
+                                       uint32_t index);
+void PVR_PER_ARCH(g9p_xfb_query_end)(struct pvr_cmd_buffer *cmd_buffer,
+                                     const struct pvr_query_pool *pool, uint32_t query);
+void PVR_PER_ARCH(g9p_xfb_query_reset)(struct pvr_cmd_buffer *cmd_buffer,
+                                       const struct pvr_query_pool *pool, uint32_t first,
+                                       uint32_t count);
+void PVR_PER_ARCH(g9p_xfb_query_copy)(struct pvr_cmd_buffer *cmd_buffer,
+                                      const struct pvr_query_pool *pool, uint32_t first,
+                                      uint32_t count, VkBuffer dst, VkDeviceSize offset,
+                                      VkDeviceSize stride, VkQueryResultFlags flags);
+VkResult PVR_PER_ARCH(g9p_xfb_before_job)(struct pvr_device *device,
+                                          struct pvr_cmd_buffer *cmd_buffer,
+                                          const struct pvr_sub_cmd_gfx *sub_cmd);
+VkResult PVR_PER_ARCH(g9p_xfb_after_job)(struct pvr_device *device, struct pvr_queue *queue,
+                                         struct pvr_cmd_buffer *cmd_buffer,
+                                         const struct pvr_sub_cmd_gfx *sub_cmd);
+VkResult PVR_PER_ARCH(g9p_xfb_end_cmd_buffer)(struct pvr_device *device,
+                                              struct pvr_cmd_buffer *cmd_buffer);
+void PVR_PER_ARCH(g9p_xfb_free)(struct pvr_cmd_buffer *cmd_buffer);
+
 struct pvr_image_view;
 void PVR_PER_ARCH(g9p_pack_image_view)(const struct pvr_image_view *iview, uint64_t words[2]);
 uint64_t PVR_PER_ARCH(g9p_pack_sampler)(const VkSamplerCreateInfo *info);

@@ -559,9 +559,13 @@ static VkResult
 stage_nir(struct pvr_device *device, struct pvr_graphics_pipeline *pipeline,
           const VkPipelineShaderStageCreateInfo *stage, void *mem_ctx, nir_shader **nir)
 {
-   return vk_pipeline_shader_stage_to_nir(&device->vk, pipeline->base.pipeline_flags, stage,
-                                          g9p_spirv_options(), g9p_nir_options(), mem_ctx,
-                                          nir);
+   VkResult result =
+      vk_pipeline_shader_stage_to_nir(&device->vk, pipeline->base.pipeline_flags, stage,
+                                      g9p_spirv_options(), g9p_nir_options(), mem_ctx, nir);
+
+   if (result == VK_SUCCESS && stage->stage == VK_SHADER_STAGE_VERTEX_BIT)
+      nir_shader_gather_xfb_info(*nir);
+   return result;
 }
 
 /*
@@ -708,6 +712,7 @@ g9p_compile_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo 
    struct g9p_vertex_attrib attribs[G9P_MAX_ATTRIBS] = { 0 };
    void *mem_ctx = ralloc_context(NULL);
    struct g9p_shader vs, fs = { 0 };
+   const nir_xfb_info *vs_xfb = NULL;
    static unsigned next_id;
    VkResult result;
 
@@ -766,6 +771,7 @@ g9p_compile_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo 
          result = stage_nir(device, pipeline, fs_info, mem_ctx, &fs_nir);
       if (result != VK_SUCCESS)
          goto out;
+      vs_xfb = vs_nir->xfb_info;
       if (seamful) {
          g9p_lower_cubes_seamful(vs_nir, mag_at_half);
          g9p_lower_cubes_seamful(fs_nir, false);
@@ -826,6 +832,38 @@ g9p_compile_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo 
       state->textures[i].index = fs.textures[i].index;
    }
    state->vs_num_textures = vs.num_textures;
+   {
+      const nir_xfb_info *x = vs_xfb;
+
+      if (x && x->buffers_written) {
+         struct g9p_xfb_layout *l = &state->xfb_layout;
+
+         if (x->streams_written > 1 || x->output_count > G9P_XFB_MAX_RANGES) {
+            result = g9p_error(device, "G9P: transform feedback of streams %#x, %u outputs",
+                               x->streams_written, x->output_count);
+            goto out;
+         }
+         state->has_xfb = true;
+         l->buffers = x->buffers_written;
+         for (unsigned b = 0; b < G9P_XFB_BUFFERS; b++)
+            l->stride[b] = x->buffers[b].stride;
+         for (unsigned i = 0; i < x->output_count; i++) {
+            l->ranges[l->nranges].buffer = x->outputs[i].buffer;
+            l->ranges[l->nranges].offset = x->outputs[i].offset;
+            l->ranges[l->nranges++].size = 4 * util_bitcount(x->outputs[i].component_mask);
+         }
+         for (unsigned k = 0; k < vs.num_buffers; k++) {
+            if (vs.buffers[k].set != G9P_XFB)
+               continue;
+            if (vs.buffers[k].binding < G9P_XFB_BUFFERS)
+               l->slot[vs.buffers[k].binding] = k;
+            else if (vs.buffers[k].binding == G9P_XFB_NUM_VERTICES)
+               l->num_vertices_slot = k;
+            else
+               l->mask_slot = k;
+         }
+      }
+   }
    state->vs_common_dwords = vs.num_textures
                                 ? g9p_tex_sampler(G9P_VS_TEX_BASE, vs.num_textures, vs.num_textures)
                                 : 2 * vs.num_buffers;
@@ -997,7 +1035,8 @@ hw_topology(VkPrimitiveTopology topology)
 
 static VkResult upload_buffer_addrs(struct pvr_cmd_buffer *cmd_buffer, unsigned n,
                                     const unsigned (*sets)[2],
-                                    enum pvr_stage_allocation stage, uint64_t *addr_out);
+                                    enum pvr_stage_allocation stage, uint64_t *addr_out,
+                                    uint8_t **map);
 static VkResult buffer_addrs(struct pvr_cmd_buffer *cmd_buffer, unsigned n,
                              const unsigned (*sets)[2], enum pvr_stage_allocation stage,
                              uint64_t *addrs);
@@ -1368,6 +1407,8 @@ buffer_addrs(struct pvr_cmd_buffer *cmd_buffer, unsigned n, const unsigned (*set
          if (result != VK_SUCCESS)
             return result;
          addrs[k] = fbo->dev_addr.addr;
+      } else if (set == G9P_XFB) {
+         /* filled after the upload (g9p_cmd_draw()) */
       } else if (set == G9P_VIEWPORT) {
          /* scale/offset x, y, z of viewport 0 (gl_FragCoord's varying) */
          const struct vk_dynamic_graphics_state *dyn = &cmd_buffer->vk.dynamic_graphics_state;
@@ -1407,7 +1448,7 @@ buffer_addrs(struct pvr_cmd_buffer *cmd_buffer, unsigned n, const unsigned (*set
 static VkResult
 upload_buffer_addrs(struct pvr_cmd_buffer *cmd_buffer, unsigned n,
                     const unsigned (*sets)[2], enum pvr_stage_allocation stage,
-                    uint64_t *addr_out)
+                    uint64_t *addr_out, uint8_t **map)
 {
    uint64_t addrs[G9P_MAX_BUFFERS];
    struct pvr_suballoc_bo *bo;
@@ -1421,13 +1462,16 @@ upload_buffer_addrs(struct pvr_cmd_buffer *cmd_buffer, unsigned n,
       return result;
    dump32("buffer addresses", bo->dev_addr.addr, (const uint32_t *)addrs, 2 * n);
    *addr_out = bo->dev_addr.addr;
+   if (map)
+      *map = pvr_bo_suballoc_get_map_addr(bo);
    return VK_SUCCESS;
 }
 
 /* The vertex shader's common store: its buffer addresses, by the draw's DMA */
 static VkResult
 upload_vs_uniforms(struct pvr_cmd_buffer *cmd_buffer,
-                   const struct pvr_g9p_graphics_state *state, struct pvr_pds_upload *dma)
+                   const struct pvr_g9p_graphics_state *state, struct pvr_pds_upload *dma,
+                   uint8_t **block_map)
 {
    unsigned sets[G9P_MAX_BUFFERS][2];
    uint32_t data[4];
@@ -1475,9 +1519,10 @@ upload_vs_uniforms(struct pvr_cmd_buffer *cmd_buffer,
       if (result != VK_SUCCESS)
          return result;
       addr = bo->dev_addr.addr;
+      *block_map = pvr_bo_suballoc_get_map_addr(bo);
    } else {
       result = upload_buffer_addrs(cmd_buffer, state->num_buffers, sets,
-                                   PVR_STAGE_ALLOCATION_VERTEX_GEOMETRY, &addr);
+                                   PVR_STAGE_ALLOCATION_VERTEX_GEOMETRY, &addr, block_map);
       if (result != VK_SUCCESS)
          return result;
    }
@@ -1510,6 +1555,8 @@ struct g9p_draw_programs {
     * render area.
     */
    uint32_t region[4];
+   /* no pixels, the vertex shader only: transform feedback */
+   bool discard;
    /* ISP words of a draw that sets its own (g9p_ds_clear()) */
    bool isp_set;
    uint32_t isp[5];
@@ -1694,6 +1741,46 @@ g9p_ds_draw_isp(const struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_gr
 
 static VkResult g9p_ds_clear(struct pvr_cmd_buffer *cmd_buffer, const VkClearAttachment *att,
                              uint32_t rect_count, const VkClearRect *rects);
+/*
+ * The draw's transform feedback slots in its common store block. Not
+ * capturing: every store goes to one scratch word. Capturing: the event fills
+ * them when the job is submitted (the counters are only known then).
+ */
+static VkResult
+xfb_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state *state,
+         const struct pvr_g9p_draw *draw, uint8_t *block, bool capturing)
+{
+   const struct g9p_xfb_layout *l = &state->xfb_layout;
+   const VkPrimitiveTopology topology = cmd_buffer->vk.dynamic_graphics_state.ia.primitive_topology;
+   VkResult result;
+
+   g9p_xfb_put32(block + 8 * l->mask_slot, capturing ? ~0u : 0);
+   if (capturing) {
+      if (draw->indexed)
+         return vk_errorf(cmd_buffer, VK_ERROR_FEATURE_NOT_PRESENT,
+                          "G9P: transform feedback of an indexed draw");
+      result = PVR_PER_ARCH(g9p_xfb_draw_check)(cmd_buffer, topology);
+      if (result == VK_SUCCESS)
+         result = PVR_PER_ARCH(g9p_xfb_draw)(cmd_buffer, l, block, draw->count, draw->instances,
+                                             draw->offset, topology);
+      return result;
+   }
+
+   /* room for a record's offsets (the mask leaves them) */
+   const uint32_t zero[512] = { 0 };
+   struct pvr_suballoc_bo *scratch;
+
+   result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, zero, sizeof(zero), &scratch);
+   if (result != VK_SUCCESS)
+      return result;
+   for (unsigned b = 0; b < G9P_XFB_BUFFERS; b++) {
+      if (l->buffers & BITFIELD_BIT(b))
+         g9p_xfb_put64(block + 8 * l->slot[b], scratch->dev_addr.addr);
+   }
+   g9p_xfb_put32(block + 8 * l->num_vertices_slot, 1);
+   return VK_SUCCESS;
+}
+
 static VkResult emit_draw(struct pvr_cmd_buffer *cmd_buffer,
                           const struct pvr_g9p_graphics_state *state,
                           const struct g9p_draw_programs *dp, const struct pvr_g9p_draw *draw,
@@ -1712,6 +1799,10 @@ PVR_PER_ARCH(g9p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer,
    const uint32_t height = info->render_area.offset.y + info->render_area.extent.height;
    struct pvr_pds_upload dma, tex = { 0 };
    struct g9p_draw_programs dp = { .dma = &dma };
+   /* the capture's own common store block, and draws (below) */
+   struct pvr_pds_upload capture_dma;
+   struct g9p_draw_programs capture_dp;
+   const bool capturing = state->has_xfb && PVR_PER_ARCH(g9p_xfb_capturing)(cmd_buffer);
    VkResult result;
 
    /*
@@ -1764,8 +1855,16 @@ PVR_PER_ARCH(g9p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer,
          y1 = MIN2(y1, (int32_t)ceilf(MAX2(v->y, v->y + v->height)));
       }
 
-      if (x1 <= x0 || y1 <= y0)
-         return VK_SUCCESS; /* nothing passes */
+      if (x1 <= x0 || y1 <= y0 || dyn->rs.rasterizer_discard_enable) {
+         /* nothing passes; the vertex stores of transform feedback still happen */
+         if (!capturing)
+            return VK_SUCCESS;
+         dp.discard = true;
+         x0 = ra->offset.x;
+         y0 = ra->offset.y;
+         x1 = width;
+         y1 = height;
+      }
       sc = (VkRect2D){ { x0, y0 }, { x1 - x0, y1 - y0 } };
       dp.scissor = scissor_index(cmd_buffer, sc);
       dp.region[0] = x0 / 32;
@@ -1805,9 +1904,23 @@ PVR_PER_ARCH(g9p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer,
       pc->dev_addr = bo->dev_addr;
       pc->dirty = false;
    }
-   result = upload_vs_uniforms(cmd_buffer, state, &dma);
+   uint8_t *vs_block;
+
+   result = upload_vs_uniforms(cmd_buffer, state, &dma, &vs_block);
    if (result != VK_SUCCESS)
       return result;
+   if (state->has_xfb) {
+      result = xfb_draw(cmd_buffer, state, draw, vs_block, false);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+   if (capturing) {
+      result = upload_vs_uniforms(cmd_buffer, state, &capture_dma, &vs_block);
+      if (result == VK_SUCCESS)
+         result = xfb_draw(cmd_buffer, state, draw, vs_block, true);
+      if (result != VK_SUCCESS)
+         return result;
+   }
    if (state->num_textures || state->fs_num_buffers) {
       result = upload_textures(cmd_buffer, state, &tex);
       if (result != VK_SUCCESS)
@@ -1834,8 +1947,11 @@ PVR_PER_ARCH(g9p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer,
                              t == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP ||
                              t == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
 
-      if (dyn->rs.cull_mode == VK_CULL_MODE_FRONT_AND_BACK && triangles)
-         return VK_SUCCESS;
+      if (dyn->rs.cull_mode == VK_CULL_MODE_FRONT_AND_BACK && triangles) {
+         if (!capturing)
+            return VK_SUCCESS;
+         dp.discard = true;
+      }
       if (dyn->rs.cull_mode == VK_CULL_MODE_BACK_BIT || dyn->rs.cull_mode == VK_CULL_MODE_FRONT_BIT)
          dp.cull = (dyn->rs.front_face == VK_FRONT_FACE_COUNTER_CLOCKWISE) ^
                          (dyn->rs.cull_mode == VK_CULL_MODE_FRONT_BIT)
@@ -1856,6 +1972,16 @@ PVR_PER_ARCH(g9p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer,
       dp.depth_test = has_depth && dyn->ds.depth.test_enable;
       dp.depth_write = dp.depth_test && dyn->ds.depth.write_enable;
       dp.depth_compare = dyn->ds.depth.compare_op;
+   }
+   /*
+    * The stores take the first vertex of a geometry job right; the later ones
+    * land at the right address with wrong data, also one point per draw (dEQP
+    * transform_feedback, gpu a10/MESA.md "Transform feedback"). Open.
+    */
+   if (capturing) {
+      capture_dp = dp;
+      capture_dp.dma = &capture_dma;
+      return emit_draw(cmd_buffer, state, &capture_dp, draw, dyn->ia.primitive_topology);
    }
    return emit_draw(cmd_buffer, state, &dp, draw, dyn->ia.primitive_topology);
 }
@@ -1984,7 +2110,19 @@ emit_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state
                 0x003e0000 | obj | pass << 24, 0x0e000000, 0x00100000 | obj | pass << 24,
                 state->vs_point_size ? 0x0e000000 : 0);
    }
-   if (dp->isp_set)
+   if (dp->discard) {
+      /*
+       * Rasterizer discard: the vertex shader runs for its stores and no pixel
+       * follows: tag write off, the colour-only form (Rogue's ISPCTL, PR #6)
+       */
+      uint32_t *isp = &ppp[blocks[nb - 1][0] + 1];
+
+      isp[0] = 0x03c40000 | BITFIELD_BIT(21) | (dp->scissor >= 0 ? BITFIELD_BIT(16) : 0);
+      isp[1] = 0x003e0000 | obj;
+      isp[2] = 0x0e000000;
+      isp[3] = 0x00100000 | obj;
+      isp[4] = state->vs_point_size ? 0x0e000000 : 0;
+   } else if (dp->isp_set)
       memcpy(&ppp[blocks[nb - 1][0] + 1], dp->isp, sizeof(dp->isp));
    else
       g9p_ds_draw_isp(cmd_buffer, state, dp->scissor >= 0, &ppp[blocks[nb - 1][0]]);

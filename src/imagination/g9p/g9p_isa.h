@@ -487,6 +487,21 @@ g9p_end_vertex(struct g9p_code *c, unsigned reg, unsigned slot)
       G9P_EMIT(c, 0x0000);
 }
 
+/* The end alone: a vertex shader that stores to memory (Apple's, xfb1.metal) */
+static inline void
+g9p_end_vertex_stores(struct g9p_code *c)
+{
+   unsigned jump = 2 * c->n;
+   unsigned end = (jump + 6 + 63) / 64 * 64;
+
+   G9P_EMIT(c, 0x0100, 0x0100 | (end - jump), 0x0000);
+   while (2 * c->n < end)
+      G9P_EMIT(c, 0xc000);
+   G9P_EMIT(c, 0x015e, 0xa000);
+   while (c->n % 32)
+      G9P_EMIT(c, 0x0000);
+}
+
 /*
  * Fragment iterate: @comps (1-4) components of the varyings, from component
  * index @first (each varying's components in order; the DOUTI program
