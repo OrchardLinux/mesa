@@ -2,6 +2,7 @@
 /* A9 compute. Pipeline/descriptor setup adapted from G9P's
  * pvr_arch_g9p.c; A9 CDM records are encoded independently from Rogue fields.
  * No captured USC/PDS/context window or fixture allowlist is used. */
+#include <stdlib.h>
 #include <string.h>
 #include "vk_pipeline.h"
 #include "vk_alloc.h"
@@ -131,11 +132,17 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
     * launch it: the sub-command's ordinary completion tail still establishes
     * command-buffer ordering and signals the submit fence. */
    if (state->a9_bodyless) {
-      /* Preserve the indirect command's device-side argument read in command
-       * order. The dimensions have no consumer, so DMA them to scratch common
-       * store without launching an empty USC task. The normal fenced pass tail
-       * waits for the DMA and retains all external synchronization. */
-      if (indirect_va) {
+      /* An indirect bodyless dispatch has no consumer of its dimensions,
+       * so its argument read is unobservable and is omitted like the kernel
+       * record. A standalone usc_common_shared PDS DMA task here (the
+       * earlier form) left the CDM silent on A9 hardware: its shared common
+       * store allocation has no following kernel to consume it. The ordered
+       * pass tail alone retires (direct case). PVR_G5P_EMPTY_INDIRECT_DMA=1
+       * restores that shared DMA task and =2 emits it with a private common
+       * store allocation; both are hardware discriminators only. */
+      const char *dma_env = getenv("PVR_G5P_EMPTY_INDIRECT_DMA");
+      const unsigned dma = dma_env ? (unsigned)atoi(dma_env) : 0;
+      if (indirect_va && (dma == 1 || dma == 2)) {
          uint32_t data[4] = { indirect_va, indirect_va >> 32,
                              BITFIELD_BIT(31) | BITFIELD_BIT(28) | 3, 0 };
          uint32_t code[2] = {
@@ -149,15 +156,20 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
             ROGUE_CDMCTRL_KERNEL1_DATA_ADDR_ALIGNMENT, &bind);
          if (result != VK_SUCCESS)
             return result;
-         const struct g5p_cdm_record rec = g5p_cdm_dma_task(
+         struct g5p_cdm_record rec = g5p_cdm_dma_task(
             G9P_CDM_DATA_BLOCKS(1), bind.data_offset, bind.code_offset, 1);
+         if (dma == 2)
+            rec.w[1] &= ~2u; /* KERNEL1 usc_common_shared */
          pvr_csb_set_relocation_mark(&sub_cmd->control_stream);
          emit_record(&sub_cmd->control_stream, &rec);
          pvr_csb_clear_relocation_mark(&sub_cmd->control_stream);
       }
       if (getenv("PVR_G5P_WS_LOG"))
          fprintf(stderr, "G5P-COMPUTE bodyless dispatch omitted; completion tail retained%s\n",
-                 indirect_va ? "; indirect argument DMA retained" : "");
+                 !indirect_va ? "" :
+                 dma == 1 ? "; indirect argument DMA retained (shared)" :
+                 dma == 2 ? "; indirect argument DMA retained (private)" :
+                            "; indirect argument read omitted");
       return VK_SUCCESS;
    }
 
