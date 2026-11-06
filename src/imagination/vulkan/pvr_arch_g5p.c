@@ -221,7 +221,7 @@ g5p_free_programs(struct pvr_device *device, struct pvr_g5p_programs *p)
       pvr_bo_suballoc_free(p->clear_usc[i]);
       pvr_bo_suballoc_free(p->clear_kick[i].pvr_bo);
    }
-   for (unsigned i = 0; i < 2; i++) {
+   for (unsigned i = 0; i < ARRAY_SIZE(p->raw_load); i++) {
       if (p->raw_load[i]) {
          g5p_free_programs(device, p->raw_load[i]);
          vk_free(&device->vk.alloc, p->raw_load[i]);
@@ -259,7 +259,7 @@ g5p_upload_load(struct pvr_device *device, struct pvr_g5p_programs *p, unsigned 
    struct pco_g5p_program prog;
    VkResult result = VK_SUCCESS;
 
-   if (!(raw ? pvr_g5p_compile_load_raw(&prog, raw == 2) : pvr_g5p_compile_load(&prog))) {
+   if (!(raw == 5 ? pvr_g5p_compile_load_rgba16ui(&prog) : raw ? pvr_g5p_compile_load_raw(&prog, raw == 2) : pvr_g5p_compile_load(&prog))) {
       snprintf(p->load_refusal, sizeof(p->load_refusal), "%s", prog.refusal);
       free(prog.code);
       return VK_SUCCESS;
@@ -355,7 +355,7 @@ g5p_raw_programs_unlocked(struct pvr_device *device, unsigned raw, unsigned word
       if (result != VK_SUCCESS)
          return result;
    }
-   if (raw <= 2 && !p->raw_load[raw - 1]) {
+   if ((raw <= 2 || raw == 5) && !p->raw_load[raw - 1]) {
       p->raw_load[raw - 1] = vk_zalloc(&device->vk.alloc, sizeof(*p), 8, VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
       if (!p->raw_load[raw - 1])
          return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
@@ -796,9 +796,9 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
           hw_render->color_init[i].index < info->clear_value_count)
          memcpy(clear[t], info->clear_values[hw_render->color_init[i].index].color.float32, sizeof(clear[t]));
    }
-   if (load && raw > 2)
+   if (load && raw > 2 && raw != 5)
       return G5P_REFUSE(cmd_buffer, "integer boundary qualification supports CLEAR only");
-   const struct pvr_g5p_programs *load_program = raw && raw <= 2 ? p->raw_load[raw - 1] : p;
+   const struct pvr_g5p_programs *load_program = raw && (raw <= 2 || raw == 5) ? p->raw_load[raw - 1] : p;
    if (load && !load_program->load_usc)
       return G5P_REFUSE(cmd_buffer, "LOAD of a colour attachment%s: the load program: %s",
                         partial ? " (a partial render area)" : "", load_program->load_refusal);

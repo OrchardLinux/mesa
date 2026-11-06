@@ -4988,7 +4988,7 @@ static void plan_fs_output(struct gctx *c)
          if (mr != G5P_MRT_OK)
             refuse(c, "%s", g5p_mrt_refusal_str(mr));
       }
-      c->mrt.words = c->mrt.pixel_output_width = 4 * c->mrt.targets;
+      c->mrt.words = c->mrt.pixel_output_width = (c->key->packed_rgba16ui ? 2 : 4) * c->mrt.targets;
       c->mrt.emit_field = g5p_mrt_emit_field(c->mrt.words);
       return; /* No narrow f16 loads, output ALU fusion, or f16 constants. */
    }
@@ -5117,7 +5117,7 @@ static void fs_output(struct gctx *c)
    c->now = LAST_END;
    if (c->key->color_output != PCO_G5P_COLOR_F16) {
       /* target t's channels: output words 4t..4t+3 (c->out[] is indexed 4 * slot + component) */
-      const unsigned words = 4 * c->mrt.targets;
+      const unsigned words = (c->key->packed_rgba16ui ? 2 : 4) * c->mrt.targets;
       struct pvr_g5p_dgl_source sources[8] = {0};
       for (unsigned k = 0; k < words; k++) {
          if (!(c->key->write_mask & (1u << (k % 4))) || !c->out_written[k]) {
@@ -5638,6 +5638,24 @@ static bool rewrite_output(nir_builder *b, nir_intrinsic_instr *in, void *data)
                    nir_fmul(b, nir_channel(b, v, 2), alpha), alpha);
    }
    nir_src_rewrite(&in->src[0], v);
+   return true;
+}
+
+/* fmt-rgba16u fw_val_u emits two raw words. Saturate each unsigned
+ * channel before packing; never pass integer bits through float. */
+static bool pack_rgba16ui(nir_builder *b, nir_intrinsic_instr *in, void *data)
+{
+   (void)data;
+   if (in->intrinsic != nir_intrinsic_store_output ||
+       nir_intrinsic_io_semantics(in).location != FRAG_RESULT_DATA0)
+      return false;
+   if (nir_intrinsic_component(in) || nir_intrinsic_write_mask(in) != 15 || in->src[0].ssa->num_components != 4)
+      return false;
+   b->cursor = nir_before_instr(&in->instr);
+   nir_def *v = nir_umin(b, in->src[0].ssa, nir_imm_ivec4(b, 65535,65535,65535,65535));
+   nir_def *rg = nir_ior(b, nir_channel(b,v,0), nir_ishl_imm(b,nir_channel(b,v,1),16));
+   nir_def *ba = nir_ior(b, nir_channel(b,v,2), nir_ishl_imm(b,nir_channel(b,v,3),16));
+   nir_src_rewrite(&in->src[0], nir_vec4(b,rg,ba,nir_imm_int(b,0),nir_imm_int(b,0)));
    return true;
 }
 
@@ -6725,6 +6743,23 @@ bool pco_g5p_compile_general_link(nir_shader *nir, bool half_output, const uint8
          if (c->key->color_output != PCO_G5P_COLOR_UINT32 &&
              c->key->color_output != PCO_G5P_COLOR_SINT32)
             refuse(c, "unknown colour output format");
+         if (c->key->packed_rgba16ui) {
+            if (c->mrt.targets != 1 || c->key->blend || c->key->write_mask != 15)
+               refuse(c, "packed RGBA16UI requires one unblended full-mask target");
+            /* IO was zero-filled before compilation, so every written target
+             * has complete vec4 stores; refuse rather than skip partial IO. */
+            foreach_instr_all(ins, c) {
+               if (ins->type != nir_instr_type_intrinsic)
+                  continue;
+               nir_intrinsic_instr *in = nir_instr_as_intrinsic(ins);
+               if (in->intrinsic == nir_intrinsic_store_output &&
+                   nir_intrinsic_io_semantics(in).location == FRAG_RESULT_DATA0 &&
+                   (nir_intrinsic_component(in) || nir_intrinsic_write_mask(in) != 15 ||
+                    in->src[0].ssa->num_components != 4))
+                  refuse(c, "packed RGBA16UI has partial output IO");
+            }
+            nir_shader_intrinsics_pass(nir, pack_rgba16ui, nir_metadata_control_flow, NULL);
+         }
          /* two targets: eight output words, the most one emitpix carries */
          if (c->mrt.targets > 2 || c->key->blend)
             refuse(c, "raw32 output needs one or two unblended targets (four words each, at most eight)");

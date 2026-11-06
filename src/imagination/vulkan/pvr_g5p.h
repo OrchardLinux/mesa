@@ -87,7 +87,7 @@ struct pvr_g5p_programs {
    } load_upload[3];
    char load_refusal[128];
    /* Lazy integer variants: float device allocation order remains identical. */
-   struct pvr_g5p_programs *raw_load[2];
+   struct pvr_g5p_programs *raw_load[5];
    /* raw clear programs by total output words: 2, 4, 8 (two 32-bit integer targets) */
    struct pvr_suballoc_bo *raw_clear_usc[3];
    /* raw end-of-tile programs by target count: 1, 2 */
@@ -292,6 +292,7 @@ bool pvr_g5p_compile_stage(const VkPipelineShaderStageCreateInfo *stage_info, bo
  * texture() of the attachment, bound as set 0 binding 0, at the fragment's
  * pixel centre. false with out->refusal set. */
 bool pvr_g5p_compile_load(struct pco_g5p_program *out);
+bool pvr_g5p_compile_load_rgba16ui(struct pco_g5p_program *out);
 bool pvr_g5p_compile_load_raw(struct pco_g5p_program *out, bool is_signed);
 /* The clear quad's stages, built with nir_builder (pvr_g5p_nir.c): the
  * vertex stage passes its vec4 position at location 0 through, the
