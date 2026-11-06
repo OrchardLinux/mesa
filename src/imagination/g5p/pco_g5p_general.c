@@ -2891,9 +2891,11 @@ static void vs_fbin(struct gctx *c, nir_alu_instr *a)
       /* v_uniform_live_*: {h31 x0 dc128 ag1 bg1} or {h71 x4 dc128 ag1 bg0} */
       ia = d[0] ? 0 : 1;
       ib = 1 - ia;
-      f.header = d[ib] ? 0x31 : 0x71;
-      f.source_extension = d[ib] ? 0 : 4;
-      f.dst_control = 0x80;
+      /* Native iv_reg_fmulreuse: one dying multiplicand and one repeated
+       * read use h31/x0/dc0. Preserve the old both-dying tuple. */
+      f.header = 0x31;
+      f.source_extension = 0;
+      f.dst_control = d[ib] ? 0x80 : 0;
       f.a = gsrc(c, reg[ia], r[ia], 1);
       f.b = gsrc(c, reg[ib], r[ib], d[ib]);
    }
@@ -3721,6 +3723,11 @@ static void vs_int(struct gctx *c, nir_alu_instr *a)
          continue;
       uint32_t k = V(c, r[i].def, r[i].comp)->imm;
       if (a->op == nir_op_iadd) {
+         /* Native iv_reg_iaddneg uses subtraction, not a long negative
+          * IADD literal. Materialize the bit pattern and use the witnessed
+          * register IADD instead of inventing that inline control tuple. */
+         if ((int32_t)k < 0)
+            break;
          struct ref x = r[1 - i];
          unsigned xr = reg_of(c, x, "iadd literal");
          unsigned g = vgrp(c, x);

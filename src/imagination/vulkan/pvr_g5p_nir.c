@@ -33,6 +33,7 @@
 /* nir->options must outlive the shader (the general backend runs NIR passes
  * after the preparation returns), so the options are static. */
 static nir_shader_compiler_options g5p_options;
+static nir_shader_compiler_options g5p_vertex_options;
 
 static void
 g5p_init_options(void)
@@ -55,6 +56,15 @@ g5p_init_options(void)
    g5p_options.lower_mul_high = true;
    g5p_options.lower_extract_byte = true;
    g5p_options.lower_extract_word = true;
+   /* GLSL's zero/full-width bitfields lower to the existing measured integer
+    * shifts, masks and selects. Keep PCO's BFE/BFI capabilities disabled. */
+   g5p_options.lower_bitfield_extract = true;
+   g5p_options.lower_bitfield_insert = true;
+   g5p_vertex_options = g5p_options;
+   /* FS keeps its existing native forms. VS uses NIR's exact SWAR sequences
+    * until register-source native vertex popcount/reverse is qualified. */
+   g5p_vertex_options.lower_bit_count = true;
+   g5p_vertex_options.lower_bitfield_reverse = true;
 }
 
 /*
@@ -298,7 +308,8 @@ g5p_nir(const uint32_t *spv, size_t words, mesa_shader_stage stage, const char *
       .skip_os_break_in_debug_build = true,
    };
    opts.workarounds.force_exact_glsl_fma = true;
-   nir_shader *nir = spirv_to_nir(spv, words, NULL, stage, entry, &opts, &g5p_options);
+   nir_shader *nir = spirv_to_nir(spv, words, NULL, stage, entry, &opts,
+      stage == MESA_SHADER_VERTEX ? &g5p_vertex_options : &g5p_options);
    if (!nir)
       return NULL;
    return g5p_nir_prepare(nir);
