@@ -2204,13 +2204,15 @@ tex_extras(struct g9p_ctx *ctx, nir_tex_instr *tex, struct tex_extras *out)
    if (oi >= 0) {
       const nir_src *o = &tex->src[oi].src;
       const unsigned n = o->ssa->num_components;
-      const unsigned v = (nir_src_comp_as_int(*o, 0) & 15) |
-                         (n > 1 ? (nir_src_comp_as_int(*o, 1) & 15) << 4 : 0);
+      /* z's bits are apart (Apple's code for int3 offsets): bit 0, 2 above y, 1 and 3 elsewhere */
       const unsigned z = n > 2 ? nir_src_comp_as_int(*o, 2) & 15 : 0;
+      const unsigned v = (nir_src_comp_as_int(*o, 0) & 15) |
+                         (n > 1 ? (nir_src_comp_as_int(*o, 1) & 15) << 4 : 0) |
+                         (z & 1) << 8 | (z >> 2 & 1) << 9;
       const unsigned half = out->compare ? 2 * (t + 1) : 2 * t;
 
-      G9P_EMIT(ctx->c, 0x0188 | z << 12, 0x0100 | half, 0x0101 | (v & 0x3f) << 1,
-               0x0120 | (v >> 6) << 1, 0x0128, 0x0039);
+      G9P_EMIT(ctx->c, 0x0188 | (z >> 1 & 1) << 13, 0x0100 | half, 0x0101 | (v & 0x3f) << 1,
+               0x0120 | (v >> 6) << 1 | (z >> 3) << 12, 0x0128, 0x0039);
       out->offset = true;
    }
    return true;
@@ -2380,6 +2382,9 @@ emit_tex_vertex(struct g9p_ctx *ctx, nir_tex_instr *tex)
       ctx->c->w[at + 2] |= 0x8000;
    }
    extras_patch(ctx, at, &extras);
+   /* Apple's vertex compare has bit 15 of W2, as its layered samples */
+   if (extras.compare)
+      ctx->c->w[at + 2] |= 0x8000;
    g9p_wait(ctx->c);
    release(ctx, &tex->instr);
    for (unsigned c = 0; c < 4; c++) {
@@ -3723,18 +3728,24 @@ lower_cube_seamful(nir_builder *b, nir_tex_instr *tex, void *data)
     * direction's derivatives with this pixel's face: past a face's edge a helper
     * pixel's face coordinates jump (dEQP mipmap.cube).
     */
-   if (b->shader->info.stage == MESA_SHADER_FRAGMENT &&
-       (tex->op == nir_texop_tex || tex->op == nir_texop_txb)) {
+   if ((b->shader->info.stage == MESA_SHADER_FRAGMENT &&
+        (tex->op == nir_texop_tex || tex->op == nir_texop_txb)) ||
+       tex->op == nir_texop_txd) {
       nir_def *grad[2];
+      /* textureGrad(): the direction's derivatives are given */
+      const int gi[2] = { nir_tex_instr_src_index(tex, nir_tex_src_ddx),
+                          nir_tex_instr_src_index(tex, nir_tex_src_ddy) };
+      nir_def *given[2] = { gi[0] >= 0 ? tex->src[gi[0]].src.ssa : NULL,
+                            gi[1] >= 0 ? tex->src[gi[1]].src.ssa : NULL };
       const int bi = nir_tex_instr_src_index(tex, nir_tex_src_bias);
       /* a bias of b scales the gradients by 2^b */
       nir_def *scale = bi >= 0 ? nir_fpow(b, nir_imm_float(b, 2.0), tex->src[bi].src.ssa) : NULL;
 
       for (unsigned d = 0; d < 2; d++) {
          nir_def *dsc, *dtc, *dma;
-         nir_def *dx = d ? nir_ddy(b, x) : nir_ddx(b, x);
-         nir_def *dy = d ? nir_ddy(b, y) : nir_ddx(b, y);
-         nir_def *dz = d ? nir_ddy(b, z) : nir_ddx(b, z);
+         nir_def *dx = given[d] ? nir_channel(b, given[d], 0) : d ? nir_ddy(b, x) : nir_ddx(b, x);
+         nir_def *dy = given[d] ? nir_channel(b, given[d], 1) : d ? nir_ddy(b, y) : nir_ddx(b, y);
+         nir_def *dz = given[d] ? nir_channel(b, given[d], 2) : d ? nir_ddy(b, z) : nir_ddx(b, z);
 
          cube_select(b, &a, dx, dy, dz, &dsc, &dtc, &dma);
 
@@ -3750,6 +3761,12 @@ lower_cube_seamful(nir_builder *b, nir_tex_instr *tex, void *data)
       }
       if (bi >= 0)
          nir_tex_instr_remove_src(tex, bi);
+      for (unsigned d = 0; d < 2; d++) {
+         const int at = nir_tex_instr_src_index(tex, d ? nir_tex_src_ddy : nir_tex_src_ddx);
+
+         if (at >= 0)
+            nir_tex_instr_remove_src(tex, at);
+      }
       nir_tex_instr_add_src(tex, nir_tex_src_ddx, grad[0]);
       nir_tex_instr_add_src(tex, nir_tex_src_ddy, grad[1]);
       tex->op = nir_texop_txd;
