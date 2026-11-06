@@ -757,14 +757,10 @@ g9p_compile_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo 
          }
          const struct vk_vertex_binding_state *b = &vk_state->vi->bindings[a->binding];
 
-         if (b->divisor != 1) {
-            result = g9p_error(device, "G9P: vertex binding %u: divisor %u not supported yet",
-                               a->binding, b->divisor);
-            goto out;
-         }
          attribs[loc] = (struct g9p_vertex_attrib){
             .present = true,
             .per_instance = b->input_rate == VK_VERTEX_INPUT_RATE_INSTANCE,
+            .divisor = b->input_rate == VK_VERTEX_INPUT_RATE_INSTANCE ? b->divisor : 1,
             .binding = a->binding,
             .offset = a->offset,
             .format = vk_format_to_pipe_format(a->format),
@@ -837,6 +833,12 @@ g9p_compile_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo 
                                                          : g9p_fs_buf_base(fs.num_textures)) +
                                 fs.buffers[i].dwords;
    }
+   state->num_fs_runs = fs.num_fs_runs;
+   memcpy(state->fs_runs, fs.fs_runs, sizeof(state->fs_runs));
+   for (unsigned i = 0; i < fs.num_fs_runs; i++)
+      state->fs_common_dwords = i ? MAX2(state->fs_common_dwords,
+                                         (unsigned)fs.fs_runs[i].dest + fs.fs_runs[i].count)
+                                  : (unsigned)fs.fs_runs[i].dest + fs.fs_runs[i].count;
    state->num_textures = fs.num_textures;
    for (unsigned i = 0; i < fs.num_textures; i++) {
       state->textures[i].set = fs.textures[i].set;
@@ -896,6 +898,8 @@ g9p_compile_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo 
    state->vs_outputs = vs.num_outputs;
    state->vs_point_size = point_size;
    state->uses_discard = fs.uses_discard;
+   state->writes_depth = fs.writes_depth;
+   state->uses_derivatives = fs.uses_derivatives;
    state->uses_fbfetch = fs.uses_fbfetch;
    /*
     * Whole blocks of 4: 17 and 18 registers drew wrong values with the field
@@ -1138,10 +1142,10 @@ upload_textures(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics
 {
    const struct pvr_g9p_gfx_programs *p = &cmd_buffer->device->g9p.gfx;
    const struct pvr_descriptor_state *desc = &cmd_buffer->state.gfx_desc_state;
-   uint64_t src[G9P_MAX_BUFFERS + 3 * G9P_MAX_TEXTURES];
-   uint32_t ctrl[G9P_MAX_BUFFERS + 3 * G9P_MAX_TEXTURES];
-   uint32_t data[3 * (G9P_MAX_BUFFERS + 3 * G9P_MAX_TEXTURES) + 4] = { 0 };
-   uint32_t code[G9P_MAX_BUFFERS + 3 * G9P_MAX_TEXTURES + 1];
+   uint64_t src[G9P_MAX_FS_RUNS + G9P_MAX_BUFFERS + 3 * G9P_MAX_TEXTURES];
+   uint32_t ctrl[G9P_MAX_FS_RUNS + G9P_MAX_BUFFERS + 3 * G9P_MAX_TEXTURES];
+   uint32_t data[3 * (G9P_MAX_FS_RUNS + G9P_MAX_BUFFERS + 3 * G9P_MAX_TEXTURES) + 4] = { 0 };
+   uint32_t code[G9P_MAX_FS_RUNS + G9P_MAX_BUFFERS + 3 * G9P_MAX_TEXTURES + 1];
    unsigned n = 0, nc = 0;
 
    if (state->fs_num_buffers) {
@@ -1163,7 +1167,13 @@ upload_textures(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics
          return result;
       unsigned next = g9p_fs_buf_base(state->num_textures);
 
-      for (unsigned k = 0; k < state->fs_num_buffers; k++) {
+      for (unsigned k = 0; k < state->num_fs_runs; k++) {
+         if (!addrs[state->fs_runs[k].slot])
+            continue;
+         src[n] = addrs[state->fs_runs[k].slot] + 4 * state->fs_runs[k].first;
+         ctrl[n++] = doutd_ctrl(state->fs_runs[k].dest, state->fs_runs[k].count, false);
+      }
+      for (unsigned k = 0; !state->num_fs_runs && k < state->fs_num_buffers; k++) {
          const unsigned base = next;
 
          next += state->fs_buffers[k].dwords;
@@ -1743,12 +1753,17 @@ g9p_ds_draw_isp(const struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_gr
 {
    const struct pvr_render_pass_info *info = &cmd_buffer->state.render_pass_info;
    const struct pvr_renderpass_hwsetup_render *hw = g9p_current_hw_render(info);
-   const unsigned pass = state->uses_fbfetch ? 1u : state->uses_discard ? 4u : 0u;
+   const unsigned pass = state->uses_fbfetch ? 1u : state->writes_depth ? 5u : state->uses_discard ? 4u : 0u;
 
    if (!hw || hw->ds_attach_idx == VK_ATTACHMENT_UNUSED ||
        !vk_format_has_stencil(info->attachments[hw->ds_attach_idx]->vk.format))
       return;
    g9p_ds_isp_words(cmd_buffer, pass, scissor, false, &ppp_block[1]);
+   /* a shader's depth: bit 20 of the ISPA words off (iOS `fragdepth`) */
+   if (state->writes_depth) {
+      ppp_block[2] &= ~BITFIELD_BIT(20);
+      ppp_block[4] &= ~BITFIELD_BIT(20);
+   }
 }
 
 static VkResult g9p_ds_clear(struct pvr_cmd_buffer *cmd_buffer, const VkClearAttachment *att,
@@ -2083,7 +2098,7 @@ emit_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state
                  * neighbouring triangle has another gradient when W varies (dEQP
                  * texture.mipmap.2d.projected). Rogue disables it for lines too.
                  */
-                (state->uses_discard || state->num_textures ||
+                (state->uses_discard || state->num_textures || state->uses_derivatives ||
                        g9p_is_line(cmd_buffer->vk.dynamic_graphics_state.ia.primitive_topology)
                     ? BITFIELD_BIT(14)
                     : 0),
@@ -2105,12 +2120,14 @@ emit_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state
     * is clear (`depth` capture: compare less and write, 03c00000 00120f00
     * 0e000000 00120f00 0e000000). Without one: always, no write.
     */
-   pass = state->uses_fbfetch ? 1u : state->uses_discard ? 4u : 0u;
+   /* a shader's depth (iOS `fragdepth`): pass 5, and bit 20 of the ISPA words off */
+   pass = state->uses_fbfetch ? 1u : state->writes_depth ? 5u : state->uses_discard ? 4u : 0u;
    const uint32_t obj = g9p_isp_objtype(&cmd_buffer->vk.dynamic_graphics_state) << 28 |
                         g9p_isp_line_width(&cmd_buffer->vk.dynamic_graphics_state) << 8;
 
    if (dp->depth_test) {
-      const uint32_t a = 0x00100000 | obj | pass << 24 | (uint32_t)dp->depth_compare << 17 |
+      const uint32_t a = (state->writes_depth ? 0 : 0x00100000) | obj | pass << 24 |
+                         (uint32_t)dp->depth_compare << 17 |
                          (dp->depth_write ? 0 : BITFIELD_BIT(21));
 
       PPP_BLOCK(0x1f, 0x03c00000 | (dp->scissor >= 0 ? BITFIELD_BIT(16) : 0) |

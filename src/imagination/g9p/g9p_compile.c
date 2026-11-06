@@ -22,6 +22,7 @@
 
 #include "compiler/nir/nir.h"
 #include "compiler/spirv/nir_spirv.h"
+#include "util/bitset.h"
 #include "util/ralloc.h"
 #include "util/u_math.h"
 
@@ -106,6 +107,7 @@ struct g9p_vs_store {
 };
 
 struct g9p_ctx {
+   int frag_depth;
    struct g9p_vs_store vs_stores[4 * 64];
    unsigned num_vs_high;
    unsigned num_vs_stores;
@@ -158,6 +160,8 @@ struct g9p_ctx {
    unsigned tex_total;  /* textures the shader samples (count_textures()) */
    /* fragment shaders: each buffer's dwords in the previous pass: its place in the common store */
    unsigned prev_dwords[G9P_MAX_BUFFERS];
+   BITSET_DECLARE(fs_used[G9P_MAX_BUFFERS], G9P_FS_BUF_DWORDS);
+   uint16_t *fs_map;
    bool flush_outputs;  /* vertex outputs written at once, for shaders that ran out */
    bool point_size;     /* a point pipeline's vertex shader: the size is the last output */
    int psize_reg;
@@ -334,6 +338,10 @@ alloc_temp(struct g9p_ctx *ctx)
 static bool
 is_const(nir_scalar s, uint32_t *value)
 {
+   if (nir_scalar_is_undef(s)) {
+      *value = 0;
+      return true;
+   }
    if (nir_scalar_is_const(s)) {
       *value = nir_scalar_as_uint(s);
       return true;
@@ -922,11 +930,25 @@ emit_alu(struct g9p_ctx *ctx, nir_alu_instr *alu)
 static unsigned
 fs_buffer_base(const struct g9p_ctx *ctx, unsigned slot)
 {
+   assert(!ctx->fs_map);
    unsigned u = g9p_fs_buf_base(ctx->tex_total);
 
    for (unsigned k = 0; k < slot; k++)
       u += ctx->prev_dwords[k];
    return u;
+}
+
+/*
+ * The common-store dword of a fragment shader's buffer dword, as a uniform operand.
+ * Operands stop at 255 (Apple's extensions end at 410e): a shader over that takes only
+ * the dwords it reads (fs_map, as Apple's compiler packs them).
+ */
+static unsigned
+fs_dword(struct g9p_ctx *ctx, unsigned slot, unsigned dword)
+{
+   BITSET_SET(ctx->fs_used[slot], dword);
+   return ctx->fs_map ? ctx->fs_map[slot * G9P_FS_BUF_DWORDS + dword]
+                      : fs_buffer_base(ctx, slot) + dword;
 }
 
 /* The op itself, sources in @r, destination @dst */
@@ -1216,7 +1238,7 @@ emit_mem(struct g9p_ctx *ctx, nir_intrinsic_instr *intr, int slot, nir_scalar of
       data = alloc_reg(ctx);
       if (zero < 0 || data < 0)
          return false;
-      g9p_mov_uniform(ctx->c, data, fs_buffer_base(ctx, slot) + byte / 4, zero);
+      g9p_mov_uniform(ctx->c, data, fs_dword(ctx, slot, byte / 4), zero);
       ctx->reg[key(&intr->def, 0)] = data;
       return true;
    }
@@ -1324,17 +1346,21 @@ emit_attrib_load(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
 
    if (loc >= G9P_MAX_ATTRIBS || !ctx->attribs[loc].present ||
        intr->def.num_components != 1 || intr->def.bit_size != 32 ||
-       !nir_src_is_const(intr->src[0])) {
+       !nir_src_is_const(*nir_get_io_offset_src(intr))) {
       fprintf(stderr, "g9p: vertex input %u: not a 32-bit attribute component\n", loc);
       return false;
    }
    a = &ctx->attribs[loc];
+   /* an instance divisor: the element is in the first source (lower_attrib_divisor()) */
+   const bool divided = intr->intrinsic == nir_intrinsic_load_per_vertex_input;
+   nir_src *offset_src = nir_get_io_offset_src(intr);
+
    slot = g9p_buffer_slot(ctx->out, G9P_VERTEX_BUFFERS, a->binding);
    stride_slot = g9p_buffer_slot(ctx->out, G9P_VERTEX_STRIDES, a->binding);
    if (slot < 0 || stride_slot < 0)
       return false;
    offset = (a->offset & ~3u) + 4 * nir_intrinsic_component(intr) +
-            16 * nir_src_as_uint(intr->src[0]);
+            16 * nir_src_as_uint(*offset_src);
 
    /* the stride from its slot: the address form with 0 added (rs:rs+1) */
    zero = const_reg(ctx, 0);
@@ -1344,7 +1370,14 @@ emit_attrib_load(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
    if (zero < 0 || rs < 0 || t < 0)
       return false;
    g9p_addr(ctx->c, rs, 2 * stride_slot, zero, 0, false);
-   g9p_alu2(ctx->c, G9P_IMUL, t, a->per_instance ? ctx->instance_reg : ctx->vertex_reg, rs, false);
+   {
+      const int element = divided ? src_reg(ctx, nir_get_scalar(intr->src[0].ssa, 0))
+                                  : a->per_instance ? ctx->instance_reg : ctx->vertex_reg;
+
+      if (element < 0)
+         return false;
+      g9p_alu2(ctx->c, G9P_IMUL, t, element, rs, false);
+   }
    ctx->busy &= ~BITFIELD64_RANGE(rs, 2);
    if (offset) {
       if (offset < 64) {
@@ -1623,6 +1656,29 @@ emit_output(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
          release(ctx, &intr->instr);
          return true;
       }
+   } else if (sem.location == FRAG_RESULT_DEPTH) {
+      /* gl_FragDepth: read once at the end (`2104 half`, Apple's depth(any)) */
+      r = src_reg(ctx, v);
+      if (r < 0)
+         return false;
+      if (ctx->temps & BITFIELD64_BIT(r)) {
+         int own = alloc_reg(ctx);
+
+         if (own < 0)
+            return false;
+         g9p_alu2(ctx->c, G9P_OR, own, r, r, false);
+         r = own;
+      }
+      if (ctx->frag_depth >= 0 && ctx->frag_depth != r) {
+         /* written again, as in a loop: the value's register stays the same one */
+         g9p_alu2(ctx->c, G9P_OR, ctx->frag_depth, r, r, false);
+      } else {
+         pin(ctx, r);
+         ctx->frag_depth = r;
+      }
+      ctx->out->writes_depth = true;
+      release(ctx, &intr->instr);
+      return true;
    } else if (sem.location >= FRAG_RESULT_DATA0 && sem.location < FRAG_RESULT_DATA0 + 8) {
       /* locations without an attachment are dropped */
       target = sem.location - FRAG_RESULT_DATA0;
@@ -2395,6 +2451,7 @@ emit_intrinsic(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
                      intr->intrinsic == nir_intrinsic_ddy_coarse;
       int regs[4], dst[4];
 
+      ctx->out->uses_derivatives = true;
       for (unsigned c = 0; c < intr->def.num_components; c++) {
          regs[c] = src_reg(ctx, nir_get_scalar(intr->src[0].ssa, c));
          /* the operand's register field stops at r31 */
@@ -2439,7 +2496,7 @@ emit_intrinsic(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
       G9P_EMIT(ctx->c, 0x0198, g9p_dst(ctx->c, r), 0x0131, 0x0110, 0x0154, 0x0038);
       if (!emit_select_const(ctx, G9P_EQ, false, r, zero, 0, ~0u, dst))
          return false;
-      g9p_mov_uniform(ctx->c, flag, fs_buffer_base(ctx, slot), zero);
+      g9p_mov_uniform(ctx->c, flag, fs_dword(ctx, slot, 0), zero);
       g9p_alu2(ctx->c, G9P_XOR, dst, dst, flag, false);
       ctx->reg[key(&intr->def, 0)] = dst;
       release(ctx, &intr->instr);
@@ -2476,6 +2533,8 @@ emit_intrinsic(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
       ctx->reg[key(&intr->def, 0)] = r;
       return true;
    }
+   case nir_intrinsic_load_per_vertex_input:
+      return emit_attrib_load(ctx, intr);
    case nir_intrinsic_load_input:
       if (ctx->stage == MESA_SHADER_VERTEX)
          return emit_attrib_load(ctx, intr);
@@ -2874,6 +2933,7 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
    ctx->busy = ctx->pinned = ctx->temps = 0;
    /* a retry starts over: the stores of the attempt that ran out of registers are gone */
    ctx->num_vs_stores = 0;
+   ctx->frag_depth = -1;
    ctx->num_vs_high = 0;
    ctx->max_reg = 0;
    ctx->st = st;
@@ -3087,6 +3147,8 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
          if (ctx->out->native_blend)
             g9p_blend_src_over(ctx->c);
       }
+      if (ctx->frag_depth >= 0)
+         G9P_EMIT(ctx->c, 0x2104, 2 * ctx->frag_depth);
       g9p_end_fragment(ctx->c, colour ? words : 0);
       break;
    }
@@ -3543,6 +3605,8 @@ wrap_loop_breaks(nir_shader *nir)
    return nir_progress(progress, impl, nir_metadata_none);
 }
 
+static _Thread_local bool g9p_no_schedule;
+
 static bool
 compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
              const struct g9p_vertex_attrib *attribs, unsigned frag_coord_slot,
@@ -3608,7 +3672,7 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
     * captures: its values leave the low registers right after their load and store, in
     * program order, and the scheduler kept them live for late outputs.
     */
-   if (repeat_loads && !(nir->xfb_info && nir->xfb_info->buffers_written)) {
+   if (repeat_loads && !g9p_no_schedule && !(nir->xfb_info && nir->xfb_info->buffers_written)) {
       const nir_schedule_options sched = { .threshold = 16, .fallback = true };
 
       nir_schedule(nir, &sched);
@@ -3734,6 +3798,50 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
       st = MAX2(ctx.max_reg, 15);
    } else if (!generate(&ctx, impl, st))
       return false;
+
+   /* buffers over the uniform operands' 256 dwords: only the dwords it reads */
+   if (stage == MESA_SHADER_FRAGMENT) {
+      unsigned total = g9p_fs_buf_base(out->num_textures);
+
+      for (unsigned k = 0; k < out->num_buffers; k++)
+         total += out->buffers[k].dwords;
+      if (total > 256) {
+         unsigned next = g9p_fs_buf_base(out->num_textures);
+
+         ctx.fs_map = rzalloc_array(mem_ctx, uint16_t, G9P_MAX_BUFFERS * G9P_FS_BUF_DWORDS);
+         out->num_fs_runs = 0;
+         for (unsigned k = 0; k < out->num_buffers; k++) {
+            unsigned d;
+
+            BITSET_FOREACH_SET (d, ctx.fs_used[k], G9P_FS_BUF_DWORDS) {
+               const bool joined = out->num_fs_runs &&
+                                   out->fs_runs[out->num_fs_runs - 1].slot == k &&
+                                   out->fs_runs[out->num_fs_runs - 1].first +
+                                         out->fs_runs[out->num_fs_runs - 1].count == d;
+
+               if (joined) {
+                  out->fs_runs[out->num_fs_runs - 1].count++;
+               } else {
+                  if (out->num_fs_runs == G9P_MAX_FS_RUNS) {
+                     fprintf(stderr, "g9p: fragment buffers in too many runs\n");
+                     return false;
+                  }
+                  out->fs_runs[out->num_fs_runs].slot = k;
+                  out->fs_runs[out->num_fs_runs].first = d;
+                  out->fs_runs[out->num_fs_runs].count = 1;
+                  out->fs_runs[out->num_fs_runs++].dest = next;
+               }
+               ctx.fs_map[k * G9P_FS_BUF_DWORDS + d] = next++;
+            }
+         }
+         if (next > 256) {
+            fprintf(stderr, "g9p: fragment shader reads %u dwords of buffers\n", next);
+            return false;
+         }
+         if (!generate(&ctx, impl, st))
+            return false;
+      }
+   }
 
    out->num_regs = MAX2(st + 1, ctx.num_homes || ctx.num_vs_high
                                    ? 32 + ctx.num_homes + ctx.num_vs_high
@@ -3967,6 +4075,32 @@ lower_xfb(nir_shader *nir)
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_xfb_store, nir_metadata_control_flow, &st);
 }
 
+/* An attribute with an instance divisor above 1: its element, computed in the shader */
+static bool
+lower_attrib_divisor(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   const struct g9p_vertex_attrib *attribs = data;
+   nir_io_semantics sem;
+   unsigned loc;
+
+   if (intr->intrinsic != nir_intrinsic_load_input)
+      return false;
+   sem = nir_intrinsic_io_semantics(intr);
+   loc = sem.location - VERT_ATTRIB_GENERIC0;
+   if (loc >= G9P_MAX_ATTRIBS || !attribs[loc].present || attribs[loc].divisor < 2)
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def_replace(&intr->def,
+                   nir_load_per_vertex_input(b, intr->def.num_components, intr->def.bit_size,
+                                             nir_udiv_imm(b, nir_load_instance_id(b),
+                                                          attribs[loc].divisor),
+                                             intr->src[0].ssa, .base = nir_intrinsic_base(intr),
+                                             .component = nir_intrinsic_component(intr),
+                                             .dest_type = nir_intrinsic_dest_type(intr),
+                                             .io_semantics = sem));
+   return true;
+}
+
 bool
 g9p_compile_vertex(nir_shader *nir, const struct g9p_vertex_attrib *attribs,
                    int frag_coord_slot, bool point_coord, struct g9p_shader *out,
@@ -3981,11 +4115,21 @@ g9p_compile_vertex(nir_shader *nir, const struct g9p_vertex_attrib *attribs,
       lower_xfb(nir);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_attrib_format,
             nir_metadata_control_flow, (void *)attribs);
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_attrib_divisor,
+            nir_metadata_control_flow, (void *)attribs);
    /* out of registers: again with a value's loads repeated, not kept live */
    nir_shader *copy = nir_shader_clone(mem_ctx, nir);
+   nir_shader *copy2 = nir_shader_clone(mem_ctx, nir);
 
-   return compile_back(nir, out, MESA_SHADER_VERTEX, attribs, 0, false, point_size, mem_ctx) ||
-          compile_back(copy, out, MESA_SHADER_VERTEX, attribs, 0, true, point_size, mem_ctx);
+   if (compile_back(nir, out, MESA_SHADER_VERTEX, attribs, 0, false, point_size, mem_ctx) ||
+       compile_back(copy, out, MESA_SHADER_VERTEX, attribs, 0, true, point_size, mem_ctx))
+      return true;
+   /* and in program order: the pressure scheduler can keep values live for longer */
+   g9p_no_schedule = true;
+   const bool ok = compile_back(copy2, out, MESA_SHADER_VERTEX, attribs, 0, true, point_size, mem_ctx);
+
+   g9p_no_schedule = false;
+   return ok;
 }
 
 /*

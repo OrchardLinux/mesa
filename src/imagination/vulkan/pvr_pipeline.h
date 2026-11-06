@@ -168,6 +168,10 @@ struct pvr_g9p_graphics_state {
     * slot: their first dwords are DMA'd into the common store
     */
    unsigned fs_num_buffers;
+   unsigned num_fs_runs;
+   struct {
+      uint16_t slot, first, count, dest;
+   } fs_runs[64]; /* G9P_MAX_FS_RUNS */
    struct {
       unsigned set, binding, dwords;
    } fs_buffers[36]; /* G9P_MAX_BUFFERS */
@@ -182,6 +186,10 @@ struct pvr_g9p_graphics_state {
    unsigned vs_num_textures, vs_common_dwords;
    /* transform feedback: the vertex shader also stores what it captures */
    bool has_xfb;
+   /* the fragment shader writes gl_FragDepth */
+   bool writes_depth;
+   /* and takes derivatives: no triangle merging, as for textures */
+   bool uses_derivatives;
    struct g9p_xfb_layout xfb_layout;
    bool vs_point_size;
    struct {

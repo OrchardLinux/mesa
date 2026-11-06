@@ -50,6 +50,19 @@ g9p_image_format(VkFormat format)
       return G9P_BGRA(0x26);
    case VK_FORMAT_A2B10G10R10_UINT_PACK32:
       return G9P_RGBA(0x126);
+   /* the 16-bit normalized formats (PR #6's table): what EAC is decoded to, too */
+   case VK_FORMAT_R16_UNORM:
+      return G9P_R001(0x09);
+   case VK_FORMAT_R16_SNORM:
+      return G9P_R001(0x89);
+   case VK_FORMAT_R16G16_UNORM:
+      return G9P_RG01(0x23);
+   case VK_FORMAT_R16G16_SNORM:
+      return G9P_RG01(0xa3);
+   case VK_FORMAT_R16G16B16A16_UNORM:
+      return G9P_RGBA(0x32);
+   case VK_FORMAT_R16G16B16A16_SNORM:
+      return G9P_RGBA(0xb2);
    case VK_FORMAT_R8_UNORM:
       return G9P_R001(0x00);
    case VK_FORMAT_R8G8_UNORM:

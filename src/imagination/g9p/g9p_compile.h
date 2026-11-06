@@ -38,6 +38,7 @@
  */
 #define G9P_VS_TEX_BASE (2 * G9P_MAX_BUFFERS)
 #define G9P_FS_BUF_DWORDS 512
+#define G9P_MAX_FS_RUNS 64
 
 static inline unsigned
 g9p_tex_state(unsigned base, unsigned t)
@@ -100,6 +101,7 @@ g9p_fs_buf_base(unsigned n)
 struct g9p_vertex_attrib {
    bool present;
    bool per_instance; /* indexed by the instance (r1), not the vertex (r0) */
+   unsigned divisor;  /* per-instance: instances per element */
    unsigned binding, offset;
    enum pipe_format format;
 };
@@ -131,6 +133,15 @@ struct g9p_shader {
       unsigned dwords;
    } buffers[G9P_MAX_BUFFERS];
 
+   /*
+    * Fragment: with buffers over the uniform operands' 256 dwords, what is loaded
+    * instead of each buffer's first dwords: runs of the dwords it reads
+    */
+   unsigned num_fs_runs;
+   struct {
+      uint16_t slot, first, count, dest;
+   } fs_runs[G9P_MAX_FS_RUNS];
+
    /* Registers per thread, mask stack included (G9P_CDM_KERNEL_REGS) */
    unsigned num_regs;
 
@@ -160,6 +171,8 @@ struct g9p_shader {
    unsigned point_coord_slot;
    /* Fragment: may discard (punch-through pass type) */
    bool uses_discard;
+   bool writes_depth;
+   bool uses_derivatives;
    bool uses_fbfetch;
    /*
     * Fragment: premultiplied source-over blended at the end with Apple's

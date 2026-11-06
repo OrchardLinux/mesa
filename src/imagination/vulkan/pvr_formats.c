@@ -459,7 +459,16 @@ pvr_get_buffer_format_features2(struct pvr_physical_device *pdevice,
       flags |= VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT;
 
    if (vk_format_is_scaled(vk_format))
-      return flags;
+      /*
+    * G9P: no texel buffers yet. Mesa's PBO path samples one when it is offered, and
+    * its fallback works; ES 3.0 does not have them.
+    */
+   if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g9p))
+      flags &= ~(VK_FORMAT_FEATURE_2_UNIFORM_TEXEL_BUFFER_BIT |
+                 VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_BIT |
+                 VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_ATOMIC_BIT);
+
+   return flags;
 
    flags |= VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT |
             VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT;
