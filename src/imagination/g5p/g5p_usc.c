@@ -1815,10 +1815,19 @@ unsigned g5p_usc_global_store(uint8_t *out, unsigned bytes, unsigned data_half, 
 unsigned g5p_usc_iadd_literal(uint8_t *out, unsigned dst_half, uint32_t value, unsigned b_half,
                               unsigned bank, unsigned b_group)
 {
+   return g5p_usc_iadd_literal2(out, dst_half, value, b_half, bank, b_group, 0x11);
+}
+
+/* The header names B's bank: 0x11 bank 1, 0x01 bank 0 (Apple's v_loop counter
+ * increment, 9901040103892001a1097000: bank 0 to bank 0). */
+unsigned g5p_usc_iadd_literal2(uint8_t *out, unsigned dst_half, uint32_t value, unsigned b_half,
+                               unsigned bank, unsigned b_group, unsigned header)
+{
    CHECK(half_register(b_half, "b_half requires a measured 32-bit aligned half index"), g5p_usc_error);
+   CHECK(header == 0x11 || header == 0x01, "iadd literal headers 0x11 and 0x01 are witnessed");
    bool wide = value > 0xffff;
    uint8_t raw[G5P_USC_MAX];
-   unsigned n = literal_prefix(raw, 0x99, dst_half, bank, value, b_half, b_group, 0x11, wide);
+   unsigned n = literal_prefix(raw, 0x99, dst_half, bank, value, b_half, b_group, header, wide);
    if (!n)
       return 0;
    raw[n++] = binop_code[G5P_BIN_IADD];

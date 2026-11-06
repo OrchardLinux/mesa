@@ -106,6 +106,10 @@ int main(void)
       fails += check(fmod[i].name, b, n, fmod[i].want);
    }
 
+   /* the loop counter increment in bank 0: Apple's v_loop (vs-canary/vscf-probes.py), bank-0 r2 += 1, header 0x01 */
+   n = g5p_usc_iadd_literal2(b, 4, 1, 4, 0, 1, 0x01);
+   fails += check("v_loop increment (bank 0)", b, n, "9901040103892001a1097000");
+
    /* ceil: v_ceil, x (r4) in place, exactly the vertex lowering */
    n = g5p_recipe(G5P_RC_CEIL, b, sizeof(b), 8, 8, 0, 0, G5P_RC_VERTEX, &err);
    fails += check("v_ceil", b, n, "9821080390014080" "991108030191a00144897000");

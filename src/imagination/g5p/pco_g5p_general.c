@@ -263,6 +263,7 @@ struct gctx {
    struct { int start, end; } loops[G5P_MAX_LOOPS];
    unsigned nloops;
    nir_def *decls[G5P_MAX_DECLS]; /* NIR registers (out of SSA) */
+   bool decl_out[G5P_MAX_DECLS];  /* vertex: a register whose value an output stores (bank 1) */
    int decl_first[G5P_MAX_DECLS];  /* their allocation point */
    unsigned ndecls;
    unsigned st;       /* mask-stack register (dword): the one after the program's own */
@@ -1207,6 +1208,7 @@ static int decl_slot(struct gctx *c, nir_def *d)
    return -1;
 }
 
+static bool vs_feeds_output(struct gctx *c, nir_def *d);
 static void plan_decls(struct gctx *c)
 {
    foreach_instr_all(ins, c) {
@@ -1220,7 +1222,26 @@ static void plan_decls(struct gctx *c)
       if (c->ndecls == G5P_MAX_DECLS)
          refuse(c, "more than %u NIR registers", G5P_MAX_DECLS);
       c->decl_first[c->ndecls] = INT_MAX;
+      c->decl_out[c->ndecls] = false;
       c->decls[c->ndecls++] = &in->def;
+   }
+   /* vertex: a register whose value (a load_reg) an output stores, also
+    * through another such register, lives in bank 1 */
+   for (bool progress = c->vs; progress;) {
+      progress = false;
+      for (unsigned i = 0; i < c->ndecls; i++) {
+         if (c->decl_out[i])
+            continue;
+         nir_foreach_use(u, c->decls[i]) {
+            nir_instr *ui = nir_src_use_instr(u);
+            if (ui->type == nir_instr_type_intrinsic &&
+                nir_instr_as_intrinsic(ui)->intrinsic == nir_intrinsic_load_reg &&
+                vs_feeds_output(c, &nir_instr_as_intrinsic(ui)->def)) {
+               c->decl_out[i] = progress = true;
+               break;
+            }
+         }
+      }
    }
 }
 
@@ -3349,17 +3370,25 @@ static void vs_int(struct gctx *c, nir_alu_instr *a);
 static void vs_bitwise(struct gctx *c, nir_alu_instr *a);
 static void vs_minsub(struct gctx *c, nir_alu_instr *a);
 
-/* A value a vertex output stores, directly or through a mov/vec. */
-static bool vs_feeds_output(nir_def *d)
+/* A value a vertex output stores, directly, through a mov/vec, or as the
+ * value of a NIR register an output stores (control flow: Apple's v_loop
+ * keeps such an accumulator in bank 1). */
+static bool vs_feeds_output(struct gctx *c, nir_def *d)
 {
    nir_foreach_use(u, d) {
       nir_instr *i = nir_src_use_instr(u);
-      if (i->type == nir_instr_type_intrinsic &&
-          nir_instr_as_intrinsic(i)->intrinsic == nir_intrinsic_store_output)
-         return true;
+      if (i->type == nir_instr_type_intrinsic) {
+         nir_intrinsic_instr *in = nir_instr_as_intrinsic(i);
+         if (in->intrinsic == nir_intrinsic_store_output)
+            return true;
+         if (in->intrinsic == nir_intrinsic_store_reg && u == &in->src[0])
+            for (unsigned k = 0; k < c->ndecls; k++)
+               if (c->decls[k] == in->src[1].ssa && c->decl_out[k])
+                  return true;
+      }
       if (i->type == nir_instr_type_alu) {
          nir_alu_instr *m = nir_instr_as_alu(i);
-         if (nir_op_is_vec_or_mov(m->op) && vs_feeds_output(&m->def))
+         if (nir_op_is_vec_or_mov(m->op) && vs_feeds_output(c, &m->def))
             return true;
       }
    }
@@ -3370,7 +3399,7 @@ static void emit_alu_body(struct gctx *c, nir_alu_instr *a);
 
 static void emit_alu(struct gctx *c, nir_alu_instr *a)
 {
-   c->alloc_out = c->vs && c->vs_bank0 && vs_feeds_output(&a->def);
+   c->alloc_out = c->vs && c->vs_bank0 && vs_feeds_output(c, &a->def);
    emit_alu_body(c, a);
    c->alloc_out = false;
 }
@@ -3577,8 +3606,7 @@ static void vs_minsub(struct gctx *c, nir_alu_instr *a)
       unsigned dst = vs_dst(c, &x, 1);
       unsigned n;
       if (sub && i == 1) {
-         vs_bank1_only(c, "vertex iadd literal", xr, -1, -1, -1);
-         n = g5p_usc_iadd_literal(raw, H(c, dst), -k, H(c, xr), vbank(c, dst), g);
+         n = g5p_usc_iadd_literal2(raw, H(c, dst), -k, H(c, xr), vbank(c, dst), g, vhdr(c, 0x11, -1, xr, -1));
       }
       else if (sub)
          n = g5p_usc_isub_literal(raw, H(c, dst), k, H(c, xr), vbank(c, dst), g, vhdr(c, 0x11, -1, xr, -1));
@@ -3655,8 +3683,9 @@ static void vs_int(struct gctx *c, nir_alu_instr *a)
          unsigned xr = reg_of(c, x, "iadd literal");
          unsigned g = vgrp(c, x);
          unsigned dst = vs_dst(c, &x, 1);
-         vs_bank1_only(c, "vertex iadd literal", xr, -1, -1, -1);
-         put(c, raw, g5p_usc_iadd_literal(raw, H(c, dst), k, H(c, xr), vbank(c, dst), g), "iadd literal");
+         /* bank 0 too: Apple's v_loop counter increment (header 0x01) */
+         put(c, raw, g5p_usc_iadd_literal2(raw, H(c, dst), k, H(c, xr), vbank(c, dst), g, vhdr(c, 0x11, -1, xr, -1)),
+             "iadd literal");
          define(c, &a->def, dst);
          return;
       }
@@ -4170,8 +4199,12 @@ static void emit_intrinsic(struct gctx *c, nir_intrinsic_instr *in)
       if (!V(c, &in->def, 0)->uses)
          break;
       unsigned g = vgrp(c, (struct ref){decl, 0, false, false});
+      /* vertex: a read that an output stores goes to bank 1 */
+      c->alloc_out = c->vs && c->vs_bank0 && vs_feeds_output(c, &in->def);
       unsigned dst = alloc_reg(c, -1);
-      put(c, raw, g5p_usc_move(raw, 2 * dst, 2 * dv->reg, 0, g, 1), "register read");
+      c->alloc_out = false;
+      put(c, raw, g5p_usc_move(raw, H(c, dst), H(c, dv->reg), vbank(c, dst), g,
+                               c->vs ? vhdr(c, 0x21, dv->reg, -1, -1) : 1), "register read");
       define(c, &in->def, dst);
       break;
    }
@@ -4182,12 +4215,13 @@ static void emit_intrinsic(struct gctx *c, nir_intrinsic_instr *in)
       struct ref r = resolve_value(c, in->src[0].ssa, 0);
       struct val *v = V(c, r.def, r.comp);
       if (v->state == VAL_CONST && !v->held) {
-         put(c, raw, g5p_usc_immediate(raw, 2 * dv->reg, v->imm, 0, -1), "register write");
+         put(c, raw, g5p_usc_immediate(raw, H(c, dv->reg), v->imm, vbank(c, dv->reg), -1), "register write");
          break;
       }
       unsigned src = reg_of(c, r, "store_reg");
       if (src != dv->reg)
-         put(c, raw, g5p_usc_move(raw, 2 * dv->reg, 2 * src, 0, vgrp(c, r), 1), "register write");
+         put(c, raw, g5p_usc_move(raw, H(c, dv->reg), H(c, src), vbank(c, dv->reg), vgrp(c, r),
+                                  c->vs ? vhdr(c, 0x21, src, -1, -1) : 1), "register write");
       free_scratch(c);
       break;
    }
@@ -5104,7 +5138,7 @@ static void vs_output(struct gctx *c)
       if (c->vout[i].at >= 0)
          continue; /* written eagerly */
       order[n] = i;
-      reg[i] = vs_out_reg(c, c->vout[i].r);
+      reg[i] = c->vs_bank0 ? vs_out_reg(c, c->vout[i].r) : reg_of(c, c->vout[i].r, "vertex output");
       n++;
    }
    if (!n)
@@ -5961,7 +5995,10 @@ static void decl_alloc(struct gctx *c, int ip)
          continue;
       c->decl_held[i] = true;
       v->state = VAL_REG;
+      const bool out = c->alloc_out;
+      c->alloc_out = c->vs && c->vs_bank0 && c->decl_out[i];
       hold(c, v, alloc_reg(c, -1));
+      c->alloc_out = out;
    }
 }
 
@@ -5973,7 +6010,7 @@ static void stack_op(struct gctx *c, enum g5p_stack_op op, bool invert, unsigned
    bool last = !c->count_pass && c->st_last == (int)c->nput;
    if (c->count_pass)
       c->st_last = c->nput;
-   put(c, raw, g5p_usc_stack(raw, op, c->st, imm, invert, levels, last && !imm), "mask stack");
+   put(c, raw, g5p_usc_stack(raw, op, H(c, c->st) / 2, imm, invert, levels, last && !imm), "mask stack");
    c->stack_used = true;
 }
 
@@ -5991,6 +6028,26 @@ static void jump_here(struct gctx *c, unsigned at)
       refuse(c, "jump: %s", g5p_usc_error ? g5p_usc_error : "?");
 }
 
+/* A control-flow compare operand: a register of the compare's bank. Apple's
+ * vertex compares (v_loop, v_brk, v_ifelse) read only bank-0 registers, so a
+ * vertex value held in bank 1 is first moved into a bank-0 scratch register
+ * (the class-98 move, destination bank 0, header 0x21). *group is the
+ * compare's read group. */
+static unsigned cf_operand(struct gctx *c, unsigned reg, unsigned *group)
+{
+   if (!c->vs || !vbank(c, reg))
+      return reg;
+   int b0 = alloc_bank0(c);
+   if (b0 < 0)
+      refuse(c, "register pressure: no bank-0 register for a vertex control-flow compare");
+   uint8_t raw[G5P_USC_MAX];
+   put(c, raw, g5p_usc_move(raw, H(c, b0), H(c, reg), 0, *group, vhdr(c, 0x21, reg, -1, -1)),
+       "compare operand into bank 0");
+   c->scratch |= BITFIELD64_BIT(b0);
+   *group = 1;
+   return b0;
+}
+
 /* The compare an if (or a break) reads; *sense: "passed" means the
  * condition holds. A fused compare of two registers, else the 0.0/1.0
  * boolean as unsigned > 0. */
@@ -6001,7 +6058,9 @@ static void emit_cond(struct gctx *c, nir_if *nif, bool *sense)
    if (!cmp) {
       struct ref r = resolve_value(c, nif->condition.ssa, 0);
       unsigned reg = reg_of(c, r, "if condition");
-      put(c, raw, g5p_usc_cf_compare_imm(raw, G5P_UGT, reg, vgrp(c, r), 0), "if compare");
+      unsigned g = vgrp(c, r);
+      reg = cf_operand(c, reg, &g);
+      put(c, raw, g5p_usc_cf_compare_imm(raw, G5P_UGT, H(c, reg) / 2, g, 0), "if compare");
       *sense = true;
       free_scratch(c);
       return;
@@ -6023,7 +6082,9 @@ static void emit_cond(struct gctx *c, nir_if *nif, bool *sense)
    struct ref b = resolve_value(c, cmp->src[1].src.ssa, cmp->src[1].swizzle[0]);
    unsigned ar = reg_of(c, a, "if compare"), br = reg_of(c, b, "if compare");
    unsigned ga = vgrp(c, a), gb = vgrp(c, b);
-   put(c, raw, g5p_usc_cf_compare(raw, op, ar, ga, br, gb), "if compare");
+   ar = cf_operand(c, ar, &ga);
+   br = cf_operand(c, br, &gb);
+   put(c, raw, g5p_usc_cf_compare(raw, op, H(c, ar) / 2, ga, H(c, br) / 2, gb), "if compare");
    free_scratch(c);
 }
 
@@ -6234,7 +6295,9 @@ static bool codegen(struct gctx *c)
       refuse(c, "out of memory");
    memcpy(out->code, c->code, c->size);
    out->size = c->size;
-   if (c->cf)
+   if (c->cf && c->vs && c->st >= VS_BANK0)
+      c->max_bank0 = MAX2(c->max_bank0, c->st - VS_BANK0 + 1);
+   else if (c->cf)
       c->max_dword = MAX2(c->max_dword, c->st + 1);
    out->temps = c->vs && c->vs_bank0 ? MAX2(8, align(c->max_dword, 4)) :
                 MAX3(8, align(c->max_dword, 4), align(c->max_bank0, 4));
@@ -6324,7 +6387,19 @@ static bool two_pass(struct gctx *c)
    c->st_last = -1;
    if (!codegen(c))
       return false;
-   if (c->cf) {
+   if (c->cf && c->vs) {
+      /* bank 0, after the program's own bank-0 registers (Apple's v_loop: the
+       * stack in bank-0 r0, the loop counter r1) */
+      c->st = VS_BANK0 + c->max_bank0;
+      if (c->max_bank0 >= NUM_DWORDS) {
+         free(c->p->code);
+         c->p->code = NULL;
+         snprintf(c->p->refusal, sizeof(c->p->refusal),
+                  "vertex: register pressure: no bank-0 register left for the mask stack (%u of %u in use)",
+                  c->max_bank0, NUM_DWORDS);
+         return false;
+      }
+   } else if (c->cf) {
       /* The ordinary path keeps Apple's allocation: the stack is the first
        * register after the program. If that first count used all 32 low
        * registers, reserve r31 and count again. The second count then fails
@@ -6433,10 +6508,15 @@ bool pco_g5p_compile_general_link(nir_shader *nir, bool half_output, const uint8
          } while (progress);
       }
    }
-   if (!c->vs && cf_left(nir)) {
+   if (cf_left(nir)) {
       c->cf = true;
       out->evidence |= PCO_G5P_EV_CF;
       cf_out_of_ssa(nir);
+      /* Vertex control flow (Apple's v_loop, v_brk, v_ifelse, v_nested): the
+       * loop state, the compares and the mask stack in bank 0, the values of
+       * outputs in bank 1 (vs-two-bank-allocator.md, stage C). */
+      if (c->vs)
+         c->vs_bank0 = true;
    }
    if (getenv("G5P_PRINT_NIR"))
       nir_print_shader(nir, stderr);

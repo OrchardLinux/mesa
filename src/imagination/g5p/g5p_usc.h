@@ -435,6 +435,8 @@ unsigned g5p_usc_global_store(uint8_t *out, unsigned bytes, unsigned data_half, 
  * (v_iadd_lit, v_iadd_lit_mid, v_iadd_lit_big). */
 unsigned g5p_usc_iadd_literal(uint8_t *out, unsigned dst_half, uint32_t value, unsigned b_half,
                               unsigned bank, unsigned b_group);
+unsigned g5p_usc_iadd_literal2(uint8_t *out, unsigned dst_half, uint32_t value, unsigned b_half,
+                               unsigned bank, unsigned b_group, unsigned header);
 /* dst = src << shift, Apple's vertex idiom for a power-of-two multiply:
  * `99 11 DD 03 01 SS 20 01 a1 05 00 (shift<<5)` (v_shl4, v_imul_lit*). */
 unsigned g5p_usc_shl_literal(uint8_t *out, unsigned dst_half, unsigned src_half, unsigned bank,
