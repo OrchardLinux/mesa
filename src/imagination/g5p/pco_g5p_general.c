@@ -3587,6 +3587,28 @@ static void emit_alu_body(struct gctx *c, nir_alu_instr *a)
  * NOT (v_not). Other literal multipliers are shift/add chains
  * (vs_mul_literal); only huge ones are materialized by MOVI. As in the other
  * vertex forms, a dying operand sits in B and gives its register. */
+/* The witnessed literal shift-add reads bank1. For a bank0 source,
+ * repeated native register IADD computes exactly x << shift modulo32,
+ * without allocating a bank1 staging word or inventing a shift encoding. */
+static void vs_shift_literal(struct gctx *c, unsigned dst, unsigned src, unsigned group, unsigned shift)
+{
+   assert(shift >= 1 && shift <= 4);
+   uint8_t raw[G5P_USC_MAX];
+   if (vbank(c, src)) {
+      put(c, raw, g5p_usc_shl_literal(raw, H(c, dst), H(c, src), vbank(c, dst), group, shift), "shift-add");
+      return;
+   }
+   for (unsigned i = 0; i < shift; i++) {
+      struct g5p_alu f = G5P_ALU(H(c, dst));
+      f.bank = vbank(c, dst);
+      f.header = vhdr(c, 0x31, src, src, -1);
+      f.a = gsrc(c, src, (struct ref){0}, 0);
+      f.b = gsrc(c, src, (struct ref){0}, i ? 1 : group);
+      put(c, raw, g5p_usc_binary(raw, G5P_BIN_IADD, &f), "bank0 shift by doubling");
+      src = dst;
+   }
+}
+
 /* x * k for a literal k outside the single shift-add (2..16). Apple's compiler
  * builds such products from shift-adds (v_imul_lit: x·5 << 2, v_imul_lit48:
  * x·3 << 4); a MOVI multiplier in a register-pair IMUL gave 0 on hardware
@@ -3610,8 +3632,7 @@ static bool vs_mul_literal(struct gctx *c, nir_alu_instr *a, struct ref x, uint3
          unsigned sh = MIN2(pend, 4), dst = acc_is_x ? alloc_reg(c, -1) : acc;
          /* x is read again by the adds; the partial product is rewritten in place. */
          unsigned g = acc_is_x ? vgrp(c, x) : 1;
-         vs_bank1_only(c, "vertex shift-add", acc, -1, -1, -1);
-         put(c, raw, g5p_usc_shl_literal(raw, H(c, dst), H(c, acc), vbank(c, dst), g, sh), "shift-add");
+         vs_shift_literal(c, dst, acc, g, sh);
          acc = dst;
          acc_is_x = false;
          pend -= sh;
@@ -3817,8 +3838,7 @@ static void vs_int(struct gctx *c, nir_alu_instr *a)
       unsigned xr = reg_of(c, x, "shift");
       unsigned g = vgrp(c, x);
       unsigned dst = vs_dst(c, &x, 1);
-      vs_bank1_only(c, "vertex shift-add", xr, -1, -1, -1);
-      put(c, raw, g5p_usc_shl_literal(raw, H(c, dst), H(c, xr), vbank(c, dst), g, shift), "shift-add");
+      vs_shift_literal(c, dst, xr, g, shift);
       define(c, &a->def, dst);
       return;
    }
