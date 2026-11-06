@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT
  * Generated-by: LLM
- * Bounded fragment common-store layout, independent of NIR and USC encoders.
+ * Bounded common-store layout, independent of NIR and USC encoders.
  */
 #ifndef G5P_FS_COMMON_H
 #define G5P_FS_COMMON_H
@@ -18,18 +18,20 @@ static inline unsigned g5p_common_align(unsigned n, unsigned a)
 }
 
 static inline bool
-g5p_fs_common_plan(unsigned start, unsigned textures, unsigned dynamic_ptrs,
+g5p_stage_common_plan(unsigned start, unsigned textures, unsigned samplers,
+                   bool compact, unsigned dynamic_ptrs,
                    unsigned size_queries, unsigned ubos, uint64_t ubo_dwords,
                    uint64_t push_dwords, struct g5p_fs_common_plan *p)
 {
-   if (start > 4 || textures > 16 || dynamic_ptrs > 16 || size_queries > 4 || ubos > 8)
+   if (start > 4 || textures > 16 || samplers > 17 ||
+       dynamic_ptrs > 16 || size_queries > 4 || ubos > 8)
       return false;
    *p = (struct g5p_fs_common_plan){0};
    /* Each retry only enables one of two monotone choices. A layout which
     * already fits keeps its exact old descriptor/pointer positions. */
    for (unsigned retry = 0; retry < 4; retry++) {
       unsigned next = start;
-      p->compact = textures > 4 || p->low_pointers;
+      p->compact = compact || p->low_pointers;
       if (p->low_pointers) {
          next = g5p_common_align(next, 2) + 2 * (dynamic_ptrs + (p->memory_ubos ? ubos : 0));
          if (next > 32)
@@ -37,7 +39,7 @@ g5p_fs_common_plan(unsigned start, unsigned textures, unsigned dynamic_ptrs,
          p->pointer_end = next;
       }
       if (textures && p->compact) {
-         next = g5p_common_align(next, 8) + 10 * textures;
+         next = g5p_common_align(next, 8) + 8 * textures + 2 * samplers;
       } else {
          for (unsigned i = 0; i < textures; i++)
             next = g5p_common_align(next, 8) + 10;
@@ -66,5 +68,15 @@ g5p_fs_common_plan(unsigned start, unsigned textures, unsigned dynamic_ptrs,
       return true;
    }
    return false;
+}
+
+static inline bool
+g5p_fs_common_plan(unsigned start, unsigned textures, unsigned dynamic_ptrs,
+                   unsigned size_queries, unsigned ubos, uint64_t ubo_dwords,
+                   uint64_t push_dwords, struct g5p_fs_common_plan *p)
+{
+   return g5p_stage_common_plan(start, textures, textures, textures > 4,
+                                dynamic_ptrs, size_queries, ubos, ubo_dwords,
+                                push_dwords, p);
 }
 #endif

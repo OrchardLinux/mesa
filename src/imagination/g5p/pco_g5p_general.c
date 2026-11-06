@@ -2080,8 +2080,15 @@ static void plan_common(struct gctx *c)
     * Apple's f16 capacity layout: all eight-dword images, then samplers.
     * Interleaving wastes six dwords per binding and exceeds the selectors. */
    bool compact = qualified || (!c->vs && c->ntex > 4);
-   struct g5p_fs_common_plan fs_plan = {0};
-   if (!c->vs) {
+   unsigned sampler_count = 0;
+   bool fetch_sampler = false;
+   for (unsigned i = 0; i < c->ntex; i++) {
+      sampler_count += !qualified || c->tex[i].needs_sampler;
+      fetch_sampler |= qualified && c->tex[i].needs_fetch_sampler;
+   }
+   struct g5p_fs_common_plan common_plan = {0};
+   bool planned = !c->vs || qualified;
+   if (planned) {
       unsigned ubos = 0;
       uint64_t ubo_dwords = 0, push_dwords = 0;
       for (unsigned i = 0; i < c->nranges; i++) {
@@ -2093,11 +2100,12 @@ static void plan_common(struct gctx *c)
             push_dwords += (r->hi - r->lo) / 4;
          }
       }
-      if (!g5p_fs_common_plan(next, c->ntex, c->nuptr, c->nsize, ubos,
-                              ubo_dwords, push_dwords, &fs_plan))
-         refuse(c, "fragment common layout cannot fit pointers below 32 and data below 256 dwords");
-      compact = fs_plan.compact;
-      if (fs_plan.low_pointers) {
+      if (!g5p_stage_common_plan(next, c->ntex, sampler_count + fetch_sampler,
+                                 compact, c->nuptr, c->nsize, ubos,
+                                 ubo_dwords, push_dwords, &common_plan))
+         refuse(c, "common layout cannot fit pointers below 32 and data below 256 dwords");
+      compact = common_plan.compact;
+      if (common_plan.low_pointers) {
          /* Address-add reads only common0..31. Reserve those pairs before
           * descriptors, rather than placing a spilled UBO after textures. */
          for (unsigned i = 0; i < c->nuptr; i++) {
@@ -2106,7 +2114,7 @@ static void plan_common(struct gctx *c)
                        c->uptr[i].element, c->uptr[i].base, 2, next);
             next += 2;
          }
-         for (unsigned i = 0; fs_plan.memory_ubos && i < c->nranges; i++) {
+         for (unsigned i = 0; common_plan.memory_ubos && i < c->nranges; i++) {
             struct range *r = &c->ranges[i];
             if (r->kind != PCO_G5P_UPLOAD_UBO)
                continue;
@@ -2115,17 +2123,11 @@ static void plan_common(struct gctx *c)
             add_upload(c, PCO_G5P_UPLOAD_UBO_ADDR, r->set, r->binding, r->element, r->lo, 2, next);
             next += 2;
          }
-         assert(next == fs_plan.pointer_end);
+         assert(next == common_plan.pointer_end);
       }
    }
    unsigned image_base = align(next, 8), sampler_base = image_base + 8 * c->ntex;
-   unsigned sampler_count = 0, sampler_cursor = sampler_base;
-   bool fetch_sampler = false;
-   if (compact)
-      for (unsigned i = 0; i < c->ntex; i++) {
-         sampler_count += !qualified || c->tex[i].needs_sampler;
-         fetch_sampler |= c->tex[i].needs_fetch_sampler;
-      }
+   unsigned sampler_cursor = sampler_base;
    c->fetch_sampler_common = sampler_base + 2 * sampler_count;
    for (unsigned i = 0; i < c->ntex; i++) {
       struct tex_bind *t = &c->tex[i];
@@ -2144,7 +2146,7 @@ static void plan_common(struct gctx *c)
    /* Pointer pairs of register-indexed UBO arrays: even dwords below 32 (the
     * addr.add_shift base field, 0x81 | 4 * dword). */
    for (unsigned i = 0; i < c->nuptr; i++) {
-      if (fs_plan.low_pointers)
+      if (common_plan.low_pointers)
          continue;
       c->uptr[i].common = next = align(next, 2);
       if (next + 2 > 32)
@@ -2171,13 +2173,13 @@ static void plan_common(struct gctx *c)
     * uses ordinary memory loads instead. Keep the small-program byte shape,
     * but make the same choice for all UBO ranges when their combined span no
     * longer fits. Push constants remain preloaded. */
-   if (c->vs ? preloaded > limit : fs_plan.memory_ubos) {
+   if (planned ? common_plan.memory_ubos : preloaded > limit) {
       for (unsigned i = 0; i < c->nranges; i++) {
          struct range *r = &c->ranges[i];
          if (r->kind != PCO_G5P_UPLOAD_UBO)
             continue;
          r->memory = true;
-         if (fs_plan.low_pointers)
+         if (common_plan.low_pointers)
             continue;
          r->common = next = align(next, 2);
          if (next + 2 > 32)
@@ -2198,8 +2200,8 @@ static void plan_common(struct gctx *c)
       add_upload(c, r->kind, r->set, r->binding, r->element, r->lo,
                  (r->hi - r->lo) / 4, r->common);
    }
-   if (!c->vs)
-      assert(next == fs_plan.end);
+   if (planned)
+      assert(next == common_plan.end);
    /* Transform feedback block: pointer pairs at even dwords (address add). */
    if (xfb) {
       c->xfb_common = align(next, 2);
