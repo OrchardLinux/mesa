@@ -73,3 +73,21 @@ g5p_dynamic_shift_test = executable(
   install : false,
 )
 test('g5p-dynamic-shifts', g5p_dynamic_shift_test, timeout : 60)
+
+# Evaluate the actual integer lowering graph against independent references.
+g5p_integer_lowering_test = executable(
+  'g5p-integer-lowering-test',
+  files('tests/integer/lowering.c'),
+  include_directories : [inc_powervr_g5p, inc_src],
+  dependencies : [idep_nir],
+  install : false,
+)
+test('g5p-integer-lowering', g5p_integer_lowering_test, timeout : 120)
+
+g5p_integer_encodings_test = executable(
+  'g5p-integer-encodings-test',
+  files('tests/integer/encodings.c', 'g5p_usc.c'),
+  include_directories : [inc_powervr_g5p],
+  install : false,
+)
+test('g5p-integer-encodings', g5p_integer_encodings_test, timeout : 60)

@@ -28,6 +28,7 @@
  * v_depth, and Hyprland's passthru FS equals the iOS tex capture.
  */
 #include "pco_g5p_general.h"
+#include "g5p_nir_integer.h"
 #include "../vulkan/pvr_g5p_dgl.h"
 #include "g5p_vtex.h"
 #include "g5p_usc.h"
@@ -707,7 +708,7 @@ static bool alu_supported(struct gctx *c, nir_alu_instr *a)
    case nir_op_f2i32: case nir_op_f2u32: /* vertex: v_f2i, v_f2u (convert, bank 1, header 0x11) */
       return bits == 32;
    case nir_op_bit_count: case nir_op_bitfield_reverse:
-      return !c->vs && bits == 32;
+      return bits == 32;
    default:
       return (is_cmp(a->op) && bits == 1) ||
              (is_recipe(a->op) && bits == 32 && (!c->vs || vs_recipe(a->op)));
@@ -3402,8 +3403,17 @@ static void emit_unary_like(struct gctx *c, nir_alu_instr *a)
    case nir_op_inot: /* vertex (v_inot32): bank 1, header 0x20 (A) */
       n = g5p_usc_unary2(raw, G5P_NOT, H(c, dst), H(c, xr), vbank(c, dst), g, uh, false, cx, 0, false);
       break;
-   case nir_op_bit_count: n = g5p_usc_unary2(raw, G5P_POPCOUNT, 2 * dst, 2 * xr, 0, g, 1, false, cx, 0, false); break;
-   default: n = g5p_usc_unary2(raw, G5P_BITREVERSE, 2 * dst, 2 * xr, 0, g, 1, false, cx, 0, false); break;
+   case nir_op_bit_count:
+   case nir_op_bitfield_reverse:
+      /* Apple iv_reg_pop/reverse and their live-source variants: bank1,
+       * header21, group alone marks last read; NO extension on repeat reads.
+       * The original fragment forms stay byte-identical. */
+      if (c->vs)
+         vs_bank1_only(c, "vertex bit-count/reverse", dst, xr, -1, -1);
+      n = g5p_usc_unary2(raw, a->op == nir_op_bit_count ? G5P_POPCOUNT : G5P_BITREVERSE,
+                        H(c, dst), H(c, xr), vbank(c, dst), g, uh, false, c->vs ? 0 : cx, 0, false);
+      break;
+   default: UNREACHABLE("unary operation");
    }
    put(c, raw, n, nir_op_infos[a->op].name);
    c->p->evidence |= c->vs ? PCO_G5P_EV_VS_ALU : PCO_G5P_EV_FS_ALU;
@@ -5478,6 +5488,9 @@ static bool lower(nir_shader *nir)
     * not decoded; these use ops we encode. */
    NIR_PASS(_, nir, nir_opt_idiv_const, 32);
    NIR_PASS(_, nir, nir_lower_idiv, &(nir_lower_idiv_options){.allow_fp16 = false});
+   /* PCO already lowers signed MSB and LSB to unsigned MSB. Finish that
+    * graph with integer fill/count instead of an unqualified native CLZ. */
+   NIR_PASS(_, nir, nir_shader_alu_pass, g5p_lower_msb_instr, nir_metadata_control_flow, NULL);
    NIR_PASS(_, nir, nir_lower_alu);
    NIR_PASS(_, nir, nir_shader_alu_pass, lower_iabs_instr, nir_metadata_control_flow, NULL);
    do {

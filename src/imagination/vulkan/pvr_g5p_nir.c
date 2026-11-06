@@ -61,10 +61,8 @@ g5p_init_options(void)
    g5p_options.lower_bitfield_extract = true;
    g5p_options.lower_bitfield_insert = true;
    g5p_vertex_options = g5p_options;
-   /* FS keeps its existing native forms. VS uses NIR's exact SWAR sequences
-    * until register-source native vertex popcount/reverse is qualified. */
-   g5p_vertex_options.lower_bit_count = true;
-   g5p_vertex_options.lower_bitfield_reverse = true;
+   /* The isolated Apple iv_reg_pop/reverse witnesses qualify native VS
+    * register forms too. Do not lower them to SWAR multiplies. */
 }
 
 /*
