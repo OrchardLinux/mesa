@@ -1819,6 +1819,13 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
       ROGUE_TA_STATE_ISPCTL_unpack(&w[1], &ctl);
       ctl.upass = isp.upass ? pvr_g5p_msaa_upass(g->samples) : 0;
       ctl.tagwritedisable = isp.tag_write_disable;
+      /* Rogue TA_STATE_ISPCTL: VISTEST enables accumulated sample counting;
+       * VISREG selects the counter in ISP_OCLQRY_BASE. Match the generic
+       * builder's discard rule, after DS has rebuilt the ISP control word. */
+      if (!discard && cmd_buffer->state.vis_test_enabled) {
+         ctl.vistest = true;
+         ctl.visreg = cmd_buffer->state.vis_reg;
+      }
       ROGUE_TA_STATE_ISPCTL_pack(&w[1], &ctl);
       /* ... with the sprite object type of a point pipeline, or a triangle's fill mode */
       if (ds_aspects && (g->vs_point_size || tri_fill_mode)) {
