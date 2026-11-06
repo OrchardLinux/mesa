@@ -150,6 +150,28 @@ fill(const struct pvr_transfer_cmd *cmd, const struct surface *dst)
    free(cols);
 }
 
+/*
+ * One aspect of D32_SFLOAT_S8_UINT (D32 at byte 0, S8 at byte 4), to or from a
+ * surface of that aspect alone or of the same format: the format pack
+ * functions have no depth/stencil conversions
+ */
+static void
+copy_ds_aspect(const struct pvr_rect_mapping *m, const struct surface *src,
+               const struct surface *dst, bool depth)
+{
+   const unsigned size = depth ? 4 : 1, at = depth ? 0 : 4;
+   const unsigned src_at = src->bpp == 8 ? at : 0, dst_at = dst->bpp == 8 ? at : 0;
+
+   for (unsigned y = 0; y < m->dst_rect.extent.height; y++) {
+      uint8_t *d = dst->base + row_offset(dst, m->dst_rect.offset.y + y);
+      const uint8_t *s = src->base + row_offset(src, m->src_rect.offset.y + y);
+
+      for (unsigned x = 0; x < m->dst_rect.extent.width; x++)
+         memcpy(d + column_offset(dst, m->dst_rect.offset.x + x) + dst_at,
+                s + column_offset(src, m->src_rect.offset.x + x) + src_at, size);
+   }
+}
+
 static void
 copy(const struct pvr_rect_mapping *m, const struct surface *src, const struct surface *dst)
 {
@@ -290,6 +312,12 @@ run(struct pvr_device *device, const struct pvr_transfer_cmd *cmd)
 
       if (!surface_init(device, &source->surface, &src))
          continue;
+      if (cmd->flags & PVR_TRANSFER_CMD_FLAGS_DSMERGE) {
+         for (unsigned k = 0; k < source->mapping_count; k++)
+            copy_ds_aspect(&source->mappings[k], &src, &dst,
+                           cmd->flags & PVR_TRANSFER_CMD_FLAGS_PICKD);
+         continue;
+      }
       if (!source->mapping_count) {
          /* the whole destination scissor, 1:1 */
          const struct pvr_rect_mapping m = { .src_rect = cmd->scissor,
@@ -387,6 +415,29 @@ host_copy(struct pvr_device *device, const struct pvr_image *image, bool to_imag
             memcpy(img.base, host, size);
          else
             memcpy(host, img.base, size);
+         continue;
+      }
+      /*
+       * Depth and stencil stored together: the memory holds one aspect, packed
+       * (D32 in 4 bytes, S8 in 1; the texel holds them at bytes 0 and 4)
+       */
+      if (image->vk.format == VK_FORMAT_D32_SFLOAT_S8_UINT) {
+         const bool depth = sub->aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT;
+         const unsigned size = depth ? 4 : 1, at = depth ? 0 : 4;
+         const size_t row = (size_t)(row_length ? row_length : extent->width) * size;
+         const size_t slice = row * (image_height ? image_height : extent->height);
+         uint8_t *host = (uint8_t *)ptr + l * slice;
+
+         for (uint32_t y = 0; y < extent->height; y++) {
+            const size_t ro = row_offset(&img, offset->y + y);
+
+            for (uint32_t x = 0; x < extent->width; x++) {
+               uint8_t *texel = img.base + ro + column_offset(&img, offset->x + x) + at;
+               uint8_t *m = host + y * row + (size_t)x * size;
+
+               memcpy(to_image ? texel : m, to_image ? m : texel, size);
+            }
+         }
          continue;
       }
       host_memory_surface(image, ptr, row_length, image_height, extent, &mem);

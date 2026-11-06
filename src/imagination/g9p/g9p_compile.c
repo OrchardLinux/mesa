@@ -1984,6 +1984,41 @@ emit_tex_grad(struct g9p_ctx *ctx, nir_tex_instr *tex)
 }
 
 /*
+ * A compare sample: the reference in a register below r32, in the sample's
+ * W4, and bit 15 of W3 (Apple's sample_compare, sc1-sc7.metal); -2 on failure
+ */
+static int
+shadow_reference(struct g9p_ctx *ctx, nir_tex_instr *tex)
+{
+   const int i = nir_tex_instr_src_index(tex, nir_tex_src_comparator);
+
+   if (!tex->is_shadow)
+      return -1;
+   if (i < 0)
+      return -2;
+   const int r = src_reg(ctx, nir_get_scalar(tex->src[i].src.ssa, 0));
+   if (r < 0)
+      return -2;
+   if (r < 32)
+      return r;
+   const int t = alloc_temp(ctx);
+
+   if (t < 0 || t >= 32)
+      return -2;
+   g9p_alu2(ctx->c, G9P_OR, t, r, r, false);
+   return t;
+}
+
+static void
+shadow_patch(struct g9p_ctx *ctx, unsigned at, int ref)
+{
+   if (ref >= 0) {
+      ctx->c->w[at + 3] |= 0x8000;
+      ctx->c->w[at + 4] |= 0x40 | 2 * ref;
+   }
+}
+
+/*
  * A 2D array or cube sample, ported from the A9 (G5P) backend (OrchardLinux/mesa
  * PR #5, Berkay Kösebay; Apple's operand layout): the coordinates in r0-r2, where
  * the sample reads them (as g9p_sample_regs() reads r0-r1); an array's layer
@@ -2003,8 +2038,7 @@ emit_tex_layered(struct g9p_ctx *ctx, nir_tex_instr *tex)
 
    if (tex->op == nir_texop_txd)
       return emit_tex_grad(ctx, tex);
-   if (ctx->stage != MESA_SHADER_FRAGMENT || ci < 0 || slot < 0 || tex->is_shadow ||
-       (cube && tex->is_array) ||
+   if (ctx->stage != MESA_SHADER_FRAGMENT || ci < 0 || slot < 0 || (cube && tex->is_array) ||
        (!cube && !is3d && tex->sampler_dim != GLSL_SAMPLER_DIM_2D) ||
        (tex->op != nir_texop_tex && tex->op != nir_texop_txl && tex->op != nir_texop_txb) ||
        nir_tex_instr_src_index(tex, nir_tex_src_offset) >= 0) {
@@ -2012,7 +2046,9 @@ emit_tex_layered(struct g9p_ctx *ctx, nir_tex_instr *tex)
       return false;
    }
    lod = lod_source(ctx, tex);
-   if (lod == -2)
+   const int ref = shadow_reference(ctx, tex);
+
+   if (lod == -2 || ref == -2)
       return false;
    for (unsigned c = 0; c < 3; c++) {
       const int r = src_reg(ctx, nir_get_scalar(tex->src[ci].src.ssa, c));
@@ -2041,6 +2077,7 @@ emit_tex_layered(struct g9p_ctx *ctx, nir_tex_instr *tex)
    ctx->c->w[at] = (ctx->c->w[at] & ~0x0f00) |
                    (cube ? G9P_TEX_CUBE : is3d ? G9P_TEX_3D : G9P_TEX_2D_ARRAY) << 8;
    sample_lod(ctx, tex, at, lod);
+   shadow_patch(ctx, at, ref);
    g9p_wait(ctx->c);
    for (unsigned c = 0; c < 4; c++) {
       ctx->reg[key(&tex->def, c)] = dst + c;
@@ -2162,7 +2199,7 @@ emit_tex(struct g9p_ctx *ctx, nir_tex_instr *tex)
        tex->sampler_dim == GLSL_SAMPLER_DIM_3D)
       return emit_tex_layered(ctx, tex);
    if (ctx->stage != MESA_SHADER_FRAGMENT || tex->sampler_dim != GLSL_SAMPLER_DIM_2D ||
-       tex->is_array || tex->is_shadow || ci < 0 || slot < 0 ||
+       tex->is_array || ci < 0 || slot < 0 ||
        (tex->op != nir_texop_tex && tex->op != nir_texop_txl && tex->op != nir_texop_txb) ||
        nir_tex_instr_src_index(tex, nir_tex_src_offset) >= 0) {
       fprintf(stderr, "g9p: only plain 2D samples of combined image samplers so far\n");
@@ -2171,17 +2208,24 @@ emit_tex(struct g9p_ctx *ctx, nir_tex_instr *tex)
    first = varying_component(ctx, nir_get_scalar(tex->src[ci].src.ssa, 0));
    second = varying_component(ctx, nir_get_scalar(tex->src[ci].src.ssa, 1));
    if (tex->op == nir_texop_tex && first >= 0 && second == first + 1) {
+      const int ref = shadow_reference(ctx, tex);
+
+      if (ref == -2)
+         return false;
       release(ctx, &tex->instr);
       dst = alloc_range(ctx, 4);
       if (dst < 0)
          return false;
       g9p_sample_varying(ctx->c, dst, first, 2, tex_state_dword(ctx, slot),
                          tex_sampler_dword(ctx, slot));
+      /* the sample is its last five words */
+      shadow_patch(ctx, ctx->c->n - 5, ref);
       ctx->out->num_varyings = MAX2(ctx->out->num_varyings, first / 4 + 1);
    } else {
       const int lod = lod_source(ctx, tex);
+      const int ref = shadow_reference(ctx, tex);
 
-      if (lod == -2)
+      if (lod == -2 || ref == -2)
          return false;
       for (unsigned c = 0; c < 2; c++) {
          const int r = src_reg(ctx, nir_get_scalar(tex->src[ci].src.ssa, c));
@@ -2199,6 +2243,7 @@ emit_tex(struct g9p_ctx *ctx, nir_tex_instr *tex)
 
          g9p_sample_regs(ctx->c, dst, tex_state_dword(ctx, slot), tex_sampler_dword(ctx, slot));
          sample_lod(ctx, tex, at, lod);
+         shadow_patch(ctx, at, ref);
       }
    }
    g9p_wait(ctx->c);

@@ -2638,6 +2638,21 @@ PVR_PER_ARCH(g9p_pack_sampler)(const VkSamplerCreateInfo *info)
    w |= (uint64_t)g9p_sampler_address(info->addressModeW) << 35;
    if (info->flags & VK_SAMPLER_CREATE_NON_SEAMLESS_CUBE_MAP_BIT_EXT)
       w |= G9P_SAMPLER_SEAMFUL;
+   /*
+    * The compare function of compare samples, bits 39-41, enable bit 42: the
+    * constant above is "never", enabled, for samples that do not compare
+    * (tested with dEQP texture.shadow; the order is not VkCompareOp's)
+    */
+   if (info->compareEnable) {
+      static const uint8_t func[] = {
+         [VK_COMPARE_OP_LESS_OR_EQUAL] = 0, [VK_COMPARE_OP_GREATER_OR_EQUAL] = 1,
+         [VK_COMPARE_OP_LESS] = 2,          [VK_COMPARE_OP_GREATER] = 3,
+         [VK_COMPARE_OP_EQUAL] = 4,         [VK_COMPARE_OP_NOT_EQUAL] = 5,
+         [VK_COMPARE_OP_ALWAYS] = 6,        [VK_COMPARE_OP_NEVER] = 7,
+      };
+
+      w = (w & ~(7ull << 39)) | (uint64_t)func[info->compareOp] << 39;
+   }
    if (getenv("G9P_DEBUG"))
       fprintf(stderr, "g9p: sampler filter %u/%u mip %u lod %f..%f address %u/%u/%u: %016" PRIx64 "\n",
               info->magFilter, info->minFilter, info->mipmapMode, info->minLod, info->maxLod,

@@ -67,6 +67,13 @@ g9p_image_format(VkFormat format)
       return G9P_RG01(0x223);
    case VK_FORMAT_R16G16B16A16_SFLOAT:
       return G9P_RGBA(0x232);
+   /* depth textures, as the matching colour format (PR #6's R16_UNORM) */
+   case VK_FORMAT_D16_UNORM:
+      return G9P_R001(0x09);
+   case VK_FORMAT_D32_SFLOAT:
+      return G9P_R001(0x221);
+   case VK_FORMAT_D32_SFLOAT_S8_UINT:
+      return G9P_R001(0x231);
    case VK_FORMAT_R32_SFLOAT:
       return G9P_R001(0x221);
    case VK_FORMAT_R32G32_SFLOAT:
