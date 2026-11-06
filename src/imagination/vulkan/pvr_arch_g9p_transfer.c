@@ -62,6 +62,8 @@ struct surface {
    uint8_t *base;
    enum pipe_format format;
    unsigned bpp, stride, width, height;
+   /* 1 or 4; four samples are a twiddled surface of twice the size (2x2 per pixel) */
+   unsigned samples;
    bool twiddled;
 };
 
@@ -76,6 +78,11 @@ surface_init(struct pvr_device *device, const struct pvr_transfer_cmd_surface *s
    out->width = s->width;
    out->height = s->height;
    out->twiddled = s->mem_layout == PVR_MEMLAYOUT_TWIDDLED;
+   out->samples = s->sample_count == 4 ? 4 : 1;
+   if (out->samples == 4) {
+      out->width *= 2;
+      out->height *= 2;
+   }
    if (!out->base)
       mesa_loge("G9P transfer: no CPU mapping for %#" PRIx64, s->dev_addr.addr);
    return out->base != NULL;
@@ -120,7 +127,10 @@ row_offset(const struct surface *s, unsigned y)
 static void
 fill(const struct pvr_transfer_cmd *cmd, const struct surface *dst)
 {
-   const VkRect2D *r = &cmd->scissor;
+   const unsigned ms = dst->samples == 4 ? 2 : 1;
+   const VkRect2D scaled = { { cmd->scissor.offset.x * ms, cmd->scissor.offset.y * ms },
+                             { cmd->scissor.extent.width * ms, cmd->scissor.extent.height * ms } };
+   const VkRect2D *r = &scaled;
    uint8_t packed[16] = { 0 };
 
    if (util_format_is_pure_integer(dst->format))
@@ -309,6 +319,75 @@ copy_linear(const struct pvr_rect_mapping *m, const struct surface *src, const s
    }
 }
 
+/* A rectangle in a four-sample surface's texels (2x2 per pixel) */
+static VkRect2D
+ms_rect(const VkRect2D *r)
+{
+   return (VkRect2D){ { r->offset.x * 2, r->offset.y * 2 }, { r->extent.width * 2, r->extent.height * 2 } };
+}
+
+/*
+ * Four samples into one: the average, or sample 0 for integers and depth/stencil. Nearest
+ * for a scaled mapping, as a resolve has none in Vulkan.
+ */
+static void
+resolve(const struct pvr_rect_mapping *m, const struct surface *src, const struct surface *dst)
+{
+   const bool first = util_format_is_pure_integer(src->format) || util_format_is_depth_or_stencil(src->format);
+
+   for (unsigned y = 0; y < m->dst_rect.extent.height; y++) {
+      const unsigned sy = m->src_rect.offset.y + y * m->src_rect.extent.height / m->dst_rect.extent.height;
+      uint8_t *row = dst->base + row_offset(dst, m->dst_rect.offset.y + y);
+
+      for (unsigned x = 0; x < m->dst_rect.extent.width; x++) {
+         const unsigned sx = m->src_rect.offset.x + x * m->src_rect.extent.width / m->dst_rect.extent.width;
+         uint8_t *d = row + column_offset(dst, m->dst_rect.offset.x + x);
+
+         if (first) {
+            memcpy(d, src->base + row_offset(src, 2 * sy) + column_offset(src, 2 * sx), dst->bpp);
+            continue;
+         }
+
+         float sum[4] = { 0 };
+
+         for (unsigned s = 0; s < 4; s++) {
+            float texel[4];
+
+            util_format_unpack_rgba(src->format, texel,
+                                    src->base + row_offset(src, 2 * sy + (s & 1)) +
+                                       column_offset(src, 2 * sx + (s >> 1)),
+                                    1);
+            for (unsigned c = 0; c < 4; c++)
+               sum[c] += texel[c] / 4;
+         }
+         util_format_pack_rgba(dst->format, d, sum, 1);
+      }
+   }
+}
+
+/* A mapping between surfaces whichever their sample counts */
+static void
+copy_samples(const struct pvr_rect_mapping *m, const struct surface *src, const struct surface *dst)
+{
+   if (src->samples == 4 && dst->samples == 1) {
+      resolve(m, src, dst);
+   } else if (src->samples == dst->samples && src->samples == 4) {
+      struct pvr_rect_mapping scaled = *m;
+
+      scaled.src_rect = ms_rect(&m->src_rect);
+      scaled.dst_rect = ms_rect(&m->dst_rect);
+      copy(&scaled, src, dst);
+   } else if (dst->samples == 4) {
+      /* one sample into all four */
+      struct pvr_rect_mapping scaled = *m;
+
+      scaled.dst_rect = ms_rect(&m->dst_rect);
+      copy(&scaled, src, dst);
+   } else {
+      copy(m, src, dst);
+   }
+}
+
 static void
 run(struct pvr_device *device, const struct pvr_transfer_cmd *cmd)
 {
@@ -340,7 +419,7 @@ run(struct pvr_device *device, const struct pvr_transfer_cmd *cmd)
                struct surface sp = ds_plane(&src, depth), dp = ds_plane(&dst, depth);
 
                sp.format = dp.format = depth ? PIPE_FORMAT_Z32_FLOAT : PIPE_FORMAT_S8_UINT;
-               copy(&source->mappings[k], &sp, &dp);
+               copy_samples(&source->mappings[k], &sp, &dp);
             }
          }
          continue;
@@ -350,7 +429,7 @@ run(struct pvr_device *device, const struct pvr_transfer_cmd *cmd)
          const struct pvr_rect_mapping m = { .src_rect = cmd->scissor,
                                              .dst_rect = cmd->scissor };
 
-         copy(&m, &src, &dst);
+         copy_samples(&m, &src, &dst);
       }
       for (unsigned k = 0; k < source->mapping_count; k++) {
          const struct pvr_rect_mapping *m = &source->mappings[k];
@@ -360,7 +439,7 @@ run(struct pvr_device *device, const struct pvr_transfer_cmd *cmd)
               m->src_rect.extent.height != m->dst_rect.extent.height))
             copy_linear(m, &src, &dst);
          else
-            copy(m, &src, &dst);
+            copy_samples(m, &src, &dst);
       }
    }
 }

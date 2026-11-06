@@ -239,7 +239,7 @@ static void pvr_setup_transfer_surface(struct pvr_device *device,
       const struct pvr_image_plane *ds_plane = pvr_single_plane_const(image);
 
       surface->dev_addr.addr +=
-         (uint64_t)ds_plane->physical_extent.width * ds_plane->physical_extent.height * 4;
+         (uint64_t)ds_plane->physical_extent.width * ds_plane->physical_extent.height * 4 * image->vk.samples;
    }
 
    if (surface->mem_layout == PVR_MEMLAYOUT_3DTWIDDLED)

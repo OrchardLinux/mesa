@@ -121,6 +121,9 @@ usc_temps(unsigned regs)
    return DIV_ROUND_UP(MAX2(regs, 8), 4) << 3;
 }
 
+/* Vulkan's standard 4x positions, x | y << 4 per sample in 1/16 pixel (iOS msaa4, PR #6) */
+#define G9P_POSITIONS_4X 0xeaa26e26u
+
 /* DOUTD control word: last, common store, destination dword, dwords */
 static uint32_t
 doutd_ctrl(unsigned dest, unsigned dwords, bool last)
@@ -184,6 +187,23 @@ g9p_pack_clear(VkFormat format, const float colour[4], uint32_t *words)
    }
 }
 
+/*
+ * A fragment-side kick at four samples: DOUTU's sample rate 2, data word 1 bits 1-2
+ * (src0[34:33]; iOS 0x10 -> 0x14, PR #6), for the same program. Only the kick differs.
+ */
+static VkResult
+g9p_kick_4x(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_pds_upload *kick, struct pvr_pds_upload *out)
+{
+   const uint32_t *old = pvr_bo_suballoc_get_map_addr(kick->pvr_bo);
+   const uint32_t data[2] = { old[0], old[1] | 2 << 1 };
+   const uint32_t code[2] = {
+      g9p_pds_dout(G9P_DOUTU, 0, G9P_PDS_DATA, 0, G9P_PDS_END),
+      g9p_pds_halt(),
+   };
+
+   return pvr_arch_cmd_buffer_upload_pds(cmd_buffer, data, ARRAY_SIZE(data), 16, code, ARRAY_SIZE(code), 32, 64, out);
+}
+
 /* --- Device programs ------------------------------------------------------ */
 
 VkResult
@@ -225,13 +245,16 @@ PVR_PER_ARCH(g9p_gfx_device_init)(struct pvr_device *device)
     * RGBA32F, 051c for RGBA16F and RGBA8, iOS capture).
     */
    for (unsigned raw = 0; raw < 2; raw++) {
-      c->n = 0;
-      g9p_mov_imm(c, 0, 0);
-      G9P_EMIT(c, raw ? 0x151c : 0x051c, 0x5100, 0x0800);
-      g9p_end(c);
-      result = upload_usc(device, c, &p->eot_usc[raw]);
-      if (result != VK_SUCCESS)
-         goto out;
+      /* A store of four samples: the emit's sample field 2 (iOS msaa4-store, PR #6) */
+      for (unsigned ms = 0; ms < 2; ms++) {
+         c->n = 0;
+         g9p_mov_imm(c, 0, 0);
+         G9P_EMIT(c, (raw ? 0x151c : 0x051c) ^ (ms ? 0x0c00 : 0), 0x5100, 0x0800);
+         g9p_end(c);
+         result = upload_usc(device, c, ms ? &p->eot_ms_usc[raw] : &p->eot_usc[raw]);
+         if (result != VK_SUCCESS)
+            goto out;
+      }
    }
 
    /*
@@ -265,7 +288,10 @@ PVR_PER_ARCH(g9p_gfx_device_init)(struct pvr_device *device)
     * emit per target, a branch to the next 64-byte boundary and the end
     */
    for (unsigned n = 2; n <= G9P_MAX_TARGETS; n++) {
-      for (unsigned raw = 0; raw < BITFIELD_BIT(n); raw++) {
+      for (unsigned raw_ms = 0; raw_ms < 2 * BITFIELD_BIT(n); raw_ms++) {
+         const unsigned raw = raw_ms & BITFIELD_MASK(n);
+         const bool ms = raw_ms >> n;
+
          c->n = 0;
          c->fragment = false;
          for (unsigned k = 0; k < n; k++)
@@ -274,7 +300,7 @@ PVR_PER_ARCH(g9p_gfx_device_init)(struct pvr_device *device)
          for (unsigned k = 0; k < n; k++) {
             const bool last = k + 1 == n;
 
-            G9P_EMIT(c, raw & BITFIELD_BIT(k) ? 0x151c : 0x051c,
+            G9P_EMIT(c, (raw & BITFIELD_BIT(k) ? 0x151c : 0x051c) ^ (ms ? 0x0c00 : 0),
                      (last ? 0x5100 : 0x7100) | 2 * (n - 1 - k), 0x0800 | 2 * k);
             if (!last)
                G9P_EMIT(c, 0x044c);
@@ -287,7 +313,7 @@ PVR_PER_ARCH(g9p_gfx_device_init)(struct pvr_device *device)
          G9P_EMIT(c, 0x8000);
          while (c->n % 32)
             G9P_EMIT(c, 0x0000);
-         result = upload_usc(device, c, &p->eot_mrt_usc[n][raw]);
+         result = upload_usc(device, c, ms ? &p->eot_mrt_ms_usc[n][raw] : &p->eot_mrt_usc[n][raw]);
          if (result != VK_SUCCESS)
             goto out;
       }
@@ -422,13 +448,18 @@ PVR_PER_ARCH(g9p_gfx_device_finish)(struct pvr_device *device)
    if (p->clear_kick.pvr_bo)
       pvr_bo_suballoc_free(p->clear_kick.pvr_bo);
    pvr_bo_suballoc_free(p->vdm_end_usc);
-   for (unsigned raw = 0; raw < 2; raw++)
+   for (unsigned raw = 0; raw < 2; raw++) {
       pvr_bo_suballoc_free(p->eot_usc[raw]);
+      pvr_bo_suballoc_free(p->eot_ms_usc[raw]);
+   }
    pvr_bo_suballoc_free(p->clear_usc);
    pvr_bo_suballoc_free(p->clear_vs_usc);
    for (unsigned n = 2; n <= G9P_MAX_TARGETS; n++) {
       for (unsigned raw = 0; raw < BITFIELD_BIT(n); raw++)
+      {
          pvr_bo_suballoc_free(p->eot_mrt_usc[n][raw]);
+         pvr_bo_suballoc_free(p->eot_mrt_ms_usc[n][raw]);
+      }
    }
    for (unsigned i = 0; i < p->num_cached; i++) {
       pvr_bo_suballoc_free(p->cached[i].usc);
@@ -1622,6 +1653,14 @@ g9p_current_hw_render(const struct pvr_render_pass_info *info)
    return &setup->renders[setup->subpass_map[info->subpass_idx].render];
 }
 
+static unsigned
+g9p_current_samples(const struct pvr_render_pass_info *info)
+{
+   const struct pvr_renderpass_hwsetup_render *hw = g9p_current_hw_render(info);
+
+   return hw ? hw->sample_count : 1;
+}
+
 static bool
 g9p_is_line(VkPrimitiveTopology t)
 {
@@ -2091,7 +2130,14 @@ emit_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state
     * SIZEINFO1 (uniform data in 16-byte units, varying sizes), SIZEINFO2
     * (the USC common store, 64-byte units), varying base
     */
-   PPP_BLOCK(0xc0, state->fs_kick.data_offset, tex ? tex->code_offset : p->halt.code_offset,
+   struct pvr_pds_upload fs_kick = state->fs_kick;
+
+   if (g9p_current_samples(info) == 4) {
+      result = g9p_kick_4x(cmd_buffer, &state->fs_kick, &fs_kick);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+   PPP_BLOCK(0xc0, fs_kick.data_offset, tex ? tex->code_offset : p->halt.code_offset,
              (tex ? MAX2(tex->data_size / 4, 1) : 1) << 23 |
                 (state->num_varyings
                     ? state->varying_units << 10 | state->varying_coeffs << 4
@@ -2159,6 +2205,13 @@ emit_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state
       memcpy(&ppp[blocks[nb - 1][0] + 1], dp->isp, sizeof(dp->isp));
    else
       g9p_ds_draw_isp(cmd_buffer, state, dp->scissor >= 0, &ppp[blocks[nb - 1][0]]);
+   /* Four samples: user pass 7 for every draw that shades */
+   if (g9p_current_samples(info) == 4) {
+      uint32_t *isp0 = &ppp[blocks[nb - 1][0] + 1];
+
+      if (((*isp0 >> 22) & 0xf) == 0xf)
+         *isp0 = (*isp0 & ~(0xfu << 22)) | 7u << 22;
+   }
    /* An occlusion query counts draws; never the clears (isp_set) */
    if (cmd_buffer->state.vis_test_enabled && !dp->isp_set && !dp->discard) {
       ppp[blocks[nb - 1][0] + 1] |= BITFIELD_BIT(15) | cmd_buffer->state.vis_reg;
@@ -2560,7 +2613,7 @@ PVR_PER_ARCH(g9p_pack_image_view)(const struct pvr_image_view *iview, uint64_t w
    const bool stencil_plane = image->vk.format == VK_FORMAT_D32_SFLOAT_S8_UINT &&
                               iview->vk.aspects == VK_IMAGE_ASPECT_STENCIL_BIT;
    const uint64_t plane_offset =
-      stencil_plane ? (uint64_t)plane->physical_extent.width * plane->physical_extent.height * 4 : 0;
+      stencil_plane ? (uint64_t)plane->physical_extent.width * plane->physical_extent.height * 4 * image->vk.samples : 0;
    uint32_t fmt = g9p_image_format(stencil_plane ? VK_FORMAT_R8_UINT : iview->vk.format);
    const bool linear = image->memlayout == PVR_MEMLAYOUT_LINEAR;
    const uint64_t addr = image->dev_addr.addr + plane->offset + plane_offset +
@@ -2606,7 +2659,12 @@ PVR_PER_ARCH(g9p_pack_image_view)(const struct pvr_image_view *iview, uint64_t w
        */
       const uint64_t base = image->dev_addr.addr + plane->offset + plane_offset +
                             iview->vk.base_array_layer * plane->layer_size;
-      const uint32_t w0 = image->vk.extent.width, h0 = image->vk.extent.height;
+      /*
+       * Four samples, sampled: a twiddled texture of twice the size, each pixel's samples
+       * its 2x2 block (each pixel 4 samples in Morton order, y in bit 0: iOS msaa4-store)
+       */
+      const uint32_t ms = image->vk.samples == VK_SAMPLE_COUNT_4_BIT ? 2 : 1;
+      const uint32_t w0 = image->vk.extent.width * ms, h0 = image->vk.extent.height * ms;
 
       d[0] = (d[0] & ~(0x1fu << 27)) | (w0 - 1) << 27;
       d[1] = (w0 - 1) >> 5 | (h0 - 1) << 9 | iview->vk.base_mip_level << 25;
@@ -2882,6 +2940,11 @@ g9p_background_mrt(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_render_pa
    }
    const uint64_t units = DIV_ROUND_UP(8 * n + 2, 16);
 
+   if (job->g9p.samples == 4) {
+      result = g9p_kick_4x(cmd_buffer, &kick, &kick);
+      if (result != VK_SUCCESS)
+         return result;
+   }
    job->g9p.bgnd[0] = (uint64_t)p->dma.code_offset << 32 | kick.data_offset;
    job->g9p.bgnd[1] = 0;
    job->g9p.bgnd[2] = up->data_offset;
@@ -2910,6 +2973,9 @@ PVR_PER_ARCH(g9p_job_init)(struct pvr_cmd_buffer *cmd_buffer,
 
    memset(&job->g9p, 0, sizeof(job->g9p));
    job->g9p.enabled = true;
+   job->g9p.samples = hw_render->sample_count;
+   if (hw_render->sample_count != 1 && hw_render->sample_count != 4)
+      return vk_errorf(cmd_buffer, VK_ERROR_FEATURE_NOT_PRESENT, "G9P: %u samples", hw_render->sample_count);
 
    if (hw_render->eot_surface_count) {
       const struct pvr_image_view *iview =
@@ -2933,6 +2999,8 @@ PVR_PER_ARCH(g9p_job_init)(struct pvr_cmd_buffer *cmd_buffer,
       job->g9p.target_linear = linear;
       pack_image_state(image, addr, iview->vk.extent.width, iview->vk.extent.height, linear,
                        pitch, iview->vk.format);
+      if (image_obj->vk.samples == 4)
+         image[0] = (image[0] & ~0xfu) | 0x0c; /* 2D multisample, twiddled (iOS msaa4-store) */
       /* the other targets' blocks: their state, their output-half offset (PR #6) */
       for (unsigned t = 1; t < eot_targets; t++) {
          const struct pvr_image_view *v = info->attachments[hw_render->eot_surfaces[t].attachment_idx];
@@ -2945,6 +3013,8 @@ PVR_PER_ARCH(g9p_job_init)(struct pvr_cmd_buffer *cmd_buffer,
                           v->vk.extent.width, v->vk.extent.height,
                           im->memlayout == PVR_MEMLAYOUT_LINEAR,
                           pl->mip_levels[v->vk.base_mip_level].pitch, v->vk.format);
+         if (im->vk.samples == 4)
+            image[8 * t] = (image[8 * t] & ~0xfu) | 0x0c;
          image[8 * t + 6] = 2 * g9p_render_words(info, hw_render, t);
          image[8 * t - 1] = 0xffffffff;
       }
@@ -2972,8 +3042,11 @@ PVR_PER_ARCH(g9p_job_init)(struct pvr_cmd_buffer *cmd_buffer,
 
       const uint32_t data[8] = { bo->dev_addr.addr, bo->dev_addr.addr >> 32,
                                  doutd_ctrl(0, eot_dwords, true), 0,
-                                 usc_offset(device, eot_targets > 1 ? p->eot_mrt_usc[eot_targets][raw]
-                                                                    : p->eot_usc[raw & 1]),
+                                 usc_offset(device, eot_targets > 1
+                                                       ? (job->g9p.samples == 4 ? p->eot_mrt_ms_usc[eot_targets][raw]
+                                                                                : p->eot_mrt_usc[eot_targets][raw])
+                                                       : (job->g9p.samples == 4 ? p->eot_ms_usc[raw & 1]
+                                                                                : p->eot_usc[raw & 1])),
                                  usc_temps(8), 0, 0 };
 
       result = pvr_arch_cmd_buffer_upload_pds(cmd_buffer, data, ARRAY_SIZE(data), 16, NULL,
@@ -3052,10 +3125,16 @@ PVR_PER_ARCH(g9p_job_init)(struct pvr_cmd_buffer *cmd_buffer,
       if (result != VK_SUCCESS)
          return result;
    } else {
-   job->g9p.bgnd[0] = (uint64_t)p->dma.code_offset << 32 |
-                      (load     ? p->load_kick[bg_output].data_offset
-                       : bg_raw ? p->clear_raw_kick[bg_output].data_offset
-                                : p->clear_kick.data_offset);
+   struct pvr_pds_upload bg_kick = load     ? p->load_kick[bg_output]
+                                   : bg_raw ? p->clear_raw_kick[bg_output]
+                                            : p->clear_kick;
+
+   if (job->g9p.samples == 4) {
+      result = g9p_kick_4x(cmd_buffer, &bg_kick, &bg_kick);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+   job->g9p.bgnd[0] = (uint64_t)p->dma.code_offset << 32 | bg_kick.data_offset;
    job->g9p.bgnd[1] = 0;
    job->g9p.bgnd[2] = up.data_offset;
    job->g9p.bgnd[3] = 0x0080000000800000ull;
@@ -3140,7 +3219,7 @@ PVR_PER_ARCH(g9p_geom_stream)(const struct pvr_device *device,
    put64(&s, 0);
    for (unsigned i = 0; i < 6; i++)
       put64(&s, 0); /* cluster */
-   put32(&s, 0x88); /* 0xc78 */
+   put32(&s, job->g9p.samples == 4 ? G9P_POSITIONS_4X : 0x88); /* 0xc78 */
    dump32("geom stream", 0, (const uint32_t *)buf, s.len / 4);
    return s.len;
 }
@@ -3180,7 +3259,7 @@ g9p_ds_stencil_offset(const struct pvr_image *img)
    const struct pvr_image_plane *plane = pvr_single_plane_const(img);
 
    return img->vk.format == VK_FORMAT_D32_SFLOAT_S8_UINT
-             ? (uint64_t)plane->physical_extent.width * plane->physical_extent.height * 4
+             ? (uint64_t)plane->physical_extent.width * plane->physical_extent.height * 4 * img->vk.samples
              : 0;
 }
 
@@ -3306,7 +3385,7 @@ PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
    put32(&s, bgobjdepth); /* ISP_BGOBJDEPTH: the depth clear */
    put32(&s, bgobjvals);  /* ISP_BGOBJVALS */
    /* ISP_AA: no multisampling */
-   put32(&s, 0);
+   put32(&s, job->g9p.samples == 4 ? 2 : 0);
    /*
     * ISP_CTL: bit 17 (Rogue's process_empty_tiles) runs the background object
     * on tiles without geometry too; without it a render's clear reaches
@@ -3318,9 +3397,15 @@ PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
     * and Hyprland's blur renders this way over the whole screen to draw a
     * small damaged part. G9P_ALL_TILES=1 keeps it on.
     */
-   put32(&s, (job->g9p.load || job->g9p.load_op == G9P_LOAD_OP_NONE) && !getenv("G9P_ALL_TILES")
-                ? 0x21000f
-                : 0x23000f);
+   {
+      /* Four samples: the low bits 7, and the partition mode of the output below */
+      const bool ms = job->g9p.samples == 4;
+      const uint32_t ctl = (job->g9p.load || job->g9p.load_op == G9P_LOAD_OP_NONE) && !getenv("G9P_ALL_TILES")
+                              ? 0x21000f
+                              : 0x23000f;
+
+      put32(&s, !ms ? ctl : (ctl & ~(0xfu | BITFIELD_BIT(21))) | 0x7 | (job->g9p.pixel_width == 8 ? 0 : BITFIELD_BIT(21)));
+   }
    put32(&s, job->g9p.eot_info); /* EVENT_PIXEL_PDS_INFO */
    put32(&s, 0);
    put32(&s, job->view_state.view[0].pds_pixel_event_data_offset);
@@ -3329,7 +3414,7 @@ PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
    *(uint32_t *)buf = s.len;
 
    put32(&s, G9P_EXTHDR_APPLE);
-   put64(&s, 0x88); /* 0xfa8 sample positions */
+   put64(&s, job->g9p.samples == 4 ? G9P_POSITIONS_4X : 0x88); /* 0xfa8 sample positions */
    for (unsigned i = 0; i < 4; i++)
       put64(&s, job->g9p.bgnd[i]);
    for (unsigned i = 0; i < 6; i++)
@@ -3339,7 +3424,7 @@ PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
     * a depth buffer), 0x4070 and each core's word (PR #74's g5p_ru_fill_3d_width(),
     * Apple's table by width; iOS record +0x6ec): 0x1d3 is width 4
     */
-   const unsigned output_count = 0x4000 / (job->g9p.pixel_width << 10);
+   const unsigned output_count = 0x4000 / (job->g9p.pixel_width << (job->g9p.samples == 4 ? 11 : 10));
    const unsigned output_code = job->g9p.pixel_width == 8 ? 0x20 : job->g9p.pixel_width == 4 ? 0x10 : 0;
 
    for (unsigned i = 0; i < 6; i++)
@@ -3356,12 +3441,13 @@ PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
       const uint32_t mx = ALIGN_POT(DIV_ROUND_UP(DIV_ROUND_UP(w, 32), 4), 4);
       const uint32_t my = ALIGN_POT(DIV_ROUND_UP(DIV_ROUND_UP(h, 32), 4), 4);
 
-      put32(&s, DIV_ROUND_UP(mx * my *
+      /* Four samples are 2x2 tiles per tile (PR #6's g5p_ru_rt_derive_samples()) */
+      put32(&s, DIV_ROUND_UP(mx * my * (job->g9p.samples == 4 ? 4 : 1) *
                                 rogue_get_region_header_size(&device->pdevice->dev_info),
                              4));
    }
    put32(&s, 0x1f); /* 0x6d0 */
-   put32(&s, 0x408);
+   put32(&s, output_count > 1 ? 0x408 : 0x204); /* 0x3e00: the mode * 0x204 */
    put32(&s, output_count); /* 0xfd8 */
    put32(&s, output_code >> 4 | 0xf8);
    /* line rasterization (iOS 10): tan 15° / size, tan 60° / size, 16 x width */
