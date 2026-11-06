@@ -10,13 +10,15 @@
  * the y bit first over the power-of-two padded size, interleaving while both
  * dimensions have bits (the A10 notes' RENDER.md "Textures with our
  * encodings"). Copies convert formats through util_format when they differ
- * and scale with nearest sampling; MSAA resolves and YUV are not handled.
+ * and scale with nearest or linear sampling; MSAA resolves and YUV are not
+ * handled.
  *
  * The same copies serve VK_EXT_host_image_copy: an upload goes straight from
  * the application's memory into the image, without a staging buffer and a
  * second copy (Zink's glTexSubImage, a compositor's window contents).
  */
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -175,7 +177,8 @@ copy(const struct pvr_rect_mapping *m, const struct surface *src, const struct s
    if (!cols)
       return;
    for (unsigned x = 0; x < dw; x++) {
-      unsigned sx = sw == dw ? x : x * sw / dw;
+      /* nearest: the source texel under the destination texel's centre */
+      unsigned sx = sw == dw ? x : (2 * x + 1) * sw / (2 * dw);
 
       if (m->flip_x)
          sx = sw - 1 - sx;
@@ -183,7 +186,7 @@ copy(const struct pvr_rect_mapping *m, const struct surface *src, const struct s
       cols[2 * x + 1] = column_offset(dst, m->dst_rect.offset.x + x);
    }
    for (unsigned y = 0; y < dh; y++) {
-      unsigned sy = sh == dh ? y : y * sh / dh;
+      unsigned sy = sh == dh ? y : (2 * y + 1) * sh / (2 * dh);
 
       if (m->flip_y)
          sy = sh - 1 - sy;
@@ -218,6 +221,58 @@ copy(const struct pvr_rect_mapping *m, const struct surface *src, const struct s
    free(cols);
 }
 
+/* A scaled blit with linear filtering; texels past the source's edges clamp */
+static void
+copy_linear(const struct pvr_rect_mapping *m, const struct surface *src, const struct surface *dst)
+{
+   const unsigned dw = m->dst_rect.extent.width, dh = m->dst_rect.extent.height;
+   const unsigned sw = m->src_rect.extent.width, sh = m->src_rect.extent.height;
+
+   for (unsigned y = 0; y < dh; y++) {
+      float v = (y + 0.5f) * sh / dh;
+
+      if (m->flip_y)
+         v = sh - v;
+      v += m->src_rect.offset.y - 0.5f;
+
+      const int y0 = floorf(v);
+      const float fy = v - y0;
+      const unsigned rows[2] = { CLAMP(y0, 0, (int)src->height - 1),
+                                 CLAMP(y0 + 1, 0, (int)src->height - 1) };
+      uint8_t *dst_row = dst->base + row_offset(dst, m->dst_rect.offset.y + y);
+
+      for (unsigned x = 0; x < dw; x++) {
+         float u = (x + 0.5f) * sw / dw;
+
+         if (m->flip_x)
+            u = sw - u;
+         u += m->src_rect.offset.x - 0.5f;
+
+         const int x0 = floorf(u);
+         const float fx = u - x0;
+         const unsigned cols[2] = { CLAMP(x0, 0, (int)src->width - 1),
+                                    CLAMP(x0 + 1, 0, (int)src->width - 1) };
+         float sum[4] = { 0 };
+
+         for (unsigned j = 0; j < 2; j++) {
+            for (unsigned i = 0; i < 2; i++) {
+               const float weight = (j ? fy : 1 - fy) * (i ? fx : 1 - fx);
+               float texel[4];
+
+               util_format_unpack_rgba(src->format, texel,
+                                       src->base + row_offset(src, rows[j]) +
+                                          column_offset(src, cols[i]),
+                                       1);
+               for (unsigned c = 0; c < 4; c++)
+                  sum[c] += weight * texel[c];
+            }
+         }
+         util_format_pack_rgba(dst->format, dst_row + column_offset(dst, m->dst_rect.offset.x + x),
+                               sum, 1);
+      }
+   }
+}
+
 static void
 run(struct pvr_device *device, const struct pvr_transfer_cmd *cmd)
 {
@@ -242,8 +297,16 @@ run(struct pvr_device *device, const struct pvr_transfer_cmd *cmd)
 
          copy(&m, &src, &dst);
       }
-      for (unsigned k = 0; k < source->mapping_count; k++)
-         copy(&source->mappings[k], &src, &dst);
+      for (unsigned k = 0; k < source->mapping_count; k++) {
+         const struct pvr_rect_mapping *m = &source->mappings[k];
+
+         if (source->filter == PVR_FILTER_LINEAR && !util_format_is_pure_integer(src.format) &&
+             (m->src_rect.extent.width != m->dst_rect.extent.width ||
+              m->src_rect.extent.height != m->dst_rect.extent.height))
+            copy_linear(m, &src, &dst);
+         else
+            copy(m, &src, &dst);
+      }
    }
 }
 

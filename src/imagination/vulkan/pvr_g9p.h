@@ -20,6 +20,7 @@ struct pvr_graphics_pipeline;
 struct pvr_render_job;
 struct pvr_renderpass_hwsetup_render;
 struct pvr_sub_cmd_compute;
+struct pvr_sub_cmd_gfx;
 struct vk_graphics_pipeline_state;
 
 /*
@@ -48,6 +49,9 @@ VkResult PVR_PER_ARCH(g9p_device_init)(struct pvr_device *device);
 /* The CPU address of a device address in a bound buffer or image, or NULL */
 uint8_t *PVR_PER_ARCH(g9p_cpu_addr)(struct pvr_device *device, uint64_t addr);
 void PVR_PER_ARCH(g9p_device_finish)(struct pvr_device *device);
+
+/* Copy a render's unaligned vertex bindings; before its job is submitted */
+void PVR_PER_ARCH(g9p_realign_vertex_bindings)(struct pvr_sub_cmd_gfx *sub_cmd);
 
 VkResult PVR_PER_ARCH(g9p_compute_pipeline_compile)(
    struct pvr_device *device,

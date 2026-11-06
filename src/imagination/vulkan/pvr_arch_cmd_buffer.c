@@ -142,6 +142,7 @@ static void pvr_cmd_buffer_free_sub_cmd(struct pvr_cmd_buffer *cmd_buffer,
                            VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT);
 
          util_dynarray_fini(&sub_cmd->gfx.sec_query_indices);
+         util_dynarray_fini(&sub_cmd->gfx.g9p_realigns);
          util_dynarray_fini(&sub_cmd->gfx.unbound_deferred_clears);
          pvr_csb_finish(&sub_cmd->gfx.control_stream);
          pvr_bo_free(cmd_buffer->device, sub_cmd->gfx.terminate_ctrl_stream);
@@ -2882,6 +2883,7 @@ VkResult pvr_arch_cmd_buffer_start_sub_cmd(struct pvr_cmd_buffer *cmd_buffer,
       }
 
       sub_cmd->gfx.sec_query_indices = UTIL_DYNARRAY_INIT;
+      sub_cmd->gfx.g9p_realigns = UTIL_DYNARRAY_INIT;
       sub_cmd->gfx.unbound_deferred_clears = UTIL_DYNARRAY_INIT;
       break;
 

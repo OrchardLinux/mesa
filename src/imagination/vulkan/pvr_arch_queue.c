@@ -546,6 +546,18 @@ static VkResult pvr_process_graphics_cmd(struct pvr_device *device,
 {
    const pvr_dev_addr_t ds_addr = sub_cmd->job.ds.addr;
 
+   if (util_dynarray_num_elements(&sub_cmd->g9p_realigns, char)) {
+      struct vk_sync *wait = queue->next_job_wait_sync[PVR_JOB_TYPE_GEOM];
+
+      if (wait) {
+         VkResult result = vk_sync_wait(&device->vk, wait, 0, VK_SYNC_WAIT_COMPLETE, UINT64_MAX);
+
+         if (result != VK_SUCCESS)
+            return result;
+      }
+      PVR_PER_ARCH(g9p_realign_vertex_bindings)(sub_cmd);
+   }
+
    u_foreach_bit (view_idx, sub_cmd->view_mask) {
       VkResult result;
 

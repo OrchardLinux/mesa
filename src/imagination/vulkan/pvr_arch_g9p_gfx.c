@@ -990,6 +990,36 @@ binding_needs_copy(const struct pvr_vertex_binding *vb, uint32_t stride)
    return vb->buffer && (((vb->buffer->dev_addr.addr + vb->offset) | stride) & 3);
 }
 
+/*
+ * The copy reads the buffer when the job is submitted: a transfer recorded
+ * before the draw (they run on the CPU at submission) may be what fills it.
+ */
+struct g9p_realign {
+   const uint8_t *src;
+   uint8_t *dst;
+   uint64_t size, count;
+   uint32_t stride, new_stride;
+};
+
+static void
+realign_copy(const struct g9p_realign *r)
+{
+   for (uint64_t i = 0; i < r->count; i++) {
+      const uint64_t at = i * r->stride;
+
+      if (at < r->size)
+         memcpy(r->dst + i * r->new_stride, r->src + at,
+                MIN2(MAX2(r->new_stride, 16), r->size - at));
+   }
+}
+
+void
+PVR_PER_ARCH(g9p_realign_vertex_bindings)(struct pvr_sub_cmd_gfx *sub_cmd)
+{
+   util_dynarray_foreach (&sub_cmd->g9p_realigns, struct g9p_realign, r)
+      realign_copy(r);
+}
+
 static VkResult
 realign_vertex_binding(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_vertex_binding *vb,
                        uint32_t stride, uint64_t *addr)
@@ -1010,17 +1040,28 @@ realign_vertex_binding(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_verte
    dst = calloc(1, copy_size);
    if (!dst)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
-   for (uint64_t i = 0; i < count; i++) {
-      const uint64_t at = i * stride;
-
-      if (at < size)
-         memcpy(dst + i * new_stride, src + at, MIN2(MAX2(new_stride, 16), size - at));
-   }
    result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, dst, copy_size, &bo);
    free(dst);
-   if (result == VK_SUCCESS)
-      *addr = bo->dev_addr.addr;
-   return result;
+   if (result != VK_SUCCESS)
+      return result;
+   *addr = bo->dev_addr.addr;
+
+   const struct g9p_realign r = {
+      .src = src,
+      .dst = pvr_bo_suballoc_get_map_addr(bo),
+      .size = size,
+      .count = count,
+      .stride = stride,
+      .new_stride = new_stride,
+   };
+
+   /* a secondary's render joins its primary's job: no list of its own there */
+   if (cmd_buffer->vk.level == VK_COMMAND_BUFFER_LEVEL_SECONDARY)
+      realign_copy(&r);
+   else
+      util_dynarray_append_typed(&cmd_buffer->state.current_sub_cmd->gfx.g9p_realigns,
+                                 struct g9p_realign, r);
+   return VK_SUCCESS;
 }
 
 /*

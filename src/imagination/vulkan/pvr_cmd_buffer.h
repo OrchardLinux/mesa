@@ -174,6 +174,9 @@ struct pvr_sub_cmd_gfx {
    const struct pvr_query_pool *query_pool;
    struct util_dynarray sec_query_indices;
 
+   /* G9P: vertex bindings to copy when the job is submitted */
+   struct util_dynarray g9p_realigns;
+
    /* Control stream builder object */
    struct pvr_csb control_stream;
 
