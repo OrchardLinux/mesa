@@ -648,7 +648,8 @@ attrib_format_ok(VkFormat format, unsigned offset)
    for (unsigned i = 0; i < desc->nr_channels; i++) {
       /* fixed point, and half floats (16-bit ALU work), not yet */
       if (desc->channel[i].type == UTIL_FORMAT_TYPE_FIXED ||
-          (desc->channel[i].type == UTIL_FORMAT_TYPE_FLOAT && desc->channel[i].size != 32))
+          (desc->channel[i].type == UTIL_FORMAT_TYPE_FLOAT && desc->channel[i].size != 32 &&
+           desc->channel[i].size != 16))
          return false;
       all32 &= desc->channel[i].size == 32;
    }

@@ -4360,7 +4360,27 @@ lower_attrib_format(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       }
       packed = nir_vec(b, comps, words);
    }
-   rgba = nir_format_unpack_rgba(b, packed, attribs[loc].format);
+   if (desc->channel[0].type == UTIL_FORMAT_TYPE_FLOAT && desc->channel[0].size == 16) {
+      /* half floats, in 32-bit code: no 16-bit values here */
+      nir_def *value[4] = { nir_imm_float(b, 0), nir_imm_float(b, 0), nir_imm_float(b, 0), nir_imm_float(b, 1) };
+
+      for (unsigned c = 0; c < desc->nr_channels; c++) {
+         nir_def *word = nir_channel(b, packed, c / 2);
+         nir_def *h = c & 1 ? nir_ushr_imm(b, word, 16) : nir_iand_imm(b, word, 0xffff);
+         nir_def *magnitude = nir_iand_imm(b, h, 0x7fff);
+         nir_def *shifted = nir_ishl_imm(b, magnitude, 13);
+         /* exponent 31: inf and NaN; exponent 0: zero and subnormals */
+         nir_def *bits = nir_bcsel(b, nir_uge_imm(b, magnitude, 0x7c00), nir_ior_imm(b, shifted, 0x7f800000),
+                                   nir_iadd_imm(b, shifted, 0x38000000));
+
+         bits = nir_bcsel(b, nir_ult_imm(b, magnitude, 0x400),
+                          nir_fmul_imm(b, nir_u2f32(b, magnitude), 1.0f / (1 << 24)), bits);
+         value[c] = nir_ior(b, bits, nir_ishl_imm(b, nir_iand_imm(b, h, 0x8000), 16));
+      }
+      rgba = nir_vec(b, value, 4);
+   } else {
+      rgba = nir_format_unpack_rgba(b, packed, attribs[loc].format);
+   }
    nir_def_replace(&intr->def, nir_channels(b, rgba, nir_component_mask(intr->def.num_components)
                                                         << nir_intrinsic_component(intr)));
    return true;
