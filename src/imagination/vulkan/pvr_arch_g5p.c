@@ -27,6 +27,8 @@
 
 #include "g5p_mrt_programs.h"
 #include "g5p_color_source.h"
+#include "g5p_pbe.h"
+#include "util/half_float.h"
 #include "pco_g5p_general.h"
 #include "g5p_usc.h"
 #include "pdsc.h"
@@ -43,6 +45,7 @@
 #include "pvr_g5p_formats.h"
 #include "pvr_g5p_msaa.h"
 #include "pvr_g5p_tex_encode.h"
+#include "pvr_g5p_tex.h"
 #include "pvr_g5p_mrt.h"
 #include "pvr_g5p_perf.h"
 #include "pvr_g5p_vdm.h"
@@ -526,10 +529,7 @@ static void
 g5p_pbe_encode(uint64_t q[3], uint32_t key, bool srgb, uint64_t va, uint32_t width, uint32_t height,
                uint32_t row_stride)
 {
-   const uint32_t s = row_stride / 16 - 1;
-   q[0] = (uint64_t)(height - 1) << 41 | (uint64_t)(width - 1) << 27 | (key & ~8u);
-   q[1] = va >> 1 | (uint64_t)(s & 0x3fffc) << 45 | (uint64_t)srgb << G5P_PBE_SRGB_BIT | 1ull << 63;
-   q[2] = (uint64_t)(s & 3) << 62;
+   g5p_pbe_2d(q,key,srgb,va,width,height,row_stride,false);
 }
 
 /* A refusal, by name, on stderr too (vk_errorf() is silent in release builds) */
@@ -743,11 +743,18 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
        * one-sample view this surface names (pvr_g5p_msaa.c) */
       const bool ms_store = g->samples == 4 && !hw_render->eot_surfaces[t].need_resolve;
 
-      if (image->memlayout != PVR_MEMLAYOUT_LINEAR && !ms_store)
-         return G5P_REFUSE(cmd_buffer, "a non-linear colour target (twiddled PBE is step 7)");
+      const bool twiddled=image->memlayout!=PVR_MEMLAYOUT_LINEAR && !ms_store;
+      if(twiddled) {
+         const char *probe=getenv("PVR_G5P_TWIDDLED_PBE");
+         if(!probe || strcmp(probe,"probe"))
+            return G5P_REFUSE(cmd_buffer,"a non-linear colour target (twiddled PBE is step 7)");
+         if(image->memlayout!=PVR_MEMLAYOUT_TWIDDLED || image->vk.image_type!=VK_IMAGE_TYPE_2D ||
+            iview->vk.layer_count!=1 || iview->vk.view_type!=VK_IMAGE_VIEW_TYPE_2D)
+            return G5P_REFUSE(cmd_buffer,"twiddled PBE needs a single 2D layer (3D brick slices are not qualified)");
+      }
       if (!g5p_pbe_key(iview->vk.format, &key, &srgb))
          return G5P_REFUSE(cmd_buffer, "colour target format %s", vk_Format_to_str(iview->vk.format));
-      if ((level->pitch % 16 && !ms_store) || addr % 64)
+      if ((level->pitch % 16 && !ms_store && !twiddled) || addr % 64)
          return G5P_REFUSE(cmd_buffer, "a colour target at %#" PRIx64 " with pitch %u (64-byte base, 16-byte rows)",
                            addr, level->pitch);
       /* SINT32 and UINT32 share the same physical channel layout. Store
@@ -773,7 +780,7 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
          pvr_g5p_msaa_pbe_store(pbe[t], key, addr, iview->vk.extent.width, iview->vk.extent.height,
                                 vk_format_is_srgb(iview->vk.format));
       } else {
-         g5p_pbe_encode(pbe[t], store_key, srgb, addr, iview->vk.extent.width, iview->vk.extent.height, level->pitch);
+         g5p_pbe_2d(pbe[t],store_key,srgb,addr,iview->vk.extent.width,iview->vk.extent.height,level->pitch,twiddled);
          if (g->samples == 4) {
             pvr_g5p_msaa_pbe_resolve(pbe[t]);
             g->msaa_resolve = true;
@@ -783,9 +790,16 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
          fprintf(stderr, "DGL-PBE target=%u/%u words=%u total=%u source_half=%u source=uint-raw key=%08x store_key=%08x "
                  "state=%016" PRIx64 ",%016" PRIx64 ",%016" PRIx64 "\n",
                  t, n, raw_words, raw_total, 2 * raw_words * t, key, store_key, pbe[t][0], pbe[t][1], pbe[t][2]);
-      if (!t)
-         pvr_g5p_tex_linear(load_state, key, srgb, addr, iview->vk.extent.width, iview->vk.extent.height,
-                            level->pitch);
+      if (!t) {
+         if(twiddled) {
+            struct pvr_image_descriptor desc;
+            const char *why=pvr_arch_g5p_pack_image_view(iview,&desc);
+            if(why)return G5P_REFUSE(cmd_buffer,"twiddled LOAD view: %s",why);
+            load_state[0]=desc.words[0];load_state[1]=desc.words[1];
+            load_state[2]=(uint64_t)desc.meta[0]|(uint64_t)desc.meta[1]<<32;
+         } else
+            pvr_g5p_tex_linear(load_state, key, srgb, addr, iview->vk.extent.width, iview->vk.extent.height,level->pitch);
+      }
       if (!t) {
          g->width = iview->vk.extent.width;
          g->height = iview->vk.extent.height;
