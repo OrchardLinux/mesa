@@ -3312,6 +3312,18 @@ lower_front(nir_shader *nir)
  * Inputs and outputs: outputs through temporaries (their stores at the
  * end), lowered to scalar load/store intrinsics with the location as base
  */
+/* gl_FragDepth reaches the depth test as it is: GL clamps it to [0, 1] */
+static bool
+clamp_frag_depth(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_store_output ||
+       nir_intrinsic_io_semantics(intr).location != FRAG_RESULT_DEPTH)
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_src_rewrite(&intr->src[0], nir_fsat(b, intr->src[0].ssa));
+   return true;
+}
+
 static void
 lower_io(nir_shader *nir)
 {
@@ -3326,6 +3338,8 @@ lower_io(nir_shader *nir)
       var->data.driver_location = var->data.location;
    NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in | nir_var_shader_out,
             type_size_vec4, 0);
+   if (nir->info.stage == MESA_SHADER_FRAGMENT)
+      NIR_PASS(_, nir, nir_shader_intrinsics_pass, clamp_frag_depth, nir_metadata_control_flow, NULL);
 }
 
 /* The last attempt at a vertex shader: in program order, every load at its use */

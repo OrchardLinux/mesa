@@ -2063,6 +2063,10 @@ emit_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state
    const uint32_t height = info->render_area.offset.y + info->render_area.extent.height;
    const struct pvr_pds_upload *dma = dp->dma, *tex = dp->tex;
    struct pvr_csb *csb = &cs->current_sub_cmd->gfx.control_stream;
+
+   /* What the render's depth/stencil store depends on; a clear draw writes both */
+   cs->current_sub_cmd->gfx.modifies_depth |= dp->isp_set || dp->depth_write;
+   cs->current_sub_cmd->gfx.modifies_stencil |= dp->isp_set || cmd_buffer->vk.dynamic_graphics_state.ds.stencil.test_enable;
    struct pvr_suballoc_bo *ppp_bo;
    uint32_t ppp[64], at = 0, blocks[12][2], nb = 0, pass;
    VkResult result;
@@ -3153,15 +3157,13 @@ PVR_PER_ARCH(g9p_geom_stream)(const struct pvr_device *device,
  *  - a stencil test sets ISPCTL bpres and two_sided and per-face ISPA/ISPB
  *    words (Rogue's fields, VkStencilOp's numbering), as Apple's A9 driver
  *    emits them (the A9 driver).
- * The A10 keeps its own choices where it has them: ZLS loads and stores
- * linear (its fragment job hangs with storetwiddled), ZLS_PIXELS the
- * physical extent. Its notes say a stencil base breaks the depth load "even
+ * As iOS: ZLS loads and stores twiddled with the extents in ZLSCTL 0, and
+ * ISP_ZLS_PIXELS in 0xfd0 sizes the surface. Earlier notes say a stencil base breaks the depth load "even
  * with stencil off in ZLSCTL": here a stencil base is set only for a render
  * whose attachment has a stencil aspect, with the stencil enables on.
  * Never 24-bit depth: X8_D24 crashed the A10's GFX firmware (glmark2), and
  * Zink renders GL's DEPTH24_STENCIL8 with D32F_S8.
- * Sampled as the matching colour format when the CPU wrote them; what the ZLS
- * stores is linear, and sampling that is not handled.
+ * Sampled as the matching colour format.
  * Refused by name: sides under 32 pixels (the ZLS writes whole 32-pixel
  * tiles past such an image), mip levels and layers other than the first.
  */
@@ -3206,8 +3208,7 @@ g9p_ds_zls(const struct pvr_render_job *job, uint64_t *zlsctl, uint64_t *stencil
       z.sstoreen = job->has_stencil_attachment && job->ds.store.s;
       z.forcezload = z.zloaden || z.sloaden;
       z.forcezstore = z.zstoreen || z.sstoreen;
-      z.zlsextent_x_z = DIV_ROUND_UP(job->ds.physical_extent.width, 32) - 1;
-      z.zlsextent_y_z = DIV_ROUND_UP(job->ds.physical_extent.height, 32) - 1;
+      z.loadtwiddled = z.storetwiddled = true;
    }
    memcpy(zlsctl, ctl, sizeof(ctl));
    if (job->has_stencil_attachment) {
@@ -3230,29 +3231,23 @@ g9p_ds_zls(const struct pvr_render_job *job, uint64_t *zlsctl, uint64_t *stencil
 }
 
 /*
- * ZLSCTL of a render with a D32_SFLOAT depth attachment: Rogue's fields
- * (enables, F32Z format) and the extent in tiles; 0 without one. The
- * hardware keeps the stored depth in its own (compressed) layout, which
- * its loads read back: a uniform 64x64 clear stores 96 of 4096 words.
+ * ISP_ZLS_PIXELS (0xfd0): the surface the ZLS stores, width - 1 | (height - 1) << 15,
+ * aligned to 32 with a stencil plane or a side under 32 (iOS's FramebufferGen2; `depth`
+ * capture 0x001f803f for 64x64). 0xfd8 is not this word: it is the output partition count.
  */
 static uint64_t
-g9p_zlsctl(const struct pvr_render_job *job)
+g9p_zls_pixels(const struct pvr_render_job *job)
 {
-   uint64_t v = 0;
-
-   if (!job->has_depth_attachment)
+   if (!job->has_depth_attachment && !job->has_stencil_attachment)
       return 0;
-   if (job->ds.load.d)
-      v |= BITFIELD64_BIT(15) | BITFIELD64_BIT(1); /* zloaden, forcezload */
-   if (job->ds.store.d)
-      v |= BITFIELD64_BIT(19) | BITFIELD64_BIT(2); /* zstoreen, forcezstore */
-   /*
-    * Not twiddled: Rogue's storetwiddled (bit 17, set by iPadOS) hangs the
-    * A10's fragment job here; loads and stores agree on the linear layout
-    */
-   v |= (uint64_t)(DIV_ROUND_UP(job->ds.physical_extent.width, 32) - 1) << 3;
-   v |= (uint64_t)(DIV_ROUND_UP(job->ds.physical_extent.height, 32) - 1) << 27;
-   return v;
+   const bool stencil = job->ds.iview && vk_format_has_stencil(job->ds.iview->vk.format);
+   uint32_t w = job->ds.physical_extent.width, h = job->ds.physical_extent.height;
+
+   if (stencil || w < 32 || h < 32) {
+      w = ALIGN_POT(w, 32);
+      h = ALIGN_POT(h, 32);
+   }
+   return (w - 1) | (uint64_t)(h - 1) << 15;
 }
 
 /* The render loads or stores a depth/stencil plane */
@@ -3281,7 +3276,7 @@ PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
    put64(&s, job->scissor_table_addr.addr);
    put64(&s, job->depth_bias_table_addr.addr);
    put64(&s, job->g9p.oclqry_base);
-   uint64_t zlsctl = g9p_zlsctl(job), stencil_base = 0;
+   uint64_t zlsctl = 0, stencil_base = 0;
    uint32_t bgobjdepth = job->has_depth_attachment ? fui(job->ds_clear_value.depth) : 0x3f800000;
    uint32_t bgobjvals = 0x300;
 
@@ -3305,12 +3300,8 @@ PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
    put32(&s, 0);
    put32(&s, bgobjdepth); /* ISP_BGOBJDEPTH: the depth clear */
    put32(&s, bgobjvals);  /* ISP_BGOBJVALS */
-   /*
-    * ISP_AA: with mode 0 the ZLS writes almost nothing (D16: 192 bytes of 8192). Mode 1
-    * stores the plane; with both its samples at the pixel centre (the sample positions
-    * below) it rasterizes as mode 0 does (dEQP fbo.render, clipping, fragment_ops.random).
-    */
-   put32(&s, g9p_zls_used(job) ? 1 : 0);
+   /* ISP_AA: no multisampling */
+   put32(&s, 0);
    /*
     * ISP_CTL: bit 17 (Rogue's process_empty_tiles) runs the background object
     * on tiles without geometry too; without it a render's clear reaches
@@ -3333,7 +3324,7 @@ PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
    *(uint32_t *)buf = s.len;
 
    put32(&s, G9P_EXTHDR_APPLE);
-   put64(&s, g9p_zls_used(job) ? 0x8888 : 0x88); /* 0xfa8 sample positions */
+   put64(&s, 0x88); /* 0xfa8 sample positions */
    for (unsigned i = 0; i < 4; i++)
       put64(&s, job->g9p.bgnd[i]);
    for (unsigned i = 0; i < 6; i++)
@@ -3348,7 +3339,7 @@ PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
 
    for (unsigned i = 0; i < 6; i++)
       put64(&s, output_code | (output_count - 1) << 7 | 0x43); /* cluster 1 */
-   put64(&s, 0);        /* 0xfd0 */
+   put64(&s, g9p_zls_pixels(job)); /* 0xfd0 */
    put32(&s, job->g9p.eot_code);
    /*
     * ISP_RGN: the dwords of one macrotile's region array: tiles per
@@ -3366,14 +3357,7 @@ PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
    }
    put32(&s, 0x1f); /* 0x6d0 */
    put32(&s, 0x408);
-   /*
-    * 0xfd8: ISP_ZLS_PIXELS, the depth buffer's size (width - 1, height - 1
-    * << 15, `depth` capture 0x001f803f for 64x64; the store writes nothing
-    * without it); iOS 10's 4 without depth
-    */
-   put32(&s, job->has_depth_attachment || job->has_stencil_attachment
-                ? (job->ds.physical_extent.width - 1) | (job->ds.physical_extent.height - 1) << 15
-                : output_count);
+   put32(&s, output_count); /* 0xfd8 */
    put32(&s, output_code >> 4 | 0xf8);
    /* line rasterization (iOS 10): tan 15° / size, tan 60° / size, 16 x width */
    put32(&s, fui(t15 / w));
