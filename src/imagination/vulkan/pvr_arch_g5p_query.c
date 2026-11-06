@@ -578,8 +578,10 @@ PVR_PER_ARCH(g5p_add_query_program)(struct pvr_cmd_buffer *cmd_buffer,
    if (result != VK_SUCCESS)
       return result;
 
-   pvr_arch_compute_generate_fence(cmd_buffer,
-                                   &cmd_buffer->state.current_sub_cmd->compute,
-                                   false);
+   /* The generic query path emits a Rogue private-compute fence here. On G5P
+    * that produces a foreign K0=0x7 record immediately before the native pass
+    * tail. Native application compute does not emit that record: the common
+    * G5P kick/fence/fenced-kick/fence tail waits for the kernel and publishes
+    * completion. Keep query jobs byte-shaped like the proven native path. */
    return pvr_arch_cmd_buffer_end_sub_cmd(cmd_buffer);
 }
