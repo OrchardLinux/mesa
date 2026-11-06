@@ -1765,16 +1765,26 @@ emit_fb_fetch(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
 {
    nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
    unsigned word = nir_intrinsic_component(intr);
+   const unsigned target = sem.location == FRAG_RESULT_COLOR ? 0 : sem.location - FRAG_RESULT_DATA0;
+   unsigned before = 0, total = 0;
    int pair = -1;
 
-   if (ctx->stage != MESA_SHADER_FRAGMENT || word > 1 ||
-       (sem.location != FRAG_RESULT_DATA0 && sem.location != FRAG_RESULT_COLOR)) {
-      fprintf(stderr, "g9p: only the first colour attachment can be read so far\n");
+   if (ctx->stage != MESA_SHADER_FRAGMENT || target >= G9P_MAX_TARGETS || word > 1) {
+      fprintf(stderr, "g9p: only colour attachments can be read\n");
       return false;
    }
+   /* The tile read starts at the pixel's first word: up to this target's */
+   for (unsigned t = 0; t < G9P_MAX_TARGETS; t++) {
+      const unsigned w = ctx->out->targets[t].present ? g9p_output_words(ctx->out->targets[t].output) : 0;
+
+      if (t < target)
+         before += w;
+      if (t <= target)
+         total += MIN2(w, t == target ? 2 : w);
+   }
    release(ctx, &intr->instr);
-   for (unsigned r = 0; r + 1 < G9P_NUM_REGS; r += 2) {
-      if (!(ctx->busy & BITFIELD64_RANGE(r, 2))) {
+   for (unsigned r = 0; r + total <= G9P_NUM_REGS; r += 2) {
+      if (!(ctx->busy & BITFIELD64_RANGE(r, total))) {
          pair = r;
          break;
       }
@@ -1783,9 +1793,10 @@ emit_fb_fetch(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
       dump_busy(ctx);
       return false;
    }
-   ctx->max_reg = MAX2(ctx->max_reg, pair + 1);
-   g9p_tile_read(ctx->c, pair, MIN2(g9p_output_words(ctx->out->output), 2));
+   ctx->max_reg = MAX2(ctx->max_reg, pair + total - 1);
+   g9p_tile_read(ctx->c, pair, total);
    g9p_wait(ctx->c);
+   word += before;
    if (ctx->last_use[key(&intr->def, 0)]) {
       ctx->reg[key(&intr->def, 0)] = pair + word;
       ctx->busy |= BITFIELD64_BIT(pair + word);
@@ -3289,7 +3300,10 @@ lower_fb_fetch_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       nir_def *low = nir_uge_imm(b, nir_iand_imm(b, nir_iadd_imm(b, h, -1), 0xffff), 0x7fff);
 
       /* a float target's tile value is its value: with its sign, not clamped */
-      if (out->output_float) {
+      const gl_frag_result location = nir_intrinsic_io_semantics(intr).location;
+      const unsigned target = location == FRAG_RESULT_COLOR ? 0 : location - FRAG_RESULT_DATA0;
+
+      if (out->targets[target].is_float) {
          nir_def *sign = nir_ishl_imm(b, nir_iand_imm(b, h, 0x8000), 16);
          nir_def *zero = nir_ieq_imm(b, nir_iand_imm(b, h, 0x7fff), 0);
 
@@ -3905,14 +3919,21 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
    } else if (!generate(&ctx, impl, st))
       return false;
 
-   /* buffers over the uniform operands' 512 dwords: only the dwords it reads */
+   /*
+    * Buffers over the uniform operands' 512 dwords: only the dwords it reads. A run spans
+    * small gaps, fewer DMAs for a few dwords nobody reads, unless that doesn't fit.
+    */
    if (stage == MESA_SHADER_FRAGMENT) {
       unsigned total = g9p_fs_buf_base(out->num_textures);
 
       for (unsigned k = 0; k < out->num_buffers; k++)
          total += out->buffers[k].dwords;
-      if (total > 512) {
-         unsigned next = g9p_fs_buf_base(out->num_textures);
+      for (unsigned gap = 3, next = 513; total > 512 && next > 512; gap = gap ? 0 : ~0u) {
+         if (gap == ~0u) {
+            fprintf(stderr, "g9p: fragment shader reads more than 512 dwords of buffers\n");
+            return false;
+         }
+         next = g9p_fs_buf_base(out->num_textures);
 
          ctx.fs_map = rzalloc_array(mem_ctx, uint16_t, G9P_MAX_BUFFERS * G9P_FS_BUF_DWORDS);
          out->num_fs_runs = 0;
@@ -3920,13 +3941,12 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
             unsigned d;
 
             BITSET_FOREACH_SET (d, ctx.fs_used[k], G9P_FS_BUF_DWORDS) {
-               /* a run spans small gaps: fewer DMAs for a few dwords nobody reads */
                const unsigned end = out->num_fs_runs && out->fs_runs[out->num_fs_runs - 1].slot == k
                                        ? out->fs_runs[out->num_fs_runs - 1].first +
                                             out->fs_runs[out->num_fs_runs - 1].count
                                        : ~0u;
 
-               if (end != ~0u && d - end <= 3) {
+               if (end != ~0u && d - end <= gap) {
                   out->fs_runs[out->num_fs_runs - 1].count += d - end + 1;
                   next += d - end;
                } else {
@@ -3942,11 +3962,7 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
                ctx.fs_map[k * G9P_FS_BUF_DWORDS + d] = next++;
             }
          }
-         if (next > 512) {
-            fprintf(stderr, "g9p: fragment shader reads %u dwords of buffers\n", next);
-            return false;
-         }
-         if (!generate(&ctx, impl, st))
+         if (next <= 512 && !generate(&ctx, impl, st))
             return false;
       }
    }

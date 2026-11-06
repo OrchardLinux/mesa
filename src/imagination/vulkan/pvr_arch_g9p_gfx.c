@@ -612,7 +612,7 @@ stage_nir(struct pvr_device *device, struct pvr_graphics_pipeline *pipeline,
 }
 
 /*
- * Blending of the first colour attachment, done in the fragment shader as
+ * Blending of the colour attachments, done in the fragment shader as
  * Apple's compiler does (it reads the tile's colour, `blend` capture and
  * offline probes); false when the attachment is written as is
  */
@@ -620,44 +620,49 @@ static bool
 blend_options(const struct vk_graphics_pipeline_state *vk_state, nir_lower_blend_options *opts)
 {
    const struct vk_color_blend_state *cb = vk_state->cb;
-   const struct vk_color_blend_attachment_state *rt;
+   bool any = false;
 
    if (!cb || !cb->attachment_count || !vk_state->rp ||
        !vk_state->rp->color_attachment_count)
-      return false;
-   rt = &cb->attachments[0];
-   if (!rt->blend_enable && !cb->logic_op_enable && (rt->write_mask & 0xf) == 0xf)
       return false;
 
    memset(opts, 0, sizeof(*opts));
    opts->scalar_blend_const = true;
    opts->logicop_enable = cb->logic_op_enable;
    opts->logicop_func = vk_logic_op_to_pipe(cb->logic_op);
-   opts->rt[0].format = vk_format_to_pipe_format(vk_state->rp->color_attachment_formats[0]);
-   opts->rt[0].colormask = rt->write_mask;
-   if (!(rt->write_mask & 0xf)) {
-      /*
-       * No colour written: the attachment's own value through the shader. With
-       * a colour mask of 0 nir_lower_blend leaves no read of the tile, and the
-       * draw would run opaque, over what is there (dEQP fragment_ops).
-       */
-      opts->rt[0].colormask = 0xf;
-      opts->rt[0].rgb.func = opts->rt[0].alpha.func = PIPE_BLEND_ADD;
-      opts->rt[0].rgb.src_factor = opts->rt[0].alpha.src_factor = PIPE_BLENDFACTOR_ZERO;
-      opts->rt[0].rgb.dst_factor = opts->rt[0].alpha.dst_factor = PIPE_BLENDFACTOR_ONE;
-   } else if (rt->blend_enable && !cb->logic_op_enable) {
-      opts->rt[0].rgb.func = vk_blend_op_to_pipe(rt->color_blend_op);
-      opts->rt[0].rgb.src_factor = vk_blend_factor_to_pipe(rt->src_color_blend_factor);
-      opts->rt[0].rgb.dst_factor = vk_blend_factor_to_pipe(rt->dst_color_blend_factor);
-      opts->rt[0].alpha.func = vk_blend_op_to_pipe(rt->alpha_blend_op);
-      opts->rt[0].alpha.src_factor = vk_blend_factor_to_pipe(rt->src_alpha_blend_factor);
-      opts->rt[0].alpha.dst_factor = vk_blend_factor_to_pipe(rt->dst_alpha_blend_factor);
-   } else {
-      opts->rt[0].rgb.func = opts->rt[0].alpha.func = PIPE_BLEND_ADD;
-      opts->rt[0].rgb.src_factor = opts->rt[0].alpha.src_factor = PIPE_BLENDFACTOR_ONE;
-      opts->rt[0].rgb.dst_factor = opts->rt[0].alpha.dst_factor = PIPE_BLENDFACTOR_ZERO;
+   for (unsigned t = 0; t < MIN3(cb->attachment_count, vk_state->rp->color_attachment_count, G9P_MAX_TARGETS); t++) {
+      const struct vk_color_blend_attachment_state *rt = &cb->attachments[t];
+      const VkFormat format = vk_state->rp->color_attachment_formats[t];
+
+      if (format == VK_FORMAT_UNDEFINED)
+         continue;
+      any |= rt->blend_enable || cb->logic_op_enable || (rt->write_mask & 0xf) != 0xf;
+      opts->rt[t].format = vk_format_to_pipe_format(format);
+      opts->rt[t].colormask = rt->write_mask;
+      if (!(rt->write_mask & 0xf)) {
+         /*
+          * No colour written: the attachment's own value through the shader. With
+          * a colour mask of 0 nir_lower_blend leaves no read of the tile, and the
+          * draw would run opaque, over what is there (dEQP fragment_ops).
+          */
+         opts->rt[t].colormask = 0xf;
+         opts->rt[t].rgb.func = opts->rt[t].alpha.func = PIPE_BLEND_ADD;
+         opts->rt[t].rgb.src_factor = opts->rt[t].alpha.src_factor = PIPE_BLENDFACTOR_ZERO;
+         opts->rt[t].rgb.dst_factor = opts->rt[t].alpha.dst_factor = PIPE_BLENDFACTOR_ONE;
+      } else if (rt->blend_enable && !cb->logic_op_enable) {
+         opts->rt[t].rgb.func = vk_blend_op_to_pipe(rt->color_blend_op);
+         opts->rt[t].rgb.src_factor = vk_blend_factor_to_pipe(rt->src_color_blend_factor);
+         opts->rt[t].rgb.dst_factor = vk_blend_factor_to_pipe(rt->dst_color_blend_factor);
+         opts->rt[t].alpha.func = vk_blend_op_to_pipe(rt->alpha_blend_op);
+         opts->rt[t].alpha.src_factor = vk_blend_factor_to_pipe(rt->src_alpha_blend_factor);
+         opts->rt[t].alpha.dst_factor = vk_blend_factor_to_pipe(rt->dst_alpha_blend_factor);
+      } else {
+         opts->rt[t].rgb.func = opts->rt[t].alpha.func = PIPE_BLEND_ADD;
+         opts->rt[t].rgb.src_factor = opts->rt[t].alpha.src_factor = PIPE_BLENDFACTOR_ONE;
+         opts->rt[t].rgb.dst_factor = opts->rt[t].alpha.dst_factor = PIPE_BLENDFACTOR_ZERO;
+      }
    }
-   return true;
+   return any;
 }
 
 static VkResult
