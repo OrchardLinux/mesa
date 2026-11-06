@@ -1633,7 +1633,9 @@ static void liveness(struct gctx *c)
             nir_tex_src_type ty = t->src[i].src_type;
             unsigned n = ty == nir_tex_src_backend1 && t->sampler_dim == GLSL_SAMPLER_DIM_BUF ? 2 :
                          ty == nir_tex_src_coord ? t->coord_components :
-                         ty == nir_tex_src_ddx || ty == nir_tex_src_ddy ? 2 :
+                         ty == nir_tex_src_ddx || ty == nir_tex_src_ddy ?
+                            (t->sampler_dim == GLSL_SAMPLER_DIM_3D ||
+                             t->sampler_dim == GLSL_SAMPLER_DIM_CUBE ? 3 : 2) :
                          ty == nir_tex_src_bias || ty == nir_tex_src_lod || ty == nir_tex_src_comparator ? 1 : 0;
             for (unsigned k = 0; k < n; k++)
                mark(c, resolve_value(c, t->src[i].src.ssa, k), idx);
