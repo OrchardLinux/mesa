@@ -199,7 +199,16 @@ static void pvr_image_plane_setup_mip_levels(struct pvr_image *image, uint8_t i)
 
    const uint32_t extent_alignment =
       image->vk.image_type == VK_IMAGE_TYPE_3D ? 4 : 1;
-   const unsigned int cpp = vk_format_get_blocksize(plane_format);
+   /*
+    * G9P: D32F_S8 has its depth levels and layers as D32F's, for the sampler
+    * and the ZLS; the stencil plane follows (doubled in the image's size)
+    */
+   const struct pvr_device *cpp_device = container_of(image->vk.base.device, struct pvr_device, vk);
+   const unsigned int cpp =
+      PVR_HAS_FEATURE(&cpp_device->pdevice->dev_info, apple_g9p) &&
+            plane_format == VK_FORMAT_D32_SFLOAT_S8_UINT
+         ? 4
+         : vk_format_get_blocksize(plane_format);
    VkExtent3D extent =
       vk_image_extent_to_elements(&image->vk, plane->physical_extent);
 
@@ -218,6 +227,8 @@ static void pvr_image_plane_setup_mip_levels(struct pvr_image *image, uint8_t i)
       mip_level->offset = plane->layer_size;
 
       plane->layer_size += mip_level->size;
+      /* the format's pitch, in texels the same */
+      mip_level->pitch = mip_level->pitch / cpp * vk_format_get_blocksize(plane_format);
 
       extent.height = u_minify(extent.height, 1);
       extent.width = u_minify(extent.width, 1);
@@ -279,6 +290,12 @@ static void pvr_image_setup_mip_levels(struct pvr_image *image)
    }
 
    image->total_size = offset;
+   /* G9P: the stencil plane of D32F_S8 (pvr_image_plane_setup_mip_levels()) */
+   if (PVR_HAS_FEATURE(&container_of(image->vk.base.device, struct pvr_device, vk)
+                           ->pdevice->dev_info,
+                       apple_g9p) &&
+       image->vk.format == VK_FORMAT_D32_SFLOAT_S8_UINT)
+      image->total_size *= 2;
 }
 
 static unsigned get_pbe_stride_align(const struct pvr_device_info *dev_info);

@@ -151,24 +151,38 @@ fill(const struct pvr_transfer_cmd *cmd, const struct surface *dst)
 }
 
 /*
- * One aspect of D32_SFLOAT_S8_UINT (D32 at byte 0, S8 at byte 4), to or from a
- * surface of that aspect alone or of the same format: the format pack
- * functions have no depth/stencil conversions
+ * D32_SFLOAT_S8_UINT is two planes in one allocation, as the ZLS has it
+ * (g9p_ds_stencil_offset()): D32 first, S8 after it. A surface's view of one
+ * plane, unchanged for a surface that holds only that aspect.
  */
+static struct surface
+ds_plane(const struct surface *s, bool depth)
+{
+   struct surface p = *s;
+
+   if (s->format == PIPE_FORMAT_Z32_FLOAT_S8X24_UINT) {
+      p.bpp = depth ? 4 : 1;
+      if (!depth)
+         p.base += (size_t)(s->twiddled ? util_next_power_of_two(s->width) : s->stride) *
+                   (s->twiddled ? util_next_power_of_two(s->height) : s->height) * 4;
+   }
+   return p;
+}
+
+/* One aspect: the format pack functions have no depth/stencil conversions */
 static void
 copy_ds_aspect(const struct pvr_rect_mapping *m, const struct surface *src,
                const struct surface *dst, bool depth)
 {
-   const unsigned size = depth ? 4 : 1, at = depth ? 0 : 4;
-   const unsigned src_at = src->bpp == 8 ? at : 0, dst_at = dst->bpp == 8 ? at : 0;
+   const struct surface sp = ds_plane(src, depth), dp = ds_plane(dst, depth);
 
    for (unsigned y = 0; y < m->dst_rect.extent.height; y++) {
-      uint8_t *d = dst->base + row_offset(dst, m->dst_rect.offset.y + y);
-      const uint8_t *s = src->base + row_offset(src, m->src_rect.offset.y + y);
+      uint8_t *d = dp.base + row_offset(&dp, m->dst_rect.offset.y + y);
+      const uint8_t *s = sp.base + row_offset(&sp, m->src_rect.offset.y + y);
 
       for (unsigned x = 0; x < m->dst_rect.extent.width; x++)
-         memcpy(d + column_offset(dst, m->dst_rect.offset.x + x) + dst_at,
-                s + column_offset(src, m->src_rect.offset.x + x) + src_at, size);
+         memcpy(d + column_offset(&dp, m->dst_rect.offset.x + x),
+                s + column_offset(&sp, m->src_rect.offset.x + x), dp.bpp);
    }
 }
 
@@ -417,22 +431,24 @@ host_copy(struct pvr_device *device, const struct pvr_image *image, bool to_imag
             memcpy(host, img.base, size);
          continue;
       }
-      /*
-       * Depth and stencil stored together: the memory holds one aspect, packed
-       * (D32 in 4 bytes, S8 in 1; the texel holds them at bytes 0 and 4)
-       */
+      /* The memory holds one aspect, packed */
       if (image->vk.format == VK_FORMAT_D32_SFLOAT_S8_UINT) {
          const bool depth = sub->aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT;
-         const unsigned size = depth ? 4 : 1, at = depth ? 0 : 4;
+         const unsigned size = depth ? 4 : 1;
+
+         if (!depth && (image->vk.mip_levels > 1 || image->vk.array_layers > 1))
+            continue; /* stencil planes only of single level images */
+
          const size_t row = (size_t)(row_length ? row_length : extent->width) * size;
          const size_t slice = row * (image_height ? image_height : extent->height);
+         const struct surface plane = ds_plane(&img, depth);
          uint8_t *host = (uint8_t *)ptr + l * slice;
 
          for (uint32_t y = 0; y < extent->height; y++) {
-            const size_t ro = row_offset(&img, offset->y + y);
+            const size_t ro = row_offset(&plane, offset->y + y);
 
             for (uint32_t x = 0; x < extent->width; x++) {
-               uint8_t *texel = img.base + ro + column_offset(&img, offset->x + x) + at;
+               uint8_t *texel = plane.base + ro + column_offset(&plane, offset->x + x);
                uint8_t *m = host + y * row + (size_t)x * size;
 
                memcpy(to_image ? texel : m, to_image ? m : texel, size);

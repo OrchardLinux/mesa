@@ -71,9 +71,8 @@ g9p_image_format(VkFormat format)
    case VK_FORMAT_D16_UNORM:
       return G9P_R001(0x09);
    case VK_FORMAT_D32_SFLOAT:
+   case VK_FORMAT_D32_SFLOAT_S8_UINT: /* depth first, stencil after it */
       return G9P_R001(0x221);
-   case VK_FORMAT_D32_SFLOAT_S8_UINT:
-      return G9P_R001(0x231);
    case VK_FORMAT_R32_SFLOAT:
       return G9P_R001(0x221);
    case VK_FORMAT_R32G32_SFLOAT:

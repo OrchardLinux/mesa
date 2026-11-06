@@ -1043,6 +1043,13 @@ pvr_copy_buffer_to_image_region(struct pvr_cmd_buffer *const cmd_buffer,
     */
    assert(image->vk.samples == VK_SAMPLE_COUNT_1_BIT);
 
+   /* G9P: stencil planes only of single level images (g9p_ds_stencil_offset()) */
+   if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g9p) &&
+       vk_format_has_stencil(image->vk.format) && vk_format_has_depth(image->vk.format) &&
+       (aspect_mask & VK_IMAGE_ASPECT_STENCIL_BIT) &&
+       (image->vk.mip_levels > 1 || image->vk.array_layers > 1))
+      return VK_SUCCESS;
+
    if (vk_format_has_depth(image->vk.format) &&
        vk_format_has_stencil(image->vk.format)) {
       flags |= PVR_TRANSFER_CMD_FLAGS_DSMERGE;

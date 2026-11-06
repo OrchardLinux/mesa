@@ -3118,8 +3118,8 @@ PVR_PER_ARCH(g9p_geom_stream)(const struct pvr_device *device,
  * whose attachment has a stencil aspect, with the stencil enables on.
  * Never 24-bit depth: X8_D24 crashed the A10's GFX firmware (glmark2), and
  * Zink renders GL's DEPTH24_STENCIL8 with D32F_S8.
- * Not sampled: the A10 stores depth in a layout of its own (its notes:
- * compressed), so depth textures stay unadvertised.
+ * Sampled as the matching colour format when the CPU wrote them; what the ZLS
+ * stores is linear, and sampling that is not handled.
  * Refused by name: sides under 32 pixels (the ZLS writes whole 32-pixel
  * tiles past such an image), mip levels and layers other than the first.
  */
