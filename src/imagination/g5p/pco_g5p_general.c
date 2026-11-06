@@ -777,7 +777,7 @@ static int packed_offset(const nir_tex_instr *t)
 }
 
 /* Why Apple's probes do not cover this texture instruction, or NULL. */
-static const char *tex_shape_refusal(const nir_tex_instr *t, bool vertex_gradient, bool vertex_xyz_offset)
+static const char *tex_shape_refusal(const nir_tex_instr *t, bool vertex_gradient, bool vertex_xyz_offset, bool fragment)
 {
    enum glsl_sampler_dim d = t->sampler_dim;
    if (d == GLSL_SAMPLER_DIM_BUF)
@@ -803,7 +803,7 @@ static const char *tex_shape_refusal(const nir_tex_instr *t, bool vertex_gradien
    }
    if (t->def.num_components != (t->is_shadow ? 1u : 4u))
       return "result width (rgba, or one compare result)";
-   if (t->op == nir_texop_txd && d != GLSL_SAMPLER_DIM_2D)
+   if (t->op == nir_texop_txd && d != GLSL_SAMPLER_DIM_2D && !(fragment && d == GLSL_SAMPLER_DIM_3D))
       return "gradients on 3D or cube (Apple's gradient layout is measured on 2D/arrays)";
    if (t->op == nir_texop_txf && (d == GLSL_SAMPLER_DIM_CUBE || t->is_shadow))
       return "texelFetch on a cube or shadow texture";
@@ -843,7 +843,7 @@ static const char *tex_shape_refusal(const nir_tex_instr *t, bool vertex_gradien
       }
    }
    if (offset && vertex_xyz_offset && packed_offset_components(t, 3) < 0)
-      return "vertex 3D offset requires constant XYZ components in -8..7";
+      return "3D offset requires constant XYZ components in -8..7";
    if (offset && ((vertex_xyz_offset ? packed_offset_components(t, 3) : packed_offset(t)) < 0 ||
                   (d != GLSL_SAMPLER_DIM_2D && !vertex_xyz_offset) || (t->op == nir_texop_txd && !vertex_gradient) ||
                   t->op == nir_texop_txf))
@@ -858,7 +858,7 @@ static const char *tex_shape_refusal(const nir_tex_instr *t, bool vertex_gradien
 /* Ordinary bank0 texture forms only. No continuation is inferred from stage. */
 static const char *vs_tex_refusal(const nir_tex_instr *t)
 {
-   const char *why = tex_shape_refusal(t, false, false);
+   const char *why = tex_shape_refusal(t, false, false, false);
    if (why || size_query(t)) return why;
    if (t->op != nir_texop_tex && t->op != nir_texop_txl)
       return "vertex fetch/bias/gradient requires separately qualified state";
@@ -880,7 +880,7 @@ static const char *vs_qualified_tex_refusal(const nir_tex_instr *t)
                    t->sampler_dim == GLSL_SAMPLER_DIM_2D;
    bool xyz = g5p_vtex_xyz_offset_probe() && t->sampler_dim == GLSL_SAMPLER_DIM_3D &&
               (t->op == nir_texop_tex || t->op == nir_texop_txl);
-   const char *why = tex_shape_refusal(t, gradient, xyz);
+   const char *why = tex_shape_refusal(t, gradient, xyz, false);
    if (why || size_query(t)) return why;
    if (t->op != nir_texop_tex && t->op != nir_texop_txl && t->op != nir_texop_txf && !gradient)
       return "vertex bias/gradient recipe not device-qualified";
@@ -1165,7 +1165,7 @@ static void scan_cf(struct gctx *c, struct exec_list *list, struct unsupported *
          case nir_instr_type_tex: {
             nir_tex_instr *t = nir_instr_as_tex(ins);
             const char *why = c->vs ? (g5p_vtex_qualified() ? vs_qualified_tex_refusal(t) : !g5p_vtex_probe() ? "vertex stage" : vs_tex_refusal(t)) :
-                              plain_tex(t) ? NULL : tex_shape_refusal(t, false, false);
+                              plain_tex(t) ? NULL : tex_shape_refusal(t, true, t->sampler_dim == GLSL_SAMPLER_DIM_3D, true);
             if (why) {
                snprintf(buf, sizeof(buf), "tex(op %u, dim %u%s%s): %s", t->op, t->sampler_dim,
                         t->is_array ? ", array" : "", t->is_shadow ? ", shadow" : "", why);
@@ -4322,7 +4322,7 @@ static void emit_tex_ext(struct gctx *c, nir_tex_instr *t)
    enum glsl_sampler_dim sd = t->sampler_dim;
    bool read = t->op == nir_texop_txf, array = t->is_array;
    bool third = array || sd == GLSL_SAMPLER_DIM_3D || sd == GLSL_SAMPLER_DIM_CUBE;
-   int packed = packed_offset(t);
+   int packed = packed_offset_components(t, sd == GLSL_SAMPLER_DIM_3D ? 3 : 2);
    struct g5p_tex_ext x = {
       .image_qword = b->image / 2, .sampler_qword = b->sampler / 2, .read = read,
       .dim = sd == GLSL_SAMPLER_DIM_CUBE ? G5P_TEX_CUBE : sd == GLSL_SAMPLER_DIM_3D ? G5P_TEX_3D :
@@ -4353,13 +4353,15 @@ static void emit_tex_ext(struct gctx *c, nir_tex_instr *t)
    /* level / bias / gradients */
    int li = nir_tex_instr_src_index(t, t->op == nir_texop_txb ? nir_tex_src_bias : nir_tex_src_lod);
    if (t->op == nir_texop_txd) {
-      unsigned g = alloc_run(c, 4, "texture gradients");
-      scratch |= BITFIELD64_RANGE(g, 4);
+      unsigned axes = sd == GLSL_SAMPLER_DIM_3D ? 3 : 2;
+      unsigned g = alloc_run(c, 2 * axes, "texture gradients");
+      scratch |= BITFIELD64_RANGE(g, 2 * axes);
       nir_def *dx = nir_get_tex_src(t, nir_tex_src_ddx), *dy = nir_get_tex_src(t, nir_tex_src_ddy);
-      move_into(c, g, dx, 0, "dPdx.x");
-      move_into(c, g + 1, dy, 0, "dPdy.x");
-      move_into(c, g + 2, dx, 1, "dPdx.y");
-      move_into(c, g + 3, dy, 1, "dPdy.y");
+      /* Apple f_3d_grad_*: [dx.x,dy.x,dx.y,dy.y,dx.z,dy.z]. */
+      for (unsigned k = 0; k < axes; k++) {
+         move_into(c, g + 2*k, dx, k, "dPdx");
+         move_into(c, g + 2*k + 1, dy, k, "dPdy");
+      }
       x.lod = G5P_TEX_LOD_GRAD;
       x.lod_dword = g;
    } else if (read && sd == GLSL_SAMPLER_DIM_BUF) {
@@ -4438,7 +4440,9 @@ static void emit_tex_ext(struct gctx *c, nir_tex_instr *t)
       off_half = x.extras_half = 2 * e;
    }
    if (x.offset)
-      put(c, raw, g5p_usc_half_immediate(raw, off_half, packed), "texel offset");
+      put(c, raw, sd == GLSL_SAMPLER_DIM_3D ?
+             g5p_usc_half_immediate_xyz(raw, off_half, packed, 0) :
+             g5p_usc_half_immediate(raw, off_half, packed), "texel offset");
    /* coordinate reads by the sample instruction itself are counted in move_into */
    /* cube: the direction becomes the cube coordinates in place, right
     * before the sample (Apple's f_cube_alu, f_cube_alu_lvl, f_cmp_cube_alu) */

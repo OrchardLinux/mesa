@@ -996,8 +996,8 @@ unsigned g5p_usc_sample_ext(uint8_t *out, const struct g5p_tex_ext *t)
    CHECK(t->mask == 0xf || (t->mask == 1 && t->compare), "only rgba and compare results are measured");
    CHECK(!t->read || (!t->compare && !t->offset && t->lod == G5P_TEX_LOD_LEVEL && t->dim != G5P_TEX_CUBE),
          "read takes a level and no compare/offset (cube reads are refused by Apple)");
-   CHECK(t->lod != G5P_TEX_LOD_GRAD || t->dim == G5P_TEX_2D || t->dim == G5P_TEX_2D_ARRAY,
-         "gradients are measured on 2D and 2D arrays only");
+   CHECK(t->lod != G5P_TEX_LOD_GRAD || t->dim == G5P_TEX_2D || t->dim == G5P_TEX_2D_ARRAY || t->dim == G5P_TEX_3D,
+         "gradients are measured on 2D, 2D arrays and 3D only");
    CHECK(!t->offset || t->dim != G5P_TEX_CUBE, "cube offsets do not exist");
    const bool xyz_tuple = t->tuple == G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL_OFFSET_3D;
    const bool compare_tuple = t->tuple == G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL_COMPARE ||
