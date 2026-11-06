@@ -990,6 +990,17 @@ unsigned g5p_usc_cube_coords(uint8_t *out, unsigned dst_half, unsigned src_half)
    return finish(out, raw, 6);
 }
 
+unsigned g5p_usc_cube_coords_bank1(uint8_t *out, unsigned dst_half, unsigned src_half)
+{
+   /* v_cube_sample_{attribute,uniform_lod_attribute}: bank0 direction
+    * producers precede this exact form; the coupled sample reads bank1.
+    * The native live LOD immediately after its three outputs bounds the
+    * result to three dwords. Source direction stays in bank0. */
+   unsigned n = g5p_usc_cube_coords(out, dst_half, src_half);
+   if (n) out[5] |= 1u << 2;
+   return n;
+}
+
 unsigned g5p_usc_f2u16_half(uint8_t *out, unsigned dst_half, unsigned src_half, unsigned group)
 {
    CHECK(dst_half <= 63, "dst_half beyond r31");

@@ -826,8 +826,10 @@ static const char *vs_qualified_tex_refusal(const nir_tex_instr *t)
    if (why || size_query(t)) return why;
    if (t->op != nir_texop_tex && t->op != nir_texop_txl && t->op != nir_texop_txf)
       return "vertex bias/gradient recipe not device-qualified";
-   if (t->is_shadow || (t->sampler_dim != GLSL_SAMPLER_DIM_2D &&
-                        t->sampler_dim != GLSL_SAMPLER_DIM_3D))
+   if (t->is_shadow || (t->sampler_dim == GLSL_SAMPLER_DIM_CUBE &&
+                        (!g5p_vtex_cube_probe() || t->is_array)) ||
+       (t->sampler_dim != GLSL_SAMPLER_DIM_2D && t->sampler_dim != GLSL_SAMPLER_DIM_3D &&
+        t->sampler_dim != GLSL_SAMPLER_DIM_CUBE))
       return "vertex cube/shadow recipe not device-qualified";
    if (nir_tex_instr_src_index(t, nir_tex_src_offset) >= 0)
       return "vertex texture offset not device-qualified";
@@ -4215,12 +4217,28 @@ static void emit_vertex_qualified_texture(struct gctx *c, nir_tex_instr *t)
    uint8_t raw[G5P_USC_MAX];
    struct tex_bind *b = tex_for(c, t);
    bool read = t->op == nir_texop_txf, array = t->is_array;
-   bool third = array || t->sampler_dim == GLSL_SAMPLER_DIM_3D;
+   bool cube = t->sampler_dim == GLSL_SAMPLER_DIM_CUBE;
+   bool third = array || t->sampler_dim == GLSL_SAMPLER_DIM_3D || cube;
    nir_def *coord = nir_get_tex_src(t, nir_tex_src_coord);
+   unsigned direction = 0;
+   uint64_t scratch = 0;
+   if (cube) {
+      /* Native uniform and attribute cube probes both write the direction
+       * in bank0. The helper's output-bank bit does not change its source. */
+      bool saved_bank = c->tex_bank0;
+      c->tex_bank0 = true;
+      direction = alloc_run(c, 3, "native cube direction in bank0");
+      scratch |= BITFIELD64_RANGE(direction, 3);
+      for (unsigned k = 0; k < 3; k++)
+         move_into(c, direction + k, coord, k, "cube direction into bank0");
+      c->tex_bank0 = saved_bank;
+   }
    unsigned block = alloc_run(c, 2 + third, "qualified vertex texture coordinates");
-   uint64_t scratch = BITFIELD64_RANGE(block, 2 + third);
-   vertex_qualified_copy(c, block, coord, 0);
-   vertex_qualified_copy(c, block + 1, coord, 1);
+   scratch |= BITFIELD64_RANGE(block, 2 + third);
+   if (!cube) {
+      vertex_qualified_copy(c, block, coord, 0);
+      vertex_qualified_copy(c, block + 1, coord, 1);
+   }
    if (array && !read) {
       unsigned tmp = alloc_reg(c, -1);
       scratch |= BITFIELD64_BIT(tmp);
@@ -4228,7 +4246,7 @@ static void emit_vertex_qualified_texture(struct gctx *c, nir_tex_instr *t)
       put(c, raw, g5p_usc_binary_literal(raw, G5P_BIN_FADD, H(c,tmp), 0x3800, H(c,tmp), 1, 1, 0x11, true, -1),
           "qualified array layer + 0.5");
       put(c, raw, g5p_usc_vertex_array_layer(raw, H(c,block+2), H(c,tmp)), "qualified array layer to u16");
-   } else if (third) vertex_qualified_copy(c, block + 2, coord, 2);
+   } else if (third && !cube) vertex_qualified_copy(c, block + 2, coord, 2);
    int li = nir_tex_instr_src_index(t, nir_tex_src_lod);
    unsigned level = alloc_reg(c, -1);
    scratch |= BITFIELD64_BIT(level);
@@ -4236,12 +4254,15 @@ static void emit_vertex_qualified_texture(struct gctx *c, nir_tex_instr *t)
    else put(c, raw, g5p_usc_immediate(raw, H(c,level), 0, 1, -1), "qualified vertex level zero");
    if (!read)
       put(c, raw, g5p_usc_vertex_texture_level(raw, H(c,level), H(c,level), 1), "qualified vertex level to f16");
+   if (cube)
+      put(c, raw, g5p_usc_cube_coords_bank1(raw, H(c,block), H(c,direction)),
+          "native bank0 direction to bank1 cube coordinates");
    unsigned dst = alloc_run(c, 4, "qualified vertex texture result");
    struct g5p_tex_ext x = {
       .dst_half=H(c,dst), .image_qword=b->image/2,
       .sampler_qword=(read ? c->fetch_sampler_common : b->sampler)/2,
       .coord_dword=H(c,block)/2,
-      .dim=t->sampler_dim==GLSL_SAMPLER_DIM_3D ? G5P_TEX_3D : array ? G5P_TEX_2D_ARRAY : G5P_TEX_2D,
+      .dim=cube ? G5P_TEX_CUBE : t->sampler_dim==GLSL_SAMPLER_DIM_3D ? G5P_TEX_3D : array ? G5P_TEX_2D_ARRAY : G5P_TEX_2D,
       .mask=15, .read=read, .lod=G5P_TEX_LOD_LEVEL, .lod_dword=H(c,level)/2,
       .tuple=G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL,
    };

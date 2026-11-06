@@ -185,6 +185,9 @@ unsigned g5p_usc_half_immediate(uint8_t *out, unsigned dst_half, uint16_t value)
  * face 0, device 2026-11-02). */
 unsigned g5p_usc_vertex_texture_level(uint8_t *out, unsigned dst_half, unsigned src_half, unsigned group);
 unsigned g5p_usc_vertex_array_layer(uint8_t *out, unsigned dst_half, unsigned src_half);
+/* Native cube direction is fixed to bank0; this form writes bank1.
+ * bit2 is the output-bank selector, not a direction-bank selector. */
+unsigned g5p_usc_cube_coords_bank1(uint8_t *out, unsigned dst_half, unsigned src_half);
 unsigned g5p_usc_cube_coords(uint8_t *out, unsigned dst_half, unsigned src_half);
 /* f32 -> u16 (truncating) into one half: Apple's array-layer conversion
  * `89 01 DH 01 09 SS 20 01 60 06`. */
