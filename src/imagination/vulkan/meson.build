@@ -164,6 +164,7 @@ if with_imagination_g5p
     'pvr_g5p_formats.c',
     'pvr_g5p_image.c',
     'pvr_g5p_nir.c',
+    'pvr_g5p_texel_buffer.c',
     'pvr_g5p_swgs.c',
     'pvr_g5p_xfb_query.c',
     'pvr_g5p_ds.c',

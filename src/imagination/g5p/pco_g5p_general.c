@@ -35,6 +35,8 @@
 
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_builder.h"
+#include "g5p_texel_nir.h"
+#include "g5p_texel_backend.h"
 #include "util/half_float.h"
 #include "util/macros.h"
 #include "util/u_math.h"
@@ -778,6 +780,8 @@ static int packed_offset(const nir_tex_instr *t)
 static const char *tex_shape_refusal(const nir_tex_instr *t, bool vertex_gradient, bool vertex_xyz_offset)
 {
    enum glsl_sampler_dim d = t->sampler_dim;
+   if (d == GLSL_SAMPLER_DIM_BUF)
+      return g5p_tbo_shape_refusal(t);
    nir_alu_type base = nir_alu_type_get_base_type(t->dest_type);
    if (d != GLSL_SAMPLER_DIM_2D && d != GLSL_SAMPLER_DIM_3D && d != GLSL_SAMPLER_DIM_CUBE)
       return "1D, buffer, rect, MS or subpass texture";
@@ -870,6 +874,8 @@ static const char *vs_tex_refusal(const nir_tex_instr *t)
 
 static const char *vs_qualified_tex_refusal(const nir_tex_instr *t)
 {
+   if (t->sampler_dim == GLSL_SAMPLER_DIM_BUF)
+      return g5p_tbo_shape_refusal(t);
    bool gradient = t->op == nir_texop_txd && g5p_vtex_gradient_probe() &&
                    t->sampler_dim == GLSL_SAMPLER_DIM_2D;
    bool xyz = g5p_vtex_xyz_offset_probe() && t->sampler_dim == GLSL_SAMPLER_DIM_3D &&
@@ -1617,7 +1623,8 @@ static void liveness(struct gctx *c)
             continue;
          for (unsigned i = 0; i < t->num_srcs; i++) {
             nir_tex_src_type ty = t->src[i].src_type;
-            unsigned n = ty == nir_tex_src_coord ? t->coord_components :
+            unsigned n = ty == nir_tex_src_backend1 && t->sampler_dim == GLSL_SAMPLER_DIM_BUF ? 2 :
+                         ty == nir_tex_src_coord ? t->coord_components :
                          ty == nir_tex_src_ddx || ty == nir_tex_src_ddy ? 2 :
                          ty == nir_tex_src_bias || ty == nir_tex_src_lod || ty == nir_tex_src_comparator ? 1 : 0;
             for (unsigned k = 0; k < n; k++)
@@ -4312,7 +4319,7 @@ static void emit_tex_ext(struct gctx *c, nir_tex_instr *t)
       .mask = t->is_shadow ? 1 : 0xf, .compare = t->is_shadow, .offset = packed >= 0,
    };
    uint64_t scratch = 0;
-   nir_def *cd = nir_get_tex_src(t, nir_tex_src_coord);
+   nir_def *cd = nir_get_tex_src(t, sd == GLSL_SAMPLER_DIM_BUF ? nir_tex_src_backend1 : nir_tex_src_coord);
    /* a cube's block has a fourth scratch dword: the cube-coordinate op's
     * output width is not measured */
    unsigned nblock = 2 + third + (sd == GLSL_SAMPLER_DIM_CUBE);
@@ -4344,6 +4351,11 @@ static void emit_tex_ext(struct gctx *c, nir_tex_instr *t)
       move_into(c, g + 3, dy, 1, "dPdy.y");
       x.lod = G5P_TEX_LOD_GRAD;
       x.lod_dword = g;
+   } else if (read && sd == GLSL_SAMPLER_DIM_BUF) {
+      /* The size upload reserves an explicit common-store level zero. */
+      x.lod_shared = true;
+      x.lod_dword = c->tsize[size_for(c, t)].common + 1;
+      x.lod = G5P_TEX_LOD_LEVEL;
    } else if (read) {
       struct ref r = li >= 0 ? resolve_value(c, t->src[li].src.ssa, 0) : (struct ref){0};
       x.lod_dword = li >= 0 ? reg_of(c, r, "texel level") : zero_reg(c);
@@ -4454,7 +4466,8 @@ static void emit_vertex_qualified_texture(struct gctx *c, nir_tex_instr *t)
    bool read = t->op == nir_texop_txf, array = t->is_array;
    bool cube = t->sampler_dim == GLSL_SAMPLER_DIM_CUBE;
    bool third = array || t->sampler_dim == GLSL_SAMPLER_DIM_3D || cube;
-   nir_def *coord = nir_get_tex_src(t, nir_tex_src_coord);
+   bool buffer = t->sampler_dim == GLSL_SAMPLER_DIM_BUF;
+   nir_def *coord = nir_get_tex_src(t, buffer ? nir_tex_src_backend1 : nir_tex_src_coord);
    unsigned direction = 0;
    uint64_t scratch = 0;
    if (cube) {
@@ -4484,8 +4497,8 @@ static void emit_vertex_qualified_texture(struct gctx *c, nir_tex_instr *t)
    } else if (third && !cube) vertex_qualified_copy(c, block + 2, coord, 2);
    bool gradient = t->op == nir_texop_txd;
    int li = nir_tex_instr_src_index(t, nir_tex_src_lod);
-   unsigned level = gradient ? alloc_run(c, 4, "qualified vertex derivatives") : alloc_reg(c, -1);
-   scratch |= BITFIELD64_RANGE(level, gradient ? 4 : 1);
+   unsigned level = buffer ? 0 : gradient ? alloc_run(c, 4, "qualified vertex derivatives") : alloc_reg(c, -1);
+   if (!buffer) scratch |= BITFIELD64_RANGE(level, gradient ? 4 : 1);
    if (gradient) {
       /* Native distinct literal gradients independently witness this order:
        * dx.x, dy.x, dx.y, dy.y, all f32 in consecutive bank1 dwords. */
@@ -4494,7 +4507,7 @@ static void emit_vertex_qualified_texture(struct gctx *c, nir_tex_instr *t)
          vertex_qualified_copy(c, level + 2*k, dx, k);
          vertex_qualified_copy(c, level + 2*k + 1, dy, k);
       }
-   } else {
+   } else if (!buffer) {
       if (li >= 0) vertex_qualified_copy(c, level, t->src[li].src.ssa, 0);
       else put(c, raw, g5p_usc_immediate(raw, H(c,level), 0, 1, -1), "qualified vertex level zero");
       if (!read)
@@ -4523,9 +4536,11 @@ static void emit_vertex_qualified_texture(struct gctx *c, nir_tex_instr *t)
       .sampler_qword=(read ? c->fetch_sampler_common : b->sampler)/2,
       .coord_dword=H(c,block)/2,
       .dim=cube ? G5P_TEX_CUBE : t->sampler_dim==GLSL_SAMPLER_DIM_3D ? G5P_TEX_3D : array ? G5P_TEX_2D_ARRAY : G5P_TEX_2D,
-      .mask=15, .read=read, .lod=gradient ? G5P_TEX_LOD_GRAD : G5P_TEX_LOD_LEVEL, .lod_dword=H(c,level)/2,
+      .mask=15, .read=read, .lod=gradient ? G5P_TEX_LOD_GRAD : G5P_TEX_LOD_LEVEL,
+      .lod_dword=buffer ? c->tsize[size_for(c,t)].common + 1 : H(c,level)/2, .lod_shared=buffer,
       .offset=packed >= 0, .extras_half=packed >= 0 ? extras : 0,
-      .tuple=xyz && packed >= 0 ? G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL_OFFSET_3D :
+      .tuple=buffer ? G5P_TEX_TUPLE_COUPLED_SHARED_LEVEL :
+             xyz && packed >= 0 ? G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL_OFFSET_3D :
              gradient ? (packed >= 0 ? G5P_TEX_TUPLE_COUPLED_GRAD_OFFSET : G5P_TEX_TUPLE_COUPLED_GRAD) :
              packed >= 0 ? G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL_OFFSET : G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL,
    };
@@ -5343,6 +5358,7 @@ static bool lower(nir_shader *nir)
                           g5p_vtex_qualified() && g5p_vtex_fetch_offset_probe(),
    };
    NIR_PASS(_, nir, nir_lower_tex, &txp);
+   pvr_g5p_tbo_lower(nir);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const, nir_address_format_32bit_offset);
    NIR_PASS(_, nir, nir_lower_flrp, 32, false);
    bool flattened = flatten(nir);

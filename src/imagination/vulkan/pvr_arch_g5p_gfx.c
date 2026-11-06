@@ -19,6 +19,7 @@
  * constants or buffers yet). Everything else is refused by name.
  */
 
+#include "pvr_g5p_texel_buffer.h"
 #include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
@@ -1406,6 +1407,13 @@ fs_uploads(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_pipeline *g, 
                            u->set, u->binding, u->element, lb->descriptor_count);
       const uint32_t *desc = (const uint32_t *)((const uint8_t *)set->mapping + lb->offset +
                                                 (size_t)u->element * lb->stride);
+      if (lb->type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER) {
+         if (!pvr_g5p_tbo_upload(u->kind, u->offset, u->dwords, desc, out))
+            return G5P_REFUSE(cmd_buffer, "unqualified texel-buffer upload at set %u binding %u element %u",
+                              u->set, u->binding, u->element);
+         copied[i] = true;
+         continue;
+      }
       switch (u->kind) {
       case PCO_G5P_UPLOAD_IMAGE:
          if (!pvr_g5p_tex_state_valid(desc))

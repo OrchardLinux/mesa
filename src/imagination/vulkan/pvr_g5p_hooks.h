@@ -27,12 +27,28 @@
 #   include "pvr_g5p_formats.h"
 #   include "pvr_g5p_layout.h"
 #   include "pvr_g5p_tex.h"
+#   include "pvr_g5p_texel_buffer.h"
 #   include "pvr_g5p_xfb.h"
 #   include "pvr_g5p_memory.h"
 #   include "pvr_g5p_spm.h"
 #   include "pvr_g5p_shm.h"
 #   include "pvr_g5p_compute_hooks.h"
 #endif
+
+/* Uniform buffer textures: independent R5 probe; no storage exposure. */
+#define PVR_G5P_HOOK_texel_state(device, info, state) \
+   if (PVR_HAS_FEATURE(&(device)->pdevice->dev_info, apple_g5p) && (info)->buffer_elems) \
+      return pvr_g5p_tbo_pack(device, info, state);
+#define PVR_G5P_HOOK_texel_features(pdevice, format, flags) \
+   if (PVR_HAS_FEATURE(&(pdevice)->dev_info, apple_g5p)) \
+      (flags) = pvr_g5p_tbo_features(format, flags);
+#define PVR_G5P_HOOK_texel_limits(pdevice, props) \
+   if (PVR_HAS_FEATURE(&(pdevice)->dev_info, apple_g5p)) { \
+      (props)->minTexelBufferOffsetAlignment = PVR_G5P_TBO_ALIGN; \
+      (props)->uniformTexelBufferOffsetAlignmentBytes = PVR_G5P_TBO_ALIGN; \
+      (props)->uniformTexelBufferOffsetSingleTexelAlignment = false; \
+      (props)->maxTexelBufferElements = PVR_G5P_TBO_LIMIT; \
+   }
 
 /* pvr_arch_image.c, pvr_CreateImageView(): the sampled state of a view is
  * the A9's three-qword image state (pvr_arch_g5p_pack_image_view()).

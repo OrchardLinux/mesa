@@ -164,6 +164,7 @@ note_set(struct reads_ctx *c, const struct pvr_descriptor_set *set)
             break;
          case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: /* the image state first */
          case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+         case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
             note_read(c, image_state_va(desc));
             break;
          case VK_DESCRIPTOR_TYPE_SAMPLER:

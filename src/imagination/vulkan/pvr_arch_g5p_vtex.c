@@ -29,6 +29,7 @@
 #include "pvr_g5p_tex.h"
 #include "pvr_g5p_tex_encode.h"
 #include "pvr_g5p_vtex.h"
+#include "pvr_g5p_texel_buffer.h"
 
 #define VTEX_REFUSE(obj, ...) \
    (fprintf(stderr, "G5P refuses: vertex texture " __VA_ARGS__), fprintf(stderr, "\n"), \
@@ -109,6 +110,12 @@ vtex_descriptor(struct pvr_cmd_buffer *cmd, const struct pco_g5p_upload *u, uint
                           u->element, lb->descriptor_count);
    const uint32_t *desc = (const uint32_t *)((const uint8_t *)set->mapping + lb->offset +
                                           (size_t)u->element * lb->stride);
+   if (lb->type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER) {
+      if (!pvr_g5p_tbo_upload(u->kind, u->offset, u->dwords, desc, out))
+         return VTEX_REFUSE(cmd, "unqualified texel-buffer upload at set %u binding %u element %u",
+                           u->set, u->binding, u->element);
+      return VK_SUCCESS;
+   }
    bool image = lb->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || lb->type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
    if (u->kind == PCO_G5P_UPLOAD_IMAGE) {
       if (!image || u->dwords != 8 || !pvr_g5p_tex_state_valid(desc))

@@ -1322,7 +1322,7 @@ VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
       memcpy(supported_properties.optimalTilingLayoutUUID, "G9P layout 1\0\0\0\0", VK_UUID_SIZE);
       supported_properties.identicalMemoryTypeRequirements = true;
    }
-
+   PVR_G5P_HOOK(texel_limits, pdevice, &supported_properties)
    vk_physical_device_dispatch_table_from_entrypoints(
       &dispatch_table,
       &pvr_physical_device_entrypoints,
