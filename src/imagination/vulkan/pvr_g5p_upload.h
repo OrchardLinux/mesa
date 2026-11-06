@@ -40,6 +40,7 @@ struct pvr_device;
 struct pvr_g5p_stage_upload {
    uint8_t kind; /* enum pco_g5p_upload_kind */
    uint8_t set, binding;
+   uint16_t element; /* descriptor-array element */
    uint16_t offset; /* bytes */
    uint16_t dwords;
    uint16_t common; /* common-store dword */
@@ -74,7 +75,7 @@ void PVR_PER_ARCH(g5p_vs_uploads_destroy)(struct pvr_device *device, struct pvr_
  * PDS_STATE_UPDATE words that run it. Before the draw's words are written
  * (it uploads into the command buffer). */
 VkResult PVR_PER_ARCH(g5p_upload_buffer)(struct pvr_cmd_buffer *cmd_buffer, unsigned set, unsigned binding,
-                                         uint64_t *addr, uint64_t *size);
+                                         unsigned element, uint64_t *addr, uint64_t *size);
 VkResult PVR_PER_ARCH(g5p_vs_uploads_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_stage_uploads *up,
                                            struct pvr_g5p_vs_upload_draw *out);
 

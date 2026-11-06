@@ -161,8 +161,7 @@ struct pvr_g5p_fetch {
 #define PVR_G5P_MAX_FS_UPLOADS 12
 struct pvr_g5p_upload {
    uint8_t kind, set, binding, dwords;
-   uint16_t offset, common;
-   uint16_t element; /* image/sampler/size: the element of an arrayed binding */
+   uint16_t element, offset, common;
 };
 
 /*

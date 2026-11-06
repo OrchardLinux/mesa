@@ -660,12 +660,13 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
          return G5P_REFUSE(device, "fragment upload kind %u", u->kind);
       }
       if (!u->dwords || u->dwords > UINT8_MAX || u->set > UINT8_MAX || u->binding > UINT8_MAX ||
-          u->offset > UINT16_MAX || u->element > UINT16_MAX)
-         return G5P_REFUSE(device, "fragment upload %u: set %u binding %u offset %u, %u dwords", i, u->set,
-                           u->binding, u->offset, u->dwords);
+          u->element > UINT16_MAX || u->offset > UINT16_MAX)
+         return G5P_REFUSE(device, "fragment upload %u: set %u binding %u[%u] offset %u, %u dwords", i,
+                           u->set, u->binding, u->element, u->offset, u->dwords);
       g->fs_uploads[i] = (struct pvr_g5p_upload){ .kind = u->kind, .set = u->set, .binding = u->binding,
-                                                  .dwords = u->dwords, .offset = u->offset,
-                                                  .common = u->common, .element = u->element };
+                                                  .element = u->element, .dwords = u->dwords,
+                                                  .offset = u->offset,
+                                                  .common = u->common };
    }
    g->fs_num_uploads = fs->num_uploads;
    g->fs_common_dwords = fs->common_dwords;
@@ -1345,7 +1346,7 @@ fs_uploads(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_pipeline *g, 
          continue;
       case PCO_G5P_UPLOAD_UBO:
          /* the buffer itself: the DOUTD reads it when the job runs */
-         result = pvr_arch_g5p_upload_buffer(cmd_buffer, u->set, u->binding, &addr, &size);
+         result = pvr_arch_g5p_upload_buffer(cmd_buffer, u->set, u->binding, u->element, &addr, &size);
          if (result != VK_SUCCESS)
             return result;
          if (u->offset + bytes > size)
@@ -1356,7 +1357,7 @@ fs_uploads(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_pipeline *g, 
       case PCO_G5P_UPLOAD_UBO_ADDR:
       case PCO_G5P_UPLOAD_SSBO_ADDR: {
          /* the 64-bit address a register-indexed or storage access adds to */
-         result = pvr_arch_g5p_upload_buffer(cmd_buffer, u->set, u->binding, &addr, &size);
+         result = pvr_arch_g5p_upload_buffer(cmd_buffer, u->set, u->binding, u->element, &addr, &size);
          if (result != VK_SUCCESS)
             return result;
          if (u->dwords != 2 || (u->kind == PCO_G5P_UPLOAD_UBO_ADDR && u->offset >= size))

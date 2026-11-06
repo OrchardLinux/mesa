@@ -131,9 +131,10 @@ PVR_PER_ARCH(g5p_vs_uploads_create)(struct pvr_device *device, const struct pco_
          return G5P_UP_REFUSE(device, "vertex-stage upload %u: %s", i, g5p_up_kind_str(u->kind));
       }
       if (!u->dwords || u->dwords > 0xfff || u->set >= PVR_MAX_DESCRIPTOR_SETS || u->binding > UINT8_MAX ||
-          u->offset > UINT16_MAX || u->common > UINT16_MAX)
-         return G5P_UP_REFUSE(device, "vertex-stage upload %u: set %u binding %u offset %u, %u dwords at common %u",
-                              i, u->set, u->binding, u->offset, u->dwords, u->common);
+          u->element > UINT16_MAX || u->offset > UINT16_MAX || u->common > UINT16_MAX)
+         return G5P_UP_REFUSE(device,
+                              "vertex-stage upload %u: set %u binding %u[%u] offset %u, %u dwords at common %u",
+                              i, u->set, u->binding, u->element, u->offset, u->dwords, u->common);
    }
 
    struct pvr_g5p_stage_uploads *up = vk_zalloc(&device->vk.alloc, sizeof(*up), 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
@@ -144,7 +145,8 @@ PVR_PER_ARCH(g5p_vs_uploads_create)(struct pvr_device *device, const struct pco_
    for (unsigned i = 0; i < up->count; i++) {
       const struct pco_g5p_upload *u = &vs->uploads[i];
       up->u[i] = (struct pvr_g5p_stage_upload){ .kind = u->kind, .set = u->set, .binding = u->binding,
-                                                .offset = u->offset, .dwords = u->dwords, .common = u->common };
+                                                .element = u->element, .offset = u->offset,
+                                                .dwords = u->dwords, .common = u->common };
    }
 
    uint32_t code[4 * PVR_G5P_MAX_STAGE_UPLOADS + 4];
@@ -167,7 +169,7 @@ PVR_PER_ARCH(g5p_vs_uploads_destroy)(struct pvr_device *device, struct pvr_g5p_s
    vk_free(&device->vk.alloc, up);
 }
 
-/* The buffer a set's binding names (element 0): its address, the dynamic
+/* The buffer a set's binding element names: its address, the dynamic
  * offset included, and its range from there */
 static VkResult
 g5p_up_buffer(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_stage_upload *u, uint64_t *addr,
@@ -180,16 +182,19 @@ g5p_up_buffer(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_stage_uplo
    if (!set || !set->layout || u->binding >= set->layout->binding_count)
       return G5P_UP_REFUSE(cmd_buffer, "upload: set %u binding %u is not bound", u->set, u->binding);
    const struct pvr_descriptor_set_layout_binding *lb = &set->layout->bindings[u->binding];
+   if (u->element >= lb->descriptor_count)
+      return G5P_UP_REFUSE(cmd_buffer, "upload: set %u binding %u element %u past %u descriptors", u->set,
+                           u->binding, u->element, lb->descriptor_count);
    struct pvr_buffer_descriptor d;
    switch (lb->type) {
    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
-      memcpy(&d, (const uint8_t *)set->mapping + lb->offset, sizeof(d));
+      memcpy(&d, (const uint8_t *)set->mapping + lb->offset + u->element * lb->stride, sizeof(d));
       d.offset = 0;
       break;
    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
-      d = set->dynamic_buffers[lb->dynamic_buffer_idx];
+      d = set->dynamic_buffers[lb->dynamic_buffer_idx + u->element];
       break;
    default:
       return G5P_UP_REFUSE(cmd_buffer, "upload: set %u binding %u is a %s, not a buffer", u->set,
@@ -205,10 +210,10 @@ g5p_up_buffer(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_stage_uplo
 
 /* The same lookup for the fragment stage's uploads (pvr_arch_g5p_gfx.c fs_uploads()) */
 VkResult
-PVR_PER_ARCH(g5p_upload_buffer)(struct pvr_cmd_buffer *cmd_buffer, unsigned set, unsigned binding, uint64_t *addr,
-                                uint64_t *size)
+PVR_PER_ARCH(g5p_upload_buffer)(struct pvr_cmd_buffer *cmd_buffer, unsigned set, unsigned binding,
+                                unsigned element, uint64_t *addr, uint64_t *size)
 {
-   const struct pvr_g5p_stage_upload u = { .set = set, .binding = binding };
+   const struct pvr_g5p_stage_upload u = { .set = set, .binding = binding, .element = element };
    if (set >= PVR_MAX_DESCRIPTOR_SETS)
       return G5P_UP_REFUSE(cmd_buffer, "upload: set %u", set);
    return g5p_up_buffer(cmd_buffer, &u, addr, size);

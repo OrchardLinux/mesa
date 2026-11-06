@@ -89,7 +89,7 @@ struct tex_bind {
 
 struct range {
    enum pco_g5p_upload_kind kind;
-   unsigned set, binding, lo, hi; /* bytes */
+   unsigned set, binding, element, lo, hi; /* bytes */
    unsigned common;
 };
 
@@ -244,7 +244,7 @@ struct gctx {
     * default-block uniform in one UBO, so each constant index offset of an
     * array is its own base: Hyprland's border reads gradient[len - 1],
     * gradient[i] and gradient[i + 1] of two arrays (6 pointers). */
-   struct { unsigned set, binding, common; uint32_t base; } uptr[16];
+   struct { unsigned set, binding, element, common; uint32_t base; } uptr[16];
    unsigned nuptr;
    unsigned common_next;
    int xfb_common; /* VS: common dword of the PCO_G5P_UPLOAD_XFB block, -1 = none */
@@ -1567,7 +1567,8 @@ static void liveness(struct gctx *c)
 }
 
 /* ---- common-store plan (fragment) ---- */
-static bool block_binding(nir_def *d, unsigned *set, unsigned *binding)
+static bool block_binding_element(nir_def *d, unsigned *set, unsigned *binding,
+                                  unsigned *element)
 {
    for (unsigned guard = 0; guard < 8; guard++) {
       struct ref r = resolve_plain(d, 0);
@@ -1578,25 +1579,32 @@ static bool block_binding(nir_def *d, unsigned *set, unsigned *binding)
          d = in->src[0].ssa;
          continue;
       }
-      if (in->intrinsic != nir_intrinsic_vulkan_resource_index || !nir_src_is_const(in->src[0]) ||
-          nir_src_as_uint(in->src[0]))
+      if (in->intrinsic != nir_intrinsic_vulkan_resource_index || !nir_src_is_const(in->src[0]))
          return false;
       *set = nir_intrinsic_desc_set(in);
       *binding = nir_intrinsic_binding(in);
+      *element = nir_src_as_uint(in->src[0]);
       return true;
    }
    return false;
 }
 
+static bool block_binding(nir_def *d, unsigned *set, unsigned *binding)
+{
+   unsigned element;
+   return block_binding_element(d, set, binding, &element) && element == 0;
+}
+
 static struct range *range_for(struct gctx *c, enum pco_g5p_upload_kind kind, unsigned set,
-                               unsigned binding)
+                               unsigned binding, unsigned element)
 {
    for (unsigned i = 0; i < c->nranges; i++)
-      if (c->ranges[i].kind == kind && c->ranges[i].set == set && c->ranges[i].binding == binding)
+      if (c->ranges[i].kind == kind && c->ranges[i].set == set && c->ranges[i].binding == binding &&
+          c->ranges[i].element == element)
          return &c->ranges[i];
    if (c->nranges == ARRAY_SIZE(c->ranges))
       refuse(c, "more than %zu uniform blocks", ARRAY_SIZE(c->ranges));
-   c->ranges[c->nranges] = (struct range){kind, set, binding, UINT_MAX, 0, 0};
+   c->ranges[c->nranges] = (struct range){kind, set, binding, element, UINT_MAX, 0, 0};
    return &c->ranges[c->nranges++];
 }
 
@@ -1781,19 +1789,14 @@ static unsigned size_for(struct gctx *c, nir_tex_instr *t)
    return c->nsize++;
 }
 
-static void add_upload_element(struct gctx *c, enum pco_g5p_upload_kind kind, unsigned set, unsigned binding,
-                               unsigned offset, unsigned dwords, unsigned common, unsigned element)
+static void add_upload(struct gctx *c, enum pco_g5p_upload_kind kind, unsigned set, unsigned binding,
+                       unsigned element, unsigned offset, unsigned dwords, unsigned common)
 {
    struct pco_g5p_program *p = c->p;
    if (p->num_uploads == PCO_G5P_MAX_UPLOADS)
       refuse(c, "more than %u common-store uploads", PCO_G5P_MAX_UPLOADS);
-   p->uploads[p->num_uploads++] = (struct pco_g5p_upload){kind, set, binding, offset, dwords, common, element};
-}
-
-static void add_upload(struct gctx *c, enum pco_g5p_upload_kind kind, unsigned set, unsigned binding,
-                       unsigned offset, unsigned dwords, unsigned common)
-{
-   add_upload_element(c, kind, set, binding, offset, dwords, common, 0);
+   p->uploads[p->num_uploads++] =
+      (struct pco_g5p_upload){kind, set, binding, element, offset, dwords, common};
 }
 
 static void plan_common(struct gctx *c)
@@ -1812,7 +1815,7 @@ static void plan_common(struct gctx *c)
       if (ins->type != nir_instr_type_intrinsic)
          continue;
       nir_intrinsic_instr *in = nir_instr_as_intrinsic(ins);
-      unsigned set = 0, binding = 0;
+      unsigned set = 0, binding = 0, element = 0;
       if (in->intrinsic == nir_intrinsic_load_xfb_address || in->intrinsic == nir_intrinsic_load_num_vertices)
          xfb = true;
       if (in->intrinsic == nir_intrinsic_store_global) {
@@ -1823,31 +1826,33 @@ static void plan_common(struct gctx *c)
       }
       if (in->intrinsic == nir_intrinsic_load_push_constant) {
          unsigned off = load_offset(c, in, 0, nir_intrinsic_base(in));
-         struct range *r = range_for(c, PCO_G5P_UPLOAD_PUSH, 0, 0);
+         struct range *r = range_for(c, PCO_G5P_UPLOAD_PUSH, 0, 0, 0);
          r->lo = MIN2(r->lo, off);
          r->hi = MAX2(r->hi, off + 4 * in->def.num_components);
       } else if (dyn_ubo_load(in)) {
-         if (!block_binding(in->src[0].ssa, &set, &binding))
+         if (!block_binding_element(in->src[0].ssa, &set, &binding, &element))
             refuse(c, "load_ubo: block index is not a constant descriptor binding");
          struct ref ix;
          unsigned shift, i;
          uint32_t base;
          dyn_ubo_offset(in, &ix, &shift, &base);
          for (i = 0; i < c->nuptr; i++)
-            if (c->uptr[i].set == set && c->uptr[i].binding == binding && c->uptr[i].base == base)
+            if (c->uptr[i].set == set && c->uptr[i].binding == binding &&
+                c->uptr[i].element == element && c->uptr[i].base == base)
                break;
          if (i == c->nuptr) {
             if (c->nuptr == ARRAY_SIZE(c->uptr))
                refuse(c, "more than %zu register-indexed UBO arrays", ARRAY_SIZE(c->uptr));
             c->uptr[c->nuptr].set = set;
             c->uptr[c->nuptr].binding = binding;
+            c->uptr[c->nuptr].element = element;
             c->uptr[c->nuptr++].base = base;
          }
       } else if (in->intrinsic == nir_intrinsic_load_ubo) {
-         if (!block_binding(in->src[0].ssa, &set, &binding))
+         if (!block_binding_element(in->src[0].ssa, &set, &binding, &element))
             refuse(c, "load_ubo: block index is not a constant descriptor binding");
          unsigned off = load_offset(c, in, 1, 0);
-         struct range *r = range_for(c, PCO_G5P_UPLOAD_UBO, set, binding);
+         struct range *r = range_for(c, PCO_G5P_UPLOAD_UBO, set, binding, element);
          r->lo = MIN2(r->lo, off);
          r->hi = MAX2(r->hi, off + 4 * in->def.num_components);
       } else if (in->intrinsic == nir_intrinsic_load_ssbo || in->intrinsic == nir_intrinsic_store_ssbo) {
@@ -1870,11 +1875,11 @@ static void plan_common(struct gctx *c)
       /* Apple's layout: the blend colour in common 0..3, everything else after it */
       if (c->nssbo)
          refuse(c, "blend constants with storage buffers (both want common dwords 0..3)");
-      add_upload(c, PCO_G5P_UPLOAD_BLEND_CONSTANTS, 0, 0, 0, 4, G5P_BLEND_CONST_BASE);
+      add_upload(c, PCO_G5P_UPLOAD_BLEND_CONSTANTS, 0, 0, 0, 0, 4, G5P_BLEND_CONST_BASE);
       next = 4;
    }
    for (unsigned i = 0; i < c->nssbo; i++)
-      add_upload(c, PCO_G5P_UPLOAD_SSBO_ADDR, c->ssbo_set[i], c->ssbo_binding[i], 0, 2, 2 * i);
+      add_upload(c, PCO_G5P_UPLOAD_SSBO_ADDR, c->ssbo_set[i], c->ssbo_binding[i], 0, 0, 2, 2 * i);
    if (c->nssbo)
       next = MAX2(next, 4);
    for (unsigned i = 0; i < c->ntex; i++) {
@@ -1884,8 +1889,8 @@ static void plan_common(struct gctx *c)
       next = t->image + 10;
       if (t->image / 2 > 28 || t->sampler / 2 > 32)
          refuse(c, "texture descriptors beyond the measured common-store selectors");
-      add_upload_element(c, PCO_G5P_UPLOAD_IMAGE, t->set, t->binding, 0, 8, t->image, t->element);
-      add_upload_element(c, PCO_G5P_UPLOAD_SAMPLER, t->sset, t->sbinding, 32, 2, t->sampler, t->selement);
+      add_upload(c, PCO_G5P_UPLOAD_IMAGE, t->set, t->binding, t->element, 0, 8, t->image);
+      add_upload(c, PCO_G5P_UPLOAD_SAMPLER, t->sset, t->sbinding, t->selement, 32, 2, t->sampler);
    }
    /* Pointer pairs of register-indexed UBO arrays: even dwords below 32 (the
     * addr.add_shift base field, 0x81 | 4 * dword). */
@@ -1893,7 +1898,8 @@ static void plan_common(struct gctx *c)
       c->uptr[i].common = next = align(next, 2);
       if (next + 2 > 32)
          refuse(c, "register-indexed UBO pointer beyond common dword 30");
-      add_upload(c, PCO_G5P_UPLOAD_UBO_ADDR, c->uptr[i].set, c->uptr[i].binding, c->uptr[i].base, 2, next);
+      add_upload(c, PCO_G5P_UPLOAD_UBO_ADDR, c->uptr[i].set, c->uptr[i].binding,
+                 c->uptr[i].element, c->uptr[i].base, 2, next);
       next += 2;
    }
    /* Shared moves are witnessed from common dword 2 upward. */
@@ -1901,8 +1907,8 @@ static void plan_common(struct gctx *c)
    for (unsigned i = 0; i < c->nsize; i++) {
       c->tsize[i].common = next;
       next += 4;
-      add_upload_element(c, PCO_G5P_UPLOAD_IMAGE_SIZE, c->tsize[i].set, c->tsize[i].binding, c->tsize[i].lod, 4,
-                         c->tsize[i].common, c->tsize[i].element);
+      add_upload(c, PCO_G5P_UPLOAD_IMAGE_SIZE, c->tsize[i].set, c->tsize[i].binding,
+                 c->tsize[i].element, c->tsize[i].lod, 4, c->tsize[i].common);
    }
    unsigned limit = c->vs ? PCO_G5P_VS_COMMON_DWORDS : PCO_G5P_FS_COMMON_DWORDS;
    for (unsigned i = 0; i < c->nranges; i++) {
@@ -1911,7 +1917,8 @@ static void plan_common(struct gctx *c)
       next += (r->hi - r->lo) / 4;
       if (next > limit)
          refuse(c, "uniforms exceed %u common-store dwords", limit);
-      add_upload(c, r->kind, r->set, r->binding, r->lo, (r->hi - r->lo) / 4, r->common);
+      add_upload(c, r->kind, r->set, r->binding, r->element, r->lo,
+                 (r->hi - r->lo) / 4, r->common);
    }
    /* Transform feedback block: pointer pairs at even dwords (address add). */
    if (xfb) {
@@ -1919,7 +1926,7 @@ static void plan_common(struct gctx *c)
       next = c->xfb_common + PCO_G5P_XFB_DWORDS;
       if (next > PCO_G5P_COMMON_DWORDS)
          refuse(c, "uniforms and the XFB block exceed %u common-store dwords", PCO_G5P_COMMON_DWORDS);
-      add_upload(c, PCO_G5P_UPLOAD_XFB, 0, 0, 0, PCO_G5P_XFB_DWORDS, c->xfb_common);
+      add_upload(c, PCO_G5P_UPLOAD_XFB, 0, 0, 0, 0, PCO_G5P_XFB_DWORDS, c->xfb_common);
    }
    if (next > PCO_G5P_COMMON_DWORDS)
       c->p->evidence |= PCO_G5P_EV_COMMON_HIGH;
@@ -3570,10 +3577,10 @@ static bool clamped_index(struct ref ix)
 static void emit_dyn_ubo(struct gctx *c, nir_intrinsic_instr *in)
 {
    uint8_t raw[G5P_USC_MAX];
-   unsigned set, binding, shift, n = in->def.num_components;
+   unsigned set, binding, element, shift, n = in->def.num_components;
    struct ref ix;
    uint32_t base;
-   block_binding(in->src[0].ssa, &set, &binding);
+   block_binding_element(in->src[0].ssa, &set, &binding, &element);
    dyn_ubo_offset(in, &ix, &shift, &base);
    unsigned bytes = 4 * n;
    /* Witnessed: 16-byte loads (Apple's v_cexpr, vec4 elements at shift 4) and
@@ -3598,7 +3605,8 @@ static void emit_dyn_ubo(struct gctx *c, nir_intrinsic_instr *in)
                 "fault: add_shift does not sign-extend)");
    unsigned common = 0;
    for (unsigned i = 0; i < c->nuptr; i++)
-      if (c->uptr[i].set == set && c->uptr[i].binding == binding && c->uptr[i].base == base)
+      if (c->uptr[i].set == set && c->uptr[i].binding == binding &&
+          c->uptr[i].element == element && c->uptr[i].base == base)
          common = c->uptr[i].common;
    unsigned index = reg_of(c, ix, "register-indexed UBO load index");
    if (c->vs)
@@ -3698,11 +3706,12 @@ static void emit_intrinsic(struct gctx *c, nir_intrinsic_instr *in)
    }
    switch (in->intrinsic) {
    case nir_intrinsic_load_vulkan_descriptor: {
-      unsigned set, binding;
+      unsigned set, binding, element;
       /* Each accepted binding is uploaded from its own start. The offset
        * channel is zero, as eval_offset() already assumes for constant
        * loads. Dynamic SSBO store arithmetic must be able to read it too. */
-      if (in->def.num_components == 2 && block_binding(in->src[0].ssa, &set, &binding)) {
+      if (in->def.num_components == 2 &&
+          block_binding_element(in->src[0].ssa, &set, &binding, &element)) {
          struct val *offset = V(c, &in->def, 1);
          offset->state = VAL_CONST;
          offset->imm = 0;
@@ -3752,16 +3761,16 @@ static void emit_intrinsic(struct gctx *c, nir_intrinsic_instr *in)
       }
       FALLTHROUGH;
    case nir_intrinsic_load_push_constant: {
-      unsigned set = 0, binding = 0, off;
+      unsigned set = 0, binding = 0, element = 0, off;
       enum pco_g5p_upload_kind kind = PCO_G5P_UPLOAD_PUSH;
       if (in->intrinsic == nir_intrinsic_load_ubo) {
-         block_binding(in->src[0].ssa, &set, &binding);
+         block_binding_element(in->src[0].ssa, &set, &binding, &element);
          off = load_offset(c, in, 1, 0);
          kind = PCO_G5P_UPLOAD_UBO;
       } else {
          off = load_offset(c, in, 0, nir_intrinsic_base(in));
       }
-      struct range *r = range_for(c, kind, set, binding);
+      struct range *r = range_for(c, kind, set, binding, element);
       for (unsigned k = 0; k < in->def.num_components; k++) {
          struct val *v = V(c, &in->def, k);
          v->state = VAL_SHARED;
