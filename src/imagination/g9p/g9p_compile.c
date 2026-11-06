@@ -1238,7 +1238,15 @@ emit_mem(struct g9p_ctx *ctx, nir_intrinsic_instr *intr, int slot, nir_scalar of
       ctx->out->buffers[slot].dwords = MAX2(ctx->out->buffers[slot].dwords, 2);
       BITSET_SET(ctx->fs_used[slot], 1);
       g9p_addr(ctx->c, pair, fs_dword(ctx, slot, 0), off, 0, false);
-      g9p_mem_at(ctx->c, true, G9P_SIZE_U32, data, pair);
+      /*
+       * Apple's fragment store (metal-tt): its compare first, without which the store
+       * writes nothing, then two words with the pair without the low bit
+       */
+      G9P_EMIT(ctx->c, 0x0182, 0x0101, 0x0120, 0x0129, 0x0110, 0xa1bd, 0x00b0);
+      G9P_EMIT(ctx->c, 0x2371, pair << 10 | 0x80 | data << 1);
+      ctx->out->uses_discard = true; /* no opaque pass with side effects */
+      /* nothing rewrites a store's registers before a wait (a10/MESA.md, vertex stores) */
+      g9p_wait(ctx->c);
       release(ctx, &intr->instr);
       return true;
    }
@@ -1803,6 +1811,9 @@ emit_fb_fetch(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
       if (t <= target)
          total += w;
    }
+   /* g9p_tile_read() reads an even number above four */
+   if (total > 4)
+      total = (total + 1) & ~1u;
    release(ctx, &intr->instr);
    for (unsigned r = 0; r + total <= G9P_NUM_REGS; r += 2) {
       if (!(ctx->busy & BITFIELD64_RANGE(r, total))) {

@@ -588,6 +588,9 @@ g9p_to_half(struct g9p_code *c, unsigned h, unsigned src)
 static inline void
 g9p_tile_read(struct g9p_code *c, unsigned dst, unsigned words)
 {
+   /* As at the end of a fragment: five or seven words hang the job */
+   if (words > 4)
+      words = (words + 1) & ~1u;
    G9P_EMIT(c, (words & 7) << 12 | 0x011c, 0x2800 | 2 * dst);
 }
 
@@ -642,6 +645,9 @@ g9p_blend_src_over(struct g9p_code *c)
 static inline void
 g9p_end_fragment(struct g9p_code *c, unsigned words)
 {
+   /* Five or seven output words: even, as the tile read's */
+   if (words > 4)
+      words = (words + 1) & ~1u;
    if (words)
       G9P_EMIT(c, (words & 7) << 12 | 0x011c, 0x0800);
    G9P_EMIT(c, 0x8000);
