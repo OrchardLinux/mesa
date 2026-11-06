@@ -5645,12 +5645,13 @@ static bool rewrite_output(nir_builder *b, nir_intrinsic_instr *in, void *data)
  * channel before packing; never pass integer bits through float. */
 static bool pack_rgba16ui(nir_builder *b, nir_intrinsic_instr *in, void *data)
 {
-   (void)data;
    if (in->intrinsic != nir_intrinsic_store_output ||
        nir_intrinsic_io_semantics(in).location != FRAG_RESULT_DATA0)
       return false;
-   if (nir_intrinsic_component(in) || nir_intrinsic_write_mask(in) != 15 || in->src[0].ssa->num_components != 4)
+   if (nir_intrinsic_component(in) || nir_intrinsic_write_mask(in) != 15 || in->src[0].ssa->num_components != 4) {
+      *(bool *)data = true;
       return false;
+   }
    b->cursor = nir_before_instr(&in->instr);
    nir_def *v = nir_umin(b, in->src[0].ssa, nir_imm_ivec4(b, 65535,65535,65535,65535));
    nir_def *rg = nir_ior(b, nir_channel(b,v,0), nir_ishl_imm(b,nir_channel(b,v,1),16));
@@ -6746,19 +6747,10 @@ bool pco_g5p_compile_general_link(nir_shader *nir, bool half_output, const uint8
          if (c->key->packed_rgba16ui) {
             if (c->mrt.targets != 1 || c->key->blend || c->key->write_mask != 15)
                refuse(c, "packed RGBA16UI requires one unblended full-mask target");
-            /* IO was zero-filled before compilation, so every written target
-             * has complete vec4 stores; refuse rather than skip partial IO. */
-            foreach_instr_all(ins, c) {
-               if (ins->type != nir_instr_type_intrinsic)
-                  continue;
-               nir_intrinsic_instr *in = nir_instr_as_intrinsic(ins);
-               if (in->intrinsic == nir_intrinsic_store_output &&
-                   nir_intrinsic_io_semantics(in).location == FRAG_RESULT_DATA0 &&
-                   (nir_intrinsic_component(in) || nir_intrinsic_write_mask(in) != 15 ||
-                    in->src[0].ssa->num_components != 4))
-                  refuse(c, "packed RGBA16UI has partial output IO");
-            }
-            nir_shader_intrinsics_pass(nir, pack_rgba16ui, nir_metadata_control_flow, NULL);
+            bool partial = false;
+            nir_shader_intrinsics_pass(nir, pack_rgba16ui, nir_metadata_control_flow, &partial);
+            if (partial)
+               refuse(c, "packed RGBA16UI has partial output IO");
          }
          /* two targets: eight output words, the most one emitpix carries */
          if (c->mrt.targets > 2 || c->key->blend)
