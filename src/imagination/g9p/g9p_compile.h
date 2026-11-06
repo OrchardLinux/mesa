@@ -21,6 +21,8 @@
  * Common-store buffer slots per shader; a vertex binding takes two (its
  * address and stride), and Zink gives each attribute its own binding
  */
+/* A buffer slot's binding: the array element above the binding number */
+#define G9P_BINDING_ELEMENT_SHIFT 8
 #define G9P_MAX_BUFFERS 36 /* 16 vertex bindings x address and stride, and more */
 #define G9P_MAX_ATTRIBS 16
 #define G9P_MAX_VARYINGS 16

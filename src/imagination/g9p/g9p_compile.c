@@ -677,12 +677,14 @@ buffer_slot(struct g9p_ctx *ctx, nir_src index)
          return -1;
       intr = nir_def_as_intrinsic(s.def);
    }
+   /* an array's element by a constant index (Zink keeps all uniform blocks in one array) */
    if (intr->intrinsic != nir_intrinsic_vulkan_resource_index ||
-       !nir_src_is_const(intr->src[0]) || nir_src_as_uint(intr->src[0]) != 0)
+       !nir_src_is_const(intr->src[0]))
       return -1;
 
    return g9p_buffer_slot(ctx->out, nir_intrinsic_desc_set(intr),
-                          nir_intrinsic_binding(intr));
+                          nir_intrinsic_binding(intr) |
+                             nir_src_as_uint(intr->src[0]) << G9P_BINDING_ELEMENT_SHIFT);
 }
 
 /*

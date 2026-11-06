@@ -1046,17 +1046,20 @@ upload_textures(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics
  * dynamic buffer plus its bound offset
  */
 static uint64_t
-descriptor_buffer_addr(const struct pvr_descriptor_set *ds, unsigned binding)
+descriptor_buffer_addr(const struct pvr_descriptor_set *ds, unsigned slot_binding)
 {
-   const struct pvr_descriptor_set_layout_binding *b = &ds->layout->bindings[binding];
+   const unsigned element = slot_binding >> G9P_BINDING_ELEMENT_SHIFT;
+   const struct pvr_descriptor_set_layout_binding *b =
+      &ds->layout->bindings[slot_binding & BITFIELD_MASK(G9P_BINDING_ELEMENT_SHIFT)];
 
    if (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC ||
        b->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) {
-      const struct pvr_buffer_descriptor *d = &ds->dynamic_buffers[b->dynamic_buffer_idx];
+      const struct pvr_buffer_descriptor *d = &ds->dynamic_buffers[b->dynamic_buffer_idx + element];
 
       return d->addr + d->offset;
    }
-   return ((const struct pvr_buffer_descriptor *)((const uint8_t *)ds->mapping + b->offset))
+   return ((const struct pvr_buffer_descriptor *)((const uint8_t *)ds->mapping + b->offset +
+                                                  element * b->stride))
       ->addr;
 }
 
