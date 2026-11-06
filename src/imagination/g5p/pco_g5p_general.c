@@ -3849,7 +3849,26 @@ static void vs_int(struct gctx *c, nir_alu_instr *a)
       unsigned xr = reg_of(c, x, "shared integer ALU");
       unsigned g = vgrp(c, x);
       unsigned dst = vs_dst(c, &x, 1);
-      vs_bank1_only(c, "vertex shared integer ALU", dst, xr, -1, -1);
+      if (!vbank(c, dst) || !vbank(c, xr)) {
+         /* The A10 developer's emit_alu()/src_reg() stages shared operands
+          * into registers. Do the same for an unqualified mixed shared
+          * form, using the witnessed register IADD/IMUL bank fields.
+          * vs_dst() may have released xr: keep that source unavailable
+          * while materializing A, even when the output goes to bank1. */
+         uint64_t reserved = c->reserved;
+         c->reserved |= BITFIELD64_BIT(xr);
+         unsigned ar = reg_of(c, r[i], "staged shared integer operand");
+         c->reserved = reserved;
+         struct g5p_alu f = G5P_ALU(H(c, dst));
+         f.bank = vbank(c, dst);
+         f.header = vhdr(c, 0x31, ar, xr, -1);
+         f.a = gsrc(c, ar, (struct ref){0}, vgrp(c, r[i]));
+         f.b = gsrc(c, xr, (struct ref){0}, g);
+         put(c, raw, g5p_usc_binary(raw, op, &f), "staged shared integer ALU");
+         c->p->evidence |= PCO_G5P_EV_VS_SHARED;
+         define(c, &a->def, dst);
+         return;
+      }
       put(c, raw, g5p_usc_alu_shared(raw, op, H(c, dst), sd, H(c, xr), vbank(c, dst), g, vhdr(c, 0x11, -1, xr, -1), 0,
                                      0, false, -1, 1),
           "shared integer ALU");
