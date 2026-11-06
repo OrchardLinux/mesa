@@ -553,6 +553,9 @@ g5p_check_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo *c
    if (pvr_g5p_packed_uint_bits(cf)) {
       key->color_output = PCO_G5P_COLOR_UINT32;
       key->packed_uint_bits = pvr_g5p_packed_uint_bits(cf);
+      key->packed_sint = pvr_g5p_packed_is_signed(cf);
+      if (key->packed_sint)
+         key->color_output = PCO_G5P_COLOR_SINT32;
    }
    if (raw32)
       key->color_output = raw32 == 2 ? PCO_G5P_COLOR_SINT32 : PCO_G5P_COLOR_UINT32;
@@ -1048,7 +1051,7 @@ g5p_clear_pipeline(struct pvr_cmd_buffer *cmd_buffer, VkFormat format, uint8_t w
          goto done;
    }
    struct nir_shader *vs = pvr_g5p_clear_nir(true);
-   struct nir_shader *fs = (pvr_g5p_raw32_kind(format) || pvr_g5p_packed_uint_bits(format)) ? pvr_g5p_clear_nir_raw(false, pvr_g5p_raw32_kind(format) == 2)
+   struct nir_shader *fs = (pvr_g5p_raw32_kind(format) || pvr_g5p_packed_uint_bits(format)) ? pvr_g5p_clear_nir_raw(false, (pvr_g5p_raw32_kind(format) == 2 || pvr_g5p_packed_is_signed(format)))
                                                       : pvr_g5p_clear_nir(false);
    const VkPipelineShaderStageCreateInfo stages[2] = {
       { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT,

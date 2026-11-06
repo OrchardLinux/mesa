@@ -5643,7 +5643,7 @@ static bool rewrite_output(nir_builder *b, nir_intrinsic_instr *in, void *data)
 
 /* fmt-rgba16u fw_val_u emits two raw words. Saturate each unsigned
  * channel before packing; never pass integer bits through float. */
-struct packed_uint_rw { unsigned bits, stores; bool partial; };
+struct packed_uint_rw { unsigned bits, stores; bool partial, is_signed; };
 static bool pack_uint(nir_builder *b, nir_intrinsic_instr *in, void *data)
 {
    if (in->intrinsic != nir_intrinsic_store_output ||
@@ -5670,7 +5670,14 @@ static bool pack_uint(nir_builder *b, nir_intrinsic_instr *in, void *data)
    }
    unsigned bits = rw->bits;
    unsigned max = bits == 8 ? 255 : bits == 10 ? 1023 : 65535;
-   nir_def *v = nir_umin(b, src, nir_imm_ivec4(b,max,max,max,bits == 10 ? 3 : max));
+   nir_def *v;
+   if (rw->is_signed) {
+      int lo = -(1 << (bits-1)), hi = (1 << (bits-1))-1;
+      v = nir_imin(b,nir_imax(b,src,nir_imm_ivec4(b,lo,lo,lo,lo)),nir_imm_ivec4(b,hi,hi,hi,hi));
+      v = nir_iand(b,v,nir_imm_ivec4(b,max,max,max,max));
+   } else {
+      v = nir_umin(b,src,nir_imm_ivec4(b,max,max,max,bits == 10 ? 3 : max));
+   }
    nir_def *rg = nir_ior(b, nir_channel(b,v,0), nir_ishl_imm(b,nir_channel(b,v,1),bits));
    nir_def *ba;
    if (bits == 8 || bits == 10) {
@@ -6773,7 +6780,7 @@ bool pco_g5p_compile_general_link(nir_shader *nir, bool half_output, const uint8
                refuse(c, "packed unsigned RT requires one unblended full-mask target");
             if (c->key->packed_uint_bits != 8 && c->key->packed_uint_bits != 10 && c->key->packed_uint_bits != 16)
                refuse(c, "unsupported packed unsigned channel width");
-            struct packed_uint_rw rw = { .bits = c->key->packed_uint_bits };
+            struct packed_uint_rw rw = { .bits = c->key->packed_uint_bits, .is_signed = c->key->packed_sint };
             nir_shader_intrinsics_pass(nir, pack_uint, nir_metadata_control_flow, &rw);
             if (rw.partial && rw.stores > 1)
                refuse(c, "packed unsigned RT needs merging of multiple partial output stores");
