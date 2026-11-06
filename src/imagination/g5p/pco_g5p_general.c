@@ -4811,6 +4811,17 @@ static void setup_inputs(struct gctx *c)
       ids[i] = &in->def;
    }
    unsigned next = c->p->input_mask ? 4 * util_last_bit(c->p->input_mask) : 0;
+   /* The last fetch need not fill its vec4 slot. Its trailing dwords are
+    * outside every DMA destination, so DOUTW can place IDs there without
+    * requiring high source encodings or racing an attribute fetch. Keep
+    * the proven default placement until this alternative is device-tested. */
+   const char *tail = getenv("PVR_G5P_XFB_ID_TAIL");
+   if (next >= NUM_DWORDS && c->attrib_components && tail && !strcmp(tail, "1")) {
+      unsigned last = util_last_bit(c->p->input_mask) - 1;
+      unsigned fetched = c->attrib_components[last];
+      if (fetched > 0 && fetched < 4)
+         next = 4 * last + fetched;
+   }
    for (unsigned i = 0; i < 2; i++) {
       if (!ids[i])
          continue;
