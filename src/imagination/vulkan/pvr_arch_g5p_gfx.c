@@ -548,11 +548,11 @@ g5p_check_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo *c
    /* 32-bit integer targets: the raw32 output (four raw words, pvr_g5p_raw32_kind()); the PBE stores the
     * target's own channels from them */
    const unsigned raw32 = colors ? pvr_g5p_raw32_kind(cf) : 0;
-   if (colors && vk_format_is_int(cf) && !raw32 && cf != VK_FORMAT_R16G16B16A16_UINT)
+   if (colors && vk_format_is_int(cf) && !raw32 && !pvr_g5p_packed_uint_bits(cf))
       return G5P_REFUSE(device, "integer boundary qualification supports CLEAR only");
-   if (cf == VK_FORMAT_R16G16B16A16_UINT) {
+   if (pvr_g5p_packed_uint_bits(cf)) {
       key->color_output = PCO_G5P_COLOR_UINT32;
-      key->packed_rgba16ui = true;
+      key->packed_uint_bits = pvr_g5p_packed_uint_bits(cf);
    }
    if (raw32)
       key->color_output = raw32 == 2 ? PCO_G5P_COLOR_SINT32 : PCO_G5P_COLOR_UINT32;
@@ -1048,7 +1048,7 @@ g5p_clear_pipeline(struct pvr_cmd_buffer *cmd_buffer, VkFormat format, uint8_t w
          goto done;
    }
    struct nir_shader *vs = pvr_g5p_clear_nir(true);
-   struct nir_shader *fs = (pvr_g5p_raw32_kind(format) || format == VK_FORMAT_R16G16B16A16_UINT) ? pvr_g5p_clear_nir_raw(false, pvr_g5p_raw32_kind(format) == 2)
+   struct nir_shader *fs = (pvr_g5p_raw32_kind(format) || pvr_g5p_packed_uint_bits(format)) ? pvr_g5p_clear_nir_raw(false, pvr_g5p_raw32_kind(format) == 2)
                                                       : pvr_g5p_clear_nir(false);
    const VkPipelineShaderStageCreateInfo stages[2] = {
       { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT,
@@ -1173,7 +1173,7 @@ PVR_PER_ARCH(g5p_clear_attachments)(struct pvr_cmd_buffer *cmd_buffer, uint32_t 
       colour = NULL; /* no colour attachment to clear */
    if (!colour && !ds_clear)
       return VK_SUCCESS;
-   if (colour && vk_format_is_int(format) && !pvr_g5p_raw32_kind(format) && format != VK_FORMAT_R16G16B16A16_UINT)
+   if (colour && vk_format_is_int(format) && !pvr_g5p_raw32_kind(format) && !pvr_g5p_packed_uint_bits(format))
       return G5P_REFUSE(cmd_buffer, "vkCmdClearAttachments of an unsupported integer target (%s)", vk_Format_to_str(format));
    /* the triangle's depth is the clear depth: inside the viewport's [0, 1] (VK_EXT_depth_range_unrestricted
     * is not exposed, so a valid clear depth is too) */

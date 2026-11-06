@@ -87,7 +87,7 @@ struct pvr_g5p_programs {
    } load_upload[3];
    char load_refusal[128];
    /* Lazy integer variants: float device allocation order remains identical. */
-   struct pvr_g5p_programs *raw_load[5];
+   struct pvr_g5p_programs *raw_load[6];
    /* raw clear programs by total output words: 2, 4, 8 (two 32-bit integer targets) */
    struct pvr_suballoc_bo *raw_clear_usc[3];
    /* raw end-of-tile programs by target count: 1, 2 */
@@ -292,6 +292,7 @@ bool pvr_g5p_compile_stage(const VkPipelineShaderStageCreateInfo *stage_info, bo
  * texture() of the attachment, bound as set 0 binding 0, at the fragment's
  * pixel centre. false with out->refusal set. */
 bool pvr_g5p_compile_load(struct pco_g5p_program *out);
+bool pvr_g5p_compile_load_rgba8ui(struct pco_g5p_program *out);
 bool pvr_g5p_compile_load_rgba16ui(struct pco_g5p_program *out);
 bool pvr_g5p_compile_load_raw(struct pco_g5p_program *out, bool is_signed);
 /* The clear quad's stages, built with nir_builder (pvr_g5p_nir.c): the
@@ -303,6 +304,15 @@ bool pvr_g5p_compile_load_raw(struct pco_g5p_program *out, bool is_signed);
 struct nir_shader;
 struct nir_shader *pvr_g5p_clear_nir(bool vertex);
 struct nir_shader *pvr_g5p_clear_nir_raw(bool vertex, bool is_signed);
+
+/* Byte-equivalent physical unsigned32 stores, gated by FORMATS=probe.
+ * RG16UI/RGBA8UI are one payload word, RGBA16UI two. Width2 padding
+ * avoids introducing the one-word clear/fragment ABI at the same time. */
+static inline unsigned pvr_g5p_packed_uint_bits(VkFormat format)
+{
+   return format == VK_FORMAT_R8G8B8A8_UINT ? 8 :
+          (format == VK_FORMAT_R16G16_UINT || format == VK_FORMAT_R16G16B16A16_UINT) ? 16 : 0;
+}
 
 /* The 32-bit integer colour targets the raw32 output renders (pco_g5p's PCO_G5P_COLOR_UINT32/SINT32: four raw
  * output words, no f16 conversion): 1 unsigned, 2 signed, 0 any other format. The PBE stores the target's own

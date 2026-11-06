@@ -47,6 +47,8 @@ int main(int argc, char **argv)
       return 2;
    static const struct { const char *name; GLenum fmt; unsigned comps; int is_signed; } F[] = {
       { "rgba16ui", GL_RGBA16UI, 4, 0 },
+      { "rg16ui", GL_RG16UI, 2, 0 },
+      { "rgba8ui", GL_RGBA8UI, 4, 0 },
       { "r32ui", GL_R32UI, 1, 0 },    { "rg32ui", GL_RG32UI, 2, 0 }, { "rgba32ui", GL_RGBA32UI, 4, 0 },
       { "r32i", GL_R32I, 1, 1 },      { "rg32i", GL_RG32I, 2, 1 },   { "rgba32i", GL_RGBA32I, 4, 1 },
    };
@@ -136,7 +138,8 @@ int main(int argc, char **argv)
       unsigned bad=0;
       for(unsigned x=0;x<W;x++)for(unsigned k=0;k<4;k++) {
          uint32_t w=k<C?(phase==0?zero[k]:want(x+(phase==2&&x<W/2?W:0),k)):(k==3?1:0);
-         if(F[f].fmt==GL_RGBA16UI && w>65535)w=65535;
+         if((F[f].fmt==GL_RGBA16UI || F[f].fmt==GL_RG16UI) && w>65535 && k<C)w=65535;
+         if(F[f].fmt==GL_RGBA8UI && w>255)w=255;
          if(px[4*x+k]!=w && bad++<8)
             printf("PACKED-RT pixel phase=%u x=%u c=%u got=%08x want=%08x\n",phase,x,k,px[4*x+k],w);
       }
