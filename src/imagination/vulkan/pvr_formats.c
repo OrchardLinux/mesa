@@ -796,6 +796,13 @@ pvr_get_image_format_properties(struct pvr_physical_device *pdevice,
 
       pImageFormatProperties->maxArrayLayers = max_array_layers;
       pImageFormatProperties->sampleCounts = max_sample_bits;
+      /*
+       * G9P: four samples of 32-bit channels: RGBA hangs the fragment job and RG and R
+       * come out wrong (dEQP fbo.msaa); GL ES needs no samples of these formats
+       */
+      if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g9p) && vk_format_is_color(info->format) &&
+          g9p_format_output(info->format) >= G9P_OUTPUT_RAW1)
+         pImageFormatProperties->sampleCounts = VK_SAMPLE_COUNT_1_BIT;
    }
 
    if (!(tiling_features2 & VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT ||

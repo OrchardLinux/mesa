@@ -100,6 +100,7 @@ g9p_image_format(VkFormat format)
       return G9P_FORMAT_KEY(0x0b, 2, 1, 0, 4);
    case VK_FORMAT_B4G4R4A4_UNORM_PACK16:
       return G9P_FORMAT_KEY(0x0c, 1, 2, 3, 0);
+   case VK_FORMAT_S8_UINT: /* its plane, sampled */
    case VK_FORMAT_R8_UINT:
       return G9P_R001(0x100);
    case VK_FORMAT_R8G8_UINT:

@@ -664,8 +664,8 @@ static VkResult
 compile_stage(struct pvr_device *device, nir_shader *nir,
               const VkPipelineShaderStageCreateInfo *stage,
               const struct g9p_vertex_attrib *attribs, int frag_coord_slot, bool point_coord,
-              const nir_lower_blend_options *blend, const struct g9p_target *targets,
-              struct g9p_shader *out, bool point_size, void *mem_ctx)
+              const nir_lower_blend_options *blend, const struct g9p_coverage *coverage,
+              const struct g9p_target *targets, struct g9p_shader *out, bool point_size, void *mem_ctx)
 {
    bool ok;
 
@@ -673,7 +673,7 @@ compile_stage(struct pvr_device *device, nir_shader *nir,
       ok = g9p_compile_vertex(nir, attribs, frag_coord_slot, point_coord, out, point_size,
                               mem_ctx);
    else
-      ok = g9p_compile_fragment(nir, frag_coord_slot, blend, targets, out, mem_ctx);
+      ok = g9p_compile_fragment(nir, frag_coord_slot, blend, coverage, targets, out, mem_ctx);
    if (!ok)
       return g9p_error(device,
                        "G9P: %s shader not supported by the backend yet",
@@ -827,6 +827,16 @@ g9p_compile_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo 
                                nir_instr_as_tex(instr)->sampler_dim == GLSL_SAMPLER_DIM_CUBE;
       }
       slot = g9p_frag_coord_slot(vs_nir);
+      /* Four samples with a coverage: the fragment program writes it (Zink: static state) */
+      struct g9p_coverage coverage = { 0xf, false };
+      const struct g9p_coverage *coverage_ptr = NULL;
+
+      if (vk_state->ms && vk_state->ms->rasterization_samples == VK_SAMPLE_COUNT_4_BIT) {
+         coverage.mask = vk_state->ms->sample_mask & 0xf;
+         coverage.alpha_to_coverage = vk_state->ms->alpha_to_coverage_enable;
+         if (coverage.mask != 0xf || coverage.alpha_to_coverage)
+            coverage_ptr = &coverage;
+      }
       struct g9p_target targets[G9P_MAX_TARGETS] = { 0 };
 
       for (unsigned t = 0; vk_state->rp && t < MIN2(vk_state->rp->color_attachment_count, G9P_MAX_TARGETS); t++) {
@@ -840,11 +850,11 @@ g9p_compile_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo 
       if (!targets[0].present && !targets[1].present && !targets[2].present && !targets[3].present)
          targets[0] = (struct g9p_target){ true, G9P_OUTPUT_HALF2, false, false };
       result = compile_stage(device, fs_nir, fs_info, NULL, slot, false,
-                             blend_options(vk_state, &blend) ? &blend : NULL, targets, &fs, false,
+                             blend_options(vk_state, &blend) ? &blend : NULL, coverage_ptr, targets, &fs, false,
                              mem_ctx);
       if (result == VK_SUCCESS)
          result = compile_stage(device, vs_nir, vs_info, attribs,
-                                fs.uses_frag_coord ? (int)slot : -1, fs.uses_point_coord, NULL, NULL, &vs,
+                                fs.uses_frag_coord ? (int)slot : -1, fs.uses_point_coord, NULL, NULL, NULL, &vs,
                                 point_size, mem_ctx);
    }
    if (result != VK_SUCCESS)

@@ -108,6 +108,7 @@ struct g9p_vs_store {
 
 struct g9p_ctx {
    int frag_depth;
+   int frag_mask; /* its coverage word's register, or -1 */
    struct g9p_vs_store vs_stores[4 * 64];
    unsigned num_vs_high;
    unsigned num_vs_stores;
@@ -1656,6 +1657,24 @@ emit_output(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
          release(ctx, &intr->instr);
          return true;
       }
+   } else if (sem.location == FRAG_RESULT_SAMPLE_MASK) {
+      /* The mask's word, read once at the end (`6104 half`, Apple's coverage) */
+      r = src_reg(ctx, v);
+      if (r < 0)
+         return false;
+      if (ctx->temps & BITFIELD64_BIT(r)) {
+         int own = alloc_reg(ctx);
+
+         if (own < 0)
+            return false;
+         g9p_alu2(ctx->c, G9P_OR, own, r, r, false);
+         r = own;
+      }
+      pin(ctx, r);
+      ctx->frag_mask = r;
+      ctx->out->uses_discard = true;
+      release(ctx, &intr->instr);
+      return true;
    } else if (sem.location == FRAG_RESULT_DEPTH) {
       /* gl_FragDepth: read once at the end (`2104 half`, Apple's depth(any)) */
       r = src_reg(ctx, v);
@@ -2934,6 +2953,7 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
    /* a retry starts over: the stores of the attempt that ran out of registers are gone */
    ctx->num_vs_stores = 0;
    ctx->frag_depth = -1;
+   ctx->frag_mask = -1;
    ctx->num_vs_high = 0;
    ctx->max_reg = 0;
    ctx->st = st;
@@ -3132,6 +3152,11 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
          colour |= ctx->colour[i] >= 0;
       for (unsigned t = 0; t < G9P_MAX_TARGETS; t++)
          words += ctx->out->targets[t].present ? g9p_output_words(ctx->out->targets[t].output) : 0;
+      /* Before the colour moves, which may take these registers (as Apple's order) */
+      if (ctx->frag_depth >= 0)
+         G9P_EMIT(ctx->c, 0x2104, 2 * ctx->frag_depth);
+      if (ctx->frag_mask >= 0)
+         G9P_EMIT(ctx->c, 0x6104, 2 * ctx->frag_mask);
       if (colour) {
          /* unwritten components: 0 */
          for (unsigned i = 0; i < 4 * G9P_MAX_TARGETS; i++) {
@@ -3147,8 +3172,6 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
          if (ctx->out->native_blend)
             g9p_blend_src_over(ctx->c);
       }
-      if (ctx->frag_depth >= 0)
-         G9P_EMIT(ctx->c, 0x2104, 2 * ctx->frag_depth);
       g9p_end_fragment(ctx->c, colour ? words : 0);
       break;
    }
@@ -3340,6 +3363,45 @@ lower_io(nir_shader *nir)
             type_size_vec4, 0);
    if (nir->info.stage == MESA_SHADER_FRAGMENT)
       NIR_PASS(_, nir, nir_shader_intrinsics_pass, clamp_frag_depth, nir_metadata_control_flow, NULL);
+}
+
+/*
+ * Sample coverage and alpha to coverage: what the fragment writes as its mask, the word
+ * `6104 half` reads (metal-tt: Apple's alpha to coverage is this mask computed in the
+ * program). The alpha is the colour's before blending; 0, 1, 3, 7 or 15 samples by it.
+ */
+static void
+lower_coverage(nir_shader *nir, const struct g9p_coverage *coverage)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_builder b = nir_builder_at(nir_after_impl(impl));
+   nir_def *alpha = NULL;
+
+   nir_foreach_block (block, impl) {
+      nir_foreach_instr (instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+
+         if (intr->intrinsic == nir_intrinsic_store_output &&
+             nir_intrinsic_io_semantics(intr).location == FRAG_RESULT_DATA0 &&
+             intr->src[0].ssa->num_components == 4) {
+            alpha = nir_channel(&b, intr->src[0].ssa, 3);
+         }
+      }
+   }
+
+   nir_def *mask = nir_imm_int(&b, coverage->mask);
+
+   if (coverage->alpha_to_coverage && alpha) {
+      nir_def *n = nir_f2u32(&b, nir_fadd_imm(&b, nir_fmul_imm(&b, nir_fsat(&b, alpha), 4.0f), 0.5f));
+
+      mask = nir_iand(&b, mask, nir_iadd_imm(&b, nir_ishl(&b, nir_imm_int(&b, 1), n), -1));
+   }
+   nir_store_output(&b, mask, nir_imm_int(&b, 0), .base = FRAG_RESULT_SAMPLE_MASK,
+                    .src_type = nir_type_uint32,
+                    .io_semantics.location = FRAG_RESULT_SAMPLE_MASK, .io_semantics.num_slots = 1);
+   nir->info.outputs_written |= BITFIELD64_BIT(FRAG_RESULT_SAMPLE_MASK);
 }
 
 /* The last attempt at a vertex shader: in program order, every load at its use */
@@ -3559,6 +3621,34 @@ g9p_lower_cubes_seamful(nir_shader *nir, bool mag_at_half)
 static bool
 lower_txf(nir_builder *b, nir_tex_instr *tex, void *data)
 {
+   /*
+    * A four-sample texture reads as a 2D one of twice the size, each pixel's samples
+    * its 2x2 block with the index in Morton order, y in bit 0 (g9p_pack_image_view())
+    */
+   if (tex->op == nir_texop_txs && tex->sampler_dim == GLSL_SAMPLER_DIM_MS) {
+      b->cursor = nir_after_instr(&tex->instr);
+      nir_def *half = nir_ushr_imm(b, &tex->def, 1);
+
+      nir_def_rewrite_uses_after(&tex->def, half);
+      tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
+      return true;
+   }
+   if (tex->op == nir_texop_txf_ms) {
+      const int coord_i = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+      const int ms_i = nir_tex_instr_src_index(tex, nir_tex_src_ms_index);
+
+      if (coord_i < 0 || ms_i < 0)
+         return false;
+      b->cursor = nir_before_instr(&tex->instr);
+      nir_def *c = tex->src[coord_i].src.ssa, *s = tex->src[ms_i].src.ssa;
+      nir_def *x = nir_iadd(b, nir_ishl_imm(b, nir_channel(b, c, 0), 1), nir_ushr_imm(b, s, 1));
+      nir_def *y = nir_iadd(b, nir_ishl_imm(b, nir_channel(b, c, 1), 1), nir_iand_imm(b, s, 1));
+
+      nir_tex_instr_remove_src(tex, ms_i);
+      nir_src_rewrite(&tex->src[nir_tex_instr_src_index(tex, nir_tex_src_coord)].src, nir_vec2(b, x, y));
+      tex->op = nir_texop_txf;
+      tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
+   }
    const int ci = nir_tex_instr_src_index(tex, nir_tex_src_coord);
    const int li = nir_tex_instr_src_index(tex, nir_tex_src_lod);
    const unsigned n = tex->coord_components - tex->is_array;
@@ -4406,7 +4496,7 @@ find_flat_varyings(nir_shader *nir, struct g9p_shader *out)
 
 bool
 g9p_compile_fragment(nir_shader *nir, unsigned frag_coord_slot,
-                     const nir_lower_blend_options *blend,
+                     const nir_lower_blend_options *blend, const struct g9p_coverage *coverage,
                      const struct g9p_target targets[G9P_MAX_TARGETS], struct g9p_shader *out,
                      void *mem_ctx)
 {
@@ -4421,6 +4511,8 @@ g9p_compile_fragment(nir_shader *nir, unsigned frag_coord_slot,
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_centroid, nir_metadata_control_flow, NULL);
    find_flat_varyings(nir, out);
    lower_io(nir);
+   if (coverage)
+      lower_coverage(nir, coverage);
    out->native_blend = blend && is_src_over(blend) && out->output == G9P_OUTPUT_HALF2 &&
                        !out->output_float && !targets[1].present && !targets[2].present &&
                        !targets[3].present && !getenv("G9P_NO_NATIVE_BLEND");

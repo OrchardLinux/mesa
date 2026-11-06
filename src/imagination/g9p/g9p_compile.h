@@ -223,8 +223,14 @@ bool g9p_compile_vertex(nir_shader *nir, const struct g9p_vertex_attrib *attribs
  * nir_lower_blend, reading the tile's colour); out->uses_fbfetch tells the
  * pipeline to mark its draws translucent.
  */
+/* What a multisample pipeline asks of each fragment's coverage */
+struct g9p_coverage {
+   uint8_t mask; /* the samples VkPipelineMultisampleStateCreateInfo keeps */
+   bool alpha_to_coverage;
+};
+
 bool g9p_compile_fragment(nir_shader *nir, unsigned frag_coord_slot,
-                          const nir_lower_blend_options *blend,
+                          const nir_lower_blend_options *blend, const struct g9p_coverage *coverage,
                           const struct g9p_target targets[G9P_MAX_TARGETS], struct g9p_shader *out,
                           void *mem_ctx);
 
