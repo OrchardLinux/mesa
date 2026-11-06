@@ -2936,21 +2936,26 @@ static void vs_ffma(struct gctx *c, nir_alu_instr *a)
          return;
       }
    }
-   /* Source modifiers on the register FMA: vsalu-probes.py v_ffma_nega/negc/absa/absc/negabsa and
-    * v_ffma_negb_rr/negc_rr, Apple's {h39} with each operand's negate/abs in place, operands in order. The
-    * common-store forms have no witnessed modifier. */
-   for (unsigned i = 0; i < 3; i++)
-      if ((r[i].neg || r[i].abs) && (vkind(c, r[0]) == VK_SHARED || vkind(c, r[1]) == VK_SHARED ||
-                                     vkind(c, r[2]) == VK_SHARED))
-         refuse(c, "ffma with a source modifier and a uniform operand (no witnessed vertex form)");
-   if (vkind(c, r[0]) == VK_SHARED && vkind(c, r[1]) == VK_SHARED)
-      reg_of(c, r[1], "uniform operand");
+   /* The A10 developer's emit_alu() stages operands with src_reg() before
+    * emitting FMA (g9p-gles2-a10, MIT). Use that path when the inline shared
+    * tuple is not witnessed: modifiers, or a shared multiplicand with a
+    * register addend that stays live. The existing shared MOV followed by
+    * the register FMA preserves a single fused operation, its modifiers and
+    * each source's real last-read group. In mask-stack code reg_of() may
+    * return instruction-local scratch, so do not rely on it changing vkind.
+    * All previously supported shared tuples keep their original path. */
+   bool register_fma = r[0].neg || r[0].abs || r[1].neg || r[1].abs || r[2].neg || r[2].abs;
+   register_fma |= (vkind(c, r[0]) == VK_SHARED || vkind(c, r[1]) == VK_SHARED) &&
+                   vkind(c, r[2]) == VK_REG && !dies(c, r[2]);
+   if (!register_fma && vkind(c, r[0]) == VK_SHARED && vkind(c, r[1]) == VK_SHARED)
+      reg_of(c, r[1], "uniform operand"); /* mov.shared to a temp */
    if (vkind(c, r[1]) == VK_SHARED) {
       struct ref t = r[0];
       r[0] = r[1];
       r[1] = t;
    }
-   bool sa = vkind(c, r[0]) == VK_SHARED, sc = vkind(c, r[2]) == VK_SHARED;
+   bool sa = !register_fma && vkind(c, r[0]) == VK_SHARED;
+   bool sc = !register_fma && vkind(c, r[2]) == VK_SHARED;
    unsigned dst;
    if (sa && sc) {
       /* fma.shared_ac route70 (A*B+C): {h11 x0 dc0 bg1|bg0} */
