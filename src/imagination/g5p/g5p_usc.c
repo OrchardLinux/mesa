@@ -917,7 +917,7 @@ unsigned g5p_usc_gather(uint8_t *out, const struct g5p_tex *t)
 unsigned g5p_usc_sample_ext(uint8_t *out, const struct g5p_tex_ext *t)
 {
    const bool coupled = t->tuple != G5P_TEX_TUPLE_ORDINARY;
-   CHECK(t->tuple <= G5P_TEX_TUPLE_COUPLED_GRAD_OFFSET, "unqualified texture recipe");
+   CHECK((unsigned)t->tuple <= G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL_OFFSET_3D, "unqualified texture recipe");
    CHECK(!coupled || t->lod_shared == (t->tuple == G5P_TEX_TUPLE_COUPLED_SHARED_LEVEL),
          "unqualified independent texture continuation choices");
    static const uint8_t dim_low[G5P_TEX_DIM_COUNT] = {0x5, 0x7, 0xb, 0xd};
@@ -935,8 +935,9 @@ unsigned g5p_usc_sample_ext(uint8_t *out, const struct g5p_tex_ext *t)
    CHECK(t->lod != G5P_TEX_LOD_GRAD || t->dim == G5P_TEX_2D || t->dim == G5P_TEX_2D_ARRAY,
          "gradients are measured on 2D and 2D arrays only");
    CHECK(!t->offset || t->dim != G5P_TEX_CUBE, "cube offsets do not exist");
+   const bool xyz_tuple = t->tuple == G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL_OFFSET_3D;
    const bool offset_tuple = t->tuple == G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL_OFFSET ||
-                             t->tuple == G5P_TEX_TUPLE_COUPLED_GRAD_OFFSET;
+                             t->tuple == G5P_TEX_TUPLE_COUPLED_GRAD_OFFSET || xyz_tuple;
    const bool grad_tuple = t->tuple == G5P_TEX_TUPLE_COUPLED_GRAD ||
                            t->tuple == G5P_TEX_TUPLE_COUPLED_GRAD_OFFSET;
    CHECK(!coupled || (!t->compare && t->offset == offset_tuple &&
@@ -946,8 +947,9 @@ unsigned g5p_usc_sample_ext(uint8_t *out, const struct g5p_tex_ext *t)
                         (t->dim == G5P_TEX_2D || t->dim == G5P_TEX_2D_ARRAY)),
          "vertex gradient recipe is a 2D or array sample with temporary derivatives");
    CHECK(!offset_tuple || (!t->read && !t->lod_shared &&
-                          (t->dim == G5P_TEX_2D || t->dim == G5P_TEX_2D_ARRAY)),
-         "vertex offset recipe is a 2D or array sample with a temporary level");
+                          (xyz_tuple ? t->dim == G5P_TEX_3D :
+                           t->dim == G5P_TEX_2D || t->dim == G5P_TEX_2D_ARRAY)),
+         "vertex offset recipe requires its witnessed dimension and temporary operands");
    CHECK(!(t->tuple == G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL) || (coupled && !t->lod_shared),
          "vertex level bank requires the vertex tuple and a temporary level");
    uint8_t raw[14] = {0x1a, (t->mask << 4) | dim_low[t->dim], t->dst_half | (t->read ? 0x40 : 0),
@@ -1004,6 +1006,21 @@ unsigned g5p_usc_vertex_half_immediate(uint8_t *out, unsigned dst_half, uint16_t
    unsigned n = g5p_usc_half_immediate(raw, dst_half, value);
    if (!n || !destination(raw + 2, dst_half, 1))
       return 0;
+   return finish(out, raw, n);
+}
+
+unsigned g5p_usc_half_immediate_xyz(uint8_t *out, unsigned dst_half, uint16_t value, unsigned bank)
+{
+   CHECK(value < 4096, "XYZ packed offset is three signed nibbles");
+   uint8_t raw[12];
+   unsigned n = g5p_usc_half_immediate(raw, dst_half, value & 1023);
+   if (!n || !destination(raw + 2, dst_half, bank))
+      return 0;
+   /* Native v_{uniform,attribute}_axis2_bit{2,3} independently witness
+    * literal bits10/11 at the existing split-immediate map positions. */
+   for (unsigned b = 10; b < 12; b++)
+      if ((value >> b) & 1)
+         raw[imm_byte[b]] |= 1u << imm_bit[b];
    return finish(out, raw, n);
 }
 
