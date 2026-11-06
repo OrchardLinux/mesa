@@ -107,6 +107,8 @@ struct g9p_vs_store {
 };
 
 struct g9p_ctx {
+   /* ifs open inside the current loop */
+   unsigned if_depth;
    int frag_depth;
    int frag_mask; /* its coverage word's register, or -1 */
    struct g9p_vs_store vs_stores[4 * 64];
@@ -2839,6 +2841,19 @@ release_condition(struct g9p_ctx *ctx, nir_if *nif)
 static bool
 emit_break(struct g9p_ctx *ctx, bool when_true)
 {
+   /*
+    * The stack is each lane's count of levels to come back up. A break at the top of the
+    * loop's body leaves it at the loop's two; under ifs it must also outlast their pops, or
+    * the lane wakes up at their end: Apple's push, 86d6 setting the count, pop.
+    */
+   if (ctx->if_depth) {
+      ctx->c->uses_stack = true;
+      g9p_push_if(ctx->c, ctx->st, !when_true);
+      G9P_EMIT(ctx->c, g9p_w0(ctx->c, 0x0188), g9p_st_dst(ctx->c, ctx->st),
+               0x0101 | (2 + ctx->if_depth + 1) << 1, 0x0120, 0x86d6);
+      g9p_pop_levels(ctx->c, ctx->st, 1);
+      return true;
+   }
    g9p_loop_break(ctx->c, ctx->st, when_true);
    if (ctx->num_exit_jumps == ctx->max_exit_jumps) {
       fprintf(stderr, "g9p: too many breaks\n");
@@ -2860,6 +2875,7 @@ emit_if_else(struct g9p_ctx *ctx, nir_if *nif, bool sense)
 
    /* keep the lanes for which the condition holds */
    g9p_push_if(ctx->c, ctx->st, !sense);
+   ctx->if_depth++;
    to_else = g9p_jump(ctx->c, G9P_JMP_NONE, 0);
    if (!emit_cf_list(ctx, &nif->then_list))
       return false;
@@ -2870,6 +2886,7 @@ emit_if_else(struct g9p_ctx *ctx, nir_if *nif, bool sense)
       return false;
    g9p_jump_patch(ctx->c, to_pop, 2 * (int)(ctx->c->n - to_pop));
    g9p_pop_levels(ctx->c, ctx->st, 1);
+   ctx->if_depth--;
    return true;
 }
 
@@ -2928,11 +2945,14 @@ emit_loop(struct g9p_ctx *ctx, nir_loop *loop)
    unsigned body;
 
    unsigned first_exit = ctx->num_exit_jumps;
+   const unsigned outer_depth = ctx->if_depth;
 
+   ctx->if_depth = 0;
    g9p_loop_begin(ctx->c, ctx->st);
    body = ctx->c->n;
    if (!emit_cf_list(ctx, &loop->body))
       return false;
+   ctx->if_depth = outer_depth;
    g9p_jump(ctx->c, G9P_JMP_ANY, -2 * (int)(ctx->c->n - body));
    /* this loop's breaks skip to here when no lane is left */
    for (unsigned j = first_exit; j < ctx->num_exit_jumps; j++)
@@ -3000,6 +3020,7 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
    /* a retry starts over: the stores of the attempt that ran out of registers are gone */
    ctx->num_vs_stores = 0;
    ctx->frag_depth = -1;
+   ctx->if_depth = 0;
    ctx->frag_mask = -1;
    ctx->num_vs_high = 0;
    ctx->max_reg = 0;
