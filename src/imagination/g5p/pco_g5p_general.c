@@ -2817,9 +2817,13 @@ static void vs_ffma(struct gctx *c, nir_alu_instr *a)
          return;
       }
    }
+   /* Source modifiers on the register FMA: vsalu-probes.py v_ffma_nega/negc/absa/absc/negabsa and
+    * v_ffma_negb_rr/negc_rr, Apple's {h39} with each operand's negate/abs in place, operands in order. The
+    * common-store forms have no witnessed modifier. */
    for (unsigned i = 0; i < 3; i++)
-      if (r[i].neg || r[i].abs)
-         refuse(c, "ffma with a source modifier (no witnessed vertex form)");
+      if ((r[i].neg || r[i].abs) && (vkind(c, r[0]) == VK_SHARED || vkind(c, r[1]) == VK_SHARED ||
+                                     vkind(c, r[2]) == VK_SHARED))
+         refuse(c, "ffma with a source modifier and a uniform operand (no witnessed vertex form)");
    if (vkind(c, r[0]) == VK_SHARED && vkind(c, r[1]) == VK_SHARED)
       reg_of(c, r[1], "uniform operand");
    if (vkind(c, r[1]) == VK_SHARED) {
@@ -2867,8 +2871,10 @@ static void vs_ffma(struct gctx *c, nir_alu_instr *a)
       bool d[3] = {dies(c, r[0]), dies(c, r[1]), dies(c, r[2])};
       struct g5p_alu f = G5P_ALU(0);
       unsigned ia = 0, ib = 1;
-      if ((!d[0] && !d[1]) || !d[2]) {
-         /* vsalu-probes.py v_ffma_rr..rr4: operands in order, each group its last read, {h39 x0} */
+      const bool mods = r[0].neg || r[0].abs || r[1].neg || r[1].abs || r[2].neg || r[2].abs;
+      if ((!d[0] && !d[1]) || !d[2] || mods) {
+         /* vsalu-probes.py v_ffma_rr..rr4 and the modifier forms: operands in order, each group its last read
+          * and its negate/abs in place, {h39 x0} */
          f.header = 0x39;
          f.a = gsrc(c, reg[0], r[0], d[0]);
          f.b = gsrc(c, reg[1], r[1], d[1]);

@@ -89,6 +89,23 @@ int main(void)
       fails += check(fm[i].name, b, n, fm[i].want);
    }
 
+   /* ffma with source modifiers, {h39 x0}, operands in order with their negate/abs (x r4, y r5, z r6) */
+   static const struct { const char *name; unsigned dst, ga, gb, gc; bool na, aa, nb, nc, ac; const char *want; } fmod[] = {
+      {"v_ffma_nega", 8, 1, 0, 0, 1, 0, 0, 0, 0, "9a390803901518014c80"},
+      {"v_ffma_negc", 8, 1, 0, 0, 0, 0, 0, 1, 0, "9a390803901518014c20"},
+      {"v_ffma_absa", 8, 1, 0, 0, 0, 1, 0, 0, 0, "9a390803901518014c010080"},
+      {"v_ffma_absc", 8, 1, 0, 0, 0, 0, 0, 0, 1, "9a390803901518014c010020"},
+      {"v_ffma_negabsa", 8, 1, 0, 0, 1, 1, 0, 0, 0, "9a390803901518014c810080"},
+      {"v_ffma_negb_rr", 14, 0, 0, 0, 0, 0, 1, 0, 0, "9a390e03101518014c40"},
+      {"v_ffma_negc_rr", 14, 0, 0, 0, 0, 0, 0, 1, 0, "9a390e03101518014c20"},
+   };
+   for (unsigned i = 0; i < sizeof(fmod) / sizeof(fmod[0]); i++) {
+      f = alu(fmod[i].dst, 0x39, SRC(8, fmod[i].ga, fmod[i].na, fmod[i].aa), SRC(10, fmod[i].gb, fmod[i].nb, 0));
+      f.c = SRC(12, fmod[i].gc, fmod[i].nc, fmod[i].ac);
+      n = g5p_usc_fma(b, &f);
+      fails += check(fmod[i].name, b, n, fmod[i].want);
+   }
+
    /* ceil: v_ceil, x (r4) in place, exactly the vertex lowering */
    n = g5p_recipe(G5P_RC_CEIL, b, sizeof(b), 8, 8, 0, 0, G5P_RC_VERTEX, &err);
    fails += check("v_ceil", b, n, "9821080390014080" "991108030191a00144897000");
