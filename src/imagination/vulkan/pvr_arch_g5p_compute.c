@@ -66,6 +66,7 @@ PVR_PER_ARCH(g5p_compute_pipeline_compile)(
    }
    state->num_regs = shader.num_regs;
    state->a9_bodyless = shader.a9_bodyless;
+   state->a9_unit_z = shader.a9_unit_z;
    state->a9_local_dwords = shader.a9_local_dwords;
    state->a9_has_barriers = shader.a9_has_barriers;
    state->a9_device_fence = shader.a9_device_fence;
@@ -134,6 +135,12 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
     * empty program does not retire under our CDM launch contract, so do not
     * launch it: the sub-command's ordinary completion tail still establishes
     * command-buffer ordering and signals the submit fence. */
+   /* The compiler's unit-Z specialization is valid only for these actual
+    * dispatch dimensions. Indirect dimensions cannot be checked here. */
+   if (state->a9_unit_z && (indirect_va || group_count[2] != 1))
+      return vk_errorf(cmd_buffer, VK_ERROR_FEATURE_NOT_PRESENT,
+                       "G5P refuses: compute workgroup Z specialization requires a direct dispatch with one Z group");
+
    if (state->a9_bodyless) {
       /* An indirect bodyless dispatch has no consumer of its dimensions,
        * so its argument read is unobservable and is omitted like the kernel
