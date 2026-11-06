@@ -517,17 +517,28 @@ upload_varyings(struct pvr_device *device, struct pvr_g9p_graphics_state *state,
    const unsigned n = state->num_varyings;
    uint32_t data[2 * (G9P_MAX_VARYINGS + 1)] = { 0x03000000, 0 };
    uint32_t code[G9P_MAX_VARYINGS + 2];
-   unsigned nc = 0;
+   unsigned nc = 0, iterates = n, first = 0;
+   bool any_persp = false;
 
    if (!n)
       return VK_SUCCESS;
 
-   for (unsigned v = 0; v < MIN2(n, fs->num_varyings); v++)
-      state->flat_varyings |= fs->varying_flat[v];
-   for (unsigned v = 0; v <= n; v++)
-      code[nc++] = g9p_pds_dout(G9P_DOUTI, v, G9P_PDS_DATA, 0, v == n ? G9P_PDS_END : 0);
+   for (unsigned v = 0; v < n; v++) {
+      const bool read = v < fs->num_varyings;
+
+      state->flat_varyings |= read && fs->varying_flat[v];
+      any_persp |= !read || (fs->varying_perspective[v] && !fs->varying_flat[v]);
+   }
+   /* The W iterate only with perspective (`flat`, `noperspective` captures have none) */
+   if (any_persp) {
+      iterates = n + 1;
+      first = 1;
+   }
+   for (unsigned v = 0; v < iterates; v++)
+      code[nc++] = g9p_pds_dout(G9P_DOUTI, v, G9P_PDS_DATA, 0,
+                                v + 1 == iterates ? G9P_PDS_END : 0);
    code[nc++] = g9p_pds_halt();
-   state->varying_units = DIV_ROUND_UP(8 * (n + 1), 16);
+   state->varying_units = DIV_ROUND_UP(8 * iterates, 16);
 
    for (unsigned pv = 0; pv < (state->flat_varyings ? 3 : 1); pv++) {
       VkResult result;
@@ -539,12 +550,12 @@ upload_varyings(struct pvr_device *device, struct pvr_g9p_graphics_state *state,
          const unsigned loc = 2 + 8 * v;
 
          /* top byte: the shade model, 3 Gouraud or the flat colour's vertex */
-         data[2 + 2 * v] = (flat ? pv : 3u) << 24 | (3u << 2 | persp) << 16 | loc << 8 | loc |
-                           (fs->uses_point_coord && v == fs->point_coord_slot ? BITFIELD_BIT(23) : 0);
-         data[3 + 2 * v] = (persp ? BITFIELD_BIT(22) : 0) | (2 * v) << 23 |
-                           (v + 1 == n ? BITFIELD_BIT(31) : 0);
+         data[2 * (first + v)] = (flat ? pv : 3u) << 24 | (3u << 2 | persp) << 16 | loc << 8 | loc |
+                                 (fs->uses_point_coord && v == fs->point_coord_slot ? BITFIELD_BIT(23) : 0);
+         data[2 * (first + v) + 1] = (persp ? BITFIELD_BIT(22) : 0) | (2 * v) << 23 |
+                                     (v + 1 == n ? BITFIELD_BIT(31) : 0);
       }
-      result = pvr_gpu_upload_pds(device, data, 2 * (n + 1), 16, code, nc, 16, 64,
+      result = pvr_gpu_upload_pds(device, data, 2 * iterates, 16, code, nc, 16, 64,
                                   &state->varyings[pv]);
       if (result != VK_SUCCESS)
          return result;
@@ -2322,8 +2333,24 @@ static void
 pack_image_state(uint32_t *w, uint64_t addr, uint32_t width, uint32_t height,
                  bool linear, uint32_t pitch, VkFormat format)
 {
-   const uint32_t key = g9p_image_format(format);
+   uint32_t key = g9p_image_format(format);
 
+   /*
+    * 32-bit channels: the PBE takes the tile in 16-bit halves and converts for a
+    * 32-bit code (0x121 packs an f32 to f16, 0x221 widens an f16; measured on the A10).
+    * One channel's two halves are stored unchanged by the 16_16 integer code, two
+    * channels' four by 16_16_16_16.
+    */
+   switch (g9p_format_output(format)) {
+   case G9P_OUTPUT_RAW1:
+      key = G9P_RG01(0x123);
+      break;
+   case G9P_OUTPUT_RAW2:
+      key = G9P_RGBA(0x132);
+      break;
+   default:
+      break;
+   }
    memset(w, 0, 8 * 4);
    w[0] = (key ? key : g9p_image_format(VK_FORMAT_B8G8R8A8_UNORM)) | (linear ? 0x02 : 0x0a) |
           (width - 1) << 27;
