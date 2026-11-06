@@ -72,6 +72,8 @@ static const unsigned g5p_mrt_variant_targets[PVR_G5P_MRT_VARIANTS] = { 1, 2, 4 
 #define G5P_RESTORE0 0x01800000u
 /* The TA scratch the kernel's records point into, and its pointer offsets */
 #define G5P_SCRATCH_BYTES 0x8000u
+#define G5P_NULL_RT_SIDE 16u  /* the null colour target: 16x16 R8, 16-byte rows (g5p_job_init()) */
+#define G5P_NULL_RT_PITCH 16u
 static const uint32_t g5p_scratch_ptr_off[6] = { 0x20, 0x24, 0x28, 0x2c, 0x6240, 0x6040 };
 /* The default scissor and depth-bias tables of a render without tables of its
  * own. Its draws index entry 0 only (scindex/dbindex 0, scissor and bias
@@ -233,6 +235,7 @@ g5p_free_programs(struct pvr_device *device, struct pvr_g5p_programs *p)
    pvr_bo_suballoc_free(p->ta_kick.pvr_bo);
    pvr_bo_suballoc_free(p->ta_usc);
    pvr_bo_suballoc_free(p->scratch);
+   pvr_bo_suballoc_free(p->null_rt);
    pvr_bo_suballoc_free(p->scissor_pool);
    pvr_bo_suballoc_free(p->dbias_pool);
    pvr_bo_suballoc_free(p->eot_usc_ms);
@@ -431,6 +434,8 @@ g5p_upload_programs(struct pvr_device *device, struct pvr_g5p_programs *p)
 
    result = g5p_upload_zeroed(device, G5P_SCRATCH_BYTES, &p->scratch);
    if (result == VK_SUCCESS)
+      result = g5p_upload_zeroed(device, G5P_NULL_RT_PITCH * G5P_NULL_RT_SIDE, &p->null_rt);
+   if (result == VK_SUCCESS)
       result = g5p_upload_zeroed(device, G5P_SCISSOR_POOL_BYTES, &p->scissor_pool);
    if (result == VK_SUCCESS)
       result = g5p_upload_zeroed(device, G5P_DBIAS_POOL_BYTES, &p->dbias_pool);
@@ -603,7 +608,15 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
    const struct pvr_g5p_programs *p = &device->g5p->programs;
    const struct pvr_render_pass_info *info = &cmd_buffer->state.render_pass_info;
    struct pvr_g5p_job *g = &job->g5p;
-   const unsigned n = hw_render->eot_surface_count;
+   /* A render without colour attachments (a depth-only or stencil-only pass): its end of tile stores the
+    * one-target form into the device's null target, a 16x16 R8 surface. The PBE cuts its writes to the
+    * surface it is given (the edge tiles' pixels past an attachment are not written), so the store touches
+    * those 256 bytes and nothing else; the render's extent is the framebuffer's. Its draws write no colour
+    * (their pipelines take write mask 0, pvr_arch_g5p_gfx.c): the no-colour ISP form, depth/stencil only.
+    * Apple's own depth-only pass is not captured (bench-gaps.md section 6.5); this takes only the forms the
+    * one-target pass already runs. */
+   const bool null_target = hw_render->eot_surface_count == 0;
+   const unsigned n = null_target ? 1 : hw_render->eot_surface_count;
    unsigned v;
 
    /* everything but the reads the pass's draws collected (pvr_g5p_perf.h) */
@@ -627,6 +640,8 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
    if (admit != VK_SUCCESS)
       return admit;
    g->samples = MAX2(hw_render->sample_count, 1);
+   if (null_target && g->samples != 1)
+      return G5P_REFUSE(cmd_buffer, "a %u-sample render without colour attachments", g->samples);
    /* the render's depth-bias table (upstream's, uploaded before this hook):
     * the kernel takes its entries from ISP_DBIAS_BASE */
    if (sub_cmd->depth_bias_bo)
@@ -660,7 +675,17 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
    float clear[4][4] = { { 0 } };
    /* a loaded target: its texture state (q0, q1, q2, 0), the load program's image upload */
    uint64_t load_state[4] = { 0 };
-   for (unsigned t = 0; t < n; t++) {
+   if (null_target) {
+      uint32_t key;
+      bool srgb;
+      if (!g5p_pbe_key(VK_FORMAT_R8_UNORM, &key, &srgb))
+         return G5P_REFUSE(cmd_buffer, "the null colour target's R8 key");
+      g5p_pbe_encode(pbe[0], key, srgb, p->null_rt->dev_addr.addr, G5P_NULL_RT_SIDE, G5P_NULL_RT_SIDE,
+                     G5P_NULL_RT_PITCH);
+      g->width = info->rstate->width;
+      g->height = info->rstate->height;
+   }
+   for (unsigned t = 0; t < n && !null_target; t++) {
       const struct pvr_image_view *iview = info->attachments[hw_render->eot_surfaces[t].attachment_idx];
       const struct pvr_image *image = pvr_image_view_get_image(iview);
       const struct pvr_image_plane *plane = pvr_single_plane_const(image);
@@ -723,8 +748,9 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
     * would need a clear of the area alone. Several targets in a partial area
     * are refused before (pvr_arch_g5p_mrt_pass_check()). */
    const VkRect2D *area = &info->render_area;
-   const bool partial = area->offset.x || area->offset.y || area->extent.width != g->width ||
-                        area->extent.height != g->height;
+   /* the null target holds nothing to keep: no colour LOAD whatever the area */
+   const bool partial = !null_target && (area->offset.x || area->offset.y || area->extent.width != g->width ||
+                                         area->extent.height != g->height);
    bool load = partial;
    for (unsigned i = 0; i < hw_render->color_init_count; i++) {
       const unsigned t = i; /* color_init follows the EOT surfaces' order */

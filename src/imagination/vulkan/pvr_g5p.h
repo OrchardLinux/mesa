@@ -65,6 +65,9 @@ struct pvr_g5p_programs {
    /* the TA scratch the kernel's records point into, and the V2 tables of
     * a render that has none of its own (the template's sizes) */
    struct pvr_suballoc_bo *scratch, *scissor_pool, *dbias_pool;
+   /* a render without colour attachments: the PBE target of its end of tile, a 16x16 R8 surface the PBE cuts
+    * every pixel past to (pvr_arch_g5p.c g5p_job_init()) */
+   struct pvr_suballoc_bo *null_rt;
    /* 4x (pvr_g5p_msaa.c): the end of tile of a one-target multisample
     * store (emitpix per sample), and the one-target clear's kick at sample
     * rate (DOUTU src0[34:33] 2) */

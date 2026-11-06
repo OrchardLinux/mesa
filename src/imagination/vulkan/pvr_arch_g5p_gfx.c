@@ -516,13 +516,12 @@ g5p_check_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo *c
       VkResult mrt = pvr_arch_g5p_mrt_pipeline_check(device, colors, cfs);
       if (mrt != VK_SUCCESS)
          return mrt;
-   } else if (colors != 1) {
-      return G5P_REFUSE(device, "%u colour attachments (rung A: 1)", colors);
    }
-   /* the formats the two-word program renders: the A9 format table's (pvr_g5p_formats.h) */
+   /* the formats the two-word program renders: the A9 format table's (pvr_g5p_formats.h); no colour
+    * attachment: a depth/stencil-only pass (its render stores the null target, pvr_arch_g5p.c) */
    uint32_t cf_key;
    bool cf_srgb;
-   if (!pvr_g5p_format_pbe(cf, &cf_key, &cf_srgb))
+   if (colors && !pvr_g5p_format_pbe(cf, &cf_key, &cf_srgb))
       return G5P_REFUSE(device, "colour attachment format %s", vk_Format_to_str(cf));
    /* a depth/stencil attachment: the ZLS formats (pvr_g5p_ds.c), no depth bounds */
    if (ds && s->ds && s->ds->depth.bounds_test.enable)
@@ -544,11 +543,15 @@ g5p_check_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo *c
       return G5P_REFUSE(device, "colour blend state: %s", why);
    /* 32-bit integer targets: the raw32 output (four raw words, pvr_g5p_raw32_kind()); the PBE stores the
     * target's own channels from them */
-   const unsigned raw32 = pvr_g5p_raw32_kind(cf);
-   if (vk_format_is_int(cf) && !raw32)
+   const unsigned raw32 = colors ? pvr_g5p_raw32_kind(cf) : 0;
+   if (colors && vk_format_is_int(cf) && !raw32)
       return G5P_REFUSE(device, "integer boundary qualification supports CLEAR only");
    if (raw32)
       key->color_output = raw32 == 2 ? PCO_G5P_COLOR_SINT32 : PCO_G5P_COLOR_UINT32;
+   /* no colour attachment: the program writes no colour (the no-colour ISP form: depth/stencil only, a
+    * discarding program still runs for its feedback) */
+   if (!colors)
+      key->write_mask = 0;
    return VK_SUCCESS;
 }
 
@@ -1025,13 +1028,13 @@ g5p_clear_pipeline(struct pvr_cmd_buffer *cmd_buffer, VkFormat format, uint8_t w
       .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
    const VkPipelineColorBlendAttachmentState cba = { .colorWriteMask = write_mask };
    const VkPipelineColorBlendStateCreateInfo cb = {
-      .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = 1,
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = format != VK_FORMAT_UNDEFINED,
       .pAttachments = &cba };
    const VkDynamicState dynamic[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
    const VkPipelineDynamicStateCreateInfo dy = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
                                                  .dynamicStateCount = 2, .pDynamicStates = dynamic };
    const VkPipelineRenderingCreateInfo rendering = { .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
-                                                     .colorAttachmentCount = 1,
+                                                     .colorAttachmentCount = format != VK_FORMAT_UNDEFINED,
                                                      .pColorAttachmentFormats = &format };
    const VkGraphicsPipelineCreateInfo gci = {
       .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &rendering, .stageCount = 2,
@@ -1087,13 +1090,16 @@ PVR_PER_ARCH(g5p_clear_attachments)(struct pvr_cmd_buffer *cmd_buffer, uint32_t 
       return G5P_REFUSE(cmd_buffer, "vkCmdClearAttachments outside a render pass");
    const struct pvr_renderpass_hwsetup_render *hw_render =
       pvr_arch_pass_info_get_hw_render(info, info->current_hw_subpass);
-   if (hw_render->eot_surface_count != 1)
+   if (hw_render->eot_surface_count > 1)
       return G5P_REFUSE(cmd_buffer, "vkCmdClearAttachments with %u colour targets (one is built)",
                         hw_render->eot_surface_count);
    if (MAX2(hw_render->sample_count, 1) != 1)
       return G5P_REFUSE(cmd_buffer, "vkCmdClearAttachments at %u samples (one is built)", hw_render->sample_count);
-   const struct pvr_image_view *iview = info->attachments[hw_render->eot_surfaces[0].attachment_idx];
-   const VkFormat format = iview->vk.format;
+   /* no colour attachment (a depth/stencil-only pass): depth/stencil rectangles alone, the clear pipeline
+    * without a colour attachment */
+   const VkFormat format = hw_render->eot_surface_count
+                              ? info->attachments[hw_render->eot_surfaces[0].attachment_idx]->vk.format
+                              : VK_FORMAT_UNDEFINED;
 
    /* what is cleared: the colour target, and the aspects of the render's depth/stencil attachment */
    VkImageAspectFlags ds_present = 0;
@@ -1116,6 +1122,8 @@ PVR_PER_ARCH(g5p_clear_attachments)(struct pvr_cmd_buffer *cmd_buffer, uint32_t 
          stencil = attachments[i].clearValue.depthStencil.stencil;
       ds_clear |= a & ds_present & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
    }
+   if (format == VK_FORMAT_UNDEFINED)
+      colour = NULL; /* no colour attachment to clear */
    if (!colour && !ds_clear)
       return VK_SUCCESS;
    if (colour && vk_format_is_int(format) && !pvr_g5p_raw32_kind(format))
