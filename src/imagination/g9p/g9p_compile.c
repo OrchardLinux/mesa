@@ -107,6 +107,7 @@ struct g9p_vs_store {
 
 struct g9p_ctx {
    struct g9p_vs_store vs_stores[4 * 64];
+   unsigned num_vs_high;
    unsigned num_vs_stores;
    unsigned num_keys;
    struct g9p_code *c;
@@ -1243,7 +1244,18 @@ emit_mem(struct g9p_ctx *ctx, nir_intrinsic_instr *intr, int slot, nir_scalar of
       if (off < 0 || data < 0 || ctx->num_vs_stores == ARRAY_SIZE(ctx->vs_stores))
          return false;
       pin(ctx, off);
-      pin(ctx, data);
+      if (ctx->flush_outputs) {
+         /* out of registers before: the value waits above r31, out of everyone's way */
+         const int high = 32 + ctx->num_homes + ctx->num_vs_high;
+
+         if (high >= 124)
+            return false;
+         ctx->num_vs_high++;
+         g9p_alu2(ctx->c, G9P_OR, high, data, data, false);
+         data = high;
+      } else {
+         pin(ctx, data);
+      }
       ctx->vs_stores[ctx->num_vs_stores++] =
          (struct g9p_vs_store){ .slot = slot, .off = off, .data = data, .dword = dword };
       release(ctx, &intr->instr);
@@ -2862,6 +2874,7 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
    ctx->busy = ctx->pinned = ctx->temps = 0;
    /* a retry starts over: the stores of the attempt that ran out of registers are gone */
    ctx->num_vs_stores = 0;
+   ctx->num_vs_high = 0;
    ctx->max_reg = 0;
    ctx->st = st;
    for (unsigned k = 0; k < G9P_MAX_BUFFERS; k++)
@@ -2968,8 +2981,11 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
       unsigned num_addrs = 0;
 
       /* what the outputs and stores still read: not for the address registers */
-      for (unsigned i = 0; i < ctx->num_vs_stores; i++)
-         ctx->busy |= BITFIELD64_BIT(ctx->vs_stores[i].data) | BITFIELD64_BIT(ctx->vs_stores[i].off);
+      for (unsigned i = 0; i < ctx->num_vs_stores; i++) {
+         ctx->busy |= BITFIELD64_BIT(ctx->vs_stores[i].off);
+         if (ctx->vs_stores[i].data < 32)
+            ctx->busy |= BITFIELD64_BIT(ctx->vs_stores[i].data);
+      }
       for (unsigned i = 0; i < ctx->num_outputs; i++)
          ctx->busy |= BITFIELD64_BIT(ctx->outputs[i].reg);
 
@@ -3001,15 +3017,46 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
       for (unsigned i = 0; i + (ctx->num_vs_stores ? 0 : 1) < ctx->num_outputs; i++)
          g9p_vs_output(ctx->c, ctx->outputs[i].reg, ctx->outputs[i].slot);
       if (ctx->num_vs_stores) {
+         /*
+          * Values above r31 come back into free registers for their store; a wait
+          * after each batch lets the next batch reuse them (Apple's, 8 stores and 004d)
+          */
+         unsigned batch = 0;
+
          for (unsigned i = 0; i < ctx->num_vs_stores; i++) {
             const struct g9p_vs_store *st = &ctx->vs_stores[i];
             unsigned k = 0;
+            int data = st->data;
 
             while (addrs[k].slot != st->slot || addrs[k].off != st->off)
                k++;
-            g9p_mem_at(ctx->c, true, G9P_SIZE_U32, st->data, addrs[k].pair);
+            if (data >= 32) {
+               data = alloc_temp(ctx);
+               if (data < 0 || data >= 32) {
+                  /* no room left in this batch: finish it and take the first free one */
+                  if (data >= 32)
+                     ctx->busy &= ~BITFIELD64_BIT(data);
+                  g9p_wait(ctx->c);
+                  batch = 0;
+                  ctx->busy &= ~ctx->temps;
+                  ctx->temps = 0;
+                  data = alloc_temp(ctx);
+                  if (data < 0 || data >= 32)
+                     return false;
+               }
+               g9p_mov_from_high(ctx->c, data, st->data);
+            }
+            g9p_mem_at(ctx->c, true, G9P_SIZE_U32, data, addrs[k].pair);
             ctx->c->w[ctx->c->n - 1] |= st->dword;
+            if (++batch == 8 && i + 1 < ctx->num_vs_stores) {
+               g9p_wait(ctx->c);
+               batch = 0;
+               ctx->busy &= ~ctx->temps;
+               ctx->temps = 0;
+            }
          }
+         ctx->busy &= ~ctx->temps;
+         ctx->temps = 0;
          g9p_end_vertex_stores(ctx->c);
       } else
          g9p_end_vertex(ctx->c, ctx->outputs[ctx->num_outputs - 1].reg,
@@ -3556,8 +3603,12 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
             nir_move_load_input);
    NIR_PASS(_, nir, nir_convert_from_ssa, true, false);
    NIR_PASS(_, nir, wrap_loop_breaks);
-   /* a shader that ran out of registers: order by register pressure */
-   if (repeat_loads) {
+   /*
+    * a shader that ran out of registers: order by register pressure. Not one that
+    * captures: its values leave the low registers right after their load and store, in
+    * program order, and the scheduler kept them live for late outputs.
+    */
+   if (repeat_loads && !(nir->xfb_info && nir->xfb_info->buffers_written)) {
       const nir_schedule_options sched = { .threshold = 16, .fallback = true };
 
       nir_schedule(nir, &sched);
@@ -3684,7 +3735,9 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
    } else if (!generate(&ctx, impl, st))
       return false;
 
-   out->num_regs = MAX2(st + 1, ctx.num_homes ? 32 + ctx.num_homes : 0);
+   out->num_regs = MAX2(st + 1, ctx.num_homes || ctx.num_vs_high
+                                   ? 32 + ctx.num_homes + ctx.num_vs_high
+                                   : 0);
    out->code = ctx.c->w;
    out->code_size = 2 * ctx.c->n;
    if (stage != MESA_SHADER_COMPUTE && st + 1 > 32) {
