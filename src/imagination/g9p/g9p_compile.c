@@ -2381,20 +2381,32 @@ emit_intrinsic(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
       const bool y = intr->intrinsic == nir_intrinsic_ddy ||
                      intr->intrinsic == nir_intrinsic_ddy_fine ||
                      intr->intrinsic == nir_intrinsic_ddy_coarse;
-      int r = src_reg(ctx, nir_get_scalar(intr->src[0].ssa, 0)), dst;
+      int regs[4], dst[4];
 
-      /* the operand's register field stops at r31 */
-      if (r >= 32)
-         r = low_reg(ctx, r);
-      if (r < 0)
-         return false;
+      for (unsigned c = 0; c < intr->def.num_components; c++) {
+         regs[c] = src_reg(ctx, nir_get_scalar(intr->src[0].ssa, c));
+         /* the operand's register field stops at r31 */
+         if (regs[c] >= 32)
+            regs[c] = low_reg(ctx, regs[c]);
+         if (regs[c] < 0)
+            return false;
+      }
+      /* each result over no source still to come */
+      for (unsigned c = 0; c < intr->def.num_components; c++) {
+         dst[c] = alloc_temp(ctx);
+         if (dst[c] < 0)
+            return false;
+         G9P_EMIT(ctx->c, g9p_w0(ctx->c, 0x0198), g9p_dst(ctx->c, dst[c]),
+                  0x0100 | regs[c] << 2, y ? 0x0145 : 0x0144, y ? 0x0400 : 0x0200);
+      }
+      for (unsigned c = 0; c < intr->def.num_components; c++)
+         ctx->temps &= ~BITFIELD64_BIT(dst[c]);
       release(ctx, &intr->instr);
-      dst = alloc_reg(ctx);
-      if (dst < 0)
-         return false;
-      G9P_EMIT(ctx->c, g9p_w0(ctx->c, 0x0198), g9p_dst(ctx->c, dst), 0x0100 | r << 2,
-               y ? 0x0145 : 0x0144, y ? 0x0400 : 0x0200);
-      ctx->reg[key(&intr->def, 0)] = dst;
+      for (unsigned c = 0; c < intr->def.num_components; c++) {
+         ctx->reg[key(&intr->def, c)] = dst[c];
+         if (!ctx->last_use[key(&intr->def, c)])
+            ctx->busy &= ~BITFIELD64_BIT(dst[c]);
+      }
       return true;
    }
    case nir_intrinsic_load_front_face: {
@@ -3427,6 +3439,35 @@ lower_grad_offset(const nir_instr *instr, const void *data)
    return instr->type == nir_instr_type_tex && nir_instr_as_tex(instr)->op == nir_texop_txd;
 }
 
+/*
+ * A break at the end of a loop's body, as a switch's last case becomes (dEQP
+ * shaders.switch): emit_if() emits breaks, so it goes in an if. After SSA: this
+ * adds a back edge, which phis would have to name.
+ */
+static bool
+wrap_loop_breaks(nir_shader *nir)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   bool progress = false;
+
+   nir_foreach_block_safe (block, impl) {
+      nir_instr *last = nir_block_last_instr(block);
+      nir_builder b;
+
+      if (!last || last->type != nir_instr_type_jump ||
+          nir_instr_as_jump(last)->type != nir_jump_break ||
+          block->cf_node.parent->type != nir_cf_node_loop)
+         continue;
+      nir_instr_remove(last);
+      b = nir_builder_at(nir_after_block(block));
+      nir_push_if(&b, nir_imm_int(&b, ~0));
+      nir_jump(&b, nir_jump_break);
+      nir_pop_if(&b, NULL);
+      progress = true;
+   }
+   return nir_progress(progress, impl, nir_metadata_none);
+}
+
 static bool
 compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
              const struct g9p_vertex_attrib *attribs, unsigned frag_coord_slot,
@@ -3486,6 +3527,7 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
             nir_move_comparisons | nir_move_copies | nir_move_load_ubo |
             nir_move_load_input);
    NIR_PASS(_, nir, nir_convert_from_ssa, true, false);
+   NIR_PASS(_, nir, wrap_loop_breaks);
    /* a shader that ran out of registers: order by register pressure */
    if (repeat_loads) {
       const nir_schedule_options sched = { .threshold = 16, .fallback = true };
