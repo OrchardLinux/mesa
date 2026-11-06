@@ -70,6 +70,7 @@ unsigned pvr_g5p_vertex_format_dwords(VkFormat format);
 struct pvr_g5p_vertex_format {
    uint8_t components, bytes;
    int8_t convert;
+   bool packed_1010102; /* one raw dword; components unpacked in NIR */
    uint8_t swizzle[4];
 };
 

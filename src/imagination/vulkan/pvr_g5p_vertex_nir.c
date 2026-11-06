@@ -21,6 +21,7 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "compiler/nir/nir.h"
@@ -81,6 +82,24 @@ pvr_g5p_vertex_format_info(VkFormat format, struct pvr_g5p_vertex_format *f)
    if (!d || d->layout != UTIL_FORMAT_LAYOUT_PLAIN || d->block.width != 1 || d->block.height != 1 ||
        d->nr_channels < 1 || d->nr_channels > 4)
       return false;
+   /* A 32-bit fetch followed by ordinary scalar NIR operations. Enable
+    * advertisement and lowering together while device qualification is
+    * pending; no hardware packed conversion opcode is assumed. */
+   const char *packed = getenv("PVR_G5P_PACKED_VERTEX");
+   if (packed && !strcmp(packed, "1") && d->nr_channels == 4 && d->block.bits == 32 &&
+       d->channel[0].size == 10 && d->channel[1].size == 10 &&
+       d->channel[2].size == 10 && d->channel[3].size == 2) {
+      f->components = 4;
+      f->bytes = 1; /* four logical components occupy one dword */
+      f->convert = -1;
+      f->packed_1010102 = true;
+      for (unsigned c = 0; c < 4; c++) {
+         if (d->swizzle[c] > PIPE_SWIZZLE_W)
+            return false;
+         f->swizzle[c] = d->swizzle[c];
+      }
+      return true;
+   }
    const struct util_format_channel_description *ch = &d->channel[0];
    const unsigned bits = ch->size;
    if ((bits != 8 && bits != 16 && bits != 32) || d->block.bits != bits * d->nr_channels)
@@ -293,6 +312,31 @@ rewrite_load(nir_builder *b, nir_intrinsic_instr *in, void *data)
          c[k] = comp != 3 ? nir_imm_int(b, 0) : is_float ? nir_imm_float(b, 1.0f) : nir_imm_int(b, 1);
          continue;
       }
+      if (f.packed_1010102) {
+         unsigned reg = rw->base[loc];
+         nir_def *word = nir_load_input(b, 1, 32, nir_imm_int(b, 0), .base = reg / 4,
+                                       .component = reg % 4, .dest_type = nir_type_uint32,
+                                       .io_semantics = (nir_io_semantics){
+                                          .location = VERT_ATTRIB_GENERIC0 + reg / 4, .num_slots = 1 });
+         const struct util_format_description *d = vk_format_description(rw->l->vi->attributes[loc].format);
+         unsigned channel = f.swizzle[comp], bits = channel == 3 ? 2 : 10;
+         unsigned shift = channel == 3 ? 30 : 10 * channel;
+         const struct util_format_channel_description *ch = &d->channel[channel];
+         bool is_signed = ch->type == UTIL_FORMAT_TYPE_SIGNED;
+         nir_def *v = is_signed ? nir_ishr_imm(b, nir_ishl_imm(b, word, 32 - shift - bits), 32 - bits) :
+                                  nir_iand_imm(b, nir_ushr_imm(b, word, shift), BITFIELD_MASK(bits));
+         if (!ch->pure_integer) {
+            v = is_signed ? nir_i2f32(b, v) : nir_u2f32(b, v);
+            if (ch->normalized) {
+               unsigned max = (1u << (bits - (is_signed ? 1 : 0))) - 1;
+               v = nir_fmul_imm(b, v, 1.0f / max);
+               if (is_signed)
+                  v = nir_fmax(b, v, nir_imm_float(b, -1.0f));
+            }
+         }
+         c[k] = v;
+         continue;
+      }
       /* the component's byte in the fetched dwords; a converted one names
        * its format and byte in the load's base */
       const unsigned at = lead + f.bytes * f.swizzle[comp], reg = rw->base[loc] + at / 4;
@@ -358,7 +402,7 @@ pvr_g5p_vertex_lower(nir_shader *vs, struct pvr_g5p_vertex_layout *l)
       if (!l->dynamic_strides && vi->bindings[at->binding].stride % 4)
          return REFUSE(l, "vertex binding %u: stride %u (the fetch is dword-granular)", at->binding,
                        vi->bindings[at->binding].stride);
-      converted |= f.convert >= 0;
+      converted |= f.convert >= 0 || f.packed_1010102;
       a[n++] = (struct attrib){ loc, at->binding, DIV_ROUND_UP(lead + f.bytes * f.components, 4), at->offset - lead,
                                 lead, f };
    }
