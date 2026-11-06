@@ -137,9 +137,11 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
     * command-buffer ordering and signals the submit fence. */
    /* The compiler's unit-Z specialization is valid only for these actual
     * dispatch dimensions. Indirect dimensions cannot be checked here. */
-   if (state->a9_unit_z && (indirect_va || group_count[2] != 1))
+   if (state->a9_unit_z && (indirect_va || group_count[2] != 1)) {
+      fprintf(stderr, "G5P refuses: compute workgroup Z specialization requires a direct dispatch with one Z group\n");
       return vk_errorf(cmd_buffer, VK_ERROR_FEATURE_NOT_PRESENT,
-                       "G5P refuses: compute workgroup Z specialization requires a direct dispatch with one Z group");
+                       "compute workgroup Z specialization requires a direct dispatch with one Z group");
+   }
 
    if (state->a9_bodyless) {
       /* An indirect bodyless dispatch has no consumer of its dimensions,
