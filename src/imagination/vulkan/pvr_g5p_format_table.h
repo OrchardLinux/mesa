@@ -125,7 +125,7 @@ static const struct pvr_g5p_format pvr_g5p_format_table[] = {
     * it). */
    G5P_FMT(A2B10G10R10_UNORM_PACK32, 4, false, G5P_SF | G5P_RT, G5P1B, 0x26, G5P_SEL_RGBA),
    G5P_FMT(A2R10G10B10_UNORM_PACK32, 4, false, G5P_SF, G5P1B, 0x26, G5P_SEL_BGRA),
-   G5P_FMT(A2B10G10R10_UINT_PACK32, 4, false, G5P_SI, G5P1B, 0x126, G5P_SEL_RGBA),
+   G5P_FMT(A2B10G10R10_UINT_PACK32, 4, false, G5P_SI | PVR_G5P_FMT_RENDER | PVR_G5P_FMT_PROBE_RENDER, G5P1B, 0x126, G5P_SEL_RGBA),
    /* R/RG 8 (fmt-r8, fmt-rg8). Apple renders them with narrower programs;
     * the two-word program with these PBE keys renders them exactly too. */
    G5P_FMT(R8_UNORM, 1, false, G5P_SF | G5P_RT, G5P1B, 0x00, G5P_SEL_R001),

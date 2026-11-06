@@ -740,17 +740,17 @@ g5p_compile_load_type(struct pco_g5p_program *out, unsigned raw)
 
    nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT, &g5p_options, "g5p-load");
    nir_variable *prev = nir_variable_create(b.shader, nir_var_uniform,
-                                            glsl_sampler_type(GLSL_SAMPLER_DIM_2D, false, false, (raw == 1 || raw == 5 || raw == 6) ? GLSL_TYPE_UINT : raw == 2 ? GLSL_TYPE_INT : GLSL_TYPE_FLOAT),
+                                            glsl_sampler_type(GLSL_SAMPLER_DIM_2D, false, false, (raw == 1 || raw == 5 || raw == 6 || raw == 7) ? GLSL_TYPE_UINT : raw == 2 ? GLSL_TYPE_INT : GLSL_TYPE_FLOAT),
                                             "prev");
    prev->data.descriptor_set = 0;
    prev->data.binding = 0;
-   nir_variable *color = nir_variable_create(b.shader, nir_var_shader_out, (raw == 1 || raw == 5 || raw == 6) ? glsl_uvec4_type() : raw == 2 ? glsl_ivec4_type() : glsl_vec4_type(), "color");
+   nir_variable *color = nir_variable_create(b.shader, nir_var_shader_out, (raw == 1 || raw == 5 || raw == 6 || raw == 7) ? glsl_uvec4_type() : raw == 2 ? glsl_ivec4_type() : glsl_vec4_type(), "color");
    color->data.location = FRAG_RESULT_DATA0;
    /* texelFetch (Mesa's form of a load): with the last-read group bits it reads every channel (the LOAD probe's
     * one-channel result was the default group rule, not the read op) */
    nir_def *xy = nir_f2i32(&b, nir_trim_vector(&b, nir_load_frag_coord(&b), 2));
    nir_def *texel = nir_txf(&b, xy, .texture_deref = nir_build_deref_var(&b, prev), .lod = nir_imm_int(&b, 0),
-                            .dim = GLSL_SAMPLER_DIM_2D, .dest_type = (raw == 1 || raw == 5 || raw == 6) ? nir_type_uint32 : raw == 2 ? nir_type_int32 : nir_type_float32);
+                            .dim = GLSL_SAMPLER_DIM_2D, .dest_type = (raw == 1 || raw == 5 || raw == 6 || raw == 7) ? nir_type_uint32 : raw == 2 ? nir_type_int32 : nir_type_float32);
    nir_store_var(&b, color, texel, 0xf);
 
    bool sample_mask = false; /* the load program reads no sample mask */
@@ -760,8 +760,8 @@ g5p_compile_load_type(struct pco_g5p_program *out, unsigned raw)
     * output component 0 (B G R A = 0 0 R 0). */
    struct pco_g5p_fs_key key = PCO_G5P_FS_KEY_DEFAULT;
    key.last_read_groups = true;
-   key.packed_uint_bits = raw == 5 ? 16 : raw == 6 ? 8 : 0;
-   key.color_output = (raw == 1 || raw == 5 || raw == 6) ? PCO_G5P_COLOR_UINT32 : raw == 2 ? PCO_G5P_COLOR_SINT32 : PCO_G5P_COLOR_F16;
+   key.packed_uint_bits = raw == 5 ? 16 : raw == 6 ? 8 : raw == 7 ? 10 : 0;
+   key.color_output = (raw == 1 || raw == 5 || raw == 6 || raw == 7) ? PCO_G5P_COLOR_UINT32 : raw == 2 ? PCO_G5P_COLOR_SINT32 : PCO_G5P_COLOR_F16;
    bool ok = nir && pco_g5p_compile_general_link(nir, true, NULL, &key, NULL, out);
    if (!nir)
       snprintf(out->refusal, sizeof(out->refusal), "the load program's NIR");
@@ -834,4 +834,9 @@ bool pvr_g5p_compile_load_rgba16ui(struct pco_g5p_program *out)
 bool pvr_g5p_compile_load_rgba8ui(struct pco_g5p_program *out)
 {
    return g5p_compile_load_type(out, 6);
+}
+
+bool pvr_g5p_compile_load_rgb10a2ui(struct pco_g5p_program *out)
+{
+   return g5p_compile_load_type(out, 7);
 }

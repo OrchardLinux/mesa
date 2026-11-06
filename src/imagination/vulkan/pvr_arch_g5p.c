@@ -259,7 +259,7 @@ g5p_upload_load(struct pvr_device *device, struct pvr_g5p_programs *p, unsigned 
    struct pco_g5p_program prog;
    VkResult result = VK_SUCCESS;
 
-   if (!(raw == 6 ? pvr_g5p_compile_load_rgba8ui(&prog) : raw == 5 ? pvr_g5p_compile_load_rgba16ui(&prog) : raw ? pvr_g5p_compile_load_raw(&prog, raw == 2) : pvr_g5p_compile_load(&prog))) {
+   if (!(raw == 7 ? pvr_g5p_compile_load_rgb10a2ui(&prog) : raw == 6 ? pvr_g5p_compile_load_rgba8ui(&prog) : raw == 5 ? pvr_g5p_compile_load_rgba16ui(&prog) : raw ? pvr_g5p_compile_load_raw(&prog, raw == 2) : pvr_g5p_compile_load(&prog))) {
       snprintf(p->load_refusal, sizeof(p->load_refusal), "%s", prog.refusal);
       free(prog.code);
       return VK_SUCCESS;
@@ -355,7 +355,7 @@ g5p_raw_programs_unlocked(struct pvr_device *device, unsigned raw, unsigned word
       if (result != VK_SUCCESS)
          return result;
    }
-   if ((raw <= 2 || raw == 5 || raw == 6) && !p->raw_load[raw - 1]) {
+   if ((raw <= 2 || raw == 5 || raw == 6 || raw == 7) && !p->raw_load[raw - 1]) {
       p->raw_load[raw - 1] = vk_zalloc(&device->vk.alloc, sizeof(*p), 8, VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
       if (!p->raw_load[raw - 1])
          return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
@@ -679,7 +679,8 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
     * target's channels (pvr_g5p_raw32_kind()); RGBA16UI clears: five (below) */
    raw = pvr_g5p_raw32_kind(first_format);
    if (pvr_g5p_packed_uint_bits(first_format))
-      raw = pvr_g5p_packed_uint_bits(first_format) == 8 ? 6 : 5;
+      raw = pvr_g5p_packed_uint_bits(first_format) == 10 ? 7 :
+            pvr_g5p_packed_uint_bits(first_format) == 8 ? 6 : 5;
    /* output words per target, and of the pass: two raw32 targets of one format (admitted by
     * pvr_arch_g5p_mrt_pass_check(), behind the format probe) take four each, eight in all */
    const unsigned raw_words = raw <= 2 ? 4 : 2;
@@ -732,7 +733,7 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
        * the original signed image key. Blending is rejected for integers.
        */
       uint32_t store_key = raw ? key & ~(0x80u << 5) : key;
-      if (raw == 5 || raw == 6) {
+      if (raw == 5 || raw == 6 || raw == 7) {
          /* Clear-only RGBA16UI: CPU clamps and packs RG/BA into two
           * uint32 words. Store those exact eight bytes through RG32UI,
           * whose two-word raw PBE path is device-proven. The logical
@@ -797,9 +798,9 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
           hw_render->color_init[i].index < info->clear_value_count)
          memcpy(clear[t], info->clear_values[hw_render->color_init[i].index].color.float32, sizeof(clear[t]));
    }
-   if (load && raw > 2 && raw != 5 && raw != 6)
+   if (load && raw > 2 && raw != 5 && raw != 6 && raw != 7)
       return G5P_REFUSE(cmd_buffer, "integer boundary qualification supports CLEAR only");
-   const struct pvr_g5p_programs *load_program = raw && (raw <= 2 || raw == 5 || raw == 6) ? p->raw_load[raw - 1] : p;
+   const struct pvr_g5p_programs *load_program = raw && (raw <= 2 || raw == 5 || raw == 6 || raw == 7) ? p->raw_load[raw - 1] : p;
    if (load && !load_program->load_usc)
       return G5P_REFUSE(cmd_buffer, "LOAD of a colour attachment%s: the load program: %s",
                         partial ? " (a partial render area)" : "", load_program->load_refusal);
@@ -811,10 +812,13 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
    /* per render: the clear floats and the PBE block, then their DOUTD data */
    if (raw) {
       uint32_t value[4]; memcpy(value, clear[0], sizeof(value));
-      if (raw == 6) {
+      if (raw == 6 || raw == 7) {
          uint32_t packed = 0;
-         for (unsigned c = 0; c < 4; c++)
-            packed |= MIN2(value[c],255u) << (8*c);
+         unsigned bits = raw == 7 ? 10 : 8;
+         for (unsigned c = 0; c < 4; c++) {
+            unsigned max = raw == 7 ? (c == 3 ? 3 : 1023) : 255;
+            packed |= MIN2(value[c],max) << (bits*c);
+         }
          value[0] = packed; value[1] = value[2] = value[3] = 0;
       } else {
          pvr_g5p_dgl_clear_pack(value, value, raw == 5);

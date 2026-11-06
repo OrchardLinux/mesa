@@ -5669,13 +5669,13 @@ static bool pack_uint(nir_builder *b, nir_intrinsic_instr *in, void *data)
       in->num_components = 4;
    }
    unsigned bits = rw->bits;
-   unsigned max = bits == 8 ? 255 : 65535;
-   nir_def *v = nir_umin(b, src, nir_imm_ivec4(b,max,max,max,max));
+   unsigned max = bits == 8 ? 255 : bits == 10 ? 1023 : 65535;
+   nir_def *v = nir_umin(b, src, nir_imm_ivec4(b,max,max,max,bits == 10 ? 3 : max));
    nir_def *rg = nir_ior(b, nir_channel(b,v,0), nir_ishl_imm(b,nir_channel(b,v,1),bits));
    nir_def *ba;
-   if (bits == 8) {
-      rg = nir_ior(b,rg,nir_ishl_imm(b,nir_channel(b,v,2),16));
-      rg = nir_ior(b,rg,nir_ishl_imm(b,nir_channel(b,v,3),24));
+   if (bits == 8 || bits == 10) {
+      rg = nir_ior(b,rg,nir_ishl_imm(b,nir_channel(b,v,2),2*bits));
+      rg = nir_ior(b,rg,nir_ishl_imm(b,nir_channel(b,v,3),3*bits));
       ba = nir_imm_int(b,0); /* pad the witnessed one-word payload to width2 */
    } else {
       ba = nir_ior(b,nir_channel(b,v,2),nir_ishl_imm(b,nir_channel(b,v,3),16));
@@ -6771,7 +6771,7 @@ bool pco_g5p_compile_general_link(nir_shader *nir, bool half_output, const uint8
          if (c->key->packed_uint_bits) {
             if (c->mrt.targets != 1 || c->key->blend || c->key->write_mask != 15)
                refuse(c, "packed unsigned RT requires one unblended full-mask target");
-            if (c->key->packed_uint_bits != 8 && c->key->packed_uint_bits != 16)
+            if (c->key->packed_uint_bits != 8 && c->key->packed_uint_bits != 10 && c->key->packed_uint_bits != 16)
                refuse(c, "unsupported packed unsigned channel width");
             struct packed_uint_rw rw = { .bits = c->key->packed_uint_bits };
             nir_shader_intrinsics_pass(nir, pack_uint, nir_metadata_control_flow, &rw);

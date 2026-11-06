@@ -36,8 +36,8 @@ static GLuint shader(GLenum t, const char *src)
 
 /* value v of pixel x, channel c: distinct high and low bits, sign bit set on odd x (signed formats see negatives) */
 static uint32_t want(unsigned x, unsigned c) {
-   static const uint32_t v[]={0,1,255,256,32767,32768,65534,65535,65536,0xffffffffu};
-   return v[(x+3*c)%10];
+   static const uint32_t v[]={0,1,2,3,4,255,256,1023,1024,32767,32768,65534,65535,65536,0xffffffffu};
+   return v[(x+3*c)%15];
 }
 
 int main(int argc, char **argv)
@@ -49,6 +49,7 @@ int main(int argc, char **argv)
       { "rgba16ui", GL_RGBA16UI, 4, 0 },
       { "rg16ui", GL_RG16UI, 2, 0 },
       { "rgba8ui", GL_RGBA8UI, 4, 0 },
+      { "rgb10_a2ui", GL_RGB10_A2UI, 4, 0 },
       { "r32ui", GL_R32UI, 1, 0 },    { "rg32ui", GL_RG32UI, 2, 0 }, { "rgba32ui", GL_RGBA32UI, 4, 0 },
       { "r32i", GL_R32I, 1, 1 },      { "rg32i", GL_RG32I, 2, 1 },   { "rgba32i", GL_RGBA32I, 4, 1 },
    };
@@ -140,6 +141,7 @@ int main(int argc, char **argv)
          uint32_t w=k<C?(phase==0?zero[k]:want(x+(phase==2&&x<W/2?W:0),k)):(k==3?1:0);
          if((F[f].fmt==GL_RGBA16UI || F[f].fmt==GL_RG16UI) && w>65535 && k<C)w=65535;
          if(F[f].fmt==GL_RGBA8UI && w>255)w=255;
+         if(F[f].fmt==GL_RGB10_A2UI && w>(k==3?3u:1023u))w=k==3?3u:1023u;
          if(px[4*x+k]!=w && bad++<8)
             printf("PACKED-RT pixel phase=%u x=%u c=%u got=%08x want=%08x\n",phase,x,k,px[4*x+k],w);
       }
