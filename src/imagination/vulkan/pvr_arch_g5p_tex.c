@@ -10,6 +10,7 @@
  */
 
 #include <inttypes.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "vk_enum_to_str.h"
@@ -56,6 +57,23 @@ g5p_view_state(const struct pvr_image_view *iview, uint64_t q[3])
       const uint64_t va = image->dev_addr.addr + plane->offset + level->offset +
                           iview->vk.base_array_layer * plane->layer_size;
 
+      if (iview->vk.view_type == VK_IMAGE_VIEW_TYPE_2D_ARRAY &&
+          image->vk.image_type == VK_IMAGE_TYPE_2D && image->vk.samples == 1 &&
+          image->vk.extent.width == 1 && image->vk.extent.height == 1 &&
+          image->vk.array_layers == 1 && image->vk.mip_levels == 1 &&
+          !iview->vk.base_mip_level && !iview->vk.base_array_layer &&
+          iview->vk.layer_count == 1 && !(va % 64)) {
+         /* A singleton has only texel (0,0,0), at the same address in
+          * linear and twiddled storage. The array sample instruction still
+          * requires the real array descriptor, even with just one layer. */
+         const struct pvr_g5p_tex_twiddled_view v = {
+            .key = key, .layout = PVR_G5P_TEX_LAYOUT_2D_ARRAY,
+            .width = 1, .height = 1, .depth = 1, .level_count = 1,
+            .srgb = f->srgb, .va = va,
+         };
+         pvr_g5p_tex_twiddled(q, &v);
+         return NULL;
+      }
       if (iview->vk.view_type != VK_IMAGE_VIEW_TYPE_2D || iview->vk.base_mip_level)
          return "array/3D/cube or mip view of a linear image (Apple samples those twiddled only)";
       if (va % 16 || level->pitch % 16)
@@ -121,6 +139,15 @@ PVR_PER_ARCH(g5p_pack_image_view)(const struct pvr_image_view *iview, struct pvr
    static_assert(sizeof(desc->words) + sizeof(desc->meta) == 32, "G5P image state is 32 bytes");
    memset(desc, 0, sizeof(*desc));
    if (why) {
+      if (getenv("PVR_G5P_WS_LOG")) {
+         const struct pvr_image *image = pvr_image_view_get_image(iview);
+         mesa_logw("G5P view state refused: format=%s image=%s type=%s aspects=%#x "
+                   "extent=%ux%u levels=%u layers=%u usage=%#" PRIx64 ": %s",
+                   vk_Format_to_str(iview->vk.format), vk_Format_to_str(image->vk.format),
+                   vk_ImageViewType_to_str(iview->vk.view_type), iview->vk.aspects,
+                   image->vk.extent.width, image->vk.extent.height,
+                   image->vk.mip_levels, image->vk.array_layers, (uint64_t)image->vk.usage, why);
+      }
       /* A view with both depth and stencil aspects is an attachment view, never sampled: a sampled descriptor
        * takes one of the two aspects (VUID-VkDescriptorImageInfo-imageView-01976), whose own view has its
        * state. No warning for it: Zink's depth/stencil surfaces are such views of sampled-usage images, and
