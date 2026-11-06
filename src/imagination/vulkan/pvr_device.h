@@ -98,7 +98,7 @@ struct pvr_device {
       struct pvr_pds_upload fence;
       /* and the device-level graphics programs (pvr_arch_g9p_gfx.c) */
       struct pvr_g9p_gfx_programs {
-         struct pvr_suballoc_bo *clear_usc, *eot_usc, *vdm_end_usc;
+         struct pvr_suballoc_bo *clear_usc, *eot_usc[2], *vdm_end_usc;
          /* load op: the old target sampled at the pixel position, and its kick */
          struct pvr_suballoc_bo *load_usc[G9P_OUTPUT_COUNT];
          struct pvr_pds_upload load_kick[G9P_OUTPUT_COUNT];
@@ -112,7 +112,8 @@ struct pvr_device {
          struct pvr_suballoc_bo *clear_raw_usc[G9P_OUTPUT_COUNT];
          struct pvr_pds_upload clear_raw_kick[G9P_OUTPUT_COUNT];
          /* several targets: end of tile by their count, others made when first used */
-         struct pvr_suballoc_bo *eot_mrt_usc[5];
+         /* by target count, and a mask of the targets of 32-bit channels */
+         struct pvr_suballoc_bo *eot_mrt_usc[5][16];
          simple_mtx_t cached_lock;
          struct g9p_cached_program {
             uint64_t key;

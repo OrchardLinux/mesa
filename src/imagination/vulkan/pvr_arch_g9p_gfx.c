@@ -219,14 +219,20 @@ PVR_PER_ARCH(g9p_gfx_device_init)(struct pvr_device *device)
    if (result != VK_SUCCESS)
       goto out;
 
-   /* End of tile: r0 = 0, the PBE emit with the image state in the common store */
-   c->n = 0;
-   g9p_mov_imm(c, 0, 0);
-   G9P_EMIT(c, 0x051c, 0x5100, 0x0800);
-   g9p_end(c);
-   result = upload_usc(device, c, &p->eot_usc);
-   if (result != VK_SUCCESS)
-      goto out;
+   /*
+    * End of tile: r0 = 0, the PBE emit with the image state in the common store.
+    * Bit 12 of the emit: a target of 32-bit channels (Apple's 151c for RG32F and
+    * RGBA32F, 051c for RGBA16F and RGBA8, iOS capture).
+    */
+   for (unsigned raw = 0; raw < 2; raw++) {
+      c->n = 0;
+      g9p_mov_imm(c, 0, 0);
+      G9P_EMIT(c, raw ? 0x151c : 0x051c, 0x5100, 0x0800);
+      g9p_end(c);
+      result = upload_usc(device, c, &p->eot_usc[raw]);
+      if (result != VK_SUCCESS)
+         goto out;
+   }
 
    /*
     * Clears the CPU packs: common-store dword k to r[k], Apple's move for a
@@ -259,29 +265,32 @@ PVR_PER_ARCH(g9p_gfx_device_init)(struct pvr_device *device)
     * emit per target, a branch to the next 64-byte boundary and the end
     */
    for (unsigned n = 2; n <= G9P_MAX_TARGETS; n++) {
-      c->n = 0;
-      c->fragment = false;
-      for (unsigned k = 0; k < n; k++)
-         G9P_EMIT(c, 0x0188, 0x0100 | 2 * (n - 1 - k), 0x0100 | (0x99 + 0x20 * k), 0x4100, 0x0128,
-                  0x0039);
-      for (unsigned k = 0; k < n; k++) {
-         const bool last = k + 1 == n;
+      for (unsigned raw = 0; raw < BITFIELD_BIT(n); raw++) {
+         c->n = 0;
+         c->fragment = false;
+         for (unsigned k = 0; k < n; k++)
+            G9P_EMIT(c, 0x0188, 0x0100 | 2 * (n - 1 - k), 0x0100 | (0x99 + 0x20 * k), 0x4100, 0x0128,
+                     0x0039);
+         for (unsigned k = 0; k < n; k++) {
+            const bool last = k + 1 == n;
 
-         G9P_EMIT(c, 0x051c, (last ? 0x5100 : 0x7100) | 2 * (n - 1 - k), 0x0800 | 2 * k);
-         if (!last)
-            G9P_EMIT(c, 0x044c);
+            G9P_EMIT(c, raw & BITFIELD_BIT(k) ? 0x151c : 0x051c,
+                     (last ? 0x5100 : 0x7100) | 2 * (n - 1 - k), 0x0800 | 2 * k);
+            if (!last)
+               G9P_EMIT(c, 0x044c);
+         }
+         const unsigned end = ALIGN_POT(2 * c->n + 6, 64);
+
+         G9P_EMIT(c, 0x0100, 0x0100 | (end - 2 * c->n), 0x0000);
+         while (2 * c->n < end)
+            G9P_EMIT(c, 0xc000);
+         G9P_EMIT(c, 0x8000);
+         while (c->n % 32)
+            G9P_EMIT(c, 0x0000);
+         result = upload_usc(device, c, &p->eot_mrt_usc[n][raw]);
+         if (result != VK_SUCCESS)
+            goto out;
       }
-      const unsigned end = ALIGN_POT(2 * c->n + 6, 64);
-
-      G9P_EMIT(c, 0x0100, 0x0100 | (end - 2 * c->n), 0x0000);
-      while (2 * c->n < end)
-         G9P_EMIT(c, 0xc000);
-      G9P_EMIT(c, 0x8000);
-      while (c->n % 32)
-         G9P_EMIT(c, 0x0000);
-      result = upload_usc(device, c, &p->eot_mrt_usc[n]);
-      if (result != VK_SUCCESS)
-         goto out;
    }
 
    /* Register 0x470's program: a jump to `015e a000` (as captured) */
@@ -413,11 +422,14 @@ PVR_PER_ARCH(g9p_gfx_device_finish)(struct pvr_device *device)
    if (p->clear_kick.pvr_bo)
       pvr_bo_suballoc_free(p->clear_kick.pvr_bo);
    pvr_bo_suballoc_free(p->vdm_end_usc);
-   pvr_bo_suballoc_free(p->eot_usc);
+   for (unsigned raw = 0; raw < 2; raw++)
+      pvr_bo_suballoc_free(p->eot_usc[raw]);
    pvr_bo_suballoc_free(p->clear_usc);
    pvr_bo_suballoc_free(p->clear_vs_usc);
-   for (unsigned n = 2; n <= G9P_MAX_TARGETS; n++)
-      pvr_bo_suballoc_free(p->eot_mrt_usc[n]);
+   for (unsigned n = 2; n <= G9P_MAX_TARGETS; n++) {
+      for (unsigned raw = 0; raw < BITFIELD_BIT(n); raw++)
+         pvr_bo_suballoc_free(p->eot_mrt_usc[n][raw]);
+   }
    for (unsigned i = 0; i < p->num_cached; i++) {
       pvr_bo_suballoc_free(p->cached[i].usc);
       pvr_bo_suballoc_free(p->cached[i].kick.pvr_bo);
@@ -2677,22 +2689,6 @@ pack_image_state(uint32_t *w, uint64_t addr, uint32_t width, uint32_t height,
 {
    uint32_t key = g9p_image_format(format);
 
-   /*
-    * 32-bit channels: the PBE takes the tile in 16-bit halves and converts for a
-    * 32-bit code (0x121 packs an f32 to f16, 0x221 widens an f16; measured on the A10).
-    * One channel's two halves are stored unchanged by the 16_16 integer code, two
-    * channels' four by 16_16_16_16.
-    */
-   switch (g9p_format_output(format)) {
-   case G9P_OUTPUT_RAW1:
-      key = G9P_RG01(0x123);
-      break;
-   case G9P_OUTPUT_RAW2:
-      key = G9P_RGBA(0x132);
-      break;
-   default:
-      break;
-   }
    memset(w, 0, 8 * 4);
    w[0] = (key ? key : g9p_image_format(VK_FORMAT_B8G8R8A8_UNORM)) | (linear ? 0x02 : 0x0a) |
           (width - 1) << 27;
@@ -2925,9 +2921,21 @@ PVR_PER_ARCH(g9p_job_init)(struct pvr_cmd_buffer *cmd_buffer,
    if (result != VK_SUCCESS)
       return result;
    {
+      /* the targets of 32-bit channels, whose emit says so */
+      unsigned raw = 0;
+
+      for (unsigned t = 0; t < eot_targets; t++) {
+         const VkFormat f =
+            info->attachments[hw_render->eot_surfaces[t].attachment_idx]->vk.format;
+
+         if (g9p_format_output(f) >= G9P_OUTPUT_RAW1)
+            raw |= BITFIELD_BIT(t);
+      }
+
       const uint32_t data[8] = { bo->dev_addr.addr, bo->dev_addr.addr >> 32,
                                  doutd_ctrl(0, eot_dwords, true), 0,
-                                 usc_offset(device, eot_targets > 1 ? p->eot_mrt_usc[eot_targets] : p->eot_usc),
+                                 usc_offset(device, eot_targets > 1 ? p->eot_mrt_usc[eot_targets][raw]
+                                                                    : p->eot_usc[raw & 1]),
                                  usc_temps(8), 0, 0 };
 
       result = pvr_arch_cmd_buffer_upload_pds(cmd_buffer, data, ARRAY_SIZE(data), 16, NULL,
