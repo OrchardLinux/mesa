@@ -731,7 +731,7 @@ static int packed_offset(const nir_tex_instr *t)
 }
 
 /* Why Apple's probes do not cover this texture instruction, or NULL. */
-static const char *tex_shape_refusal(const nir_tex_instr *t)
+static const char *tex_shape_refusal(const nir_tex_instr *t, bool vertex_gradient)
 {
    enum glsl_sampler_dim d = t->sampler_dim;
    nir_alu_type base = nir_alu_type_get_base_type(t->dest_type);
@@ -794,7 +794,7 @@ static const char *tex_shape_refusal(const nir_tex_instr *t)
          return "texture source: other (not probed)";
       }
    }
-   if (offset && (packed_offset(t) < 0 || d != GLSL_SAMPLER_DIM_2D || t->op == nir_texop_txd ||
+   if (offset && (packed_offset(t) < 0 || d != GLSL_SAMPLER_DIM_2D || (t->op == nir_texop_txd && !vertex_gradient) ||
                   t->op == nir_texop_txf))
       return "texel offset: Apple's packed form is probed for constant 2D offsets in -8..7 on "
              "sample/level/bias/compare";
@@ -807,7 +807,7 @@ static const char *tex_shape_refusal(const nir_tex_instr *t)
 /* Ordinary bank0 texture forms only. No continuation is inferred from stage. */
 static const char *vs_tex_refusal(const nir_tex_instr *t)
 {
-   const char *why = tex_shape_refusal(t);
+   const char *why = tex_shape_refusal(t, false);
    if (why || size_query(t)) return why;
    if (t->op != nir_texop_tex && t->op != nir_texop_txl)
       return "vertex fetch/bias/gradient requires separately qualified state";
@@ -823,9 +823,11 @@ static const char *vs_tex_refusal(const nir_tex_instr *t)
 
 static const char *vs_qualified_tex_refusal(const nir_tex_instr *t)
 {
-   const char *why = tex_shape_refusal(t);
+   bool gradient = t->op == nir_texop_txd && g5p_vtex_gradient_probe() &&
+                   t->sampler_dim == GLSL_SAMPLER_DIM_2D;
+   const char *why = tex_shape_refusal(t, gradient);
    if (why || size_query(t)) return why;
-   if (t->op != nir_texop_tex && t->op != nir_texop_txl && t->op != nir_texop_txf)
+   if (t->op != nir_texop_tex && t->op != nir_texop_txl && t->op != nir_texop_txf && !gradient)
       return "vertex bias/gradient recipe not device-qualified";
    if (t->is_shadow || (t->sampler_dim == GLSL_SAMPLER_DIM_CUBE &&
                         (!g5p_vtex_cube_probe() || t->is_array)) ||
@@ -1072,7 +1074,7 @@ static void scan_cf(struct gctx *c, struct exec_list *list, struct unsupported *
          case nir_instr_type_tex: {
             nir_tex_instr *t = nir_instr_as_tex(ins);
             const char *why = c->vs ? (g5p_vtex_qualified() ? vs_qualified_tex_refusal(t) : !g5p_vtex_probe() ? "vertex stage" : vs_tex_refusal(t)) :
-                              plain_tex(t) ? NULL : tex_shape_refusal(t);
+                              plain_tex(t) ? NULL : tex_shape_refusal(t, false);
             if (why) {
                snprintf(buf, sizeof(buf), "tex(op %u, dim %u%s%s): %s", t->op, t->sampler_dim,
                         t->is_array ? ", array" : "", t->is_shadow ? ", shadow" : "", why);
@@ -4337,13 +4339,24 @@ static void emit_vertex_qualified_texture(struct gctx *c, nir_tex_instr *t)
           "qualified array layer + 0.5");
       put(c, raw, g5p_usc_vertex_array_layer(raw, H(c,block+2), H(c,tmp)), "qualified array layer to u16");
    } else if (third && !cube) vertex_qualified_copy(c, block + 2, coord, 2);
+   bool gradient = t->op == nir_texop_txd;
    int li = nir_tex_instr_src_index(t, nir_tex_src_lod);
-   unsigned level = alloc_reg(c, -1);
-   scratch |= BITFIELD64_BIT(level);
-   if (li >= 0) vertex_qualified_copy(c, level, t->src[li].src.ssa, 0);
-   else put(c, raw, g5p_usc_immediate(raw, H(c,level), 0, 1, -1), "qualified vertex level zero");
-   if (!read)
-      put(c, raw, g5p_usc_vertex_texture_level(raw, H(c,level), H(c,level), 1), "qualified vertex level to f16");
+   unsigned level = gradient ? alloc_run(c, 4, "qualified vertex derivatives") : alloc_reg(c, -1);
+   scratch |= BITFIELD64_RANGE(level, gradient ? 4 : 1);
+   if (gradient) {
+      /* Native distinct literal gradients independently witness this order:
+       * dx.x, dy.x, dx.y, dy.y, all f32 in consecutive bank1 dwords. */
+      nir_def *dx = nir_get_tex_src(t, nir_tex_src_ddx), *dy = nir_get_tex_src(t, nir_tex_src_ddy);
+      for (unsigned k = 0; k < 2; k++) {
+         vertex_qualified_copy(c, level + 2*k, dx, k);
+         vertex_qualified_copy(c, level + 2*k + 1, dy, k);
+      }
+   } else {
+      if (li >= 0) vertex_qualified_copy(c, level, t->src[li].src.ssa, 0);
+      else put(c, raw, g5p_usc_immediate(raw, H(c,level), 0, 1, -1), "qualified vertex level zero");
+      if (!read)
+         put(c, raw, g5p_usc_vertex_texture_level(raw, H(c,level), H(c,level), 1), "qualified vertex level to f16");
+   }
    if (cube)
       put(c, raw, g5p_usc_cube_coords_bank1(raw, H(c,block), H(c,direction)),
           "native bank0 direction to bank1 cube coordinates");
@@ -4351,6 +4364,12 @@ static void emit_vertex_qualified_texture(struct gctx *c, nir_tex_instr *t)
    /* Match the native producers: an array's offset uses the layer's high
     * half; a 2D offset uses the f16 level's high half. The low half survives. */
    unsigned extras = H(c,array ? block + 2 : level) + 1;
+   if (packed >= 0 && gradient && !array) {
+      /* Derivatives occupy full dwords; their high halves are not spare. */
+      unsigned e = alloc_reg(c, -1);
+      scratch |= BITFIELD64_BIT(e);
+      extras = H(c,e);
+   }
    if (packed >= 0)
       put(c, raw, g5p_usc_vertex_half_immediate(raw, extras, packed), "qualified vertex packed offset");
    unsigned dst = alloc_run(c, 4, "qualified vertex texture result");
@@ -4359,9 +4378,10 @@ static void emit_vertex_qualified_texture(struct gctx *c, nir_tex_instr *t)
       .sampler_qword=(read ? c->fetch_sampler_common : b->sampler)/2,
       .coord_dword=H(c,block)/2,
       .dim=cube ? G5P_TEX_CUBE : t->sampler_dim==GLSL_SAMPLER_DIM_3D ? G5P_TEX_3D : array ? G5P_TEX_2D_ARRAY : G5P_TEX_2D,
-      .mask=15, .read=read, .lod=G5P_TEX_LOD_LEVEL, .lod_dword=H(c,level)/2,
+      .mask=15, .read=read, .lod=gradient ? G5P_TEX_LOD_GRAD : G5P_TEX_LOD_LEVEL, .lod_dword=H(c,level)/2,
       .offset=packed >= 0, .extras_half=packed >= 0 ? extras : 0,
-      .tuple=packed >= 0 ? G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL_OFFSET : G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL,
+      .tuple=gradient ? (packed >= 0 ? G5P_TEX_TUPLE_COUPLED_GRAD_OFFSET : G5P_TEX_TUPLE_COUPLED_GRAD) :
+             packed >= 0 ? G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL_OFFSET : G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL,
    };
    put(c, raw, g5p_usc_sample_ext(raw,&x), "qualified vertex sample/read recipe");
    put(c, raw, g5p_usc_wait(raw,0), "wait");

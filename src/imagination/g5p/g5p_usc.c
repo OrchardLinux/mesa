@@ -917,7 +917,7 @@ unsigned g5p_usc_gather(uint8_t *out, const struct g5p_tex *t)
 unsigned g5p_usc_sample_ext(uint8_t *out, const struct g5p_tex_ext *t)
 {
    const bool coupled = t->tuple != G5P_TEX_TUPLE_ORDINARY;
-   CHECK(t->tuple <= G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL_OFFSET, "unqualified texture recipe");
+   CHECK(t->tuple <= G5P_TEX_TUPLE_COUPLED_GRAD_OFFSET, "unqualified texture recipe");
    CHECK(!coupled || t->lod_shared == (t->tuple == G5P_TEX_TUPLE_COUPLED_SHARED_LEVEL),
          "unqualified independent texture continuation choices");
    static const uint8_t dim_low[G5P_TEX_DIM_COUNT] = {0x5, 0x7, 0xb, 0xd};
@@ -935,9 +935,16 @@ unsigned g5p_usc_sample_ext(uint8_t *out, const struct g5p_tex_ext *t)
    CHECK(t->lod != G5P_TEX_LOD_GRAD || t->dim == G5P_TEX_2D || t->dim == G5P_TEX_2D_ARRAY,
          "gradients are measured on 2D and 2D arrays only");
    CHECK(!t->offset || t->dim != G5P_TEX_CUBE, "cube offsets do not exist");
-   const bool offset_tuple = t->tuple == G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL_OFFSET;
-   CHECK(!coupled || (!t->compare && t->offset == offset_tuple && t->lod == G5P_TEX_LOD_LEVEL),
+   const bool offset_tuple = t->tuple == G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL_OFFSET ||
+                             t->tuple == G5P_TEX_TUPLE_COUPLED_GRAD_OFFSET;
+   const bool grad_tuple = t->tuple == G5P_TEX_TUPLE_COUPLED_GRAD ||
+                           t->tuple == G5P_TEX_TUPLE_COUPLED_GRAD_OFFSET;
+   CHECK(!coupled || (!t->compare && t->offset == offset_tuple &&
+                     t->lod == (grad_tuple ? G5P_TEX_LOD_GRAD : G5P_TEX_LOD_LEVEL)),
          "vertex texture tuple requires its complete level/offset recipe");
+   CHECK(!grad_tuple || (!t->read && !t->lod_shared &&
+                        (t->dim == G5P_TEX_2D || t->dim == G5P_TEX_2D_ARRAY)),
+         "vertex gradient recipe is a 2D or array sample with temporary derivatives");
    CHECK(!offset_tuple || (!t->read && !t->lod_shared &&
                           (t->dim == G5P_TEX_2D || t->dim == G5P_TEX_2D_ARRAY)),
          "vertex offset recipe is a 2D or array sample with a temporary level");
@@ -963,7 +970,7 @@ unsigned g5p_usc_sample_ext(uint8_t *out, const struct g5p_tex_ext *t)
        * keep this suffix indivisible rather than guessing mixed forms. */
       raw[9] = (1u << 7) | 1u;
       raw[10] = 1u << 3;
-      if (t->tuple == G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL || offset_tuple) {
+      if (t->tuple == G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL || offset_tuple || grad_tuple) {
          /* The level producer writes a bank-1 temp. A common-store level
           * (native buffer/manual fold) has no level-bank extension. */
          raw[11] = 1;
