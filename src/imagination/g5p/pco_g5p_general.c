@@ -1946,8 +1946,12 @@ static struct tex_bind *tex_for(struct gctx *c, nir_tex_instr *t)
          { c->tex[i].needs_sampler |= b.needs_sampler;
            c->tex[i].needs_fetch_sampler |= b.needs_fetch_sampler;
            return &c->tex[i]; }
-   if (c->ntex == (c->vs ? 4 : ARRAY_SIZE(c->tex)))
-      refuse(c, "more than %u textures", c->vs ? 4u : (unsigned)ARRAY_SIZE(c->tex));
+   /* Qualified vertex programs use the compact image-then-sampler layout of
+    * Apple's v_units16_sample (16 images at qwords 0..60, samplers from 64),
+    * as fragment programs beyond four; the other vertex modes keep four. */
+   const unsigned max = c->vs && !g5p_vtex_qualified() ? 4u : (unsigned)ARRAY_SIZE(c->tex);
+   if (c->ntex == max)
+      refuse(c, "more than %u textures", max);
    c->tex[c->ntex] = b;
    return &c->tex[c->ntex++];
 }
