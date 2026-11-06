@@ -535,14 +535,74 @@ g9p_keep_kick(struct pvr_device *device, unsigned words, struct pvr_pds_upload *
 }
 
 /* The words before a render's target @first, and all of its targets' words */
+static const struct pvr_renderpass_hwsetup_render *
+g9p_current_hw_render(const struct pvr_render_pass_info *info);
+
+/* The targets of a render the fragment program writes to memory (g9p_overflow_targets()) */
+static unsigned
+g9p_hw_overflow(const struct pvr_render_pass_info *info, const struct pvr_renderpass_hwsetup_render *hw)
+{
+   enum g9p_output outputs[8] = { 0 };
+   unsigned present = 0;
+
+   for (unsigned t = 0; hw && t < MIN2(hw->eot_surface_count, 8); t++) {
+      outputs[t] = g9p_format_output(info->attachments[hw->eot_surfaces[t].attachment_idx]->vk.format);
+      present |= BITFIELD_BIT(t);
+   }
+   return g9p_overflow_targets(outputs, present);
+}
+
+/* A clear of such a target, by the CPU before the job */
+struct g9p_fill {
+   uint64_t addr;
+   uint32_t pitch, width, height, words;
+   uint32_t value[4];
+};
+
+static void
+g9p_fill_target(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_image_view *v, const uint32_t *value)
+{
+   const struct pvr_image *im = pvr_image_view_get_image(v);
+   const struct pvr_image_plane *pl = pvr_single_plane_const(im);
+   struct g9p_fill fill = {
+      .addr = im->dev_addr.addr + pl->offset + pl->mip_levels[v->vk.base_mip_level].offset +
+              v->vk.base_array_layer * pl->layer_size,
+      .pitch = pl->mip_levels[v->vk.base_mip_level].pitch,
+      .width = v->vk.extent.width,
+      .height = v->vk.extent.height,
+      .words = g9p_output_words(g9p_format_output(v->vk.format)),
+   };
+
+   memcpy(fill.value, value, sizeof(fill.value));
+   util_dynarray_append_typed(&cmd_buffer->state.current_sub_cmd->gfx.g9p_fills, struct g9p_fill, fill);
+}
+
+void
+PVR_PER_ARCH(g9p_run_fills)(struct pvr_device *device, struct pvr_sub_cmd_gfx *sub_cmd)
+{
+   util_dynarray_foreach (&sub_cmd->g9p_fills, struct g9p_fill, f) {
+      uint8_t *map = PVR_PER_ARCH(g9p_cpu_addr)(device, f->addr);
+
+      for (unsigned y = 0; map && y < f->height; y++) {
+         uint32_t *row = (uint32_t *)(map + (size_t)y * f->pitch);
+
+         for (unsigned x = 0; x < f->width; x++)
+            memcpy(row + x * f->words, f->value, 4 * f->words);
+      }
+   }
+}
+
 static unsigned
 g9p_render_words(const struct pvr_render_pass_info *info,
                  const struct pvr_renderpass_hwsetup_render *hw, unsigned first)
 {
+   const unsigned overflow = g9p_hw_overflow(info, hw);
    unsigned words = 0;
 
-   for (unsigned t = 0; hw && t < MIN2(hw->eot_surface_count, first); t++)
-      words += g9p_output_words(g9p_format_output(info->attachments[hw->eot_surfaces[t].attachment_idx]->vk.format));
+   for (unsigned t = 0; hw && t < MIN2(hw->eot_surface_count, first); t++) {
+      if (!(overflow >> t & 1))
+         words += g9p_output_words(g9p_format_output(info->attachments[hw->eot_surfaces[t].attachment_idx]->vk.format));
+   }
    return words;
 }
 
@@ -636,10 +696,19 @@ blend_options(const struct vk_graphics_pipeline_state *vk_state, nir_lower_blend
 
       if (format == VK_FORMAT_UNDEFINED)
          continue;
-      any |= rt->blend_enable || cb->logic_op_enable || (rt->write_mask & 0xf) != 0xf;
+      /* integers don't blend */
+      const bool blends = rt->blend_enable && !vk_format_is_int(format);
+
+      any |= blends || cb->logic_op_enable || (rt->write_mask & 0xf) != 0xf;
       opts->rt[t].format = vk_format_to_pipe_format(format);
       opts->rt[t].colormask = rt->write_mask;
-      if (!(rt->write_mask & 0xf)) {
+      if (!(rt->write_mask & 0xf) && vk_format_is_int(format)) {
+         /* lower_keep_target() has written the tile's value */
+         opts->rt[t].colormask = 0xf;
+         opts->rt[t].rgb.func = opts->rt[t].alpha.func = PIPE_BLEND_ADD;
+         opts->rt[t].rgb.src_factor = opts->rt[t].alpha.src_factor = PIPE_BLENDFACTOR_ONE;
+         opts->rt[t].rgb.dst_factor = opts->rt[t].alpha.dst_factor = PIPE_BLENDFACTOR_ZERO;
+      } else if (!(rt->write_mask & 0xf)) {
          /*
           * No colour written: the attachment's own value through the shader. With
           * a colour mask of 0 nir_lower_blend leaves no read of the tile, and the
@@ -649,7 +718,7 @@ blend_options(const struct vk_graphics_pipeline_state *vk_state, nir_lower_blend
          opts->rt[t].rgb.func = opts->rt[t].alpha.func = PIPE_BLEND_ADD;
          opts->rt[t].rgb.src_factor = opts->rt[t].alpha.src_factor = PIPE_BLENDFACTOR_ZERO;
          opts->rt[t].rgb.dst_factor = opts->rt[t].alpha.dst_factor = PIPE_BLENDFACTOR_ONE;
-      } else if (rt->blend_enable && !cb->logic_op_enable) {
+      } else if (blends && !cb->logic_op_enable) {
          opts->rt[t].rgb.func = vk_blend_op_to_pipe(rt->color_blend_op);
          opts->rt[t].rgb.src_factor = vk_blend_factor_to_pipe(rt->src_color_blend_factor);
          opts->rt[t].rgb.dst_factor = vk_blend_factor_to_pipe(rt->dst_color_blend_factor);
@@ -849,7 +918,13 @@ g9p_compile_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo 
 
          if (f != VK_FORMAT_UNDEFINED)
             targets[t] = (struct g9p_target){ true, g9p_format_output(f), vk_format_is_int(f),
-                                              vk_format_is_float(f) };
+                                              vk_format_is_float(f), .write_mask = 0xf };
+      }
+      for (unsigned t = 0; vk_state->cb && t < MIN2(vk_state->cb->attachment_count, G9P_MAX_TARGETS); t++)
+      {
+         targets[t].keep = targets[t].present && targets[t].integer &&
+                           !(vk_state->cb->attachments[t].write_mask & 0xf);
+         targets[t].write_mask = vk_state->cb->attachments[t].write_mask;
       }
       /* no attachment: as for BGRA8, the first target's programs stay valid */
       if (!targets[0].present && !targets[1].present && !targets[2].present && !targets[3].present)
@@ -1464,6 +1539,23 @@ buffer_addrs(struct pvr_cmd_buffer *cmd_buffer, unsigned n, const unsigned (*set
          if (result != VK_SUCCESS)
             return result;
          addrs[k] = bbo->dev_addr.addr;
+      } else if (set == G9P_OVERFLOW_TARGETS) {
+         const struct pvr_render_pass_info *info = &cs->render_pass_info;
+         const struct pvr_renderpass_hwsetup_render *hw = g9p_current_hw_render(info);
+         const struct pvr_image_view *v = info->attachments[hw->eot_surfaces[binding].attachment_idx];
+         const struct pvr_image *im = pvr_image_view_get_image(v);
+         const struct pvr_image_plane *pl = pvr_single_plane_const(im);
+         const uint64_t addr = im->dev_addr.addr + pl->offset + pl->mip_levels[v->vk.base_mip_level].offset +
+                               v->vk.base_array_layer * pl->layer_size;
+         const uint32_t block[3] = { addr, addr >> 32, pl->mip_levels[v->vk.base_mip_level].pitch };
+         struct pvr_suballoc_bo *obo;
+
+         if (im->memlayout != PVR_MEMLAYOUT_LINEAR)
+            mesa_logw_once("G9P: a target past what a pixel holds must be linear");
+         result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, block, sizeof(block), &obo);
+         if (result != VK_SUCCESS)
+            return result;
+         addrs[k] = obo->dev_addr.addr;
       } else if (set == G9P_FRONT_FACE) {
          const uint32_t cw = cmd_buffer->vk.dynamic_graphics_state.rs.front_face ==
                                    VK_FRONT_FACE_CLOCKWISE
@@ -1655,7 +1747,7 @@ scissor_index(struct pvr_cmd_buffer *cmd_buffer, VkRect2D r)
 }
 
 /* The hardware render of the current subpass, NULL outside a render pass */
-static struct pvr_renderpass_hwsetup_render *
+static const struct pvr_renderpass_hwsetup_render *
 g9p_current_hw_render(const struct pvr_render_pass_info *info)
 {
    if (info->dr_info)
@@ -2571,6 +2663,12 @@ PVR_PER_ARCH(g9p_clear_attachments)(struct pvr_cmd_buffer *cmd_buffer, uint32_t 
    {
       const struct pvr_renderpass_hwsetup_render *hw = g9p_current_hw_render(info);
 
+      if (hw && colour->colorAttachment < hw->eot_surface_count &&
+          (g9p_hw_overflow(info, hw) >> colour->colorAttachment & 1)) {
+         g9p_fill_target(cmd_buffer, info->attachments[hw->eot_surfaces[colour->colorAttachment].attachment_idx],
+                         colour->clearValue.color.uint32);
+         return VK_SUCCESS;
+      }
       if (hw && colour->colorAttachment < hw->eot_surface_count) {
          const unsigned t = colour->colorAttachment;
          const VkFormat format = info->attachments[hw->eot_surfaces[t].attachment_idx]->vk.format;
@@ -2979,12 +3077,48 @@ PVR_PER_ARCH(g9p_job_init)(struct pvr_cmd_buffer *cmd_buffer,
    struct pvr_suballoc_bo *bo;
    struct pvr_pds_upload up;
    uint32_t image[8 * G9P_MAX_TARGETS];
-   const unsigned eot_targets = MIN2(hw_render->eot_surface_count, G9P_MAX_TARGETS);
    VkResult result;
 
    result = g9p_ds_check(cmd_buffer, hw_render);
    if (result != VK_SUCCESS)
       return result;
+
+   /*
+    * Targets past what a pixel holds take no part in the pixel's storage, end of tile or
+    * background; the CPU clears them before the job. Everything below sees the others.
+    */
+   struct pvr_renderpass_hwsetup_render live_render = *hw_render;
+   struct pvr_renderpass_hwsetup_eot_surface live_eot[G9P_MAX_TARGETS];
+   struct pvr_renderpass_colorinit live_init[G9P_MAX_TARGETS];
+   const unsigned overflow = g9p_hw_overflow(info, hw_render);
+
+   if (overflow) {
+      live_render.eot_surfaces = live_eot;
+      live_render.color_init = live_init;
+      live_render.eot_surface_count = 0;
+      live_render.color_init_count = 0;
+      for (unsigned t = 0; t < hw_render->eot_surface_count; t++) {
+         if (!(overflow >> t & 1))
+            live_eot[live_render.eot_surface_count++] = hw_render->eot_surfaces[t];
+      }
+      for (unsigned i = 0; i < hw_render->color_init_count; i++) {
+         const struct pvr_renderpass_colorinit *init = &hw_render->color_init[i];
+         bool past = false;
+
+         u_foreach_bit (t, overflow)
+            past |= hw_render->eot_surfaces[t].attachment_idx == init->index;
+         if (!past) {
+            if (live_render.color_init_count < G9P_MAX_TARGETS)
+               live_init[live_render.color_init_count++] = *init;
+         } else if (init->op == VK_ATTACHMENT_LOAD_OP_CLEAR && init->index < info->clear_value_count) {
+            g9p_fill_target(cmd_buffer, info->attachments[init->index],
+                            info->clear_values[init->index].color.uint32);
+         }
+      }
+      hw_render = &live_render;
+   }
+
+   const unsigned eot_targets = MIN2(hw_render->eot_surface_count, G9P_MAX_TARGETS);
 
    memset(&job->g9p, 0, sizeof(job->g9p));
    job->g9p.enabled = true;

@@ -48,6 +48,8 @@ VkResult PVR_PER_ARCH(g9p_device_init)(struct pvr_device *device);
 
 /* The CPU address of a device address in a bound buffer or image, or NULL */
 uint8_t *PVR_PER_ARCH(g9p_cpu_addr)(struct pvr_device *device, uint64_t addr);
+struct pvr_sub_cmd_gfx;
+void PVR_PER_ARCH(g9p_run_fills)(struct pvr_device *device, struct pvr_sub_cmd_gfx *sub_cmd);
 void PVR_PER_ARCH(g9p_device_finish)(struct pvr_device *device);
 
 /* Copy a render's unaligned vertex bindings; before its job is submitted */

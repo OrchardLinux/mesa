@@ -561,6 +561,20 @@ static VkResult pvr_process_graphics_cmd(struct pvr_device *device,
       PVR_PER_ARCH(g9p_realign_vertex_bindings)(sub_cmd);
    }
 
+   if (util_dynarray_num_elements(&sub_cmd->g9p_fills, char)) {
+      for (unsigned i = 0; i < ARRAY_SIZE(queue->last_job_signal_sync); i++) {
+         struct vk_sync *s = queue->last_job_signal_sync[i];
+
+         if (s) {
+            VkResult result = vk_sync_wait(&device->vk, s, 0, VK_SYNC_WAIT_COMPLETE, UINT64_MAX);
+
+            if (result != VK_SUCCESS)
+               return result;
+         }
+      }
+      PVR_PER_ARCH(g9p_run_fills)(device, sub_cmd);
+   }
+
    sub_cmd->job.g9p.oclqry_base = sub_cmd->query_pool ? sub_cmd->query_pool->result_buffer->dev_addr.addr : 0;
 
    {

@@ -62,6 +62,8 @@ g9p_fs_buf_base(unsigned n)
 #define G9P_PUSH_CONSTANTS (~0u)
 /* The set of the dynamic blend constants (binding 0): 4 floats */
 #define G9P_BLEND_CONSTANTS (~5u)
+/* The set of target t's memory (binding t) when it overflows: address, pitch (3 dwords) */
+#define G9P_OVERFLOW_TARGETS (~20u)
 /* The set of the front face state: one word, ~0 for clockwise */
 #define G9P_FRONT_FACE (~6u)
 /* The set of vertex buffer slots (binding = the vertex buffer binding) */
@@ -112,6 +114,12 @@ struct g9p_target {
    bool present;
    enum g9p_output output;
    bool integer, is_float;
+   /* colour mask 0 on an integer target: the tile's value stays */
+   bool keep;
+   /* VkColorComponentFlags, for a target the program writes to memory */
+   uint8_t write_mask;
+   /* past what a pixel holds: the program writes it to memory */
+   bool overflow;
 };
 
 struct g9p_shader {

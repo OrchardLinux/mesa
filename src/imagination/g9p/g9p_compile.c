@@ -1222,6 +1222,27 @@ emit_mem(struct g9p_ctx *ctx, nir_intrinsic_instr *intr, int slot, nir_scalar of
       return false;
    }
 
+   /* A target past what a pixel holds: to memory, the address from the common store */
+   if (value && ctx->stage == MESA_SHADER_FRAGMENT) {
+      off = src_reg(ctx, offset);
+      data = src_reg(ctx, nir_get_scalar(value->ssa, 0));
+      if (off < 0 || data < 0)
+         return false;
+      off = low_reg(ctx, off);
+      if (off < 0)
+         return false;
+      pair = alloc_pair(ctx);
+      if (pair < 0)
+         return false;
+      ctx->temps |= BITFIELD64_RANGE(pair, 2);
+      ctx->out->buffers[slot].dwords = MAX2(ctx->out->buffers[slot].dwords, 2);
+      BITSET_SET(ctx->fs_used[slot], 1);
+      g9p_addr(ctx->c, pair, fs_dword(ctx, slot, 0), off, 0, false);
+      g9p_mem_at(ctx->c, true, G9P_SIZE_U32, data, pair);
+      release(ctx, &intr->instr);
+      return true;
+   }
+
    /* fragment shaders: the buffer's contents in the common store */
    if (ctx->stage == MESA_SHADER_FRAGMENT) {
       const unsigned byte = base + (nir_scalar_is_const(offset) ? nir_scalar_as_uint(offset) : 0);
@@ -3276,6 +3297,76 @@ zero_descriptor_offset(nir_builder *b, nir_intrinsic_instr *intr, void *data)
  * shader wrote, unclamped until it is written to memory: a blend that went
  * negative read back positive (dEQP fragment_ops).
  */
+/*
+ * Colour mask 0 on an integer target, which nir_lower_blend passes through as written
+ * (it doesn't blend integers): store the tile's value. A float one blends it instead.
+ */
+static bool
+lower_keep_target(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   const struct g9p_shader *out = data;
+
+   if (intr->intrinsic != nir_intrinsic_store_output)
+      return false;
+   nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+
+   if (sem.location < FRAG_RESULT_DATA0 || sem.location >= FRAG_RESULT_DATA0 + G9P_MAX_TARGETS ||
+       !out->targets[sem.location - FRAG_RESULT_DATA0].keep)
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   sem.fb_fetch_output = true;
+   nir_src_rewrite(&intr->src[0],
+                   nir_load_output(b, intr->src[0].ssa->num_components, 32, nir_imm_int(b, 0),
+                                   .base = nir_intrinsic_base(intr), .component = nir_intrinsic_component(intr),
+                                   .dest_type = nir_intrinsic_src_type(intr), .io_semantics = sem));
+   b->shader->info.fs.uses_fbfetch_output = true;
+   return true;
+}
+
+/*
+ * A target past what a pixel holds: each written channel straight to its pixel in the
+ * (linear) image, at the address and pitch of the draw's block (g9p_overflow_targets()).
+ */
+static bool
+lower_overflow_target(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   const struct g9p_target *targets = data;
+
+   if (intr->intrinsic != nir_intrinsic_store_output)
+      return false;
+   const nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+
+   if (sem.location < FRAG_RESULT_DATA0 || sem.location >= FRAG_RESULT_DATA0 + G9P_MAX_TARGETS)
+      return false;
+   const struct g9p_target *target = &targets[sem.location - FRAG_RESULT_DATA0];
+
+   if (!target->overflow)
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *index = nir_vulkan_resource_index(b, 2, 32, nir_imm_int(b, 0), .desc_set = G9P_OVERFLOW_TARGETS,
+                                              .binding = sem.location - FRAG_RESULT_DATA0,
+                                              .desc_type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+   nir_def *pitch = nir_load_ubo(b, 1, 32, index, nir_imm_int(b, 8), .align_mul = 4, .range = 12);
+   nir_def *coord = nir_load_frag_coord(b);
+   nir_def *x = nir_f2u32(b, nir_channel(b, coord, 0)), *y = nir_f2u32(b, nir_channel(b, coord, 1));
+   nir_def *pixel = nir_iadd(b, nir_imul(b, y, pitch),
+                             nir_imul_imm(b, x, 4 * g9p_output_words(target->output)));
+   nir_def *value = intr->src[0].ssa;
+   const unsigned first = nir_intrinsic_component(intr);
+
+   for (unsigned c = 0; c < value->num_components; c++) {
+      const unsigned channel = first + c;
+
+      if (!(nir_intrinsic_write_mask(intr) >> c & 1) || !(target->write_mask >> channel & 1) ||
+          channel >= g9p_output_words(target->output))
+         continue;
+      nir_store_ssbo(b, nir_channel(b, value, c), index, nir_iadd_imm(b, pixel, 4 * channel), .align_mul = 4,
+                     .write_mask = 1);
+   }
+   nir_instr_remove(&intr->instr);
+   return true;
+}
+
 #define G9P_RAW_TILE_READ 0x7f
 
 static bool
@@ -4536,6 +4627,25 @@ g9p_compile_fragment(nir_shader *nir, unsigned frag_coord_slot,
                      const struct g9p_target targets[G9P_MAX_TARGETS], struct g9p_shader *out,
                      void *mem_ctx)
 {
+   /* Targets past what a pixel holds are no part of its output */
+   struct g9p_target live[G9P_MAX_TARGETS];
+   {
+      enum g9p_output outputs[8] = { 0 };
+      unsigned present = 0;
+
+      for (unsigned t = 0; t < G9P_MAX_TARGETS; t++) {
+         live[t] = targets[t];
+         outputs[t] = targets[t].output;
+         present |= targets[t].present ? BITFIELD_BIT(t) : 0;
+      }
+      const unsigned overflow = g9p_overflow_targets(outputs, present);
+
+      u_foreach_bit (t, overflow) {
+         live[t].present = false;
+         live[t].overflow = true;
+      }
+      targets = live;
+   }
    memset(out, 0, sizeof(*out));
    memcpy(out->targets, targets, sizeof(out->targets));
    out->output = targets[0].output;
@@ -4547,8 +4657,10 @@ g9p_compile_fragment(nir_shader *nir, unsigned frag_coord_slot,
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_centroid, nir_metadata_control_flow, NULL);
    find_flat_varyings(nir, out);
    lower_io(nir);
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_overflow_target, nir_metadata_control_flow, (void *)targets);
    if (coverage)
       lower_coverage(nir, coverage);
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_keep_target, nir_metadata_control_flow, out);
    out->native_blend = blend && is_src_over(blend) && out->output == G9P_OUTPUT_HALF2 &&
                        !out->output_float && !targets[1].present && !targets[2].present &&
                        !targets[3].present && !getenv("G9P_NO_NATIVE_BLEND");

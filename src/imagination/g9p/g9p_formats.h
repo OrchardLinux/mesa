@@ -199,6 +199,34 @@ g9p_output_words(enum g9p_output output)
    return output == G9P_OUTPUT_RAW4 ? 4 : output == G9P_OUTPUT_HALF2 || output == G9P_OUTPUT_RAW2 ? 2 : 1;
 }
 
+/* A pixel holds eight output words (A10: 32 bytes) */
+#define G9P_PIXEL_WORDS 8
+
+/*
+ * The targets past what a pixel holds: the fragment program writes these to memory itself.
+ * Only 32-bit channels, which need no packing and don't blend; four targets of the others
+ * always fit. Largest first, from the last target: every caller gets the same answer.
+ * @present: the targets there are
+ */
+static inline unsigned
+g9p_overflow_targets(const enum g9p_output *outputs, unsigned present)
+{
+   static const enum g9p_output order[] = { G9P_OUTPUT_RAW4, G9P_OUTPUT_RAW2, G9P_OUTPUT_RAW1 };
+   unsigned total = 0, mask = 0;
+
+   for (unsigned t = 0; t < 8; t++)
+      total += present >> t & 1 ? g9p_output_words(outputs[t]) : 0;
+   for (unsigned o = 0; o < 3; o++) {
+      for (int t = 7; t >= 0 && total > G9P_PIXEL_WORDS; t--) {
+         if ((present >> t & 1) && outputs[t] == order[o]) {
+            mask |= 1u << t;
+            total -= g9p_output_words(outputs[t]);
+         }
+      }
+   }
+   return mask;
+}
+
 /* Has a key, and is not snorm, shared-exponent or 4444 (Zink picks another for those) */
 static inline bool
 g9p_format_renderable(VkFormat format)

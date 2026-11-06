@@ -176,6 +176,8 @@ struct pvr_sub_cmd_gfx {
 
    /* G9P: vertex bindings to copy when the job is submitted */
    struct util_dynarray g9p_realigns;
+   /* G9P: clears of targets the fragment program writes to memory (struct g9p_fill) */
+   struct util_dynarray g9p_fills;
 
    /* Control stream builder object */
    struct pvr_csb control_stream;
