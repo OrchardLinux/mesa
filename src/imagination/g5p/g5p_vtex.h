@@ -18,7 +18,7 @@ static inline bool g5p_vtex_qualified(void)
 {
    const char *v = getenv("PVR_G5P_VERTEX_TEXTURE");
    return !v || !strcmp(v, "qualified") || !strcmp(v, "qualified-cube") ||
-          !strcmp(v, "qualified-offset") || !strcmp(v, "qualified-gradient");
+          !strcmp(v, "qualified-offset") || !strcmp(v, "qualified-gradient") || !strcmp(v, "qualified-integer");
 }
 static inline bool g5p_vtex_cube_probe(void)
 {
@@ -35,5 +35,10 @@ static inline bool g5p_vtex_gradient_probe(void)
 {
    const char *v = getenv("PVR_G5P_VERTEX_TEXTURE");
    return v && !strcmp(v, "qualified-gradient");
+}
+static inline bool g5p_vtex_integer_probe(void)
+{
+   const char *v = getenv("PVR_G5P_VERTEX_TEXTURE");
+   return v && !strcmp(v, "qualified-integer");
 }
 #endif
