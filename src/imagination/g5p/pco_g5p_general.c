@@ -810,7 +810,12 @@ static const char *tex_shape_refusal(const nir_tex_instr *t, bool vertex_gradien
       return "gradients on 3D or cube (Apple's gradient layout is measured on 2D/arrays)";
    if (t->op == nir_texop_txf && (d == GLSL_SAMPLER_DIM_CUBE || t->is_shadow))
       return "texelFetch on a cube or shadow texture";
-   if (t->is_shadow && (t->op == nir_texop_txb || t->op == nir_texop_txd || d == GLSL_SAMPLER_DIM_3D))
+   /* Complete Apple register-only 2D compare bias/gradient recipes, including
+    * XY offsets, match the existing encoder. Array/cube combinations retain
+    * their separate boundary; their operand layouts are not inferred here. */
+   bool fragment_2d_compare = fragment && d == GLSL_SAMPLER_DIM_2D && !t->is_array;
+   if (t->is_shadow && (d == GLSL_SAMPLER_DIM_3D ||
+       ((t->op == nir_texop_txb || t->op == nir_texop_txd) && !fragment_2d_compare)))
       return "compare with bias/gradients or on 3D (not probed)";
    bool offset = false;
    for (unsigned i = 0; i < t->num_srcs; i++) {
