@@ -91,3 +91,11 @@ g5p_integer_encodings_test = executable(
   install : false,
 )
 test('g5p-integer-encodings', g5p_integer_encodings_test, timeout : 60)
+
+g5p_derivative_encodings_test = executable(
+  'g5p-derivative-encodings-test',
+  files('tests/derivatives/encodings.c', 'g5p_usc.c'),
+  include_directories : [inc_powervr_g5p],
+  install : false,
+)
+test('g5p-derivative-encodings', g5p_derivative_encodings_test, timeout : 60)

@@ -4093,12 +4093,23 @@ static void emit_memory_ubo(struct gctx *c, nir_intrinsic_instr *in,
 }
 
 /* Apple's derivatives (f_ddx_*, f_ddy_*): one instruction, the unary
- * hints for a source read again. Straight-line only: under the mask stack a
- * neighbouring lane may not have run. */
+ * hints for a source read again. Apple fw_l7_*_uniform_loop witnesses the
+ * same token under its mask stack. A divergent path still cannot promise
+ * that the neighbouring lane produced the source. */
 static void emit_deriv(struct gctx *c, nir_intrinsic_instr *in)
 {
-   if (c->cf_depth)
-      refuse(c, "%s inside control flow (no Apple witness)", nir_intrinsic_infos[in->intrinsic].name);
+   if (c->cf_depth) {
+      bool divergent = in->instr.block->divergent;
+      /* NIR reconverges the remaining active lanes after a divergent break.
+       * Derivatives still need neighbours that may have left this loop, so
+       * block divergence alone is not a sufficient quad-execution proof. */
+      for (nir_cf_node *node = in->instr.block->cf_node.parent; node; node = node->parent)
+         if (node->type == nir_cf_node_loop)
+            divergent |= nir_loop_is_divergent(nir_cf_node_as_loop(node));
+      if (divergent)
+         refuse(c, "%s inside divergent control flow (helper-lane execution not qualified)",
+                nir_intrinsic_infos[in->intrinsic].name);
+   }
    bool y = in->intrinsic == nir_intrinsic_ddy || in->intrinsic == nir_intrinsic_ddy_fine ||
             in->intrinsic == nir_intrinsic_ddy_coarse;
    struct ref x = resolve_value(c, in->src[0].ssa, 0);
@@ -6104,12 +6115,29 @@ static bool simplify_nested_breaks(nir_shader *nir)
  * (G9P's order: convert_from_ssa, then trivialize_registers). */
 static void cf_out_of_ssa(nir_shader *nir)
 {
+   bool derivatives = false;
+   if (nir->info.stage == MESA_SHADER_FRAGMENT) {
+      nir_foreach_function_impl(impl, nir) {
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr(ins, block) {
+               if (ins->type == nir_instr_type_intrinsic)
+                  derivatives |= is_deriv(nir_instr_as_intrinsic(ins)->intrinsic);
+            }
+         }
+      }
+   }
    NIR_PASS(_, nir, nir_lower_phis_to_scalar, NULL, NULL);
-   NIR_PASS(_, nir, nir_convert_from_ssa, true, false);
+   /* Preserve divergent register webs: treating every out-of-SSA register
+    * as uniform would incorrectly admit a loop with varying trip counts. */
+   if (derivatives)
+      nir_divergence_analysis(nir);
+   NIR_PASS(_, nir, nir_convert_from_ssa, true, derivatives);
    NIR_PASS(_, nir, nir_trivialize_registers);
    NIR_PASS(_, nir, simplify_nested_breaks);
    NIR_PASS(_, nir, hoist_break_work);
    NIR_PASS(_, nir, nir_opt_dce);
+   if (derivatives)
+      nir_divergence_analysis(nir);
 }
 
 bool pco_g5p_compile_general(nir_shader *nir, bool half_output, const uint8_t *attrib_components,
