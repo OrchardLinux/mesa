@@ -770,6 +770,23 @@ only_tex_uses(nir_def *def)
 
 static int varying_component(const struct g9p_ctx *ctx, nir_scalar s);
 
+/* @def (a vector of varyings) is only the coordinates of samples other than cube ones */
+static bool
+only_coord_uses(nir_def *def)
+{
+   nir_foreach_use_including_if(src, def) {
+      if (nir_src_is_if(src) || nir_src_use_instr(src)->type != nir_instr_type_tex)
+         return false;
+
+      const nir_tex_instr *tex = nir_instr_as_tex(nir_src_use_instr(src));
+      const int ci = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+
+      if (tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE || ci < 0 || &tex->src[ci].src != src)
+         return false;
+   }
+   return true;
+}
+
 /*
  * vecN: no code when only texture coordinates read straight from two
  * consecutive varying components use it (emit_tex() iterates them itself),
@@ -1504,6 +1521,21 @@ emit_varying_load(struct g9p_ctx *ctx, nir_intrinsic_instr *intr, bool persp)
          ctx->out->straight_samples = true;
          return true;
       }
+   }
+   /* a varying read only as coordinates, through registers (arrays, 3D) */
+   {
+      bool coords = !nir_def_is_unused(&intr->def) && !ctx->out->varying_flat[n];
+
+      nir_foreach_use_including_if(src, &intr->def) {
+         if (nir_src_is_if(src) || nir_src_use_instr(src)->type != nir_instr_type_alu ||
+             !nir_op_is_vec(nir_instr_as_alu(nir_src_use_instr(src))->op) ||
+             !only_coord_uses(&nir_instr_as_alu(nir_src_use_instr(src))->def)) {
+            coords = false;
+            break;
+         }
+      }
+      if (coords)
+         ctx->out->straight_samples = true;
    }
    r = alloc_reg(ctx);
    if (r < 0)
