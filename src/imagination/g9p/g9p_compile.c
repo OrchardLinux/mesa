@@ -738,9 +738,9 @@ walk_liveness(struct g9p_ctx *ctx, struct exec_list *list, bool uses)
 
 /* --- Code ---------------------------------------------------------------- */
 
-/* The common-store slot of the storage buffer @index refers to */
+/* The common-store slot of the storage buffer @index refers to (@flags on the binding) */
 static int
-buffer_slot(struct g9p_ctx *ctx, nir_src index)
+buffer_slot_flags(struct g9p_ctx *ctx, nir_src index, unsigned flags)
 {
    nir_scalar s = nir_scalar_chase_movs(nir_get_scalar(index.ssa, 0));
    nir_intrinsic_instr *intr;
@@ -761,7 +761,13 @@ buffer_slot(struct g9p_ctx *ctx, nir_src index)
 
    return g9p_buffer_slot(ctx->out, nir_intrinsic_desc_set(intr),
                           nir_intrinsic_binding(intr) |
-                             nir_src_as_uint(intr->src[0]) << G9P_BINDING_ELEMENT_SHIFT);
+                             nir_src_as_uint(intr->src[0]) << G9P_BINDING_ELEMENT_SHIFT | flags);
+}
+
+static int
+buffer_slot(struct g9p_ctx *ctx, nir_src index)
+{
+   return buffer_slot_flags(ctx, index, 0);
 }
 
 /*
@@ -2698,6 +2704,25 @@ emit_intrinsic(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
          g9p_alu2(ctx->c, G9P_OR, r, dst, dst, false);
          ctx->reg[key(&intr->def, 0)] = r;
       }
+      ctx->busy &= ~ctx->temps;
+      ctx->temps = 0;
+      return true;
+   }
+
+   case nir_intrinsic_get_ssbo_size: {
+      /* compute: the size the binding DMA copies from the descriptor (pvr_arch_g9p.c) */
+      const int slot = ctx->stage == MESA_SHADER_COMPUTE
+                          ? buffer_slot_flags(ctx, intr->src[0], G9P_BINDING_SIZE) : -1;
+      int zero = const_reg(ctx, 0), r;
+
+      zero = zero < 0 ? zero : low_reg(ctx, zero);
+      if (slot < 0 || zero < 0)
+         return false;
+      r = alloc_reg(ctx);
+      if (r < 0)
+         return false;
+      g9p_mov_uniform(ctx->c, r, 2 * slot, zero);
+      ctx->reg[key(&intr->def, 0)] = r;
       ctx->busy &= ~ctx->temps;
       ctx->temps = 0;
       return true;

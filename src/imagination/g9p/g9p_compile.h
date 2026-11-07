@@ -23,6 +23,8 @@
  */
 /* A buffer slot's binding: the array element above the binding number */
 #define G9P_BINDING_ELEMENT_SHIFT 8
+/* On a slot's binding: the buffer's size (the descriptor's dword 2), not its address */
+#define G9P_BINDING_SIZE (1u << 30)
 #define G9P_MAX_BUFFERS 40 /* 16 vertex bindings x address and stride, 4 capture buffers, uniforms */
 #define G9P_MAX_ATTRIBS 16
 /*

@@ -230,15 +230,17 @@ PVR_PER_ARCH(g9p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
           state->buffers[k].set != G9P_NUM_WORKGROUPS) {
          const struct pvr_descriptor_set *set = desc->sets[state->buffers[k].set];
          /* an array's element (Zink keeps all storage buffers in one array) */
-         const unsigned element = state->buffers[k].binding >> G9P_BINDING_ELEMENT_SHIFT;
+         const unsigned element =
+            (state->buffers[k].binding & ~G9P_BINDING_SIZE) >> G9P_BINDING_ELEMENT_SHIFT;
          const struct pvr_descriptor_set_layout_binding *binding;
 
          if (!set)
             return vk_error(cmd_buffer, VK_ERROR_UNKNOWN);
          binding = &set->layout->bindings[state->buffers[k].binding &
                                           BITFIELD_MASK(G9P_BINDING_ELEMENT_SHIFT)];
-         /* pvr_buffer_descriptor: the address comes first */
-         src = set->dev_addr.addr + binding->offset + element * binding->stride;
+         /* pvr_buffer_descriptor: the address comes first, the size at byte 8 */
+         src = set->dev_addr.addr + binding->offset + element * binding->stride +
+               (state->buffers[k].binding & G9P_BINDING_SIZE ? 8 : 0);
       } else {
          src = uniforms_bo->dev_addr.addr + 8 * k;
          if (k == n)
