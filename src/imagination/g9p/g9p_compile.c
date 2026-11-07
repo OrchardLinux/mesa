@@ -117,6 +117,12 @@ struct g9p_vs_store {
 struct g9p_ctx {
    /* a sample iterated straight to the sampler has been emitted */
    bool straight_done;
+   /*
+    * Fragment samples (each one's first word): W3 bit 8
+    * of a sample lets helper pixels go after it, Apple's on the program's last sample only
+    * (helper_samples_end())
+    */
+   unsigned frag_samples[64], num_frag_samples;
    /* ifs open inside the current loop */
    unsigned if_depth;
    int frag_depth;
@@ -197,6 +203,42 @@ static unsigned
 key(const nir_def *def, unsigned comp)
 {
    return def->index * 4 + comp;
+}
+
+/* A fragment sample at word @at, for helper_samples_end() */
+static void
+note_sample(struct g9p_ctx *ctx, const nir_tex_instr *tex, unsigned at)
+{
+   if (ctx->stage != MESA_SHADER_FRAGMENT)
+      return;
+   if (ctx->num_frag_samples < ARRAY_SIZE(ctx->frag_samples))
+      ctx->frag_samples[ctx->num_frag_samples++] = at;
+}
+
+/*
+ * Helper pixels stay through every sample but the program's last: Apple's code ends a sample
+ * before the last with W3 0600 and W4 044d, the last with 0700 and 0200. With 0700 on every
+ * sample a second one took its level from helper pixels already gone, at random where a
+ * quad leaves the primitive (dEQP samplers.multi_cubemap); W3 0600 without W4 044d hung.
+ * The last keeps its words, also before a derivative; so do samples whose W4 names an
+ * extra operand (compare reference, offset).
+ */
+static void
+helper_samples_end(struct g9p_ctx *ctx)
+{
+   if (!ctx->num_frag_samples)
+      return;
+   const unsigned last = ctx->frag_samples[ctx->num_frag_samples - 1];
+
+   for (unsigned i = 0; i < ctx->num_frag_samples; i++) {
+      const unsigned at = ctx->frag_samples[i];
+
+      /* Apple's word pair for a sample before the last: W3 0600, W4 044d */
+      if (at != last && ctx->c->w[at + 4] == 0x0200) {
+         ctx->c->w[at + 3] &= ~0x0100;
+         ctx->c->w[at + 4] = 0x044d;
+      }
+   }
 }
 
 static void
@@ -2212,6 +2254,7 @@ emit_tex_grad(struct g9p_ctx *ctx, nir_tex_instr *tex)
       return false;
    G9P_EMIT(ctx->c, 0xf71a, g9p_sample_w1(dst, tex_state_dword(ctx, slot)),
             0x8100 | coord << 9 | tex_sampler_dword(ctx, slot), 0x07e0, 0x0080);
+   note_sample(ctx, tex, ctx->c->n - 5);
    g9p_wait(ctx->c);
    ctx->busy &= ~ctx->temps;
    ctx->temps = 0;
@@ -2350,6 +2393,7 @@ emit_tex_layered(struct g9p_ctx *ctx, nir_tex_instr *tex)
                    (cube ? G9P_TEX_CUBE : is3d ? G9P_TEX_3D : G9P_TEX_2D_ARRAY) << 8;
    sample_lod(ctx, tex, at, lod);
    extras_patch(ctx, at, &extras);
+   note_sample(ctx, tex, at);
    g9p_wait(ctx->c);
    /*
     * A one-layer, one-level 2D image is linear (pvr_image.c), and the sampler reads no
@@ -2367,6 +2411,7 @@ emit_tex_layered(struct g9p_ctx *ctx, nir_tex_instr *tex)
       g9p_sample_regs(ctx->c, alt, tex_state_dword(ctx, slot), tex_sampler_dword(ctx, slot));
       sample_lod(ctx, tex, at, lod);
       extras_patch(ctx, at, &extras);
+      note_sample(ctx, tex, at);
       g9p_wait(ctx->c);
       g9p_mov_uniform(ctx->c, d0, tex_state_dword(ctx, slot), zero);
       g9p_mov_imm(ctx->c, mask, 7);
@@ -2536,6 +2581,7 @@ emit_tex(struct g9p_ctx *ctx, nir_tex_instr *tex)
       }
       /* the sample is its last five words */
       extras_patch(ctx, ctx->c->n - 5, &extras);
+      note_sample(ctx, tex, ctx->c->n - 5);
       ctx->out->num_varyings = MAX2(ctx->out->num_varyings, first / 4 + 1);
    } else {
       const int lod = lod_source(ctx, tex);
@@ -2560,6 +2606,7 @@ emit_tex(struct g9p_ctx *ctx, nir_tex_instr *tex)
          g9p_sample_regs(ctx->c, dst, tex_state_dword(ctx, slot), tex_sampler_dword(ctx, slot));
          sample_lod(ctx, tex, at, lod);
          extras_patch(ctx, at, &extras);
+         note_sample(ctx, tex, at);
       }
    }
    g9p_wait(ctx->c);
@@ -3184,8 +3231,11 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
    }
 
    ctx->ip = 0;
+   ctx->num_frag_samples = 0;
    if (!emit_cf_list(ctx, &impl->body))
       return false;
+   if (ctx->c->fragment)
+      helper_samples_end(ctx);
 
    /*
     * Frame. Compute: prologue (thread count), mask stack, body, epilogue,
