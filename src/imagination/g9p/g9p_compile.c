@@ -2351,6 +2351,32 @@ emit_tex_layered(struct g9p_ctx *ctx, nir_tex_instr *tex)
    sample_lod(ctx, tex, at, lod);
    extras_patch(ctx, at, &extras);
    g9p_wait(ctx->c);
+   /*
+    * A one-layer, one-level 2D image is linear (pvr_image.c), and the sampler reads no
+    * linear arrays (the pitch takes the layer field): when the state's layout is 2, the
+    * result is a 2D sample of the same coordinates (dEQP texstorage3d 2d_array_1x1x1)
+    */
+   if (tex->is_array && !cube && !is3d) {
+      const int alt = alloc_range(ctx, 4);
+      const int zero = const_reg(ctx, 0);
+      const int d0 = alloc_temp(ctx), mask = alloc_temp(ctx), two = alloc_temp(ctx);
+
+      if (alt < 0 || zero < 0 || d0 < 0 || mask < 0 || two < 0)
+         return false;
+      at = ctx->c->n;
+      g9p_sample_regs(ctx->c, alt, tex_state_dword(ctx, slot), tex_sampler_dword(ctx, slot));
+      sample_lod(ctx, tex, at, lod);
+      extras_patch(ctx, at, &extras);
+      g9p_wait(ctx->c);
+      g9p_mov_uniform(ctx->c, d0, tex_state_dword(ctx, slot), zero);
+      g9p_mov_imm(ctx->c, mask, 7);
+      g9p_alu2(ctx->c, G9P_AND, d0, d0, mask, false);
+      g9p_mov_imm(ctx->c, two, 2);
+      for (unsigned c = 0; c < tex->def.num_components; c++)
+         emit_select(ctx, G9P_EQ, false, d0, two, alt + c, dst + c, dst + c);
+      ctx->busy &= ~(BITFIELD64_RANGE(alt, 4) | ctx->temps);
+      ctx->temps = 0;
+   }
    for (unsigned c = 0; c < 4; c++) {
       ctx->reg[key(&tex->def, c)] = dst + c;
       if (c >= tex->def.num_components || !ctx->last_use[key(&tex->def, c)])
