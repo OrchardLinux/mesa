@@ -1082,6 +1082,7 @@ g9p_compile_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo 
    state->writes_depth = fs.writes_depth;
    state->uses_derivatives = fs.uses_derivatives;
    state->straight_samples = fs.straight_samples;
+   state->writes_coverage = fs.writes_coverage;
    state->uses_fbfetch = fs.uses_fbfetch;
    /*
     * Whole blocks of 4: 17 and 18 registers drew wrong values with the field
@@ -2005,7 +2006,7 @@ g9p_ds_draw_isp(const struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_gr
 {
    const struct pvr_render_pass_info *info = &cmd_buffer->state.render_pass_info;
    const struct pvr_renderpass_hwsetup_render *hw = g9p_current_hw_render(info);
-   const unsigned pass = state->uses_fbfetch ? 1u : state->writes_depth ? 5u : state->uses_discard ? 4u : 0u;
+   const unsigned pass = state->uses_fbfetch && !state->writes_coverage ? 1u : state->writes_depth ? 5u : state->uses_discard ? 4u : 0u;
 
    if (!hw || hw->ds_attach_idx == VK_ATTACHMENT_UNUSED ||
        !vk_format_has_stencil(info->attachments[hw->ds_attach_idx]->vk.format))
@@ -2387,7 +2388,8 @@ emit_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state
     * 0e000000 00120f00 0e000000). Without one: always, no write.
     */
    /* a shader's depth (iOS `fragdepth`): pass 5, and bit 20 of the ISPA words off */
-   pass = state->uses_fbfetch ? 1u : state->writes_depth ? 5u : state->uses_discard ? 4u : 0u;
+   /* a written coverage with tile reads: punch-through, or the samples it drops are lost */
+   pass = state->uses_fbfetch && !state->writes_coverage ? 1u : state->writes_depth ? 5u : state->uses_discard ? 4u : 0u;
    const uint32_t obj = g9p_isp_objtype(&cmd_buffer->vk.dynamic_graphics_state) << 28 |
                         g9p_isp_line_width(&cmd_buffer->vk.dynamic_graphics_state) << 8;
 

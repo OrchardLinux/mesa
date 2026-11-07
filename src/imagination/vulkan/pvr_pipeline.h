@@ -192,6 +192,7 @@ struct pvr_g9p_graphics_state {
    bool uses_derivatives;
    /* samples with coordinates iterated straight to the sampler */
    bool straight_samples;
+   bool writes_coverage;
    struct g9p_xfb_layout xfb_layout;
    bool vs_point_size;
    struct {

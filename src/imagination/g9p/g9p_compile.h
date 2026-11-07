@@ -188,6 +188,8 @@ struct g9p_shader {
    bool uses_derivatives;
    /* samples with coordinates iterated straight to the sampler */
    bool straight_samples;
+   /* writes its coverage (sample mask, alpha to coverage) */
+   bool writes_coverage;
    bool uses_fbfetch;
    /*
     * Fragment: premultiplied source-over blended at the end with Apple's

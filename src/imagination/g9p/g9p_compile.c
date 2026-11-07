@@ -1714,6 +1714,7 @@ emit_output(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
       pin(ctx, r);
       ctx->frag_mask = r;
       ctx->out->uses_discard = true;
+      ctx->out->writes_coverage = true;
       release(ctx, &intr->instr);
       return true;
    } else if (sem.location == FRAG_RESULT_DEPTH) {
