@@ -144,6 +144,10 @@ static void pvr_cmd_buffer_free_sub_cmd(struct pvr_cmd_buffer *cmd_buffer,
          util_dynarray_fini(&sub_cmd->gfx.sec_query_indices);
          util_dynarray_fini(&sub_cmd->gfx.g9p_realigns);
          util_dynarray_fini(&sub_cmd->gfx.g9p_fills);
+         util_dynarray_fini(&sub_cmd->gfx.g9p_view_kicks);
+         util_dynarray_foreach (&sub_cmd->gfx.g9p_view_bos, struct pvr_bo *, bo)
+            pvr_bo_free(cmd_buffer->device, *bo);
+         util_dynarray_fini(&sub_cmd->gfx.g9p_view_bos);
          util_dynarray_fini(&sub_cmd->gfx.unbound_deferred_clears);
          pvr_csb_finish(&sub_cmd->gfx.control_stream);
          pvr_bo_free(cmd_buffer->device, sub_cmd->gfx.terminate_ctrl_stream);
@@ -2559,7 +2563,12 @@ VkResult pvr_arch_cmd_buffer_end_sub_cmd(struct pvr_cmd_buffer *cmd_buffer)
       if (result != VK_SUCCESS)
          return pvr_cmd_buffer_set_error_unwarned(cmd_buffer, result);
 
-      if (gfx_sub_cmd->view_index_wanted) {
+      /* G9P: per-view copies of the stream instead (Rogue's PDS program is not G9P's) */
+      if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p)) {
+         result = pvr_arch_g9p_build_view_streams(cmd_buffer, gfx_sub_cmd);
+         if (result != VK_SUCCESS)
+            return pvr_cmd_buffer_set_error_unwarned(cmd_buffer, result);
+      } else if (gfx_sub_cmd->view_index_wanted) {
          result = pvr_csb_gfx_build_view_index_ctrl_stream(
             device,
             pvr_csb_get_start_address(&gfx_sub_cmd->control_stream),
@@ -2888,6 +2897,9 @@ VkResult pvr_arch_cmd_buffer_start_sub_cmd(struct pvr_cmd_buffer *cmd_buffer,
       sub_cmd->gfx.sec_query_indices = UTIL_DYNARRAY_INIT;
       sub_cmd->gfx.g9p_realigns = UTIL_DYNARRAY_INIT;
       sub_cmd->gfx.g9p_fills = UTIL_DYNARRAY_INIT;
+      sub_cmd->gfx.g9p_view_kicks = UTIL_DYNARRAY_INIT;
+      sub_cmd->gfx.g9p_view_bos = UTIL_DYNARRAY_INIT;
+      memset(sub_cmd->gfx.g9p_view_stream, 0, sizeof(sub_cmd->gfx.g9p_view_stream));
       sub_cmd->gfx.unbound_deferred_clears = UTIL_DYNARRAY_INIT;
       break;
 

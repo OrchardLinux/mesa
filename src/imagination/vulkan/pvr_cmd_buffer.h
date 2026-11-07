@@ -181,6 +181,14 @@ struct pvr_sub_cmd_gfx {
    struct util_dynarray g9p_realigns;
    /* G9P: clears of targets the fragment program writes to memory (struct g9p_fill) */
    struct util_dynarray g9p_fills;
+   /*
+    * G9P multiview: where each draw that reads the view index names its vertex kick
+    * (struct g9p_view_kick), and per view a copy of the control stream with those words
+    * naming that view's kick and program (pvr_arch_g9p_build_view_streams()); its buffers
+    */
+   struct util_dynarray g9p_view_kicks;
+   uint64_t g9p_view_stream[PVR_MAX_MULTIVIEW];
+   struct util_dynarray g9p_view_bos;
 
    /* Control stream builder object */
    struct pvr_csb control_stream;

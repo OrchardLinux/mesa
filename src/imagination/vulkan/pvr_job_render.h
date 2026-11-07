@@ -150,6 +150,8 @@ struct pvr_render_job {
       uint32_t pixel_width;
       /* PDS_BGRND0-3 in the Apple layout */
       uint64_t bgnd[4];
+      /* multiview: the background DMA's data per view (bgnd[2] otherwise) */
+      uint32_t bgnd_data_view[PVR_MAX_MULTIVIEW];
       uint32_t width, height;
       /* 1 or 4 */
       uint32_t samples;

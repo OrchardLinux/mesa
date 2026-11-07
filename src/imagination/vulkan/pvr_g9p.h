@@ -11,6 +11,7 @@
 
 #include <vulkan/vulkan_core.h>
 
+#include "pvr_limits.h"
 #include "pvr_macros.h"
 
 struct pvr_cmd_buffer;
@@ -84,6 +85,17 @@ VkResult PVR_PER_ARCH(g9p_job_init)(struct pvr_cmd_buffer *cmd_buffer,
                                     const struct pvr_renderpass_hwsetup_render *hw_render,
                                     struct pvr_render_job *job);
 
+/* A draw's vertex kick words (data, code) in the control stream, and each view's kick (multiview) */
+struct g9p_view_kick {
+   struct pvr_bo *bo;
+   uint32_t dword, code_dword;
+   uint32_t data_offset[PVR_MAX_MULTIVIEW], code_offset[PVR_MAX_MULTIVIEW];
+};
+
+struct pvr_sub_cmd_gfx;
+VkResult PVR_PER_ARCH(g9p_build_view_streams)(struct pvr_cmd_buffer *cmd_buffer,
+                                              struct pvr_sub_cmd_gfx *sub_cmd);
+
 /* The job streams with the Apple register block; return their length */
 uint32_t PVR_PER_ARCH(g9p_geom_stream)(const struct pvr_device *device,
                                        const struct pvr_render_job *job, uint8_t *buf,
@@ -155,6 +167,7 @@ VkResult PVR_PER_ARCH(g9p_transfer_submit)(struct pvr_device *device,
       PVR_PER_ARCH(g9p_graphics_pipeline_destroy)
 #   define pvr_arch_g9p_cmd_draw PVR_PER_ARCH(g9p_cmd_draw)
 #   define pvr_arch_g9p_job_init PVR_PER_ARCH(g9p_job_init)
+#   define pvr_arch_g9p_build_view_streams PVR_PER_ARCH(g9p_build_view_streams)
 #   define pvr_arch_g9p_geom_stream PVR_PER_ARCH(g9p_geom_stream)
 #   define pvr_arch_g9p_frag_stream PVR_PER_ARCH(g9p_frag_stream)
 #   define pvr_arch_g9p_device_init PVR_PER_ARCH(g9p_device_init)

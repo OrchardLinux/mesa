@@ -735,6 +735,30 @@ blend_options(const struct vk_graphics_pipeline_state *vk_state, nir_lower_blend
    return any;
 }
 
+/* Multiview: the view index as the constant of one view's program */
+static bool
+view_index_constant(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_view_index)
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def_replace(&intr->def, nir_imm_int(b, *(const unsigned *)data));
+   return true;
+}
+
+static bool
+reads_view_index(nir_shader *nir)
+{
+   nir_foreach_function_impl (impl, nir)
+      nir_foreach_block (block, impl)
+         nir_foreach_instr (instr, block) {
+            if (instr->type == nir_instr_type_intrinsic &&
+                nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_load_view_index)
+               return true;
+         }
+   return false;
+}
+
 static VkResult
 compile_stage(struct pvr_device *device, nir_shader *nir,
               const VkPipelineShaderStageCreateInfo *stage,
@@ -891,6 +915,9 @@ g9p_compile_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo 
    struct g9p_vertex_attrib attribs[G9P_MAX_ATTRIBS] = { 0 };
    void *mem_ctx = ralloc_context(NULL);
    struct g9p_shader vs, fs = { 0 };
+   /* multiview: the vertex shader per view, views past the first (view_index_constant()) */
+   nir_shader *vs_views[PVR_MAX_MULTIVIEW] = { 0 };
+   struct g9p_shader vs_view[PVR_MAX_MULTIVIEW];
    const nir_xfb_info *vs_xfb = NULL;
    static unsigned next_id;
    VkResult result;
@@ -967,6 +994,22 @@ g9p_compile_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo 
 
          slot = MIN2(g9p_frag_coord_slot(vs_nir) + last_with_w, G9P_MAX_VARYINGS - 1);
       }
+      /* gl_ViewIndex as load_view_index (a system value variable until then) */
+      NIR_PASS(_, vs_nir, nir_lower_system_values);
+      if (reads_view_index(vs_nir)) {
+         for (unsigned v = 0; v < PVR_MAX_MULTIVIEW; v++) {
+            vs_views[v] = v ? nir_shader_clone(mem_ctx, vs_nir) : vs_nir;
+            if (v)
+               NIR_PASS(_, vs_views[v], nir_shader_intrinsics_pass, view_index_constant,
+                        nir_metadata_control_flow, &v);
+         }
+         {
+            const unsigned zero = 0;
+
+            NIR_PASS(_, vs_nir, nir_shader_intrinsics_pass, view_index_constant,
+                     nir_metadata_control_flow, &zero);
+         }
+      }
       /* Four samples with a coverage: the fragment program writes it (Zink: static state) */
       /* only a pipeline that drops samples writes its coverage: that takes punch-through */
       const struct g9p_coverage coverage = { true };
@@ -1000,6 +1043,13 @@ g9p_compile_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo 
          result = compile_stage(device, vs_nir, vs_info, attribs,
                                 fs.uses_frag_coord ? (int)slot : -1, fs.uses_point_coord, NULL, NULL, NULL, &vs,
                                 point_size, mem_ctx);
+      for (unsigned v = 1; result == VK_SUCCESS && vs_views[1] && v < PVR_MAX_MULTIVIEW; v++) {
+         result = compile_stage(device, vs_views[v], vs_info, attribs,
+                                fs.uses_frag_coord ? (int)slot : -1, fs.uses_point_coord, NULL, NULL, NULL,
+                                &vs_view[v], point_size, mem_ctx);
+         if (result == VK_SUCCESS)
+            vs.num_regs = MAX2(vs.num_regs, vs_view[v].num_regs);
+      }
    }
    if (result != VK_SUCCESS)
       goto out;
@@ -1075,6 +1125,12 @@ g9p_compile_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo 
    result = pvr_gpu_upload_usc(device, vs.code, vs.code_size, 64, &state->vs_bo);
    if (result != VK_SUCCESS)
       goto out;
+   for (unsigned v = 1; vs_views[1] && v < PVR_MAX_MULTIVIEW; v++) {
+      result = pvr_gpu_upload_usc(device, vs_view[v].code, vs_view[v].code_size, 64,
+                                  &state->vs_view_bo[v]);
+      if (result != VK_SUCCESS)
+         goto out;
+   }
    result = pvr_gpu_upload_usc(device, fs.code, fs.code_size, 64, &state->fs_bo);
    if (result != VK_SUCCESS)
       goto out;
@@ -1118,6 +1174,28 @@ g9p_compile_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo 
 
       result = pvr_gpu_upload_pds(device, data, ARRAY_SIZE(data), 16, code,
                                   ARRAY_SIZE(code), 16, 64, &state->vs_kick);
+      if (result != VK_SUCCESS)
+         goto out;
+   }
+   /*
+    * Multiview: a vertex kick per view, each with that view's program (the view index a
+    * constant in it, g9p_view_index_constant()); view 0's is the pipeline's own program.
+    * Kick data beyond four dwords hangs the geometry job, so the kick cannot carry it.
+    */
+   state->uses_view_index = vs_views[1] != NULL;
+   for (unsigned v = 0; state->uses_view_index && v < PVR_MAX_MULTIVIEW; v++) {
+      const struct pvr_suballoc_bo *bo = v ? state->vs_view_bo[v] : state->vs_bo;
+      const uint32_t data[4] = { usc_offset(device, bo), usc_temps(vs.num_regs),
+                                 0, 0x80000000u | 1u << 13 | 1u };
+      const uint32_t code[4] = {
+         g9p_pds_dout(G9P_DOUTW, 0, G9P_PDS_TEMPS, 2, 0),
+         g9p_pds_dout(G9P_DOUTW, 0, G9P_PDS_TEMPS, 3, 0),
+         g9p_pds_dout(G9P_DOUTU, 0, G9P_PDS_DATA, 0, G9P_PDS_END | G9P_PDS_CC),
+         g9p_pds_halt(),
+      };
+
+      result = pvr_gpu_upload_pds(device, data, ARRAY_SIZE(data), 16, code,
+                                  ARRAY_SIZE(code), 16, 64, &state->vs_kick_views[v]);
       if (result != VK_SUCCESS)
          goto out;
    }
@@ -1177,6 +1255,12 @@ g9p_state_destroy(struct pvr_g9p_graphics_state *state)
       pvr_bo_suballoc_free(state->fs_kick.pvr_bo);
    if (state->vs_kick.pvr_bo)
       pvr_bo_suballoc_free(state->vs_kick.pvr_bo);
+   for (unsigned v = 0; v < PVR_MAX_MULTIVIEW; v++) {
+      if (state->vs_kick_views[v].pvr_bo)
+         pvr_bo_suballoc_free(state->vs_kick_views[v].pvr_bo);
+      if (state->vs_view_bo[v])
+         pvr_bo_suballoc_free(state->vs_view_bo[v]);
+   }
    pvr_bo_suballoc_free(state->fs_bo);
    pvr_bo_suballoc_free(state->vs_bo);
 }
@@ -2498,8 +2582,13 @@ emit_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state
                                                                                : 0;
    const uint32_t cam = (vector <= 32 ? 95u : vector <= 64 ? 31u : 15u) << 7 | flatshade << 1;
 
+   /* a shader reading the view index: the first view's kick (others: g9p_build_view_streams()) */
+   const uint32_t view_mask = MAX2(cs->current_sub_cmd->gfx.view_mask, 1);
+   const struct pvr_pds_upload *kick =
+      state->uses_view_index ? &state->vs_kick_views[ffs(view_mask) - 1] : &state->vs_kick;
+   const uint32_t kick_data = kick->data_offset;
    {
-      const uint32_t w[4] = { 0x44000000 | cam, state->vs_kick.code_offset, state->vs_outputs,
+      const uint32_t w[4] = { 0x44000000 | cam, kick->code_offset, state->vs_outputs,
                               (vector > 64 ? BITFIELD_BIT(30) : 0) |
                                  vs_max_instances(state->vs_regs) << 25 |
                                  DIV_ROUND_UP(MAX2(state->vs_regs, 8), 2) << 10 | 2 << 6 | 1 };
@@ -2526,7 +2615,7 @@ emit_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state
       emit_words(csb, w, 2);
    }
    {
-      const uint32_t w[2] = { 0x48000000 | cam, state->vs_kick.data_offset };
+      const uint32_t w[2] = { 0x48000000 | cam, kick_data };
 
       emit_words(csb, w, 2);
    }
@@ -2566,8 +2655,105 @@ emit_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state
       w[n++] = 0xaa;
       emit_words(csb, w, n);
    }
+   /*
+    * Multiview: where this draw's kick word ended up (the whole draw sits in the current
+    * buffer, moved there whole if the stream grew), for the other views' copies
+    */
+   if (state->uses_view_index && util_bitcount(view_mask) > 1 && csb->status == VK_SUCCESS) {
+      const uint32_t *start = csb->start, *p = csb->next;
+
+      const uint32_t *q;
+
+      while (--p > start && !(p[0] == kick_data && p[-1] == (0x48000000 | cam)))
+         ;
+      /* and the first VDM state's word naming the kick's code, before it */
+      for (q = p; q > start && !(q[0] == kick->code_offset && q[-1] == (0x44000000 | cam)); q--)
+         ;
+      if (p > start && q > start) {
+         struct g9p_view_kick k = { csb->pvr_bo, p - start, q - start };
+
+         for (unsigned v = 0; v < PVR_MAX_MULTIVIEW; v++) {
+            k.data_offset[v] = state->vs_kick_views[v].data_offset;
+            k.code_offset[v] = state->vs_kick_views[v].code_offset;
+         }
+         util_dynarray_append_typed(&cs->current_sub_cmd->gfx.g9p_view_kicks, struct g9p_view_kick, k);
+      }
+   }
    pvr_csb_clear_relocation_mark(csb);
    return csb->status;
+}
+
+/*
+ * Multiview with the view index in the vertex shader: per view a copy of the sub-command's
+ * control stream, its links between buffers and its draws' kick words naming that view's
+ * vertex kick (the jobs share nothing else that could carry the index)
+ */
+VkResult
+PVR_PER_ARCH(g9p_build_view_streams)(struct pvr_cmd_buffer *cmd_buffer,
+                                     struct pvr_sub_cmd_gfx *sub_cmd)
+{
+   struct pvr_device *device = cmd_buffer->device;
+   struct pvr_csb *csb = &sub_cmd->control_stream;
+   const unsigned nbo = list_length(&csb->pvr_bo_list);
+   struct pvr_bo *orig[64], *copy[64];
+   unsigned i = 0;
+
+   if (!util_dynarray_num_elements(&sub_cmd->g9p_view_kicks, struct g9p_view_kick))
+      return VK_SUCCESS;
+   if (csb->stream_type != PVR_CMD_STREAM_TYPE_GRAPHICS || nbo > ARRAY_SIZE(orig)) {
+      mesa_logw_once("G9P: multiview view index not passed for this command buffer");
+      return VK_SUCCESS;
+   }
+   list_for_each_entry (struct pvr_bo, bo, &csb->pvr_bo_list, link)
+      orig[i++] = bo;
+
+   u_foreach_bit (view, sub_cmd->view_mask) {
+      for (i = 0; i < nbo; i++) {
+         VkResult result = pvr_bo_alloc(device, device->heaps.general_heap, orig[i]->bo->size,
+                                        pvr_get_slc_cache_line_size(&device->pdevice->dev_info),
+                                        PVR_BO_ALLOC_FLAG_CPU_MAPPED, &copy[i]);
+
+         if (result != VK_SUCCESS)
+            return result;
+         util_dynarray_append_typed(&sub_cmd->g9p_view_bos, struct pvr_bo *, copy[i]);
+         memcpy(copy[i]->bo->map, orig[i]->bo->map, orig[i]->bo->size);
+      }
+      /* each buffer's link to the next, packed as pvr_csb_emit_link_unmarked() does */
+      for (i = 0; i + 1 < nbo; i++) {
+         uint32_t from[2], to[2], *w = copy[i]->bo->map;
+         const unsigned n = orig[i]->bo->size / 4;
+         unsigned j;
+
+         pvr_csb_pack (&from[0], VDMCTRL_STREAM_LINK0, link)
+            link.link_addrmsb = orig[i + 1]->vma->dev_addr;
+         pvr_csb_pack (&from[1], VDMCTRL_STREAM_LINK1, link)
+            link.link_addrlsb = orig[i + 1]->vma->dev_addr;
+         pvr_csb_pack (&to[0], VDMCTRL_STREAM_LINK0, link)
+            link.link_addrmsb = copy[i + 1]->vma->dev_addr;
+         pvr_csb_pack (&to[1], VDMCTRL_STREAM_LINK1, link)
+            link.link_addrlsb = copy[i + 1]->vma->dev_addr;
+         for (j = 0; j + 1 < n && !(w[j] == from[0] && w[j + 1] == from[1]); j++)
+            ;
+         if (j + 1 == n)
+            return vk_errorf(cmd_buffer, VK_ERROR_UNKNOWN, "G9P: control stream link not found");
+         w[j] = to[0];
+         w[j + 1] = to[1];
+      }
+      util_dynarray_foreach (&sub_cmd->g9p_view_kicks, struct g9p_view_kick, k) {
+         for (i = 0; i < nbo && orig[i] != k->bo; i++)
+            ;
+         if (i < nbo) {
+            ((uint32_t *)copy[i]->bo->map)[k->dword] = k->data_offset[view];
+            ((uint32_t *)copy[i]->bo->map)[k->code_dword] = k->code_offset[view];
+         }
+      }
+      sub_cmd->g9p_view_stream[view] = copy[0]->vma->dev_addr.addr;
+      if (getenv("G9P_DEBUG"))
+         fprintf(stderr, "g9p: view %u stream @0x%" PRIx64 " (%u buffers, %u kicks)\n", view,
+                 sub_cmd->g9p_view_stream[view], nbo,
+                 (unsigned)util_dynarray_num_elements(&sub_cmd->g9p_view_kicks, struct g9p_view_kick));
+   }
+   return VK_SUCCESS;
 }
 
 /*
@@ -3251,84 +3437,87 @@ PVR_PER_ARCH(g9p_job_init)(struct pvr_cmd_buffer *cmd_buffer,
    if (hw_render->sample_count != 1 && hw_render->sample_count != 4)
       return vk_errorf(cmd_buffer, VK_ERROR_FEATURE_NOT_PRESENT, "G9P: %u samples", hw_render->sample_count);
 
-   if (hw_render->eot_surface_count) {
-      const struct pvr_image_view *iview =
-         info->attachments[hw_render->eot_surfaces[0].attachment_idx];
-      const struct pvr_image *image_obj = pvr_image_view_get_image(iview);
-      const struct pvr_image_plane *plane = pvr_single_plane_const(image_obj);
-      const uint64_t addr = image_obj->dev_addr.addr + plane->offset +
-                            plane->mip_levels[iview->vk.base_mip_level].offset +
-                            iview->vk.base_array_layer * plane->layer_size;
+   /* multiview: each view's job stores to its own layer */
+   u_foreach_bit (view, MAX2(hw_render->view_mask, 1)) {
+      if (hw_render->eot_surface_count) {
+         const struct pvr_image_view *iview =
+            info->attachments[hw_render->eot_surfaces[0].attachment_idx];
+         const struct pvr_image *image_obj = pvr_image_view_get_image(iview);
+         const struct pvr_image_plane *plane = pvr_single_plane_const(image_obj);
+         const uint64_t addr = image_obj->dev_addr.addr + plane->offset +
+                               plane->mip_levels[iview->vk.base_mip_level].offset +
+                               (iview->vk.base_array_layer + view) * plane->layer_size;
 
-      if (!g9p_image_format(iview->vk.format))
-         mesa_logw_once("G9P: render target format %s stored as BGRA8",
-                        vk_Format_to_str(iview->vk.format));
-      const bool linear = image_obj->memlayout == PVR_MEMLAYOUT_LINEAR;
-      const uint32_t pitch = plane->mip_levels[iview->vk.base_mip_level].pitch;
+         if (!g9p_image_format(iview->vk.format))
+            mesa_logw_once("G9P: render target format %s stored as BGRA8",
+                           vk_Format_to_str(iview->vk.format));
+         const bool linear = image_obj->memlayout == PVR_MEMLAYOUT_LINEAR;
+         const uint32_t pitch = plane->mip_levels[iview->vk.base_mip_level].pitch;
 
-      if (linear && pitch % 64)
-         mesa_logw("G9P: linear render target pitch %u is not a multiple of 64", pitch);
-      job->g9p.target_addr = addr;
-      job->g9p.target_pitch = pitch;
-      job->g9p.target_linear = linear;
-      pack_image_state(image, addr, iview->vk.extent.width, iview->vk.extent.height, linear,
-                       pitch, iview->vk.format);
-      if (image_obj->vk.samples == 4)
-         image[0] = (image[0] & ~0xfu) | 0x0c; /* 2D multisample, twiddled (iOS msaa4-store) */
-      /* the other targets' blocks: their state, their output-half offset (PR #6) */
-      for (unsigned t = 1; t < eot_targets; t++) {
-         const struct pvr_image_view *v = info->attachments[hw_render->eot_surfaces[t].attachment_idx];
-         const struct pvr_image *im = pvr_image_view_get_image(v);
-         const struct pvr_image_plane *pl = pvr_single_plane_const(im);
+         if (linear && pitch % 64)
+            mesa_logw("G9P: linear render target pitch %u is not a multiple of 64", pitch);
+         job->g9p.target_addr = addr;
+         job->g9p.target_pitch = pitch;
+         job->g9p.target_linear = linear;
+         pack_image_state(image, addr, iview->vk.extent.width, iview->vk.extent.height, linear,
+                          pitch, iview->vk.format);
+         if (image_obj->vk.samples == 4)
+            image[0] = (image[0] & ~0xfu) | 0x0c; /* 2D multisample, twiddled (iOS msaa4-store) */
+         /* the other targets' blocks: their state, their output-half offset (PR #6) */
+         for (unsigned t = 1; t < eot_targets; t++) {
+            const struct pvr_image_view *v = info->attachments[hw_render->eot_surfaces[t].attachment_idx];
+            const struct pvr_image *im = pvr_image_view_get_image(v);
+            const struct pvr_image_plane *pl = pvr_single_plane_const(im);
 
-         pack_image_state(&image[8 * t],
-                          im->dev_addr.addr + pl->offset + pl->mip_levels[v->vk.base_mip_level].offset +
-                             v->vk.base_array_layer * pl->layer_size,
-                          v->vk.extent.width, v->vk.extent.height,
-                          im->memlayout == PVR_MEMLAYOUT_LINEAR,
-                          pl->mip_levels[v->vk.base_mip_level].pitch, v->vk.format);
-         if (im->vk.samples == 4)
-            image[8 * t] = (image[8 * t] & ~0xfu) | 0x0c;
-         image[8 * t + 6] = 2 * g9p_render_words(info, hw_render, t);
-         image[8 * t - 1] = 0xffffffff;
+            pack_image_state(&image[8 * t],
+                             im->dev_addr.addr + pl->offset + pl->mip_levels[v->vk.base_mip_level].offset +
+                                (v->vk.base_array_layer + view) * pl->layer_size,
+                             v->vk.extent.width, v->vk.extent.height,
+                             im->memlayout == PVR_MEMLAYOUT_LINEAR,
+                             pl->mip_levels[v->vk.base_mip_level].pitch, v->vk.format);
+            if (im->vk.samples == 4)
+               image[8 * t] = (image[8 * t] & ~0xfu) | 0x0c;
+            image[8 * t + 6] = 2 * g9p_render_words(info, hw_render, t);
+            image[8 * t - 1] = 0xffffffff;
+         }
+         job->g9p.width = iview->vk.extent.width;
+         job->g9p.height = iview->vk.extent.height;
+      } else {
+         memset(image, 0, sizeof(image));
       }
-      job->g9p.width = iview->vk.extent.width;
-      job->g9p.height = iview->vk.extent.height;
-   } else {
-      memset(image, 0, sizeof(image));
-   }
-   const unsigned eot_dwords = 8 * MAX2(eot_targets, 1) - 1;
+      const unsigned eot_dwords = 8 * MAX2(eot_targets, 1) - 1;
 
-   result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, image, 4 * eot_dwords, &bo);
-   if (result != VK_SUCCESS)
-      return result;
-   {
-      /* the targets of 32-bit channels, whose emit says so */
-      unsigned raw = 0;
-
-      for (unsigned t = 0; t < eot_targets; t++) {
-         const VkFormat f =
-            info->attachments[hw_render->eot_surfaces[t].attachment_idx]->vk.format;
-
-         if (g9p_format_output(f) >= G9P_OUTPUT_RAW1)
-            raw |= BITFIELD_BIT(t);
-      }
-
-      const uint32_t data[8] = { bo->dev_addr.addr, bo->dev_addr.addr >> 32,
-                                 doutd_ctrl(0, eot_dwords, true), 0,
-                                 usc_offset(device, eot_targets > 1
-                                                       ? (job->g9p.samples == 4 ? p->eot_mrt_ms_usc[eot_targets][raw]
-                                                                                : p->eot_mrt_usc[eot_targets][raw])
-                                                       : (job->g9p.samples == 4 ? p->eot_ms_usc[raw & 1]
-                                                                                : p->eot_usc[raw & 1])),
-                                 usc_temps(8), 0, 0 };
-
-      result = pvr_arch_cmd_buffer_upload_pds(cmd_buffer, data, ARRAY_SIZE(data), 16, NULL,
-                                              0, 0, 64, &up);
+      result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, image, 4 * eot_dwords, &bo);
       if (result != VK_SUCCESS)
          return result;
+      {
+         /* the targets of 32-bit channels, whose emit says so */
+         unsigned raw = 0;
+
+         for (unsigned t = 0; t < eot_targets; t++) {
+            const VkFormat f =
+               info->attachments[hw_render->eot_surfaces[t].attachment_idx]->vk.format;
+
+            if (g9p_format_output(f) >= G9P_OUTPUT_RAW1)
+               raw |= BITFIELD_BIT(t);
+         }
+
+         const uint32_t data[8] = { bo->dev_addr.addr, bo->dev_addr.addr >> 32,
+                                    doutd_ctrl(0, eot_dwords, true), 0,
+                                    usc_offset(device, eot_targets > 1
+                                                          ? (job->g9p.samples == 4 ? p->eot_mrt_ms_usc[eot_targets][raw]
+                                                                                   : p->eot_mrt_usc[eot_targets][raw])
+                                                          : (job->g9p.samples == 4 ? p->eot_ms_usc[raw & 1]
+                                                                                   : p->eot_usc[raw & 1])),
+                                    usc_temps(8), 0, 0 };
+
+         result = pvr_arch_cmd_buffer_upload_pds(cmd_buffer, data, ARRAY_SIZE(data), 16, NULL,
+                                                 0, 0, 64, &up);
+         if (result != VK_SUCCESS)
+            return result;
+      }
+      job->view_state.view[view].pds_pixel_event_data_offset = up.data_offset;
    }
-   job->view_state.view[0].pds_pixel_event_data_offset = up.data_offset;
    job->g9p.eot_code = p->eot.code_offset;
    /* twice DIV_ROUND_UP(dwords, 16) at bit 9 (Apple's 0x402, 0x402, 0x802) */
    job->g9p.eot_info = eot_targets > 2 ? 0x802 : 0x402;
@@ -3393,6 +3582,42 @@ PVR_PER_ARCH(g9p_job_init)(struct pvr_cmd_buffer *cmd_buffer,
                                               0, 0, 64, &up);
       if (result != VK_SUCCESS)
          return result;
+   }
+   /*
+    * Multiview loads: each view's job loads its own layer, a 2D state at that layer's
+    * address (the address in the state's second qword, >> 1)
+    */
+   if (load && util_bitcount(hw_render->view_mask) > 1) {
+      const struct pvr_image_view *iview =
+         info->attachments[hw_render->eot_surfaces[0].attachment_idx];
+      const struct pvr_image_plane *plane =
+         pvr_single_plane_const(pvr_image_view_get_image(iview));
+
+      if (eot_targets > 1)
+         mesa_logw_once("G9P: multiview loads of several targets load the first layer");
+      u_foreach_bit (view, hw_render->view_mask) {
+         uint32_t vbg[16];
+         uint64_t tex[2];
+         struct pvr_suballoc_bo *vbo;
+         struct pvr_pds_upload vup;
+
+         memcpy(vbg, bg, sizeof(vbg));
+         memcpy(tex, bg, sizeof(tex));
+         tex[0] = (tex[0] & ~7ull) | 2;
+         tex[1] = (tex[1] & ~((uint64_t)0x3fff << 47)) + ((uint64_t)view * plane->layer_size >> 1);
+         memcpy(vbg, tex, sizeof(tex));
+         result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, vbg, 4 * bg_dwords, &vbo);
+         if (result != VK_SUCCESS)
+            return result;
+         const uint32_t data[4] = { vbo->dev_addr.addr, vbo->dev_addr.addr >> 32,
+                                    doutd_ctrl(0, bg_dwords, true), 0 };
+
+         result = pvr_arch_cmd_buffer_upload_pds(cmd_buffer, data, ARRAY_SIZE(data), 16, NULL,
+                                                 0, 0, 64, &vup);
+         if (result != VK_SUCCESS)
+            return result;
+         job->g9p.bgnd_data_view[view] = vup.data_offset;
+      }
    }
    if (eot_targets > 1) {
       result = g9p_background_mrt(cmd_buffer, info, hw_render, eot_targets, job, &up);
@@ -3680,15 +3905,18 @@ PVR_PER_ARCH(g9p_frag_stream)(const struct pvr_device *device,
    }
    put32(&s, job->g9p.eot_info); /* EVENT_PIXEL_PDS_INFO */
    put32(&s, 0);
-   put32(&s, job->view_state.view[0].pds_pixel_event_data_offset);
+   put32(&s, job->view_state.view[job->view_state.view_index].pds_pixel_event_data_offset);
    put32(&s, 0);
    put32(&s, 0);
    *(uint32_t *)buf = s.len;
 
    put32(&s, G9P_EXTHDR_APPLE);
    put64(&s, job->g9p.samples == 4 ? G9P_POSITIONS_4X : 0x88); /* 0xfa8 sample positions */
-   for (unsigned i = 0; i < 4; i++)
-      put64(&s, job->g9p.bgnd[i]);
+   for (unsigned i = 0; i < 4; i++) {
+      const uint32_t view_data = job->g9p.bgnd_data_view[job->view_state.view_index];
+
+      put64(&s, i == 2 && view_data ? view_data : job->g9p.bgnd[i]);
+   }
    for (unsigned i = 0; i < 6; i++)
       put64(&s, 0);     /* cluster 0 */
    /*

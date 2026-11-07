@@ -145,6 +145,9 @@ struct pvr_g9p_graphics_state {
    struct pvr_suballoc_bo *vs_bo, *fs_bo;
    /* vertex kick (code and data), fragment kick bundle, DOUTI program */
    struct pvr_pds_upload vs_kick, fs_kick;
+   /* multiview: a vertex kick per view and its program (the view index a constant in it) */
+   struct pvr_pds_upload vs_kick_views[PVR_MAX_MULTIVIEW];
+   struct pvr_suballoc_bo *vs_view_bo[PVR_MAX_MULTIVIEW];
    /* The DOUTI program by provoking vertex; only [0] without flat varyings */
    struct pvr_pds_upload varyings[3];
    bool flat_varyings;
@@ -192,6 +195,7 @@ struct pvr_g9p_graphics_state {
    bool uses_derivatives;
    /* samples with coordinates iterated straight to the sampler */
    bool straight_samples;
+   bool uses_view_index;
    bool writes_coverage;
    struct g9p_xfb_layout xfb_layout;
    bool vs_point_size;

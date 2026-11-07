@@ -337,6 +337,17 @@ pvr_process_graphics_cmd_for_view(struct pvr_device *device,
        */
       assert(sub_cmd->terminate_ctrl_stream);
       job->ctrl_stream_addr = sub_cmd->terminate_ctrl_stream->vma->dev_addr;
+   } else if (job->g9p.enabled) {
+      if (getenv("G9P_DEBUG"))
+         fprintf(stderr, "g9p: render view %u of mask %#x, end of tile data 0x%x, stream 0x%" PRIx64 "\n",
+                 view_index, sub_cmd->view_mask,
+                 job->view_state.view[view_index].pds_pixel_event_data_offset,
+                 sub_cmd->g9p_view_stream[view_index]);
+      /* the view's copy of the stream when its draws read the view index */
+      if (sub_cmd->g9p_view_stream[view_index]) {
+         original_ctrl_stream_addr = job->ctrl_stream_addr;
+         job->ctrl_stream_addr.addr = sub_cmd->g9p_view_stream[view_index];
+      }
    } else if (sub_cmd->view_index_wanted) {
       original_ctrl_stream_addr = job->ctrl_stream_addr;
       job->ctrl_stream_addr.addr =
