@@ -128,6 +128,7 @@ struct pvr_g9p_compute_state {
    unsigned num_regs;
    bool uses_workgroup_id;
    unsigned local_size[3];
+   unsigned shared_size;
 };
 
 /* Apple G9P (has_apple_g9p): a graphics pipeline's programs (pvr_arch_g9p_gfx.c) */

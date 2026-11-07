@@ -147,6 +147,7 @@ PVR_PER_ARCH(g9p_compute_pipeline_compile)(
    state->num_regs = shader.num_regs;
    state->uses_workgroup_id = shader.uses_workgroup_id;
    memcpy(state->local_size, shader.local_size, sizeof(state->local_size));
+   state->shared_size = shader.shared_size;
 
 out:
    ralloc_free(mem_ctx);
@@ -292,6 +293,12 @@ PVR_PER_ARCH(g9p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
    if (result != VK_SUCCESS)
       return result;
 
+   /*
+    * Threadgroup memory: the workgroup IDs (G9P_SHARED_BASE bytes), then the shared
+    * variables; kernel record word 6's allocation (COMPUTE.md), in 16-byte units (one was enough
+    * so far; the unit is not measured)
+    */
+   const uint32_t tg_alloc = MAX2(DIV_ROUND_UP(G9P_SHARED_BASE + state->shared_size, 16), 1);
    {
       struct pvr_csb *csb = &sub_cmd->control_stream;
       const struct g9p_cdm_record bind_rec =
@@ -301,7 +308,7 @@ PVR_PER_ARCH(g9p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
          G9P_CDM_KERNEL_REGS(state->num_regs) | G9P_CDM_ANY_CLUSTER | G9P_CDM_FENCE |
             G9P_CDM_DATA_BLOCKS(G9P_KERNEL_DATA_DWORDS / 4),
          kernel.data_offset, kernel.code_offset, group_count[0], group_count[1],
-         group_count[2], threads, 1);
+         group_count[2], threads, tg_alloc);
 
       pvr_csb_set_relocation_mark(csb);
       emit_record(csb, &bind_rec);

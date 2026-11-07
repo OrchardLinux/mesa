@@ -65,6 +65,8 @@ g9p_fs_buf_base(unsigned n)
    return n <= 1 ? 16 : (10 * n + 15) & ~15u;
 }
 
+/* Compute: where shared variables start in threadgroup memory (the workgroup IDs before) */
+#define G9P_SHARED_BASE 16
 /* Compute: gl_NumWorkGroups, x and y in binding 0's slot, z in binding 1's (filled per dispatch) */
 #define G9P_NUM_WORKGROUPS (~22u)
 /* The set of the push-constant slot (its address is loaded like a buffer's) */
@@ -167,6 +169,8 @@ struct g9p_shader {
    /* Compute: the workgroup ID is read from threadgroup words 0-2 */
    bool uses_workgroup_id;
    unsigned local_size[3];
+   /* compute: bytes of shared variables (after G9P_SHARED_BASE) */
+   unsigned shared_size;
 
    /*
     * Vertex: varyings written (VARn, each 4 components after the position);

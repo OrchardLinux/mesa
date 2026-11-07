@@ -2703,6 +2703,73 @@ emit_intrinsic(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
       return true;
    }
 
+   case nir_intrinsic_load_shared:
+   case nir_intrinsic_store_shared: {
+      /*
+       * Threadgroup memory with registers (metal-tt, threadgroup arrays): 2114, W1 a base
+       * register (1 | base << 2) << 8, store 0x80 and the value << 1, W2 0x8100 | the index
+       * << 1 (0x0800: times 4), W3 0002; a wait after a load. Bytes: base 0, the index the
+       * offset. The workgroup IDs hold words 0-2 (the PDS program's), so shared data starts
+       * 16 bytes in.
+       */
+      const bool store = intr->intrinsic == nir_intrinsic_store_shared;
+      nir_def *v = store ? intr->src[0].ssa : &intr->def;
+      const unsigned base = nir_intrinsic_base(intr) + G9P_SHARED_BASE;
+      int off = src_reg(ctx, nir_get_scalar(intr->src[store ? 1 : 0].ssa, 0));
+      int t, kb;
+
+      if (v->bit_size != 32 || v->num_components != 1 || off < 0) {
+         fprintf(stderr, "g9p: shared memory: one 32-bit value at a time so far\n");
+         return false;
+      }
+      kb = const_reg(ctx, base);
+      t = alloc_low_temp(ctx);
+      /* Apple's: the byte address in the base register, a zero index (times 4) in W2 */
+      int z = const_reg(ctx, 0);
+
+      z = z < 0 ? z : low_reg(ctx, z);
+      if (kb < 0 || t < 0 || z < 0)
+         return false;
+      g9p_alu2(ctx->c, G9P_IADD, t, off, kb, false);
+      if (store) {
+         int data = src_reg(ctx, nir_get_scalar(v, 0));
+
+         data = data < 0 ? data : low_reg(ctx, data);
+         if (data < 0)
+            return false;
+         G9P_EMIT(ctx->c, 0x2114, (1 | t << 2) << 8 | 0x80 | data << 1, 0x8900 | z << 1, 0x0002);
+         g9p_wait(ctx->c);
+         release(ctx, &intr->instr);
+      } else {
+         const int dst = alloc_low_temp(ctx);
+         int r;
+
+         if (dst < 0)
+            return false;
+         G9P_EMIT(ctx->c, 0x2114, (1 | t << 2) << 8 | dst << 1, 0x8900 | z << 1, 0x0002);
+         g9p_wait(ctx->c);
+         release(ctx, &intr->instr);
+         r = alloc_reg(ctx);
+         if (r < 0)
+            return false;
+         g9p_alu2(ctx->c, G9P_OR, r, dst, dst, false);
+         ctx->reg[key(&intr->def, 0)] = r;
+      }
+      ctx->busy &= ~ctx->temps;
+      ctx->temps = 0;
+      return true;
+   }
+
+   case nir_intrinsic_barrier:
+      /*
+       * Workgroups within one task run in step: the barrier is the memory's: the wait, and for
+       * device memory Apple's fence (c330 1100 0900 1000, threadgroup_barrier(mem_device))
+       */
+      if (nir_intrinsic_memory_modes(intr) & (nir_var_mem_ssbo | nir_var_mem_global | nir_var_image))
+         G9P_EMIT(ctx->c, 0xc330, 0x1100, 0x0900, 0x1000);
+      g9p_wait(ctx->c);
+      return true;
+
    case nir_intrinsic_load_num_workgroups: {
       /* common-store dwords the dispatch fills (pvr_arch_g9p.c): x, y in one slot, z in another */
       const int xy = g9p_buffer_slot(ctx->out, G9P_NUM_WORKGROUPS, 0);
@@ -3733,6 +3800,12 @@ lower_front(nir_shader *nir)
             nir_address_format_32bit_index_offset);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const,
             nir_address_format_32bit_offset);
+   /* shared variables: byte offsets into threadgroup memory (emit_shared()) */
+   if (nir->info.stage == MESA_SHADER_COMPUTE) {
+      NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_mem_shared,
+               glsl_get_natural_size_align_bytes);
+      NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_shared, nir_address_format_32bit_offset);
+   }
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, zero_descriptor_offset,
             nir_metadata_control_flow, NULL);
 }
@@ -4269,6 +4342,7 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
    if (stage == MESA_SHADER_COMPUTE) {
       for (unsigned i = 0; i < 3; i++)
          out->local_size[i] = nir->info.workgroup_size[i];
+      out->shared_size = nir->info.shared_size;
    }
 
    out->stage = stage;
