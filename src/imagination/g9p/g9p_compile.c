@@ -4251,6 +4251,8 @@ static _Thread_local bool g9p_no_schedule;
  * 100 registers with homes on the first attempt, 4 instances, geometry 10x slower)
  */
 static _Thread_local bool g9p_no_homes;
+/* vertex shaders: attribute loads moved next to their uses (g9p_compile_vertex() tries both) */
+static _Thread_local bool g9p_move_inputs;
 /* the homes an attempt may use: few first (r32-r63), all of them last */
 static _Thread_local unsigned g9p_max_homes = 92;
 
@@ -4680,7 +4682,11 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
    if (!g9p_no_schedule)
       NIR_PASS(_, nir, nir_opt_move, nir_move_alu | nir_move_const_undef |
                nir_move_comparisons | nir_move_copies | nir_move_load_ubo |
-               nir_move_load_input);
+               /*
+                * vertex attribute loads stay together, so that one wait covers them
+                * (flush_loads()); G9P_MOVE_INPUTS: next to their uses as before
+                */
+               (stage != MESA_SHADER_VERTEX || g9p_move_inputs ? nir_move_load_input : 0));
    NIR_PASS(_, nir, nir_convert_from_ssa, true, false);
    NIR_PASS(_, nir, wrap_loop_breaks);
    /*
@@ -5334,6 +5340,9 @@ lower_attrib_divisor(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return true;
 }
 
+static bool g9p_compile_vertex_attempts(nir_shader *nir, const struct g9p_vertex_attrib *attribs,
+                                        bool point_size, struct g9p_shader *out, void *mem_ctx);
+
 bool
 g9p_compile_vertex(nir_shader *nir, const struct g9p_vertex_attrib *attribs,
                    int frag_coord_slot, bool point_coord, struct g9p_shader *out,
@@ -5362,6 +5371,37 @@ g9p_compile_vertex(nir_shader *nir, const struct g9p_vertex_attrib *attribs,
             nir_metadata_control_flow, (void *)attribs);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_attrib_divisor,
             nir_metadata_control_flow, (void *)attribs);
+   /*
+    * Twice: attribute loads kept together (one wait for them, flush_loads()) and moved to
+    * their uses; the one in fewer registers, together on a tie (the aquarium's fish shader:
+    * 32 registers moved, 59 together; others the other way round)
+    */
+   if (!getenv("G9P_MOVE_INPUTS")) {
+      nir_shader *moved = nir_shader_clone(mem_ctx, nir);
+      struct g9p_shader together_out = *out;
+      bool together_ok;
+
+      g9p_move_inputs = false;
+      together_ok = g9p_compile_vertex_attempts(nir, attribs, point_size, &together_out, mem_ctx);
+      g9p_move_inputs = true;
+      const bool moved_ok = g9p_compile_vertex_attempts(moved, attribs, point_size, out, mem_ctx);
+
+      g9p_move_inputs = false;
+      if (together_ok && (!moved_ok || together_out.num_regs <= out->num_regs))
+         *out = together_out;
+      return together_ok || moved_ok;
+   }
+   g9p_move_inputs = true;
+   const bool ok = g9p_compile_vertex_attempts(nir, attribs, point_size, out, mem_ctx);
+
+   g9p_move_inputs = false;
+   return ok;
+}
+
+static bool
+g9p_compile_vertex_attempts(nir_shader *nir, const struct g9p_vertex_attrib *attribs,
+                            bool point_size, struct g9p_shader *out, void *mem_ctx)
+{
    /* out of registers: again with a value's loads repeated, not kept live */
    nir_shader *attempt[3];
 
