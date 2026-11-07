@@ -178,7 +178,6 @@ struct g9p_ctx {
    bool flush_outputs;  /* vertex outputs written at once, for shaders that ran out */
    bool point_size;     /* a point pipeline's vertex shader: the size is the last output */
    int psize_reg;
-   uint64_t flushed_outputs;
    int vertex_reg, instance_reg; /* vertex shaders: r0-r1, or copies of them */
    bool reserve_st_low; /* the mask stack is r15, reserved (compile_back()) */
    unsigned reserve_low;    /* r11-r14 for address work, after running out (compile_back()) */
@@ -1778,7 +1777,6 @@ emit_output(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
          bool live = prev == r;
 
          g9p_vs_output(ctx->c, prev, ctx->outputs[ctx->num_outputs - 1].slot);
-         ctx->flushed_outputs |= BITFIELD64_BIT(ctx->outputs[ctx->num_outputs - 1].slot);
          ctx->num_outputs--;
          for (unsigned k = 0; k < ctx->num_keys && !live; k++)
             live = ctx->reg[k] == prev && ctx->last_use[k] > ctx->ip;

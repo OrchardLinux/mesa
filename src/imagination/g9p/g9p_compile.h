@@ -25,7 +25,11 @@
 #define G9P_BINDING_ELEMENT_SHIFT 8
 #define G9P_MAX_BUFFERS 36 /* 16 vertex bindings x address and stride, and more */
 #define G9P_MAX_ATTRIBS 16
-#define G9P_MAX_VARYINGS 16
+/*
+ * vec4 varyings: a fragment iterate's index (7 bits) holds W and 120 components, and
+ * the coefficient count (6 bits) two per vec4 with W
+ */
+#define G9P_MAX_VARYINGS 30
 #define G9P_MAX_TEXTURES 16
 /*
  * Texture state in the common store (Apple's layout for n textures, metal-tt):
