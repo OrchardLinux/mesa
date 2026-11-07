@@ -3273,7 +3273,8 @@ g9p_background_mrt(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_render_pa
    struct g9p_code *c = calloc(1, sizeof(*c));
    struct pvr_suballoc_bo *bo;
    struct pvr_pds_upload kick;
-   uint64_t key = (uint64_t)G9P_CACHED_BACKGROUND << 60;
+   /* the targets' count in the key too: RGBA8's output kind is 0 */
+   uint64_t key = (uint64_t)G9P_CACHED_BACKGROUND << 60 | (uint64_t)n << 16;
    unsigned tmp = 8, words = 0, loads = 0;
    unsigned at[G9P_MAX_TARGETS];
    VkResult result;
