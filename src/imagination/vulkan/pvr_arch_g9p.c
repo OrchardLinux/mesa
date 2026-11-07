@@ -195,6 +195,11 @@ PVR_PER_ARCH(g9p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
     * push-constant buffer's address and the thread count.
     */
    for (unsigned k = 0; k < n; k++) {
+      if (state->buffers[k].set == G9P_NUM_WORKGROUPS) {
+         /* gl_NumWorkGroups: x and y in binding 0's slot, z in binding 1's */
+         uniforms[2 * k] = group_count[state->buffers[k].binding ? 2 : 0];
+         uniforms[2 * k + 1] = state->buffers[k].binding ? 0 : group_count[1];
+      }
       if (state->buffers[k].set == G9P_PUSH_CONSTANTS) {
          const struct pvr_push_constants *pc =
             &cmd_buffer->state.push_consts[PVR_STAGE_ALLOCATION_COMPUTE];
@@ -220,15 +225,19 @@ PVR_PER_ARCH(g9p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
       uint64_t src;
       uint32_t dest = 2 * k, dwords = 2;
 
-      if (k < n && state->buffers[k].set != G9P_PUSH_CONSTANTS) {
+      if (k < n && state->buffers[k].set != G9P_PUSH_CONSTANTS &&
+          state->buffers[k].set != G9P_NUM_WORKGROUPS) {
          const struct pvr_descriptor_set *set = desc->sets[state->buffers[k].set];
+         /* an array's element (Zink keeps all storage buffers in one array) */
+         const unsigned element = state->buffers[k].binding >> G9P_BINDING_ELEMENT_SHIFT;
          const struct pvr_descriptor_set_layout_binding *binding;
 
          if (!set)
             return vk_error(cmd_buffer, VK_ERROR_UNKNOWN);
-         binding = &set->layout->bindings[state->buffers[k].binding];
+         binding = &set->layout->bindings[state->buffers[k].binding &
+                                          BITFIELD_MASK(G9P_BINDING_ELEMENT_SHIFT)];
          /* pvr_buffer_descriptor: the address comes first */
-         src = set->dev_addr.addr + binding->offset;
+         src = set->dev_addr.addr + binding->offset + element * binding->stride;
       } else {
          src = uniforms_bo->dev_addr.addr + 8 * k;
          if (k == n)
@@ -255,15 +264,17 @@ PVR_PER_ARCH(g9p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
 
    /*
     * Kernel task: DOUTU source (USC offset, 0x10), the local-ID control
-    * word (temps q0 -> r0) and the workgroup-ID one (temps q0, 64 bits ->
-    * threadgroup words 0-1) in the coefficient task.
+    * word (temps q0 -> r0) and in the coefficient task the workgroup IDs:
+    * temps q0, 64 bits -> threadgroup words 0-1 (x, y), then q1's upper half
+    * -> word 2 (z; COMPUTE.md "y and z", Apple's EncodeComputePDSProgram)
     */
    g9p_pds_kick_data(kernel_data, usc_offset(device, state->shader_bo));
    kernel_data[2] = 0x80000000;
-   kernel_data[4] = 0x90000002;
+   kernel_data[4] = 0x10000002;
+   kernel_data[5] = 0x90004001;
    kernel_code[0] = g9p_pds_bra_not_if1(4);
-   kernel_code[1] = g9p_pds_dout(G9P_DOUTW, 0, G9P_PDS_TEMPS, 4, G9P_PDS_END);
-   kernel_code[2] = g9p_pds_halt();
+   kernel_code[1] = g9p_pds_dout(G9P_DOUTW, 0, G9P_PDS_TEMPS, 4, 0);
+   kernel_code[2] = g9p_pds_dout(G9P_DOUTW, 1, G9P_PDS_TEMPS, 5, G9P_PDS_END);
    kernel_code[3] = g9p_pds_halt();
    kernel_code[4] = g9p_pds_dout(G9P_DOUTW, 0, G9P_PDS_TEMPS, 2, 0);
    kernel_code[5] = g9p_pds_dout(G9P_DOUTU, 0, G9P_PDS_DATA, 0,

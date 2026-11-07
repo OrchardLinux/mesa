@@ -2633,11 +2633,6 @@ emit_intrinsic(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
 
          if (!ctx->last_use[key(&intr->def, c)])
             continue;
-         if (c > 1) {
-            /* the PDS program writes x and y only so far */
-            fprintf(stderr, "g9p: workgroup ID z not supported yet\n");
-            return false;
-         }
          r = alloc_reg(ctx);
          if (r < 0)
             return false;
@@ -2647,6 +2642,31 @@ emit_intrinsic(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
       g9p_wait(ctx->c);
       ctx->out->uses_workgroup_id = true;
       return true;
+
+   case nir_intrinsic_load_num_workgroups: {
+      /* common-store dwords the dispatch fills (pvr_arch_g9p.c): x, y in one slot, z in another */
+      const int xy = g9p_buffer_slot(ctx->out, G9P_NUM_WORKGROUPS, 0);
+      const int z = g9p_buffer_slot(ctx->out, G9P_NUM_WORKGROUPS, 1);
+      int zero = const_reg(ctx, 0);
+
+      zero = zero < 0 ? zero : low_reg(ctx, zero);
+      if (xy < 0 || z < 0 || zero < 0)
+         return false;
+      for (unsigned c = 0; c < intr->def.num_components; c++) {
+         int r;
+
+         if (!ctx->last_use[key(&intr->def, c)])
+            continue;
+         r = alloc_reg(ctx);
+         if (r < 0)
+            return false;
+         g9p_mov_uniform(ctx->c, r, c < 2 ? 2 * xy + c : 2 * z, zero);
+         ctx->reg[key(&intr->def, c)] = r;
+      }
+      ctx->busy &= ~ctx->temps;
+      ctx->temps = 0;
+      return true;
+   }
 
    case nir_intrinsic_vulkan_resource_index:
    case nir_intrinsic_load_vulkan_descriptor:

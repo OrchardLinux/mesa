@@ -65,6 +65,8 @@ g9p_fs_buf_base(unsigned n)
    return n <= 1 ? 16 : (10 * n + 15) & ~15u;
 }
 
+/* Compute: gl_NumWorkGroups, x and y in binding 0's slot, z in binding 1's (filled per dispatch) */
+#define G9P_NUM_WORKGROUPS (~22u)
 /* The set of the push-constant slot (its address is loaded like a buffer's) */
 #define G9P_PUSH_CONSTANTS (~0u)
 /* The set of the dynamic blend constants (binding 0): 4 floats */
