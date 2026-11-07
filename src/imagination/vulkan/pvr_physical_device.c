@@ -416,7 +416,7 @@ static void pvr_physical_device_get_supported_features(
       .uniformBufferStandardLayout = true,
 
       /* VK_EXT_color_write_enable */
-      .colorWriteEnable = true,
+      .colorWriteEnable = !PVR_HAS_FEATURE(dev_info, apple_g9p),
 
       /* Vulkan 1.3 / VK_EXT_extended_dynamic_state */
       .extendedDynamicState = true,
@@ -1265,6 +1265,13 @@ VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
    pdevice->memory.memoryTypes[0].heapIndex = 0;
 
    pvr_physical_device_get_supported_extensions(&supported_extensions, instance);
+   /*
+    * G9P draws do not apply the dynamic color write enables (the targets' masks are in the
+    * pipeline's fragment program): Zink switched targets off on a pipeline it reused and they
+    * were written all the same (dEQP draw_buffers_indexed.random after other tests)
+    */
+   if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g9p))
+      supported_extensions.EXT_color_write_enable = false;
    pvr_physical_device_get_supported_features(&pdevice->dev_info,
                                               &supported_features);
    if (!pvr_physical_device_get_properties(pdevice, &supported_properties)) {
