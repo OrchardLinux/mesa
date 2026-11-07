@@ -1499,8 +1499,10 @@ emit_varying_load(struct g9p_ctx *ctx, nir_intrinsic_instr *intr, bool persp)
             break;
          }
       }
-      if (straight)
+      if (straight) {
+         ctx->out->straight_samples = true;
          return true;
+      }
    }
    r = alloc_reg(ctx);
    if (r < 0)

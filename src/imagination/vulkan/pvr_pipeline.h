@@ -190,6 +190,8 @@ struct pvr_g9p_graphics_state {
    bool writes_depth;
    /* and takes derivatives: no triangle merging, as for textures */
    bool uses_derivatives;
+   /* samples with coordinates iterated straight to the sampler */
+   bool straight_samples;
    struct g9p_xfb_layout xfb_layout;
    bool vs_point_size;
    struct {

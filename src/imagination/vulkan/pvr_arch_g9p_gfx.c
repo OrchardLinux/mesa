@@ -1087,6 +1087,7 @@ g9p_compile_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo 
    state->uses_discard = fs.uses_discard;
    state->writes_depth = fs.writes_depth;
    state->uses_derivatives = fs.uses_derivatives;
+   state->straight_samples = fs.straight_samples;
    state->uses_fbfetch = fs.uses_fbfetch;
    /*
     * Whole blocks of 4: 17 and 18 registers drew wrong values with the field
@@ -2353,17 +2354,14 @@ emit_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state
                     : 0),
              DIV_ROUND_UP(4 * dp->fs_common_dwords, 64) << 23 |
                 /*
-                 * No triangle merging for textures: a helper pixel taken from the
-                 * neighbouring triangle has another gradient when W varies (dEQP
-                 * texture.mipmap.2d.projected). Rogue disables it for lines too.
+                 * Triangle merging off for samples iterated straight to the sampler: their
+                 * gradients come from the triangle's own plane, and a neighbour's has
+                 * another when W varies (dEQP texture.mipmap.2d.projected). Computed
+                 * coordinates and derivatives take their neighbours from helper pixels,
+                 * which want merging (texture.units, shaders.derivate.*.texture). Rogue
+                 * disables it for lines too.
                  */
-                /*
-                 * Merging off, for a helper pixel's own gradients (mip levels). Except a
-                 * shader's derivatives of what it samples: across triangles they want the
-                 * neighbour's real value (dEQP shaders.derivate.*.texture)
-                 */
-                ((state->uses_discard || state->num_textures || state->uses_derivatives) &&
-                    !(state->uses_derivatives && state->num_textures) ||
+                (state->straight_samples && !state->uses_derivatives ||
                        g9p_is_line(cmd_buffer->vk.dynamic_graphics_state.ia.primitive_topology)
                     ? BITFIELD_BIT(14)
                     : 0),
