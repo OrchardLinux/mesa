@@ -345,7 +345,7 @@ pvr_stage_mask(VkPipelineStageFlags2 stage_mask)
       static int gpu_transfers = -1;
 
       if (gpu_transfers < 0)
-         gpu_transfers = getenv("G9P_GPU_BLIT") || getenv("G9P_GPU_UPLOAD");
+         gpu_transfers = !getenv("G9P_NO_GPU_BLIT") || getenv("G9P_GPU_UPLOAD");
       stages |= PVR_PIPELINE_STAGE_TRANSFER_BIT |
                 (gpu_transfers ? PVR_PIPELINE_STAGE_GEOM_BIT | PVR_PIPELINE_STAGE_FRAG_BIT : 0);
    }

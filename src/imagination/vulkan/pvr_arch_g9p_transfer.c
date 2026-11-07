@@ -839,8 +839,12 @@ g9p_meta_image_ok(struct pvr_device *device, const struct pvr_image *image, VkFo
    const VkFormatFeatureFlags2 need = dst ? VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT
                                           : VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT;
 
-   /* opt-in until the GPU hang with Firefox's blits is found */
-   if (!getenv("G9P_GPU_BLIT"))
+   /*
+    * On by default: the hang with Firefox's blits was the kernel's interleaving of two
+    * processes' submissions (fixed there); the aquarium went from 34 to 37-40 fps.
+    * G9P_NO_GPU_BLIT: the CPU path.
+    */
+   if (getenv("G9P_NO_GPU_BLIT"))
       return false;
    if (image->vk.image_type != VK_IMAGE_TYPE_2D || image->vk.samples != VK_SAMPLE_COUNT_1_BIT ||
        image->vk.array_layers != 1 || vk_format_is_depth_or_stencil(format) ||
