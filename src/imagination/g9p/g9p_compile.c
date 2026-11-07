@@ -2406,6 +2406,9 @@ emit_tex_vertex(struct g9p_ctx *ctx, nir_tex_instr *tex)
       ctx->c->w[at + 2] |= 0x8000;
    }
    extras_patch(ctx, at, &extras);
+   /* the vertex form's compare also sets bit 15 of W6 (Apple's sample_compare at a level) */
+   if (extras.compare)
+      ctx->c->w[at + 6] |= 0x8000;
    g9p_wait(ctx->c);
    release(ctx, &tex->instr);
    for (unsigned c = 0; c < 4; c++) {
