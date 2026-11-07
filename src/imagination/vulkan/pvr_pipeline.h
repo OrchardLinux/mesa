@@ -124,7 +124,7 @@ struct pvr_g9p_compute_state {
    unsigned num_buffers;
    struct {
       unsigned set, binding;
-   } buffers[36]; /* G9P_MAX_BUFFERS */
+   } buffers[40]; /* G9P_MAX_BUFFERS */
    unsigned num_regs;
    bool uses_workgroup_id;
    unsigned local_size[3];
@@ -162,7 +162,7 @@ struct pvr_g9p_graphics_state {
    unsigned num_buffers;
    struct {
       unsigned set, binding;
-   } buffers[36]; /* G9P_MAX_BUFFERS */
+   } buffers[40]; /* G9P_MAX_BUFFERS */
    /*
     * the fragment shader's buffers (uniform buffers, push constants), by
     * slot: their first dwords are DMA'd into the common store
@@ -174,7 +174,7 @@ struct pvr_g9p_graphics_state {
    } fs_runs[64]; /* G9P_MAX_FS_RUNS */
    struct {
       unsigned set, binding, dwords;
-   } fs_buffers[36]; /* G9P_MAX_BUFFERS */
+   } fs_buffers[40]; /* G9P_MAX_BUFFERS */
    /* the fragment shader's common store in dwords */
    unsigned fs_common_dwords;
    /* the fragment shader's combined image samplers, by common-store slot */

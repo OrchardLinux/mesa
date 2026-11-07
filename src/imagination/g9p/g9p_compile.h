@@ -23,7 +23,7 @@
  */
 /* A buffer slot's binding: the array element above the binding number */
 #define G9P_BINDING_ELEMENT_SHIFT 8
-#define G9P_MAX_BUFFERS 36 /* 16 vertex bindings x address and stride, and more */
+#define G9P_MAX_BUFFERS 40 /* 16 vertex bindings x address and stride, 4 capture buffers, uniforms */
 #define G9P_MAX_ATTRIBS 16
 /*
  * vec4 varyings: a fragment iterate's index (7 bits) holds W and 120 components, and

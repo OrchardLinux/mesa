@@ -217,6 +217,11 @@ dump_busy(struct g9p_ctx *ctx)
          fprintf(stderr, "  r%d: value %u.%u, last use %u\n", ctx->reg[k], k / 4, k % 4,
                  ctx->last_use[k]);
    }
+   /* what else pins: outputs kept for the end, store offsets, NIR registers (the rest) */
+   for (unsigned i = 0; i < ctx->num_outputs; i++)
+      fprintf(stderr, "  r%d: output slot %u\n", ctx->outputs[i].reg, ctx->outputs[i].slot);
+   for (unsigned i = 0; i < ctx->num_vs_stores; i++)
+      fprintf(stderr, "  r%d: store offset, data r%d\n", ctx->vs_stores[i].off, ctx->vs_stores[i].data);
 }
 
 static int
