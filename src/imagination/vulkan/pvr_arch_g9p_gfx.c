@@ -2487,7 +2487,16 @@ emit_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state
     * vertices
     */
    const unsigned vector = state->vs_outputs + 5;
-   const uint32_t cam = (vector <= 32 ? 95u : vector <= 64 ? 31u : 15u) << 7;
+   /*
+    * VDM_STATE0 bits 1-2: the vertex of a strip's triangle with the flat colour (Rogue's
+    * flatshade_control, needed for strips: dEQP rasterization.flatshading.triangle_strip)
+    */
+   const struct vk_dynamic_graphics_state *dyn_pv = &cmd_buffer->vk.dynamic_graphics_state;
+   const uint32_t flatshade =
+      dyn_pv->rs.provoking_vertex == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT ? 2
+      : topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN                         ? 1
+                                                                               : 0;
+   const uint32_t cam = (vector <= 32 ? 95u : vector <= 64 ? 31u : 15u) << 7 | flatshade << 1;
 
    {
       const uint32_t w[4] = { 0x44000000 | cam, state->vs_kick.code_offset, state->vs_outputs,
@@ -2537,6 +2546,7 @@ emit_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state
             v0.cut_index_present = true;
             v0.cut_index_enable = true;
             v0.cam_size = vector <= 32 ? 95 : vector <= 64 ? 31 : 15;
+            v0.flatshade_control = flatshade;
          }
          pvr_csb_pack (&w[n++], VDMCTRL_VDM_STATE1, v1) {
             v1.cut_index = draw->index_size == 1   ? 0xff
