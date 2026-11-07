@@ -757,6 +757,67 @@ compile_stage(struct pvr_device *device, nir_shader *nir,
 }
 
 /*
+ * A varying without W (flat or noperspective) right after one with W loses that one's last
+ * component: its first iterate lands there (dEQP fragment_out). An unused slot between
+ * them, in both stages' locations. Returns whether the last varying has W, which wants
+ * the same gap before gl_FragCoord's. Not with transform feedback, whose layout names
+ * the locations.
+ */
+static bool
+g9p_gap_varyings(nir_shader *vs, nir_shader *fs)
+{
+   bool with_w[G9P_MAX_VARYINGS], used[G9P_MAX_VARYINGS] = { 0 };
+   unsigned shift[G9P_MAX_VARYINGS];
+   bool prev = false;
+
+   for (unsigned s = 0; s < G9P_MAX_VARYINGS; s++)
+      with_w[s] = true;
+   nir_foreach_variable_with_modes(var, fs, nir_var_shader_in) {
+      if (var->data.location < VARYING_SLOT_VAR0)
+         continue;
+      const unsigned first = var->data.location - VARYING_SLOT_VAR0;
+      const unsigned n = glsl_count_attribute_slots(var->type, false);
+      const bool w = var->data.interpolation != INTERP_MODE_FLAT &&
+                     var->data.interpolation != INTERP_MODE_NOPERSPECTIVE &&
+                     !glsl_type_is_integer(glsl_without_array(var->type));
+
+      for (unsigned s = first; s < MIN2(first + n, G9P_MAX_VARYINGS); s++) {
+         with_w[s] = w;
+         used[s] = true;
+      }
+   }
+   nir_foreach_variable_with_modes(var, vs, nir_var_shader_out) {
+      if (var->data.location < VARYING_SLOT_VAR0)
+         continue;
+      const unsigned first = var->data.location - VARYING_SLOT_VAR0;
+      const unsigned n = glsl_count_attribute_slots(var->type, false);
+
+      for (unsigned s = first; s < MIN2(first + n, G9P_MAX_VARYINGS); s++)
+         used[s] = true;
+   }
+   unsigned gap = 0;
+
+   for (unsigned s = 0; s < G9P_MAX_VARYINGS; s++) {
+      if (used[s]) {
+         gap += prev && !with_w[s];
+         prev = with_w[s];
+      }
+      shift[s] = gap;
+   }
+   if (vs->xfb_info)
+      return false;
+   nir_foreach_variable_with_modes(var, vs, nir_var_shader_out) {
+      if (var->data.location >= VARYING_SLOT_VAR0 && var->data.location - VARYING_SLOT_VAR0 < G9P_MAX_VARYINGS)
+         var->data.location += shift[var->data.location - VARYING_SLOT_VAR0];
+   }
+   nir_foreach_variable_with_modes(var, fs, nir_var_shader_in) {
+      if (var->data.location >= VARYING_SLOT_VAR0 && var->data.location - VARYING_SLOT_VAR0 < G9P_MAX_VARYINGS)
+         var->data.location += shift[var->data.location - VARYING_SLOT_VAR0];
+   }
+   return prev;
+}
+
+/*
  * The DOUTI program (RENDER.md "Varyings and textures with our encodings"):
  * the W iterate, then per varying n (a vec4 at component 4n, location 2 +
  * 8n in halves, destination 2n in units of two components), the data padded
@@ -901,7 +962,11 @@ g9p_compile_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo 
                   *has_cube |= instr->type == nir_instr_type_tex &&
                                nir_instr_as_tex(instr)->sampler_dim == GLSL_SAMPLER_DIM_CUBE;
       }
-      slot = g9p_frag_coord_slot(vs_nir);
+      {
+         const bool last_with_w = g9p_gap_varyings(vs_nir, fs_nir) && !vs_nir->xfb_info;
+
+         slot = MIN2(g9p_frag_coord_slot(vs_nir) + last_with_w, G9P_MAX_VARYINGS - 1);
+      }
       /* Four samples with a coverage: the fragment program writes it (Zink: static state) */
       struct g9p_coverage coverage = { 0xf, false };
       const struct g9p_coverage *coverage_ptr = NULL;
