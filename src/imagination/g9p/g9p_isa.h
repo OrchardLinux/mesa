@@ -291,6 +291,17 @@ g9p_mem_at(struct g9p_code *c, bool store, unsigned size, unsigned reg,
  * the high bits in the extension word 0x4100 | (u >> 5) << 1) + r[zero]: a
  * move from the common store (probes/fsuni*.metal)
  */
+/*
+ * dst = common-store dword @u OP r[b], the uniform as the first operand (Apple's vertex
+ * code: 1199 dst 81uu 41xx op, e.g. FADD 0x44)
+ */
+static inline void
+g9p_alu2_uniform(struct g9p_code *c, unsigned op, unsigned dst, unsigned u, unsigned b)
+{
+   G9P_EMIT(c, c->fragment ? g9p_w0(c, 0x3199) | (u >> 8) << 13 : 0x1199, g9p_dst(c, dst),
+            0x0181 | (u & 31) << 2 | b << 10, 0x4100 | ((u >> 5) & 7) << 1, op);
+}
+
 static inline void
 g9p_mov_uniform(struct g9p_code *c, unsigned dst, unsigned u, unsigned zero)
 {

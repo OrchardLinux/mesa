@@ -163,6 +163,12 @@ struct g9p_ctx {
 
    /* Per SSA scalar (def index * 4 + component) */
    int8_t *reg;
+   /*
+    * Vertex shaders: per SSA scalar, the common-store dword holding it, or -1: a uniform
+    * read from the common store takes no register; ALU ops take it as an operand,
+    * anything else a temporary copy (src_reg())
+    */
+   int16_t *uni;
    unsigned *last_use;
    /* Per SSA def: the instruction defining it */
    unsigned *def_ip;
@@ -588,9 +594,29 @@ src_reg(struct g9p_ctx *ctx, nir_scalar s)
          g9p_mov_from_high(ctx->c, r, ctx->home[key(s.def, s.comp)]);
       return r;
    }
+   if (r < 0 && ctx->uni && ctx->uni[key(s.def, s.comp)] >= 0) {
+      /* a uniform in the common store: a temporary copy for this instruction */
+      const int zero = const_reg(ctx, 0);
+
+      r = alloc_temp(ctx);
+      if (r >= 0 && zero >= 0)
+         g9p_mov_uniform(ctx->c, r, ctx->uni[key(s.def, s.comp)], zero);
+      return zero >= 0 ? r : -1;
+   }
    if (r < 0)
       fprintf(stderr, "g9p: value %u has no register\n", s.def->index);
    return r;
+}
+
+/* The common-store dword of @s when it is a vertex shader's uniform without a register, or -1 */
+static int
+uni_of(struct g9p_ctx *ctx, nir_scalar s)
+{
+   uint32_t value;
+
+   if (!ctx->uni || is_const(s, &value) || ctx->reg[key(s.def, s.comp)] >= 0)
+      return -1;
+   return ctx->uni[key(s.def, s.comp)];
 }
 
 static void
@@ -1055,6 +1081,38 @@ emit_alu(struct g9p_ctx *ctx, nir_alu_instr *alu)
       if (iop == nir_intrinsic_load_vulkan_descriptor ||
           iop == nir_intrinsic_vulkan_resource_index)
          return true;
+   }
+
+   /* a vertex shader's uniform as an operand, no register for it (g9p_alu2_uniform()) */
+   if (num_inputs == 2 && ctx->uni) {
+      unsigned op = 0;
+
+      switch (alu->op) {
+      case nir_op_fadd: op = G9P_FADD; break;
+      case nir_op_fmul: op = G9P_FMUL; break;
+      case nir_op_iadd: op = G9P_IADD; break;
+      case nir_op_imul: op = G9P_IMUL; break;
+      case nir_op_iand: op = G9P_AND; break;
+      case nir_op_ior: op = G9P_OR; break;
+      case nir_op_ixor: op = G9P_XOR; break;
+      default: break;
+      }
+      const int u0 = op ? uni_of(ctx, s[0]) : -1, u1 = op ? uni_of(ctx, s[1]) : -1;
+
+      if (u0 >= 0 || u1 >= 0) {
+         const int u = u0 >= 0 ? u0 : u1;
+         const int rb = src_reg(ctx, u0 >= 0 ? s[1] : s[0]);
+
+         if (rb < 0)
+            return false;
+         release(ctx, &alu->instr);
+         dst = alloc_reg(ctx);
+         if (dst < 0)
+            return false;
+         g9p_alu2_uniform(ctx->c, op, dst, u, rb);
+         ctx->reg[key(&alu->def, 0)] = dst;
+         return true;
+      }
    }
 
    /* dst = src + small immediate */
@@ -1549,10 +1607,15 @@ emit_mem(struct g9p_ctx *ctx, nir_intrinsic_instr *intr, int slot, nir_scalar of
 
       if (!(byte % 4) && before + byte / 4 < G9P_VS_BUF_DWORDS &&
           vs_base + before + byte / 4 < G9P_VS_UNIFORM_LIMIT) {
-         const int zero = const_reg(ctx, 0);
-
          ctx->out->buffers[slot].dwords = MAX2(ctx->out->buffers[slot].dwords, byte / 4 + 1);
          release(ctx, &intr->instr);
+         if (!getenv("G9P_NO_UNIFORM_OPERANDS")) {
+            /* no register: ALU ops take the dword as an operand (emit_alu(), src_reg()) */
+            ctx->uni[key(&intr->def, 0)] = vs_base + before + byte / 4;
+            return true;
+         }
+         const int zero = const_reg(ctx, 0);
+
          data = alloc_reg(ctx);
          if (zero < 0 || data < 0)
             return false;
@@ -3519,6 +3582,7 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
    bool stack;
 
    memset(ctx->reg, -1, impl->ssa_alloc * 4);
+   memset(ctx->uni, -1, impl->ssa_alloc * 4 * sizeof(*ctx->uni));
    ctx->c->n = 0;
    ctx->c->uses_stack = false;
    ctx->busy = ctx->pinned = ctx->temps = 0;
@@ -4581,6 +4645,8 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
    ctx.c = rzalloc(mem_ctx, struct g9p_code);
    ctx.c->fragment = stage == MESA_SHADER_FRAGMENT;
    ctx.reg = ralloc_array(mem_ctx, int8_t, impl->ssa_alloc * 4);
+   ctx.uni = ralloc_array(mem_ctx, int16_t, impl->ssa_alloc * 4);
+   memset(ctx.uni, -1, impl->ssa_alloc * 4 * sizeof(*ctx.uni));
    ctx.num_keys = impl->ssa_alloc * 4;
    ctx.last_use = rzalloc_array(mem_ctx, unsigned, impl->ssa_alloc * 4);
    ctx.def_ip = rzalloc_array(mem_ctx, unsigned, impl->ssa_alloc);
@@ -4678,7 +4744,8 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
          return false;
       stuck = ctx.oom_ip == last_oom_ip ? stuck + 1 : 0;
       last_oom_ip = ctx.oom_ip;
-      if (stuck >= 16) {
+      /* each retry parks one more value; 40 live scalars need more than 16 (drawbench fs 2) */
+      if (stuck >= 64) {
          fprintf(stderr, "g9p: out of registers at instruction %u (parking does not help)\n",
                  ctx.oom_ip);
          return false;
