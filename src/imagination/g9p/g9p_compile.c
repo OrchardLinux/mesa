@@ -3580,20 +3580,29 @@ lower_coverage(nir_shader *nir, const struct g9p_coverage *coverage)
             continue;
          nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
 
+         /* the alpha, as a vec4's or by itself (Zink stores components one by one) */
          if (intr->intrinsic == nir_intrinsic_store_output &&
-             nir_intrinsic_io_semantics(intr).location == FRAG_RESULT_DATA0 &&
-             intr->src[0].ssa->num_components == 4) {
-            alpha = nir_channel(&b, intr->src[0].ssa, 3);
+             (nir_intrinsic_io_semantics(intr).location == FRAG_RESULT_DATA0 ||
+              nir_intrinsic_io_semantics(intr).location == FRAG_RESULT_COLOR)) {
+            const unsigned first = nir_intrinsic_component(intr);
+            const unsigned n = intr->src[0].ssa->num_components;
+
+            if (first <= 3 && 3 < first + n && (nir_intrinsic_write_mask(intr) >> (3 - first) & 1))
+               alpha = nir_channel(&b, intr->src[0].ssa, 3 - first);
          }
       }
    }
 
-   nir_def *mask = nir_imm_int(&b, coverage->mask);
+   nir_def *index = nir_vulkan_resource_index(&b, 2, 32, nir_imm_int(&b, 0), .desc_set = G9P_COVERAGE,
+                                              .binding = 0, .desc_type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
+   nir_def *mask = nir_load_ubo(&b, 1, 32, index, nir_imm_int(&b, 0), .align_mul = 4, .range = 8);
 
-   if (coverage->alpha_to_coverage && alpha) {
+   if (alpha) {
+      nir_def *enabled = nir_load_ubo(&b, 1, 32, index, nir_imm_int(&b, 4), .align_mul = 4, .range = 8);
       nir_def *n = nir_f2u32(&b, nir_fadd_imm(&b, nir_fmul_imm(&b, nir_fsat(&b, alpha), 4.0f), 0.5f));
+      nir_def *by_alpha = nir_iadd_imm(&b, nir_ishl(&b, nir_imm_int(&b, 1), n), -1);
 
-      mask = nir_iand(&b, mask, nir_iadd_imm(&b, nir_ishl(&b, nir_imm_int(&b, 1), n), -1));
+      mask = nir_iand(&b, mask, nir_bcsel(&b, nir_ine_imm(&b, enabled, 0), by_alpha, nir_imm_int(&b, ~0)));
    }
    nir_store_output(&b, mask, nir_imm_int(&b, 0), .base = FRAG_RESULT_SAMPLE_MASK,
                     .src_type = nir_type_uint32,

@@ -67,6 +67,8 @@ g9p_fs_buf_base(unsigned n)
 #define G9P_BLEND_CONSTANTS (~5u)
 /* The set of target t's memory (binding t) when it overflows: address, pitch (3 dwords) */
 #define G9P_OVERFLOW_TARGETS (~20u)
+/* The set of a draw's coverage state (binding 0): the sample mask, alpha to coverage */
+#define G9P_COVERAGE (~21u)
 /* The set of the front face state: one word, ~0 for clockwise */
 #define G9P_FRONT_FACE (~6u)
 /* The set of vertex buffer slots (binding = the vertex buffer binding) */
@@ -236,10 +238,12 @@ bool g9p_compile_vertex(nir_shader *nir, const struct g9p_vertex_attrib *attribs
  * nir_lower_blend, reading the tile's colour); out->uses_fbfetch tells the
  * pipeline to mark its draws translucent.
  */
-/* What a multisample pipeline asks of each fragment's coverage */
+/*
+ * A four-sample pipeline: the fragment program writes its coverage from the draw's
+ * sample mask and alpha to coverage, the block of G9P_COVERAGE (binding 0: mask, enable)
+ */
 struct g9p_coverage {
-   uint8_t mask; /* the samples VkPipelineMultisampleStateCreateInfo keeps */
-   bool alpha_to_coverage;
+   bool dynamic;
 };
 
 bool g9p_compile_fragment(nir_shader *nir, unsigned frag_coord_slot,

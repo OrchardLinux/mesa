@@ -968,15 +968,9 @@ g9p_compile_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo 
          slot = MIN2(g9p_frag_coord_slot(vs_nir) + last_with_w, G9P_MAX_VARYINGS - 1);
       }
       /* Four samples with a coverage: the fragment program writes it (Zink: static state) */
-      struct g9p_coverage coverage = { 0xf, false };
-      const struct g9p_coverage *coverage_ptr = NULL;
-
-      if (vk_state->ms && vk_state->ms->rasterization_samples == VK_SAMPLE_COUNT_4_BIT) {
-         coverage.mask = vk_state->ms->sample_mask & 0xf;
-         coverage.alpha_to_coverage = vk_state->ms->alpha_to_coverage_enable;
-         if (coverage.mask != 0xf || coverage.alpha_to_coverage)
-            coverage_ptr = &coverage;
-      }
+      const struct g9p_coverage coverage = { true };
+      const struct g9p_coverage *coverage_ptr =
+         vk_state->ms && vk_state->ms->rasterization_samples == VK_SAMPLE_COUNT_4_BIT ? &coverage : NULL;
       struct g9p_target targets[G9P_MAX_TARGETS] = { 0 };
 
       for (unsigned t = 0; vk_state->rp && t < MIN2(vk_state->rp->color_attachment_count, G9P_MAX_TARGETS); t++) {
@@ -1659,6 +1653,15 @@ buffer_addrs(struct pvr_cmd_buffer *cmd_buffer, unsigned n, const unsigned (*set
          if (result != VK_SUCCESS)
             return result;
          addrs[k] = obo->dev_addr.addr;
+      } else if (set == G9P_COVERAGE) {
+         const struct vk_dynamic_graphics_state *dyn = &cmd_buffer->vk.dynamic_graphics_state;
+         const uint32_t block[2] = { dyn->ms.sample_mask, dyn->ms.alpha_to_coverage_enable };
+         struct pvr_suballoc_bo *cbo;
+
+         result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, block, sizeof(block), &cbo);
+         if (result != VK_SUCCESS)
+            return result;
+         addrs[k] = cbo->dev_addr.addr;
       } else if (set == G9P_FRONT_FACE) {
          const uint32_t cw = cmd_buffer->vk.dynamic_graphics_state.rs.front_face ==
                                    VK_FRONT_FACE_CLOCKWISE

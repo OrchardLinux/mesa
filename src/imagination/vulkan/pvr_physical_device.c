@@ -430,10 +430,11 @@ static void pvr_physical_device_get_supported_features(
       .extendedDynamicState3TessellationDomainOrigin = false,
       .extendedDynamicState3DepthClampEnable = false,
       .extendedDynamicState3PolygonMode = false,
-      /* G9P: in the fragment program (g9p_compile_fragment()), known at compile time */
+      /* G9P: the sample rate is the program's (g9p_compile_fragment()); mask and alpha to
+       * coverage are a draw's block it reads */
       .extendedDynamicState3RasterizationSamples = !PVR_HAS_FEATURE(dev_info, apple_g9p),
-      .extendedDynamicState3SampleMask = !PVR_HAS_FEATURE(dev_info, apple_g9p),
-      .extendedDynamicState3AlphaToCoverageEnable = !PVR_HAS_FEATURE(dev_info, apple_g9p),
+      .extendedDynamicState3SampleMask = true,
+      .extendedDynamicState3AlphaToCoverageEnable = true,
       .extendedDynamicState3AlphaToOneEnable = true,
       .extendedDynamicState3LogicOpEnable = false,
       .extendedDynamicState3ColorBlendEnable = false,
