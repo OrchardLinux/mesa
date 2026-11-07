@@ -115,6 +115,8 @@ struct g9p_vs_store {
 };
 
 struct g9p_ctx {
+   /* a sample iterated straight to the sampler has been emitted */
+   bool straight_done;
    /* ifs open inside the current loop */
    unsigned if_depth;
    int frag_depth;
@@ -2454,8 +2456,20 @@ emit_tex(struct g9p_ctx *ctx, nir_tex_instr *tex)
       dst = alloc_range(ctx, 4);
       if (dst < 0)
          return false;
-      g9p_sample_varying(ctx->c, dst, first, 2, tex_state_dword(ctx, slot),
-                         tex_sampler_dword(ctx, slot));
+      /*
+       * Only a program's first sample iterates to the sampler: helper pixels have no
+       * coordinates in a second one, and its level is wrong where a quad leaves the
+       * primitive (dEQP samplers.multi_tex_2d). Later ones iterate into r0-r1.
+       */
+      if (ctx->straight_done) {
+         g9p_iterate(ctx->c, 0, first, 2, true);
+         g9p_wait(ctx->c);
+         g9p_sample_regs(ctx->c, dst, tex_state_dword(ctx, slot), tex_sampler_dword(ctx, slot));
+      } else {
+         g9p_sample_varying(ctx->c, dst, first, 2, tex_state_dword(ctx, slot),
+                            tex_sampler_dword(ctx, slot));
+         ctx->straight_done = true;
+      }
       /* the sample is its last five words */
       extras_patch(ctx, ctx->c->n - 5, &extras);
       ctx->out->num_varyings = MAX2(ctx->out->num_varyings, first / 4 + 1);
