@@ -4017,6 +4017,37 @@ wrap_loop_breaks(nir_shader *nir)
 
 static bool lower_half_packing(nir_builder *b, nir_instr *instr, void *data);
 
+/*
+ * Vertex compare samples with an offset: the hardware applies the offset (W2 bit 14, the
+ * forms Apple's compiler emits) but rounds differently from GL where a coordinate lands
+ * on a texel edge (dEQP's vertex grids put every vertex there). The offset goes into the
+ * coordinates instead, in texels of the level a nearest-mipmap sample takes,
+ * ceil(lod + 0.5) - 1 and none below 0: exact for nearest and nearest-mipmap filtering, an
+ * approximation for linear-mipmap's second level.
+ */
+static bool
+vertex_compare_offset(const nir_instr *instr, const void *data)
+{
+   const nir_tex_instr *tex = nir_instr_as_tex(instr);
+
+   return tex->is_shadow && nir_tex_instr_src_index(tex, nir_tex_src_offset) >= 0;
+}
+
+static nir_def *
+size_of_sampled_level(nir_builder *b, nir_tex_instr *tex, void *data)
+{
+   const int li = nir_tex_instr_src_index(tex, nir_tex_src_lod);
+   nir_def *lod = li >= 0 ? tex->src[li].src.ssa : nir_imm_float(b, 0.0f);
+   nir_def *level = nir_f2i32(b, nir_fmax(b, nir_fadd_imm(b, nir_fceil(b, nir_fadd_imm(b, lod, 0.5f)), -1.0f),
+                                          nir_imm_float(b, 0.0f)));
+   nir_def *size = nir_build_texture_query(b, tex, nir_texop_txs, nir_tex_instr_dest_size(tex),
+                                           nir_type_int32, false, true);
+   nir_tex_instr *txs = nir_def_as_tex(size);
+
+   nir_src_rewrite(&txs->src[nir_tex_instr_src_index(txs, nir_tex_src_lod)].src, level);
+   return size;
+}
+
 static bool
 compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
              const struct g9p_vertex_attrib *attribs, unsigned frag_coord_slot,
@@ -4036,6 +4067,17 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
       };
 
       NIR_PASS(_, nir, nir_lower_tex, &tex);
+      if (stage == MESA_SHADER_VERTEX) {
+         /* after the gradients became levels above */
+         const nir_lower_tex_options offsets = {
+            .lower_offset_filter = vertex_compare_offset,
+            .build_txs_lod0 = size_of_sampled_level,
+         };
+         const nir_lower_tex_options levels = { .lower_txs_lod = true };
+
+         NIR_PASS(_, nir, nir_lower_tex, &offsets);
+         NIR_PASS(_, nir, nir_lower_tex, &levels);
+      }
       NIR_PASS(_, nir, nir_shader_tex_pass, lower_txf, nir_metadata_control_flow, NULL);
       NIR_PASS(_, nir, nir_shader_instructions_pass, lower_half_packing, nir_metadata_control_flow, NULL);
    }
