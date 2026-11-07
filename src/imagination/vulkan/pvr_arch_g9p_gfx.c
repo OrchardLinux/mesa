@@ -2834,7 +2834,7 @@ PVR_PER_ARCH(g9p_pack_image_view)(const struct pvr_image_view *iview, uint64_t w
    const bool stencil_plane = image->vk.format == VK_FORMAT_D32_SFLOAT_S8_UINT &&
                               iview->vk.aspects == VK_IMAGE_ASPECT_STENCIL_BIT;
    const uint64_t plane_offset =
-      stencil_plane ? (uint64_t)plane->physical_extent.width * plane->physical_extent.height * 4 * image->vk.samples : 0;
+      stencil_plane ? image->total_size / 2 : 0;
    uint32_t fmt = g9p_image_format(stencil_plane ? VK_FORMAT_R8_UINT : iview->vk.format);
    const bool linear = image->memlayout == PVR_MEMLAYOUT_LINEAR;
    const uint64_t addr = image->dev_addr.addr + plane->offset + plane_offset +
@@ -3509,14 +3509,12 @@ PVR_PER_ARCH(g9p_geom_stream)(const struct pvr_device *device,
  * tiles past such an image), mip levels and layers other than the first.
  */
 
-/* The stencil plane's offset in a D32F_S8 image: the second half */
+/* The stencil plane's offset in a D32F_S8 image: the second half, after the depth's whole chain */
 static uint64_t
 g9p_ds_stencil_offset(const struct pvr_image *img)
 {
-   const struct pvr_image_plane *plane = pvr_single_plane_const(img);
-
    return img->vk.format == VK_FORMAT_D32_SFLOAT_S8_UINT
-             ? (uint64_t)plane->physical_extent.width * plane->physical_extent.height * 4 * img->vk.samples
+             ? img->total_size / 2
              : 0;
 }
 

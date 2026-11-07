@@ -64,6 +64,8 @@ struct surface {
    unsigned bpp, stride, width, height;
    /* 1 or 4; four samples are a twiddled surface of twice the size (2x2 per pixel) */
    unsigned samples;
+   /* D32F_S8: from the depth to the stencil, 0 when unknown */
+   uint64_t stencil_offset;
    bool twiddled;
 };
 
@@ -79,6 +81,7 @@ surface_init(struct pvr_device *device, const struct pvr_transfer_cmd_surface *s
    out->height = s->height;
    out->twiddled = s->mem_layout == PVR_MEMLAYOUT_TWIDDLED;
    out->samples = s->sample_count == 4 ? 4 : 1;
+   out->stencil_offset = s->g9p_stencil_offset;
    if (out->samples == 4) {
       out->width *= 2;
       out->height *= 2;
@@ -172,7 +175,9 @@ ds_plane(const struct surface *s, bool depth)
 
    if (s->format == PIPE_FORMAT_Z32_FLOAT_S8X24_UINT) {
       p.bpp = depth ? 4 : 1;
-      if (!depth)
+      if (!depth && s->stencil_offset)
+         p.base += s->stencil_offset;
+      else if (!depth)
          p.base += (size_t)(s->twiddled ? util_next_power_of_two(s->width) : s->stride) *
                    (s->twiddled ? util_next_power_of_two(s->height) : s->height) * 4;
    }

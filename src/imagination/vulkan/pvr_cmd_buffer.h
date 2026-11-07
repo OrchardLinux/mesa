@@ -52,6 +52,9 @@ struct pvr_transfer_cmd_surface {
 
    uint32_t depth;
 
+   /* G9P: from this surface's depth to its stencil (D32F_S8), 0 when unknown */
+   uint64_t g9p_stencil_offset;
+
    /* Z position in a 3D tecture. 0.0f <= z_position <= depth. */
    float z_position;
 
