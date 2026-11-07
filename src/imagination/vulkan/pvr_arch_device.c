@@ -969,6 +969,11 @@ VkResult PVR_PER_ARCH(create_device)(struct pvr_physical_device *pdevice,
    simple_mtx_init(&device->rs_mtx, mtx_plain);
    list_inithead(&device->render_states);
 
+   /* G9P: GPU blits and copies; without them the CPU path does every one */
+   if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g9p) &&
+       pvr_arch_g9p_meta_init(device) != VK_SUCCESS)
+      mesa_logw("G9P: no GPU blits (vk_meta); copies stay on the CPU");
+
    *pDevice = pvr_device_to_handle(device);
 
    return VK_SUCCESS;

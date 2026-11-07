@@ -22,6 +22,9 @@
  */
 
 #include <errno.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <sys/file.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -624,10 +627,29 @@ VkResult pvr_drm_winsys_render_submit(
    if (submit_info->has_fragment_job)
       jobs_args[args.jobs.count - 1].sync_ops.count = num_frag_syncs;
 
+   /*
+    * Apple GPUs: one submission at a time, across processes. The kernel orders each
+    * geometry job after the last fragment job pushed on any context (pvr_apple_job_add_deps()),
+    * but records the pair one job at a time: another process's geometry job submitted in
+    * between ran between this geometry job and its fragment job, which then drew the other
+    * scene and hung the GPU (Firefox with the compositor; never with one process submitting).
+    * A file lock until the kernel takes one itself. G9P_NO_SUBMIT_LOCK: without it.
+    */
+   static int lock_fd = -2;
+
+   if (lock_fd == -2)
+      lock_fd = getenv("G9P_NO_SUBMIT_LOCK") ? -1 : open("/tmp/.g9p-submit.lock", O_RDWR | O_CREAT | O_CLOEXEC, 0666);
+   if (lock_fd >= 0)
+      flock(lock_fd, LOCK_EX);
+
    /* Returns VK_ERROR_OUT_OF_DEVICE_MEMORY to match pvrsrv. */
-   return pvr_ioctlf(drm_ws->base.render_fd,
-                     DRM_IOCTL_PVR_SUBMIT_JOBS,
-                     &args,
-                     VK_ERROR_OUT_OF_DEVICE_MEMORY,
-                     "Failed to submit render job");
+   const VkResult result = pvr_ioctlf(drm_ws->base.render_fd,
+                                      DRM_IOCTL_PVR_SUBMIT_JOBS,
+                                      &args,
+                                      VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                                      "Failed to submit render job");
+
+   if (lock_fd >= 0)
+      flock(lock_fd, LOCK_UN);
+   return result;
 }

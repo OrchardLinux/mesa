@@ -16,6 +16,7 @@
  */
 
 #include <inttypes.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,6 +34,9 @@
 #include "compiler/nir/nir_xfb_info.h"
 #include "compiler/nir/nir_builtin_builder.h"
 #include "compiler/nir/nir_format_convert.h"
+#include "compiler/nir/nir_serialize.h"
+#include "util/blob.h"
+#include "util/hash_table.h"
 #include "util/format/u_format.h"
 #include "g9p_compile.h"
 #include "g9p_isa.h"
@@ -266,6 +270,16 @@ dump_busy(struct g9p_ctx *ctx)
       fprintf(stderr, "  r%d: store offset, data r%d\n", ctx->vs_stores[i].off, ctx->vs_stores[i].data);
 }
 
+/*
+ * Vertex shaders' first attempt: only r12-r14 kept free for what must lie below r16 (an
+ * address pair and a one-source operand's copy), values packed from r0 up. The retries
+ * after running out put values above r15 first and keep r11-r14 or r7-r14 free, which
+ * made small shaders use up to r29: a vertex task holds about 256 registers' worth of
+ * vertices, so every register halves throughput sooner (dEQP-like loop: 30 registers,
+ * 8 vertices a task)
+ */
+#define G9P_RESERVE_LOW_PAIR 3
+
 static int
 alloc_reg(struct g9p_ctx *ctx)
 {
@@ -273,7 +287,7 @@ alloc_reg(struct g9p_ctx *ctx)
     * A vertex shader that ran out: values above r15 first, and r11-r14, then
     * r7-r14, stay free for what reaches r15 only (one_src(), alloc_pair()).
     */
-   if (ctx->reserve_low) {
+   if (ctx->reserve_low && ctx->reserve_low != G9P_RESERVE_LOW_PAIR) {
       for (unsigned r = 16; r < G9P_NUM_REGS; r++) {
          if (!(ctx->busy & BITFIELD64_BIT(r))) {
             ctx->busy |= BITFIELD64_BIT(r);
@@ -283,7 +297,8 @@ alloc_reg(struct g9p_ctx *ctx)
       }
    }
    for (unsigned r = 0; r < G9P_NUM_REGS; r++) {
-      if (ctx->reserve_low && r >= (ctx->reserve_low > 1 ? 7 : 11) && r <= 14)
+      if (ctx->reserve_low == G9P_RESERVE_LOW_PAIR ? (r >= 12 && r <= 14)
+          : ctx->reserve_low && r >= (ctx->reserve_low > 1 ? 7 : 11) && r <= 14)
          continue;
       if (!(ctx->busy & BITFIELD64_BIT(r))) {
          ctx->busy |= BITFIELD64_BIT(r);
@@ -2904,12 +2919,18 @@ emit_intrinsic(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
       ctx->reg[key(&intr->def, 0)] = 1;
       return true;
    case nir_intrinsic_load_base_instance: {
-      /* firstInstance is not passed in: draws with one are refused */
-      int r = alloc_reg(ctx);
+      /* firstInstance: the draw's parameter slot holds it (g9p_cmd_draw()) */
+      const int slot = g9p_buffer_slot(ctx->out, G9P_DRAW_PARAMS, 0);
+      const int zero = const_reg(ctx, 0);
+      int r;
 
-      if (r < 0)
+      if (ctx->stage != MESA_SHADER_VERTEX)
          return false;
-      g9p_mov_imm(ctx->c, r, 0);
+      release(ctx, &intr->instr);
+      r = alloc_reg(ctx);
+      if (slot < 0 || zero < 0 || r < 0)
+         return false;
+      g9p_mov_uniform(ctx->c, r, 2 * slot, zero);
       ctx->reg[key(&intr->def, 0)] = r;
       return true;
    }
@@ -3019,7 +3040,13 @@ emit_intrinsic(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
       uint32_t imm;
       int src;
 
-      if (is_const(v, &imm)) {
+      if (is_const(v, &imm) && dst >= 32) {
+         /* above r31 through the OR form only (vertex code: "Registers above r31") */
+         src = const_reg(ctx, imm);
+         if (src < 0)
+            return false;
+         g9p_mov_to_high(ctx->c, dst, src);
+      } else if (is_const(v, &imm)) {
          g9p_mov_imm(ctx->c, dst, imm);
       } else {
          src = src_reg(ctx, v);
@@ -3754,6 +3781,15 @@ lower_fb_fetch_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    b->cursor = nir_before_instr(&intr->instr);
    const nir_io_semantics raw_sem = nir_intrinsic_io_semantics(intr);
    const unsigned read_target = raw_sem.location == FRAG_RESULT_COLOR ? 0 : raw_sem.location - FRAG_RESULT_DATA0;
+
+   /*
+    * An output without an attachment reads undefined values in GL: zero (WebGL shaders
+    * declare gl_FragData[0..7] and read them back with one attachment, the aquarium sample)
+    */
+   if (read_target >= G9P_MAX_TARGETS || !out->targets[read_target].present) {
+      nir_def_replace(&intr->def, nir_imm_zero(b, intr->def.num_components, intr->def.bit_size));
+      return true;
+   }
    const enum g9p_output read_output = out->targets[read_target].output;
    const bool whole_words = read_output >= G9P_OUTPUT_RAW1;
    const bool sint = nir_alu_type_get_base_type(nir_intrinsic_dest_type(intr)) == nir_type_int;
@@ -3919,6 +3955,14 @@ lower_coverage(nir_shader *nir, const struct g9p_coverage *coverage)
 
 /* The last attempt at a vertex shader: in program order, every load at its use */
 static _Thread_local bool g9p_no_schedule;
+/*
+ * Registers above r31 only once every attempt without them failed: a shader that fits
+ * reloading its values runs far more instances at once (the aquarium's fish vertex shader:
+ * 100 registers with homes on the first attempt, 4 instances, geometry 10x slower)
+ */
+static _Thread_local bool g9p_no_homes;
+/* the homes an attempt may use: few first (r32-r63), all of them last */
+static _Thread_local unsigned g9p_max_homes = 92;
 
 /*
  * Loads that are cheap to repeat (uniform buffers, push constants,
@@ -3957,7 +4001,13 @@ rematerialize_loads(nir_shader *nir, bool every_use)
 
             if (nir_src_is_if(src) || user->type == nir_instr_type_phi)
                continue;
-            if (user->block == instr->block && (!every_use || (first && !g9p_no_schedule))) {
+            /*
+             * A load used once, in its block, stays: copying it (in program order every use
+             * is copied) gave a copy used once, and so on until memory ran out (dEQP
+             * vector_subscript vertex shaders)
+             */
+            if (user->block == instr->block &&
+                (!every_use || (first && !g9p_no_schedule) || list_is_singular(&intr->def.uses))) {
                first = false;
                continue;
             }
@@ -4404,20 +4454,46 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
     */
    ctx.home = ralloc_array(mem_ctx, int8_t, impl->ssa_alloc * 4);
    memset(ctx.home, -1, impl->ssa_alloc * 4);
+   /*
+    * Homes are shared: a value parks in the first one no other parked value is live in.
+    * One home each ran out at 96 in Firefox's shaders.
+    */
+   struct {
+      unsigned start, end;
+      int8_t home;
+   } *homed = ralloc_array(mem_ctx, __typeof__(*homed), 1024);
+   unsigned num_homed = 0;
+   /* retries that ran out at the same instruction: parking more does not help there */
+   unsigned stuck = 0, last_oom_ip = UINT_MAX;
+
+   if (stage == MESA_SHADER_VERTEX && !getenv("G9P_OLD_VS_ALLOC")) {
+      ctx.reserve_low = G9P_RESERVE_LOW_PAIR;
+      ctx.reserve_st_low = true;
+   }
+
    for (;;) {
       unsigned best = 0;
       int victim = -1;
+      bool victim_decl = false;
 
       ctx.oom = false;
       if (generate(&ctx, impl, ctx.reserve_st_low ? 15 : G9P_NUM_REGS))
          break;
-      if (ctx.oom && stage == MESA_SHADER_VERTEX && ctx.reserve_low < 2) {
-         ctx.reserve_low++;
+      if (ctx.oom && stage == MESA_SHADER_VERTEX &&
+          (ctx.reserve_low < 2 || ctx.reserve_low == G9P_RESERVE_LOW_PAIR)) {
+         ctx.reserve_low = ctx.reserve_low == G9P_RESERVE_LOW_PAIR ? 1 : ctx.reserve_low + 1;
          ctx.reserve_st_low = true;
          continue;
       }
-      if (!ctx.oom || stage == MESA_SHADER_COMPUTE || ctx.num_homes >= 96)
+      if (!ctx.oom || stage == MESA_SHADER_COMPUTE || num_homed >= 1024 || g9p_no_homes)
          return false;
+      stuck = ctx.oom_ip == last_oom_ip ? stuck + 1 : 0;
+      last_oom_ip = ctx.oom_ip;
+      if (stuck >= 16) {
+         fprintf(stderr, "g9p: out of registers at instruction %u (parking does not help)\n",
+                 ctx.oom_ip);
+         return false;
+      }
       for (unsigned d = 0; d < ctx.num_decls; d++) {
          const unsigned k = key(ctx.decls[d], 0);
 
@@ -4425,14 +4501,17 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
              ctx.last_use[k] >= ctx.oom_ip && ctx.last_use[k] > best) {
             best = ctx.last_use[k];
             victim = k;
+            victim_decl = true;
          }
       }
       /* else any NIR register, even past its last use: they stay pinned (dEQP tmp_array) */
       for (unsigned d = 0; victim < 0 && d < ctx.num_decls; d++) {
          const unsigned k = key(ctx.decls[d], 0);
 
-         if (ctx.home[k] < 0 && ctx.reg_first[ctx.decls[d]->index] <= ctx.oom_ip)
+         if (ctx.home[k] < 0 && ctx.reg_first[ctx.decls[d]->index] <= ctx.oom_ip) {
             victim = k;
+            victim_decl = true;
+         }
       }
       /* else the live value (not a NIR register's) with the furthest last use */
       for (unsigned k = 0, ssa_best = 0; victim < 0 && k < ctx.num_keys; k++) {
@@ -4451,7 +4530,29 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
          fprintf(stderr, "g9p: out of registers at instruction %u\n", ctx.oom_ip);
          return false;
       }
-      ctx.home[victim] = 32 + ctx.num_homes++;
+      {
+         const unsigned start = victim_decl ? ctx.reg_first[victim / 4] : ctx.def_ip[victim / 4];
+         /* a NIR register's range takes in the loops it is used in (use_scalar()) */
+         const unsigned end = ctx.last_use[victim];
+         const unsigned max_homes = g9p_max_homes;
+         int home = -1;
+
+         for (unsigned h = 0; home < 0 && h < max_homes; h++) {
+            bool free = true;
+
+            for (unsigned i = 0; free && i < num_homed; i++)
+               free = homed[i].home != 32 + (int)h + (getenv("G9P_HOME_SKIP") ? atoi(getenv("G9P_HOME_SKIP")) : 0) || homed[i].end < start || end < homed[i].start;
+            if (free)
+               home = 32 + h + (getenv("G9P_HOME_SKIP") ? atoi(getenv("G9P_HOME_SKIP")) : 0);
+         }
+         if (home < 0) {
+            fprintf(stderr, "g9p: out of registers above r31 at instruction %u\n", ctx.oom_ip);
+            return false;
+         }
+         homed[num_homed++] = (__typeof__(*homed)){ start, end, (int8_t)home };
+         ctx.home[victim] = home;
+         ctx.num_homes = MAX2(ctx.num_homes, (unsigned)home - 31);
+      }
    }
    st = ctx.max_reg + 1;
    /*
@@ -4859,7 +4960,10 @@ lower_xfb(nir_shader *nir)
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_xfb_store, nir_metadata_control_flow, &st);
 }
 
-/* An attribute with an instance divisor above 1: its element, computed in the shader */
+/*
+ * A per-instance attribute: its element computed in the shader, firstInstance +
+ * instance / divisor (Vulkan's; divisor 0: firstInstance's for every instance)
+ */
 static bool
 lower_attrib_divisor(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
@@ -4871,13 +4975,18 @@ lower_attrib_divisor(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       return false;
    sem = nir_intrinsic_io_semantics(intr);
    loc = sem.location - VERT_ATTRIB_GENERIC0;
-   if (loc >= G9P_MAX_ATTRIBS || !attribs[loc].present || attribs[loc].divisor < 2)
+   if (loc >= G9P_MAX_ATTRIBS || !attribs[loc].present || !attribs[loc].per_instance ||
+       (getenv("G9P_OLD_INSTANCE_ATTRIB") && attribs[loc].divisor < 2))
       return false;
    b->cursor = nir_before_instr(&intr->instr);
+   nir_def *element = nir_load_base_instance(b);
+
+   if (attribs[loc].divisor)
+      element = nir_iadd(b, element, nir_udiv_imm(b, nir_load_instance_id(b),
+                                                  attribs[loc].divisor));
    nir_def_replace(&intr->def,
                    nir_load_per_vertex_input(b, intr->def.num_components, intr->def.bit_size,
-                                             nir_udiv_imm(b, nir_load_instance_id(b),
-                                                          attribs[loc].divisor),
+                                             element,
                                              intr->src[0].ssa, .base = nir_intrinsic_base(intr),
                                              .component = nir_intrinsic_component(intr),
                                              .dest_type = nir_intrinsic_dest_type(intr),
@@ -4891,6 +5000,18 @@ g9p_compile_vertex(nir_shader *nir, const struct g9p_vertex_attrib *attribs,
                    bool point_size, void *mem_ctx)
 {
    memset(out, 0, sizeof(*out));
+   /*
+    * gl_Layer and gl_ViewportIndex: one layer and one viewport only, so the writes go
+    * (vk_meta's rectangle shader writes layer 0)
+    */
+   nir_foreach_shader_out_variable(var, nir) {
+      if (var->data.location == VARYING_SLOT_LAYER ||
+          var->data.location == VARYING_SLOT_VIEWPORT)
+         var->data.mode = nir_var_shader_temp;
+   }
+   NIR_PASS(_, nir, nir_fixup_deref_modes);
+   NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+   NIR_PASS(_, nir, nir_opt_dce);
    lower_front(nir);
    if (frag_coord_slot >= 0)
       add_frag_coord_output(nir, frag_coord_slot, point_coord);
@@ -4902,18 +5023,31 @@ g9p_compile_vertex(nir_shader *nir, const struct g9p_vertex_attrib *attribs,
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_attrib_divisor,
             nir_metadata_control_flow, (void *)attribs);
    /* out of registers: again with a value's loads repeated, not kept live */
-   nir_shader *copy = nir_shader_clone(mem_ctx, nir);
-   nir_shader *copy2 = nir_shader_clone(mem_ctx, nir);
+   nir_shader *attempt[3];
 
-   if (compile_back(nir, out, MESA_SHADER_VERTEX, attribs, 0, false, point_size, mem_ctx) ||
-       compile_back(copy, out, MESA_SHADER_VERTEX, attribs, 0, true, point_size, mem_ctx))
-      return true;
-   /* and in program order: the pressure scheduler can keep values live for longer */
-   g9p_no_schedule = true;
-   const bool ok = compile_back(copy2, out, MESA_SHADER_VERTEX, attribs, 0, true, point_size, mem_ctx);
+   for (unsigned i = 0; i < 3; i++)
+      attempt[i] = nir_shader_clone(mem_ctx, nir);
+   /*
+    * every attempt within r0-r31 first, then the same with values parked in r32-r63, then
+    * above: the fewer registers, the more instances run at once
+    */
+   for (unsigned homes = 0; homes < 3; homes++) {
+      g9p_no_homes = !homes;
+      g9p_max_homes = homes == 1 ? 32 : 92;
+      for (unsigned i = 0; i < 3; i++) {
+         nir_shader *n = nir_shader_clone(mem_ctx, attempt[i]);
 
-   g9p_no_schedule = false;
-   return ok;
+         g9p_no_schedule = i == 2;
+         if (compile_back(n, out, MESA_SHADER_VERTEX, attribs, 0, i > 0, point_size, mem_ctx)) {
+            g9p_no_schedule = g9p_no_homes = false;
+            g9p_max_homes = 92;
+            return true;
+         }
+      }
+   }
+   g9p_no_schedule = g9p_no_homes = false;
+   g9p_max_homes = 92;
+   return false;
 }
 
 /*
@@ -5170,6 +5304,16 @@ find_flat_varyings(nir_shader *nir, struct g9p_shader *out)
    }
 }
 
+static bool
+layer_id_zero(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_layer_id)
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def_replace(&intr->def, nir_imm_int(b, 0));
+   return true;
+}
+
 bool
 g9p_compile_fragment(nir_shader *nir, unsigned frag_coord_slot,
                      const nir_lower_blend_options *blend, const struct g9p_coverage *coverage,
@@ -5197,6 +5341,8 @@ g9p_compile_fragment(nir_shader *nir, unsigned frag_coord_slot,
    }
    memset(out, 0, sizeof(*out));
    memcpy(out->targets, targets, sizeof(out->targets));
+   /* one layer only: gl_Layer reads 0 (vk_meta's blit shaders read it) */
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, layer_id_zero, nir_metadata_control_flow, NULL);
    out->output = targets[0].output;
    out->output_int = targets[0].integer;
    out->output_float = targets[0].is_float;
@@ -5239,12 +5385,62 @@ g9p_compile_fragment(nir_shader *nir, unsigned frag_coord_slot,
 
    nir_shader *copy2 = nir_shader_clone(mem_ctx, nir);
 
-   if (compile_back(nir, out, MESA_SHADER_FRAGMENT, NULL, frag_coord_slot, false, false, mem_ctx) ||
-       compile_back(copy, out, MESA_SHADER_FRAGMENT, NULL, frag_coord_slot, true, false, mem_ctx))
-      return true;
-   g9p_no_schedule = true;
-   const bool ok = compile_back(copy2, out, MESA_SHADER_FRAGMENT, NULL, frag_coord_slot, true, false, mem_ctx);
+   nir_shader *attempt[3] = { nir, copy, copy2 };
 
-   g9p_no_schedule = false;
-   return ok;
+   /*
+    * every attempt within r0-r31 first, then the same with values parked in r32-r63, then
+    * above: the fewer registers, the more instances run at once
+    */
+   for (unsigned homes = 0; homes < 3; homes++) {
+      g9p_no_homes = !homes;
+      g9p_max_homes = homes == 1 ? 32 : 92;
+      for (unsigned i = 0; i < 3; i++) {
+         nir_shader *n = nir_shader_clone(mem_ctx, attempt[i]);
+
+         g9p_no_schedule = i == 2;
+         if (compile_back(n, out, MESA_SHADER_FRAGMENT, NULL, frag_coord_slot, i > 0, false, mem_ctx)) {
+            g9p_no_schedule = g9p_no_homes = false;
+            g9p_max_homes = 92;
+            return true;
+         }
+      }
+   }
+   g9p_no_schedule = g9p_no_homes = false;
+   g9p_max_homes = 92;
+   return false;
+}
+
+void
+g9p_capture_failure(const nir_shader *nir, const struct g9p_capture_args *args)
+{
+   const char *dir = getenv("G9P_CAPTURE");
+   struct blob blob;
+
+   if (!dir)
+      return;
+   blob_init(&blob);
+   nir_serialize(&blob, nir, false);
+   if (!blob.out_of_memory) {
+      char path[512];
+      const uint32_t hash = _mesa_hash_data(blob.data, blob.size);
+
+      snprintf(path, sizeof(path), "%s/%s-%08x.g9pc", dir,
+               _mesa_shader_stage_to_abbrev(args->stage), hash);
+      FILE *f = fopen(path, "wb");
+
+      if (f) {
+         const uint32_t head[2] = { G9P_CAPTURE_MAGIC, (uint32_t)sizeof(*args) };
+         const uint64_t size = blob.size;
+
+         fwrite(head, sizeof(head), 1, f);
+         fwrite(args, sizeof(*args), 1, f);
+         fwrite(&size, sizeof(size), 1, f);
+         fwrite(blob.data, blob.size, 1, f);
+         fclose(f);
+         fprintf(stderr, "g9p: captured %s\n", path);
+      } else {
+         fprintf(stderr, "g9p: cannot write %s\n", path);
+      }
+   }
+   blob_finish(&blob);
 }

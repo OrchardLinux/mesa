@@ -23,13 +23,22 @@
 #include <string.h>
 
 #include "vk_format.h"
+#include "vk_enum_to_str.h"
 #include "vk_sync.h"
+#include "vk_meta.h"
+#include "vk_internal_exts.h"
+#include "util/ralloc.h"
+#include "compiler/nir/nir_builder.h"
+#include "util/bitset.h"
 
 #include "util/format/u_format.h"
 #include "util/u_dynarray.h"
 #include "util/u_math.h"
+#include "util/os_time.h"
 
+#include "pvr_buffer.h"
 #include "pvr_cmd_buffer.h"
+#include "pvr_physical_device.h"
 #include "pvr_device.h"
 #include "pvr_entrypoints.h"
 #include "pvr_g9p.h"
@@ -231,6 +240,46 @@ copy(const struct pvr_rect_mapping *m, const struct surface *src, const struct s
                    column_offset(src, m->src_rect.offset.x),
                 (size_t)dw * dst->bpp);
       return;
+   }
+
+   /*
+    * RGBA8 <-> BGRA8 (unorm or both sRGB), linear to linear, unscaled: whole rows through a
+    * cached buffer with red and blue swapped. Firefox copies its 1024x1024 WebGL frame into a
+    * BGRA image every frame: through the unpack/pack below that took 28 ms.
+    */
+   {
+      const enum pipe_format a = src->format, b = dst->format;
+      const bool swap = (a == PIPE_FORMAT_R8G8B8A8_UNORM && b == PIPE_FORMAT_B8G8R8A8_UNORM) ||
+                        (a == PIPE_FORMAT_B8G8R8A8_UNORM && b == PIPE_FORMAT_R8G8B8A8_UNORM) ||
+                        (a == PIPE_FORMAT_R8G8B8A8_SRGB && b == PIPE_FORMAT_B8G8R8A8_SRGB) ||
+                        (a == PIPE_FORMAT_B8G8R8A8_SRGB && b == PIPE_FORMAT_R8G8B8A8_SRGB) ||
+                        (a == PIPE_FORMAT_R8G8B8X8_UNORM && b == PIPE_FORMAT_B8G8R8X8_UNORM) ||
+                        (a == PIPE_FORMAT_B8G8R8X8_UNORM && b == PIPE_FORMAT_R8G8B8X8_UNORM) ||
+                        (a == PIPE_FORMAT_R8G8B8A8_UNORM && b == PIPE_FORMAT_B8G8R8X8_UNORM) ||
+                        (a == PIPE_FORMAT_B8G8R8A8_UNORM && b == PIPE_FORMAT_R8G8B8X8_UNORM);
+
+      if (swap && !src->twiddled && !dst->twiddled && sw == dw && sh == dh && !m->flip_x &&
+          !m->flip_y && src->samples == 1 && dst->samples == 1) {
+         uint32_t *tmp = malloc((size_t)dw * 4);
+
+         if (tmp) {
+            for (unsigned y = 0; y < dh; y++) {
+               memcpy(tmp, src->base + row_offset(src, m->src_rect.offset.y + y) +
+                              column_offset(src, m->src_rect.offset.x),
+                      (size_t)dw * 4);
+               for (unsigned x = 0; x < dw; x++) {
+                  const uint32_t v = tmp[x];
+
+                  tmp[x] = (v & 0xff00ff00u) | ((v & 0xffu) << 16) | ((v >> 16) & 0xffu);
+               }
+               memcpy(dst->base + row_offset(dst, m->dst_rect.offset.y + y) +
+                         column_offset(dst, m->dst_rect.offset.x),
+                      tmp, (size_t)dw * 4);
+            }
+            free(tmp);
+            return;
+         }
+      }
    }
 
    /* each destination column's source and destination offsets */
@@ -466,14 +515,45 @@ PVR_PER_ARCH(g9p_transfer_submit)(struct pvr_device *device,
                                   struct vk_sync *wait_sync, struct vk_sync *signal_sync)
 {
    VkResult result;
+   /* G9P_TIME: how long each CPU transfer waited for the GPU and copied, and how much */
+   const bool timing = getenv("G9P_TIME") != NULL;
+   const int64_t t0 = timing ? os_time_get_nano() : 0;
 
    if (wait_sync) {
       result = vk_sync_wait(&device->vk, wait_sync, 0, VK_SYNC_WAIT_COMPLETE, UINT64_MAX);
       if (result != VK_SUCCESS)
          return result;
    }
-   list_for_each_entry (struct pvr_transfer_cmd, cmd, sub_cmd->transfer_cmds, link)
+   const int64_t t1 = timing ? os_time_get_nano() : 0;
+   uint64_t texels = 0;
+   unsigned n = 0;
+
+   list_for_each_entry (struct pvr_transfer_cmd, cmd, sub_cmd->transfer_cmds, link) {
       run(device, cmd);
+      if (timing) {
+         n++;
+         unsigned mapped = 0;
+
+         for (unsigned i = 0; i < cmd->source_count; i++)
+            for (unsigned m = 0; m < cmd->sources[i].mapping_count; m++, mapped++)
+               texels += (uint64_t)cmd->sources[i].mappings[m].dst_rect.extent.width *
+                         cmd->sources[i].mappings[m].dst_rect.extent.height;
+         if (!mapped)
+            texels += (uint64_t)cmd->scissor.extent.width * cmd->scissor.extent.height;
+      }
+   }
+   if (timing) {
+      const struct pvr_transfer_cmd *c0 =
+         list_first_entry(sub_cmd->transfer_cmds, struct pvr_transfer_cmd, link);
+
+      fprintf(stderr, "g9p: transfer %u cmds, %" PRIu64 " texels: waited %" PRId64 " us, copied %" PRId64 " us;"
+              " dst %s %ux%u layout %d, src %s layout %d stride %u\n",
+              n, texels, (t1 - t0) / 1000, (os_time_get_nano() - t1) / 1000,
+              vk_Format_to_str(c0->dst.vk_format), c0->dst.width, c0->dst.height, c0->dst.mem_layout,
+              c0->source_count ? vk_Format_to_str(c0->sources[0].surface.vk_format) : "-",
+              c0->source_count ? c0->sources[0].surface.mem_layout : -1,
+              c0->source_count ? c0->sources[0].surface.stride : 0);
+   }
    return vk_sync_signal(&device->vk, signal_sync, 0);
 }
 
@@ -648,4 +728,439 @@ PVR_PER_ARCH(TransitionImageLayout)(VkDevice device, uint32_t transitionCount,
                                     const VkHostImageLayoutTransitionInfo *pTransitions)
 {
    return VK_SUCCESS;
+}
+
+/* --- GPU blits and copies (vk_meta) -------------------------------------- */
+
+/*
+ * Image to image blits and same-format copies drawn by the GPU: Mesa's vk_meta draws a
+ * rectangle sampling the source into the destination, through this driver's own
+ * pipelines. The CPU path above reads the source through an uncached mapping: a
+ * 1024x1024 copy (Firefox's WebGL frame, every frame) took 25-75 ms there, and waited
+ * for the GPU before it. Depth/stencil, compressed and multisampled images, 3D and
+ * array images stay on the CPU path.
+ */
+
+static VkResult
+g9p_meta_bind_map_buffer(struct vk_command_buffer *cmd, struct vk_meta_device *meta,
+                         VkBuffer _buffer, void **map_out)
+{
+   struct pvr_cmd_buffer *cmd_buffer = container_of(cmd, struct pvr_cmd_buffer, vk);
+   VK_FROM_HANDLE(pvr_buffer, buffer, _buffer);
+   struct pvr_suballoc_bo *bo;
+   void *zeros = calloc(1, buffer->vk.size);
+   VkResult result;
+
+   if (!zeros)
+      return vk_error(cmd_buffer, VK_ERROR_OUT_OF_HOST_MEMORY);
+   result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, zeros, buffer->vk.size, &bo);
+   free(zeros);
+   if (result != VK_SUCCESS)
+      return result;
+   buffer->dev_addr = bo->dev_addr;
+   *map_out = pvr_bo_suballoc_get_map_addr(bo);
+   return VK_SUCCESS;
+}
+
+VkResult
+PVR_PER_ARCH(g9p_meta_init)(struct pvr_device *device)
+{
+   VkResult result = vk_meta_device_init(&device->vk, &device->meta);
+
+   if (result != VK_SUCCESS)
+      return result;
+   device->meta.cmd_bind_map_buffer = g9p_meta_bind_map_buffer;
+   /* the rectangle vertex shader comes with the topology (vk_meta_create_graphics_pipeline()) */
+   device->meta.use_rect_list_pipeline = true;
+   device->meta.max_bind_map_buffer_size_B = 64 * 1024;
+   device->meta_ready = true;
+   return VK_SUCCESS;
+}
+
+void
+PVR_PER_ARCH(g9p_meta_finish)(struct pvr_device *device)
+{
+   if (device->meta_ready)
+      vk_meta_device_finish(&device->vk, &device->meta);
+   device->meta_ready = false;
+}
+
+struct g9p_meta_save {
+   struct vk_dynamic_graphics_state dyn;
+   const struct pvr_graphics_pipeline *pipeline;
+   struct pvr_vertex_binding vertex_binding0;
+   struct pvr_descriptor_state desc;
+   struct pvr_push_constants push[2];
+};
+
+static void
+g9p_meta_begin(struct pvr_cmd_buffer *cmd_buffer, struct g9p_meta_save *save)
+{
+   struct pvr_cmd_buffer_state *state = &cmd_buffer->state;
+
+   save->dyn = cmd_buffer->vk.dynamic_graphics_state;
+   save->pipeline = state->gfx_pipeline;
+   save->vertex_binding0 = state->vertex_bindings[0];
+   save->desc = state->gfx_desc_state;
+   save->push[0] = state->push_consts[PVR_STAGE_ALLOCATION_VERTEX_GEOMETRY];
+   save->push[1] = state->push_consts[PVR_STAGE_ALLOCATION_FRAGMENT];
+}
+
+static void
+g9p_meta_end(struct pvr_cmd_buffer *cmd_buffer, const struct g9p_meta_save *save)
+{
+   struct pvr_cmd_buffer_state *state = &cmd_buffer->state;
+
+   cmd_buffer->vk.dynamic_graphics_state = save->dyn;
+   BITSET_SET_RANGE(cmd_buffer->vk.dynamic_graphics_state.dirty, 0, MESA_VK_DYNAMIC_GRAPHICS_STATE_ENUM_MAX - 1);
+   state->gfx_pipeline = save->pipeline;
+   state->vertex_bindings[0] = save->vertex_binding0;
+   state->gfx_desc_state = save->desc;
+   state->gfx_desc_state.dirty_sets = ~0u;
+   state->gfx_desc_state.push_set_dirty = state->gfx_desc_state.push_set != NULL;
+   state->push_consts[PVR_STAGE_ALLOCATION_VERTEX_GEOMETRY] = save->push[0];
+   state->push_consts[PVR_STAGE_ALLOCATION_FRAGMENT] = save->push[1];
+   state->push_consts[PVR_STAGE_ALLOCATION_VERTEX_GEOMETRY].dirty = true;
+   state->push_consts[PVR_STAGE_ALLOCATION_FRAGMENT].dirty = true;
+   state->dirty.gfx_pipeline_binding = true;
+   state->dirty.gfx_desc_dirty = true;
+   state->dirty.vertex_bindings = true;
+   state->dirty.vertex_descriptors = true;
+   state->dirty.fragment_descriptors = true;
+}
+
+/* A colour image the GPU can sample (src) or draw into (dst), one layer, one sample */
+static bool
+g9p_meta_image_ok(struct pvr_device *device, const struct pvr_image *image, VkFormat format,
+                  bool dst)
+{
+   VkFormatProperties3 props3 = { .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3 };
+   VkFormatProperties2 props = { .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, .pNext = &props3 };
+   const VkFormatFeatureFlags2 need = dst ? VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT
+                                          : VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT;
+
+   /* opt-in until the GPU hang with Firefox's blits is found */
+   if (!getenv("G9P_GPU_BLIT"))
+      return false;
+   if (image->vk.image_type != VK_IMAGE_TYPE_2D || image->vk.samples != VK_SAMPLE_COUNT_1_BIT ||
+       image->vk.array_layers != 1 || vk_format_is_depth_or_stencil(format) ||
+       vk_format_is_compressed(format) || image->vk.format != format)
+      return false;
+   if (!(image->vk.usage & (dst ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : VK_IMAGE_USAGE_SAMPLED_BIT)))
+      return false;
+   device->pdevice->vk.dispatch_table.GetPhysicalDeviceFormatProperties2(
+      vk_physical_device_to_handle(&device->pdevice->vk), format, &props);
+   return (image->memlayout == PVR_MEMLAYOUT_LINEAR ? props3.linearTilingFeatures
+                                                    : props3.optimalTilingFeatures) & need;
+}
+
+bool
+PVR_PER_ARCH(g9p_meta_blit)(struct pvr_cmd_buffer *cmd_buffer, const VkBlitImageInfo2 *info)
+{
+   struct pvr_device *device = cmd_buffer->device;
+   VK_FROM_HANDLE(pvr_image, src, info->srcImage);
+   VK_FROM_HANDLE(pvr_image, dst, info->dstImage);
+   struct g9p_meta_save save;
+
+   if (!device->meta_ready || !g9p_meta_image_ok(device, src, src->vk.format, false) ||
+       !g9p_meta_image_ok(device, dst, dst->vk.format, true) ||
+       (info->filter == VK_FILTER_LINEAR && util_format_is_pure_integer(vk_format_to_pipe_format(src->vk.format))))
+      return false;
+   /*
+    * Scaled with linear filtering: 11 dEQP fbo.blit cases off by a filter step on the GPU.
+    * Into a mip level above 0: dEQP basic_copyteximage2d/copytexsubimage2d 2D cases wrong.
+    */
+   for (uint32_t i = 0; i < info->regionCount; i++) {
+      const VkImageBlit2 *r = &info->pRegions[i];
+
+      if (r->dstSubresource.mipLevel)
+         return false;
+      if (info->filter != VK_FILTER_LINEAR)
+         continue;
+
+      if (abs(r->srcOffsets[1].x - r->srcOffsets[0].x) != abs(r->dstOffsets[1].x - r->dstOffsets[0].x) ||
+          abs(r->srcOffsets[1].y - r->srcOffsets[0].y) != abs(r->dstOffsets[1].y - r->dstOffsets[0].y))
+         return false;
+   }
+   g9p_meta_begin(cmd_buffer, &save);
+   vk_meta_blit_image2(&cmd_buffer->vk, &device->meta, info);
+   g9p_meta_end(cmd_buffer, &save);
+   return true;
+}
+
+bool
+PVR_PER_ARCH(g9p_meta_copy)(struct pvr_cmd_buffer *cmd_buffer, const VkCopyImageInfo2 *info)
+{
+   struct pvr_device *device = cmd_buffer->device;
+   VK_FROM_HANDLE(pvr_image, src, info->srcImage);
+   VK_FROM_HANDLE(pvr_image, dst, info->dstImage);
+   VkImageBlit2 regions[16];
+
+   /* a same-format copy is an unscaled blit; nearest keeps the texels as they are */
+   /* unorm and float formats only: their texels come through sampling unchanged */
+   if (src->vk.format != dst->vk.format || info->regionCount > ARRAY_SIZE(regions) ||
+       (!util_format_is_float(vk_format_to_pipe_format(src->vk.format)) &&
+        !vk_format_is_unorm(src->vk.format)))
+      return false;
+   for (uint32_t i = 0; i < info->regionCount; i++) {
+      const VkImageCopy2 *r = &info->pRegions[i];
+
+      regions[i] = (VkImageBlit2){
+         .sType = VK_STRUCTURE_TYPE_IMAGE_BLIT_2,
+         .srcSubresource = r->srcSubresource,
+         .srcOffsets = { r->srcOffset, { r->srcOffset.x + (int32_t)r->extent.width,
+                                         r->srcOffset.y + (int32_t)r->extent.height, 1 } },
+         .dstSubresource = r->dstSubresource,
+         .dstOffsets = { r->dstOffset, { r->dstOffset.x + (int32_t)r->extent.width,
+                                         r->dstOffset.y + (int32_t)r->extent.height, 1 } },
+      };
+   }
+   const VkBlitImageInfo2 blit = {
+      .sType = VK_STRUCTURE_TYPE_BLIT_IMAGE_INFO_2,
+      .srcImage = info->srcImage,
+      .srcImageLayout = info->srcImageLayout,
+      .dstImage = info->dstImage,
+      .dstImageLayout = info->dstImageLayout,
+      .regionCount = info->regionCount,
+      .pRegions = regions,
+      .filter = VK_FILTER_NEAREST,
+   };
+
+   return PVR_PER_ARCH(g9p_meta_blit)(cmd_buffer, &blit);
+}
+
+/*
+ * Buffer to image uploads drawn by the GPU: one point per texel, the vertex shader fetching
+ * the texel as its attribute and handing it to the fragment shader unchanged (flat, raw
+ * bits through a same-size uint view). The CPU path writes the image in place, so it waits
+ * for every GPU job before it: Firefox's per-frame data uploads (2048x32 RGBA32UI and the
+ * like) waited 23 s of a 45 s aquarium run. vk_meta's own upload reads the buffer in the
+ * fragment shader, which G9P cannot do yet.
+ */
+
+static VkFormat
+g9p_upload_format(unsigned bpp)
+{
+   return bpp == 4 ? VK_FORMAT_R32_UINT : bpp == 8 ? VK_FORMAT_R32G32_UINT
+          : bpp == 16 ? VK_FORMAT_R32G32B32A32_UINT : VK_FORMAT_UNDEFINED;
+}
+
+struct g9p_upload_key {
+   char name[16];
+   uint32_t bpp;
+};
+
+struct g9p_upload_push {
+   float x_scale, y_scale;
+   uint32_t x0, y;
+};
+
+static nir_shader *
+g9p_upload_vs(void)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_VERTEX, NULL, "g9p-upload-vs");
+   nir_variable *in = nir_variable_create(b.shader, nir_var_shader_in, glsl_uvec4_type(), "texel");
+   nir_variable *pos = nir_variable_create(b.shader, nir_var_shader_out, glsl_vec4_type(), "gl_Position");
+   nir_variable *psz = nir_variable_create(b.shader, nir_var_shader_out, glsl_float_type(), "gl_PointSize");
+   nir_variable *out = nir_variable_create(b.shader, nir_var_shader_out, glsl_uvec4_type(), "texel_out");
+
+   in->data.location = VERT_ATTRIB_GENERIC0;
+   pos->data.location = VARYING_SLOT_POS;
+   psz->data.location = VARYING_SLOT_PSIZ;
+   out->data.location = VARYING_SLOT_VAR0;
+   out->data.interpolation = INTERP_MODE_FLAT;
+
+   nir_def *pc = nir_load_push_constant(&b, 4, 32, nir_imm_int(&b, 0), .base = 0, .range = 16);
+   nir_def *x = nir_iadd(&b, nir_channel(&b, pc, 2), nir_load_vertex_id(&b));
+   nir_def *fx = nir_fadd_imm(&b, nir_fmul(&b, nir_fadd_imm(&b, nir_u2f32(&b, x), 0.5f),
+                                           nir_channel(&b, pc, 0)), -1.0f);
+   nir_def *fy = nir_fadd_imm(&b, nir_fmul(&b, nir_fadd_imm(&b, nir_u2f32(&b, nir_channel(&b, pc, 3)), 0.5f),
+                                           nir_channel(&b, pc, 1)), -1.0f);
+
+   nir_store_var(&b, pos, nir_vec4(&b, fx, fy, nir_imm_float(&b, 0), nir_imm_float(&b, 1)), 0xf);
+   nir_store_var(&b, psz, nir_imm_float(&b, 1.0f), 0x1);
+   nir_store_var(&b, out, nir_load_var(&b, in), 0xf);
+   return b.shader;
+}
+
+static nir_shader *
+g9p_upload_fs(void)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT, NULL, "g9p-upload-fs");
+   nir_variable *in = nir_variable_create(b.shader, nir_var_shader_in, glsl_uvec4_type(), "texel_in");
+   nir_variable *out = nir_variable_create(b.shader, nir_var_shader_out, glsl_uvec4_type(), "color");
+
+   in->data.location = VARYING_SLOT_VAR0;
+   in->data.interpolation = INTERP_MODE_FLAT;
+   out->data.location = FRAG_RESULT_DATA0;
+   nir_store_var(&b, out, nir_load_var(&b, in), 0xf);
+   return b.shader;
+}
+
+static VkResult
+g9p_upload_pipeline(struct pvr_device *device, unsigned bpp, VkPipelineLayout *layout_out,
+                    VkPipeline *pipeline_out)
+{
+   struct g9p_upload_key key = { .name = "g9p-upload", .bpp = bpp };
+   const VkPushConstantRange push = { VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(struct g9p_upload_push) };
+   VkResult result = vk_meta_get_pipeline_layout(&device->vk, &device->meta, NULL, &push, &key,
+                                                 sizeof(key), layout_out);
+
+   if (result != VK_SUCCESS)
+      return result;
+   *pipeline_out = vk_meta_lookup_pipeline(&device->meta, &key, sizeof(key));
+   if (*pipeline_out)
+      return VK_SUCCESS;
+
+   VkPipelineShaderStageNirCreateInfoMESA vs_nir = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_NIR_CREATE_INFO_MESA, .nir = g9p_upload_vs() };
+   VkPipelineShaderStageNirCreateInfoMESA fs_nir = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_NIR_CREATE_INFO_MESA, .nir = g9p_upload_fs() };
+   const VkPipelineShaderStageCreateInfo stages[2] = {
+      { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pNext = &vs_nir,
+        .stage = VK_SHADER_STAGE_VERTEX_BIT, .pName = "main" },
+      { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pNext = &fs_nir,
+        .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .pName = "main" },
+   };
+   const VkVertexInputBindingDescription vb = { 0, bpp, VK_VERTEX_INPUT_RATE_VERTEX };
+   const VkVertexInputAttributeDescription va = { 0, 0, g9p_upload_format(bpp), 0 };
+   const VkPipelineVertexInputStateCreateInfo vi = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+      .vertexBindingDescriptionCount = 1, .pVertexBindingDescriptions = &vb,
+      .vertexAttributeDescriptionCount = 1, .pVertexAttributeDescriptions = &va,
+   };
+   const VkPipelineInputAssemblyStateCreateInfo ia = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+      .topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST,
+   };
+   const VkPipelineViewportStateCreateInfo vp = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+      .viewportCount = 1, .scissorCount = 1,
+   };
+   const VkDynamicState dyn_states[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+   const VkPipelineDynamicStateCreateInfo dyn = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+      .dynamicStateCount = ARRAY_SIZE(dyn_states), .pDynamicStates = dyn_states,
+   };
+   const VkGraphicsPipelineCreateInfo info = {
+      .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+      .stageCount = 2, .pStages = stages,
+      .pVertexInputState = &vi, .pInputAssemblyState = &ia, .pViewportState = &vp,
+      .pDynamicState = &dyn, .layout = *layout_out,
+   };
+   const struct vk_meta_rendering_info render = {
+      .samples = 1, .color_attachment_count = 1,
+      .color_attachment_formats = { g9p_upload_format(bpp) },
+      .color_attachment_write_masks = { 0xf },
+   };
+
+   result = vk_meta_create_graphics_pipeline(&device->vk, &device->meta, &info, &render, &key,
+                                             sizeof(key), pipeline_out);
+   ralloc_free(vs_nir.nir);
+   ralloc_free(fs_nir.nir);
+   return result;
+}
+
+bool
+PVR_PER_ARCH(g9p_meta_upload)(struct pvr_cmd_buffer *cmd_buffer, const VkCopyBufferToImageInfo2 *info)
+{
+   struct pvr_device *device = cmd_buffer->device;
+   VK_FROM_HANDLE(pvr_image, dst, info->dstImage);
+   const struct vk_device_dispatch_table *disp = &device->vk.dispatch_table;
+   VkCommandBuffer cmd = pvr_cmd_buffer_to_handle(cmd_buffer);
+   const unsigned bpp = vk_format_get_blocksize(dst->vk.format);
+   VkPipelineLayout layout;
+   VkPipeline pipeline;
+   struct g9p_meta_save save;
+
+   /*
+    * Formats of 32-bit channels only: their texels go through the uint view unchanged.
+    * Packed and narrower ones (RGBA4, RGB5A1, RGBA8 snorm) failed dEQP basic_teximage2d.
+    */
+   const struct util_format_description *desc =
+      util_format_description(vk_format_to_pipe_format(dst->vk.format));
+
+   if (!desc || desc->layout != UTIL_FORMAT_LAYOUT_PLAIN || desc->channel[0].size != 32 ||
+       (desc->nr_channels > 1 && desc->channel[desc->nr_channels - 1].size != 32))
+      return false;
+   if (!device->meta_ready || !getenv("G9P_GPU_UPLOAD") || !g9p_upload_format(bpp) ||
+       dst->vk.image_type != VK_IMAGE_TYPE_2D || dst->vk.samples != VK_SAMPLE_COUNT_1_BIT ||
+       vk_format_is_depth_or_stencil(dst->vk.format) || vk_format_is_compressed(dst->vk.format) ||
+       !(dst->vk.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))
+      return false;
+   for (uint32_t i = 0; i < info->regionCount; i++) {
+      const VkBufferImageCopy2 *r = &info->pRegions[i];
+
+      /* mip levels above 0: dEQP basic_teximage2d rgb32* wrong there (as the blits) */
+      if (r->imageSubresource.mipLevel ||
+          vk_image_subresource_layer_count(&dst->vk, &r->imageSubresource) != 1 ||
+          r->imageSubresource.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT || r->imageExtent.depth != 1 ||
+          (r->bufferOffset % bpp))
+         return false;
+   }
+   if (g9p_upload_pipeline(device, bpp, &layout, &pipeline) != VK_SUCCESS)
+      return false;
+   if (getenv("G9P_UPLOAD_LOG"))
+      fprintf(stderr, "g9p: GPU upload into %s, %u regions, first %ux%u row %u offset %" PRIu64 "\n",
+              vk_Format_to_str(dst->vk.format), info->regionCount, info->pRegions[0].imageExtent.width,
+              info->pRegions[0].imageExtent.height, info->pRegions[0].bufferRowLength,
+              (uint64_t)info->pRegions[0].bufferOffset);
+
+   g9p_meta_begin(cmd_buffer, &save);
+   for (uint32_t i = 0; i < info->regionCount; i++) {
+      const VkBufferImageCopy2 *r = &info->pRegions[i];
+      const uint32_t mip = r->imageSubresource.mipLevel;
+      const uint32_t w = u_minify(dst->vk.extent.width, mip), h = u_minify(dst->vk.extent.height, mip);
+      const uint32_t row = r->bufferRowLength ? r->bufferRowLength : r->imageExtent.width;
+      const VkImageViewUsageCreateInfo view_usage = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
+         .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+      };
+      const VkImageViewCreateInfo view_info = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+         .pNext = &view_usage,
+         .flags = VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA,
+         .image = info->dstImage,
+         .viewType = VK_IMAGE_VIEW_TYPE_2D,
+         .format = g9p_upload_format(bpp),
+         .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, mip, 1, r->imageSubresource.baseArrayLayer, 1 },
+      };
+      VkImageView view;
+
+      if (vk_meta_create_image_view(&cmd_buffer->vk, &device->meta, &view_info, &view) != VK_SUCCESS)
+         break;
+
+      const VkRenderingAttachmentInfo att = {
+         .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+         .imageView = view,
+         .imageLayout = info->dstImageLayout,
+         .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+         .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+      };
+      const VkRect2D area = { { r->imageOffset.x, r->imageOffset.y },
+                              { r->imageExtent.width, r->imageExtent.height } };
+      const VkRenderingInfo rendering = {
+         .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+         .renderArea = area, .layerCount = 1,
+         .colorAttachmentCount = 1, .pColorAttachments = &att,
+      };
+      const VkViewport viewport = { 0, 0, (float)w, (float)h, 0, 1 };
+
+      disp->CmdBeginRendering(cmd, &rendering);
+      disp->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+      disp->CmdSetViewport(cmd, 0, 1, &viewport);
+      disp->CmdSetScissor(cmd, 0, 1, &area);
+      for (uint32_t y = 0; y < r->imageExtent.height; y++) {
+         const struct g9p_upload_push pc = { 2.0f / w, 2.0f / h, (uint32_t)r->imageOffset.x,
+                                             (uint32_t)r->imageOffset.y + y };
+         const VkDeviceSize offset = r->bufferOffset + (VkDeviceSize)y * row * bpp;
+
+         disp->CmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pc), &pc);
+         disp->CmdBindVertexBuffers(cmd, 0, 1, &info->srcBuffer, &offset);
+         disp->CmdDraw(cmd, r->imageExtent.width, 1, 0, 0);
+      }
+      disp->CmdEndRendering(cmd);
+   }
+   g9p_meta_end(cmd_buffer, &save);
+   return true;
 }

@@ -284,6 +284,11 @@ void pvr_rogue_CmdBlitImage2(VkCommandBuffer commandBuffer,
 
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
 
+   /* G9P: drawn by the GPU where it can (pvr_arch_g9p_transfer.c) */
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p) &&
+       pvr_arch_g9p_meta_blit(cmd_buffer, pBlitImageInfo))
+      return;
+
    PVR_TRACE_BEGIN_TRANSFER(cmd_buffer, PVR_TRANSFER_OP_BLIT_IMAGE);
 
    if (pBlitImageInfo->filter == VK_FILTER_LINEAR)
@@ -876,6 +881,11 @@ void pvr_rogue_CmdCopyImage2(VkCommandBuffer commandBuffer,
 
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
 
+   /* G9P: drawn by the GPU where it can (pvr_arch_g9p_transfer.c) */
+   if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g9p) &&
+       pvr_arch_g9p_meta_copy(cmd_buffer, pCopyImageInfo))
+      return;
+
    PVR_TRACE_BEGIN_TRANSFER(cmd_buffer, PVR_TRANSFER_OP_COPY_IMAGE);
 
    for (uint32_t i = 0U; i < pCopyImageInfo->regionCount; i++) {
@@ -1100,6 +1110,11 @@ void pvr_rogue_CmdCopyBufferToImage2(
    VK_FROM_HANDLE(pvr_cmd_buffer, cmd_buffer, commandBuffer);
 
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
+
+   /* G9P: drawn by the GPU where it can (pvr_arch_g9p_transfer.c) */
+   if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g9p) &&
+       pvr_arch_g9p_meta_upload(cmd_buffer, pCopyBufferToImageInfo))
+      return;
 
    PVR_TRACE_BEGIN_TRANSFER(cmd_buffer, PVR_TRANSFER_OP_COPY_BUFFER_TO_IMAGE);
 

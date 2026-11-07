@@ -1092,6 +1092,7 @@ static VkResult pvr_process_cmd_buffer(struct pvr_device *device,
                              sub_cmd,
                              &cmd_buffer->sub_cmds,
                              link) {
+      const int64_t g9p_t0 = getenv("G9P_TIME") ? os_time_get_nano() : 0;
       switch (sub_cmd->type) {
       case PVR_SUB_CMD_TYPE_GRAPHICS: {
          /* If the fragment job utilizes queries, for data integrity
@@ -1207,6 +1208,9 @@ static VkResult pvr_process_cmd_buffer(struct pvr_device *device,
 
       if (result != VK_SUCCESS)
          return result;
+      if (g9p_t0 && os_time_get_nano() - g9p_t0 > 1000000)
+         fprintf(stderr, "g9p: sub-command type %d took %" PRId64 " us\n", sub_cmd->type,
+                 (os_time_get_nano() - g9p_t0) / 1000);
 
       p_atomic_inc(&device->global_cmd_buffer_submit_count);
    }
@@ -1219,6 +1223,7 @@ static VkResult pvr_clear_last_submits_syncs(struct pvr_queue *queue)
    struct vk_sync_wait waits[PVR_JOB_TYPE_MAX * 2];
    uint32_t wait_count = 0;
    VkResult result;
+
 
    for (uint32_t i = 0; i < PVR_JOB_TYPE_MAX; i++) {
       if (queue->next_job_wait_sync[i]) {
@@ -1327,13 +1332,15 @@ static VkResult pvr_process_queue_waits(struct pvr_queue *queue,
    struct pvr_device *device = queue->device;
    VkResult result;
 
-   STACK_ARRAY(struct vk_sync_wait, stage_waits, wait_count);
+   STACK_ARRAY(struct vk_sync_wait, stage_waits, wait_count + 1);
    if (!stage_waits)
       return vk_error(queue, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    for (uint32_t i = 0; i < PVR_JOB_TYPE_MAX; i++) {
       struct vk_sync_signal next_job_wait_signal_sync;
       uint32_t stage_wait_count = 0;
+      /* a wait the last submit left for this job type (G9P keeps them): still waited for */
+      struct vk_sync *prev_wait = NULL;
 
       for (uint32_t wait_idx = 0; wait_idx < wait_count; wait_idx++) {
          if (!(pvr_stage_mask_dst(waits[wait_idx].stage_mask) &
@@ -1351,13 +1358,24 @@ static VkResult pvr_process_queue_waits(struct pvr_queue *queue,
       if (!stage_wait_count)
          continue;
 
+      if (queue->next_job_wait_sync[i]) {
+         prev_wait = queue->next_job_wait_sync[i];
+         stage_waits[stage_wait_count++] = (struct vk_sync_wait){
+            .sync = prev_wait,
+            .stage_mask = ~(VkPipelineStageFlags2)0,
+            .wait_value = 0,
+         };
+      }
+
       result = vk_sync_create(&device->vk,
                               &device->pdevice->ws->syncobj_type,
                               0U,
                               0UL,
                               &queue->next_job_wait_sync[i]);
-      if (result != VK_SUCCESS)
+      if (result != VK_SUCCESS) {
+         queue->next_job_wait_sync[i] = prev_wait;
          goto err_free_waits;
+      }
 
       next_job_wait_signal_sync = (struct vk_sync_signal){
          .sync = queue->next_job_wait_sync[i],
@@ -1371,6 +1389,8 @@ static VkResult pvr_process_queue_waits(struct pvr_queue *queue,
                                                 &next_job_wait_signal_sync);
       if (result != VK_SUCCESS)
          goto err_free_waits;
+      if (prev_wait)
+         vk_sync_destroy(&device->vk, prev_wait);
    }
 
    STACK_ARRAY_FINISH(stage_waits);
@@ -1394,6 +1414,8 @@ static VkResult pvr_driver_queue_submit_jobs(struct vk_queue *queue,
    if (result != VK_SUCCESS)
       return result;
 
+   const int64_t g9p_tw = os_time_get_nano();
+
    if (submit->wait_count) {
       result = pvr_process_queue_waits(driver_queue,
                                        submit->waits,
@@ -1401,6 +1423,9 @@ static VkResult pvr_driver_queue_submit_jobs(struct vk_queue *queue,
       if (result != VK_SUCCESS)
          return result;
    }
+   if (getenv("G9P_TIME") && os_time_get_nano() - g9p_tw > 1000000)
+      fprintf(stderr, "g9p: %u queue waits took %" PRId64 " us\n", submit->wait_count,
+              (os_time_get_nano() - g9p_tw) / 1000);
 
    struct pvr_suspended_data suspended_data = {0};
 
@@ -1433,8 +1458,25 @@ static VkResult pvr_driver_queue_submit_jobs(struct vk_queue *queue,
 static VkResult pvr_driver_queue_submit(struct vk_queue *queue,
                                         struct vk_queue_submit *submit)
 {
+   const int64_t g9p_t0 = os_time_get_nano();
    VkResult result = pvr_driver_queue_submit_jobs(queue, submit);
 
+   if (getenv("G9P_TIME"))
+      fprintf(stderr, "g9p: submit of %u command buffers took %" PRId64 " us\n",
+              submit->command_buffer_count, (os_time_get_nano() - g9p_t0) / 1000);
+
+   /*
+    * A failed submission still signals what it promised: a waiter on its semaphores or
+    * fence (Zink's flush thread in a compositor) otherwise waited forever after a GPU
+    * reset, freezing the desktop; signalled, it sees the device lost and can recover
+    */
+   if (result != VK_SUCCESS) {
+      struct pvr_queue *driver_queue = container_of(queue, struct pvr_queue, vk);
+
+      for (uint32_t i = 0; i < submit->signal_count; i++)
+         vk_sync_signal(&driver_queue->device->vk, submit->signals[i].sync,
+                        submit->signals[i].signal_value);
+   }
    if (result == VK_ERROR_DEVICE_LOST)
       return vk_queue_set_lost(queue, "GPU context lost");
    return result;

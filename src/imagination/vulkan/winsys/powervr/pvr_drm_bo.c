@@ -26,6 +26,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <inttypes.h>
 #include <sys/mman.h>
 #include <sys/types.h>
 #include <vulkan/vulkan.h>
@@ -104,6 +106,35 @@ static VkResult pvr_drm_get_bo_mmap_offset(struct pvr_drm_winsys *drm_ws,
    return VK_SUCCESS;
 }
 
+
+/* G9P_BOLOG: each BO's creation (size, callers) and release on stderr, to find leaks */
+#include <dlfcn.h>
+#include <execinfo.h>
+static void
+g9p_bolog(char op, uint32_t handle, uint64_t size)
+{
+   static int on = -1;
+
+   if (on < 0)
+      on = getenv("G9P_BOLOG") != NULL;
+   if (!on)
+      return;
+   if (op == '-') {
+      fprintf(stderr, "g9pbo - %u\n", handle);
+      return;
+   }
+   void *bt[8];
+   const int n = backtrace(bt, 8);
+   Dl_info info;
+
+   fprintf(stderr, "g9pbo %c %u %" PRIu64, op, handle, size);
+   for (int i = 2; i < n; i++)
+      fprintf(stderr, " %#lx", dladdr(bt[i], &info) && info.dli_fbase
+                                  ? (unsigned long)((uintptr_t)bt[i] - (uintptr_t)info.dli_fbase)
+                                  : (unsigned long)(uintptr_t)bt[i]);
+   fprintf(stderr, "\n");
+}
+
 static void pvr_drm_buffer_acquire(struct pvr_drm_winsys_bo *drm_bo)
 {
    p_atomic_inc(&drm_bo->ref_count);
@@ -128,6 +159,7 @@ static void pvr_drm_buffer_release(struct pvr_drm_winsys_bo *drm_bo)
        */
       memset(drm_bo, 0, sizeof(*drm_bo));
 
+      g9p_bolog('-', handle, 0);
       pvr_drm_destroy_gem_bo(drm_ws, handle);
    }
 
@@ -220,6 +252,7 @@ VkResult pvr_drm_winsys_buffer_create(struct pvr_winsys *ws,
    drm_bo->flags = drm_flags;
 
    p_atomic_set(&drm_bo->ref_count, 1);
+   g9p_bolog('+', handle, size);
 
    *bo_out = &drm_bo->base;
 
@@ -264,6 +297,7 @@ pvr_drm_winsys_buffer_create_from_fd(struct pvr_winsys *ws,
       drm_bo->handle = handle;
 
       p_atomic_set(&drm_bo->ref_count, 1);
+      g9p_bolog('i', handle, (uint64_t)size);
    } else {
       pvr_drm_buffer_acquire(drm_bo);
    }
@@ -278,6 +312,10 @@ pvr_drm_winsys_buffer_create_from_fd(struct pvr_winsys *ws,
 void pvr_drm_winsys_buffer_destroy(struct pvr_winsys_bo *bo)
 {
    struct pvr_drm_winsys_bo *drm_bo = to_pvr_drm_winsys_bo(bo);
+
+   if (getenv("G9P_BOLOG"))
+      fprintf(stderr, "g9pbo d %u refs %d%s\n", drm_bo->handle, p_atomic_read(&drm_bo->ref_count),
+              bo->map ? " mapped" : "");
 
    pvr_drm_buffer_release(drm_bo);
 }

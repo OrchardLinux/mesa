@@ -64,6 +64,7 @@
 #include "vk_alloc.h"
 #include "vk_blend.h"
 #include "vk_format.h"
+#include "vk_internal_exts.h"
 #include "vk_graphics_state.h"
 #include "vk_log.h"
 #include "vk_object.h"
@@ -3599,6 +3600,9 @@ pvr_graphics_pipeline_init(struct pvr_device *device,
 
    /* Load static state into base dynamic state holder. */
    vk_dynamic_graphics_state_fill(dynamic_state, &state);
+   /* vk_meta's rectangles come as two triangles each (vk_meta_draw_rects()) */
+   if (dynamic_state->ia.primitive_topology == VK_PRIMITIVE_TOPOLOGY_META_RECT_LIST_MESA)
+      dynamic_state->ia.primitive_topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 
    /* The value of ms.rasterization_samples is undefined when
     * rasterizer_discard_enable is set, but we need a specific value.

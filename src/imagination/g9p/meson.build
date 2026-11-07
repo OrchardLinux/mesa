@@ -17,3 +17,14 @@ idep_powervr_g9p = declare_dependency(
   link_with : libpowervr_g9p,
   include_directories : inc_powervr_g9p,
 )
+
+# Replays shaders captured with G9P_CAPTURE (g9p_replay.c)
+g9p_replay = executable(
+  'g9p_replay',
+  files('g9p_replay.c'),
+  include_directories : [inc_imagination, inc_powervr_g9p, inc_include, inc_src],
+  c_args : [imagination_c_args],
+  link_with : libpowervr_g9p,
+  dependencies : [idep_mesautil, idep_nir],
+  install : false,
+)

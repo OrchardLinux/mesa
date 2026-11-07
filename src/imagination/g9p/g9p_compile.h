@@ -71,6 +71,8 @@ g9p_fs_buf_base(unsigned n)
 #define G9P_SHARED_BASE 16
 /* Compute: gl_NumWorkGroups, x and y in binding 0's slot, z in binding 1's (filled per dispatch) */
 #define G9P_NUM_WORKGROUPS (~22u)
+/* A draw's parameters: binding 0's slot holds firstInstance (filled per draw) */
+#define G9P_DRAW_PARAMS (~23u)
 /* The set of the push-constant slot (its address is loaded like a buffer's) */
 #define G9P_PUSH_CONSTANTS (~0u)
 /* The set of the dynamic blend constants (binding 0): 4 floats */
@@ -264,5 +266,23 @@ bool g9p_compile_fragment(nir_shader *nir, unsigned frag_coord_slot,
                           const nir_lower_blend_options *blend, const struct g9p_coverage *coverage,
                           const struct g9p_target targets[G9P_MAX_TARGETS], struct g9p_shader *out,
                           void *mem_ctx);
+
+/*
+ * A shader the backend refused, with what its compile was given, for replaying it offline
+ * (g9p_replay): written to the directory in G9P_CAPTURE, one file per shader
+ */
+struct g9p_capture_args {
+   uint32_t stage; /* gl_shader_stage */
+   int32_t frag_coord_slot;
+   uint8_t point_coord, point_size, has_blend, has_coverage;
+   struct g9p_vertex_attrib attribs[G9P_MAX_ATTRIBS];
+   nir_lower_blend_options blend;
+   struct g9p_coverage coverage;
+   struct g9p_target targets[G9P_MAX_TARGETS];
+};
+
+#define G9P_CAPTURE_MAGIC 0x43503947u /* "G9PC" */
+
+void g9p_capture_failure(const nir_shader *nir, const struct g9p_capture_args *args);
 
 #endif /* G9P_COMPILE_H */

@@ -100,6 +100,7 @@ err_free_empty:
 void
 PVR_PER_ARCH(g9p_device_finish)(struct pvr_device *device)
 {
+   PVR_PER_ARCH(g9p_meta_finish)(device);
    pvr_free_list_destroy(device->g9p.free_list);
    pvr_bo_suballoc_free(device->g9p.fence.pvr_bo);
    pvr_bo_suballoc_free(device->g9p.kick.pvr_bo);
@@ -128,7 +129,11 @@ PVR_PER_ARCH(g9p_compute_pipeline_compile)(
    if (result != VK_SUCCESS)
       goto out;
 
+   nir_shader *capture = getenv("G9P_CAPTURE") ? nir_shader_clone(mem_ctx, nir) : NULL;
+
    if (!g9p_compile_compute(nir, &shader, mem_ctx)) {
+      if (capture)
+         g9p_capture_failure(capture, &(struct g9p_capture_args){ .stage = MESA_SHADER_COMPUTE });
       result = vk_errorf(device, VK_ERROR_UNKNOWN,
                          "G9P: shader not supported by the backend yet");
       goto out;

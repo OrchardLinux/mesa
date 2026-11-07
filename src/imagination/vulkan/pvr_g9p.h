@@ -13,6 +13,8 @@
 
 #include "pvr_limits.h"
 #include "pvr_macros.h"
+#include "util/log.h"
+#include "vk_log.h"
 
 struct pvr_cmd_buffer;
 struct pvr_compute_pipeline;
@@ -156,7 +158,19 @@ VkResult PVR_PER_ARCH(g9p_transfer_submit)(struct pvr_device *device,
                                            struct vk_sync *wait_sync,
                                            struct vk_sync *signal_sync);
 
+VkResult PVR_PER_ARCH(g9p_meta_init)(struct pvr_device *device);
+void PVR_PER_ARCH(g9p_meta_finish)(struct pvr_device *device);
+struct pvr_cmd_buffer;
+bool PVR_PER_ARCH(g9p_meta_blit)(struct pvr_cmd_buffer *cmd_buffer, const VkBlitImageInfo2 *info);
+bool PVR_PER_ARCH(g9p_meta_copy)(struct pvr_cmd_buffer *cmd_buffer, const VkCopyImageInfo2 *info);
+bool PVR_PER_ARCH(g9p_meta_upload)(struct pvr_cmd_buffer *cmd_buffer, const VkCopyBufferToImageInfo2 *info);
+
 #   define pvr_arch_g9p_transfer_submit PVR_PER_ARCH(g9p_transfer_submit)
+#   define pvr_arch_g9p_meta_init PVR_PER_ARCH(g9p_meta_init)
+#   define pvr_arch_g9p_meta_finish PVR_PER_ARCH(g9p_meta_finish)
+#   define pvr_arch_g9p_meta_blit PVR_PER_ARCH(g9p_meta_blit)
+#   define pvr_arch_g9p_meta_copy PVR_PER_ARCH(g9p_meta_copy)
+#   define pvr_arch_g9p_meta_upload PVR_PER_ARCH(g9p_meta_upload)
 #   define pvr_arch_g9p_pack_image_view PVR_PER_ARCH(g9p_pack_image_view)
 #   define pvr_arch_g9p_pack_sampler PVR_PER_ARCH(g9p_pack_sampler)
 #   define pvr_arch_g9p_gfx_device_init PVR_PER_ARCH(g9p_gfx_device_init)
@@ -178,5 +192,13 @@ VkResult PVR_PER_ARCH(g9p_transfer_submit)(struct pvr_device *device,
 #   define pvr_arch_g9p_end_pass PVR_PER_ARCH(g9p_end_pass)
 
 #endif /* PVR_PER_ARCH */
+
+/*
+ * Something a command buffer asks for that G9P does not do yet: said on stderr too, where
+ * vk_errorf() is quiet outside debug builds (an application sees only the failed
+ * vkEndCommandBuffer)
+ */
+#define g9p_feature_error(obj, ...)                                                      \
+   (mesa_loge(__VA_ARGS__), vk_errorf((obj), VK_ERROR_FEATURE_NOT_PRESENT, __VA_ARGS__))
 
 #endif /* PVR_G9P_H */

@@ -766,13 +766,40 @@ compile_stage(struct pvr_device *device, nir_shader *nir,
               const nir_lower_blend_options *blend, const struct g9p_coverage *coverage,
               const struct g9p_target *targets, struct g9p_shader *out, bool point_size, void *mem_ctx)
 {
-   bool ok;
+   bool ok, capture_ok = false;
+   /* G9P_CAPTURE: the shader as the backend got it, kept for a refusal (g9p_replay) */
+   nir_shader *capture = getenv("G9P_CAPTURE") ? nir_shader_clone(mem_ctx, nir) : NULL;
 
    if (stage->stage == VK_SHADER_STAGE_VERTEX_BIT)
       ok = g9p_compile_vertex(nir, attribs, frag_coord_slot, point_coord, out, point_size,
                               mem_ctx);
    else
       ok = g9p_compile_fragment(nir, frag_coord_slot, blend, coverage, targets, out, mem_ctx);
+   /* G9P_CAPTURE_REGS=N: also the shaders that compiled to N registers or more */
+   if (ok && capture && getenv("G9P_CAPTURE_REGS") &&
+       out->num_regs >= (unsigned)atoi(getenv("G9P_CAPTURE_REGS")))
+      ok = false, capture_ok = true;
+   if (!ok && capture) {
+      struct g9p_capture_args args = {
+         .stage = capture->info.stage,
+         .frag_coord_slot = frag_coord_slot,
+         .point_coord = point_coord,
+         .point_size = point_size,
+         .has_blend = blend != NULL,
+         .has_coverage = coverage != NULL,
+      };
+
+      if (attribs)
+         memcpy(args.attribs, attribs, sizeof(args.attribs));
+      if (blend)
+         args.blend = *blend;
+      if (coverage)
+         args.coverage = *coverage;
+      if (targets)
+         memcpy(args.targets, targets, sizeof(args.targets));
+      g9p_capture_failure(capture, &args);
+      ok = capture_ok;
+   }
    if (!ok)
       return g9p_error(device,
                        "G9P: %s shader not supported by the backend yet",
@@ -1751,6 +1778,8 @@ buffer_addrs(struct pvr_cmd_buffer *cmd_buffer, unsigned n, const unsigned (*set
          if (result != VK_SUCCESS)
             return result;
          addrs[k] = cbo->dev_addr.addr;
+      } else if (set == G9P_DRAW_PARAMS) {
+         addrs[k] = cs->draw_state.base_instance;
       } else if (set == G9P_FRONT_FACE) {
          const uint32_t cw = cmd_buffer->vk.dynamic_graphics_state.rs.front_face ==
                                    VK_FRONT_FACE_CLOCKWISE
@@ -2125,7 +2154,7 @@ xfb_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state 
    g9p_xfb_put32(block + 8 * l->mask_slot, capturing ? ~0u : 0);
    if (capturing) {
       if (draw->indexed)
-         return vk_errorf(cmd_buffer, VK_ERROR_FEATURE_NOT_PRESENT,
+         return g9p_feature_error(cmd_buffer,
                           "G9P: transform feedback of an indexed draw");
       result = PVR_PER_ARCH(g9p_xfb_draw_check)(cmd_buffer, topology);
       if (result == VK_SUCCESS)
@@ -2370,7 +2399,16 @@ static uint32_t
 vs_max_instances(unsigned regs)
 {
    const unsigned allocated = 2 * DIV_ROUND_UP(MAX2(regs, 8), 2);
-   const unsigned n = 1u << util_logbase2(MAX2(256 / allocated, 2));
+   /*
+    * At least 4: vertex shaders of 68 to 124 registers (2 here) drew wrong values or hung
+    * the geometry job, and passed with 4 (dEQP indexing with homes, 2026-11-08)
+    */
+   const unsigned n = getenv("G9P_VS_MAXINST") ? (unsigned)atoi(getenv("G9P_VS_MAXINST"))
+                      : getenv("G9P_VS_NPOT") ? MIN2(MAX2(256 / allocated, 4), 32)
+                                              : 1u << util_logbase2(MAX2(256 / allocated, 4));
+
+   if (getenv("G9P_VS_REGLOG"))
+      fprintf(stderr, "g9p: vertex shader %u registers, %u instances\n", regs, n);
 
    return n >= 32 ? 0 : n;
 }
@@ -3244,11 +3282,11 @@ g9p_ds_check(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_renderpass_hwse
    iview = info->attachments[hw->ds_attach_idx];
    plane = pvr_single_plane_const(pvr_image_view_get_image(iview));
    if (!g9p_ds_format(iview->vk.format))
-      return vk_errorf(cmd_buffer, VK_ERROR_FEATURE_NOT_PRESENT,
+      return g9p_feature_error(cmd_buffer,
                        "G9P: depth/stencil format %s", vk_Format_to_str(iview->vk.format));
    if (plane->physical_extent.width < 32 || plane->physical_extent.height < 32 ||
        iview->vk.base_mip_level || iview->vk.base_array_layer)
-      return vk_errorf(cmd_buffer, VK_ERROR_FEATURE_NOT_PRESENT,
+      return g9p_feature_error(cmd_buffer,
                        "G9P: a depth/stencil attachment of %ux%u (level %u, layer %u): "
                        "32x32 or larger, level 0, layer 0 only",
                        plane->physical_extent.width, plane->physical_extent.height,
@@ -3436,7 +3474,7 @@ PVR_PER_ARCH(g9p_job_init)(struct pvr_cmd_buffer *cmd_buffer,
    job->g9p.enabled = true;
    job->g9p.samples = hw_render->sample_count;
    if (hw_render->sample_count != 1 && hw_render->sample_count != 4)
-      return vk_errorf(cmd_buffer, VK_ERROR_FEATURE_NOT_PRESENT, "G9P: %u samples", hw_render->sample_count);
+      return g9p_feature_error(cmd_buffer, "G9P: %u samples", hw_render->sample_count);
 
    /* multiview: each view's job stores to its own layer */
    u_foreach_bit (view, MAX2(hw_render->view_mask, 1)) {
@@ -3535,8 +3573,28 @@ PVR_PER_ARCH(g9p_job_init)(struct pvr_cmd_buffer *cmd_buffer,
     * colour of the first colour attachment (dwords 0-3) and the clear
     * shader; load ops other than these clear to transparent black.
     */
-   const bool load = hw_render->eot_surface_count && hw_render->color_init_count &&
-                     hw_render->color_init[0].op == VK_ATTACHMENT_LOAD_OP_LOAD;
+   /*
+    * A render area that ends inside tiles: the tiles' pixels outside it keep their
+    * contents, which only a load does (tiles are drawn and stored whole). Load op don't
+    * care loads them then (vk_meta's blits render into their rectangle with it; without
+    * the load the rest of each edge tile came out white).
+    */
+   bool partial_tiles = false;
+
+   if (hw_render->eot_surface_count && !getenv("G9P_NO_PARTIAL_LOAD")) {
+      const struct pvr_image_view *iv = info->attachments[hw_render->eot_surfaces[0].attachment_idx];
+      const VkRect2D *ra = &info->render_area;
+      const uint32_t x1 = ra->offset.x + ra->extent.width, y1 = ra->offset.y + ra->extent.height;
+
+      partial_tiles = (ra->offset.x % 32) || (ra->offset.y % 32) ||
+                      ((x1 % 32) && x1 < iv->vk.extent.width) ||
+                      ((y1 % 32) && y1 < iv->vk.extent.height);
+   }
+   const bool load = hw_render->eot_surface_count &&
+                     ((hw_render->color_init_count &&
+                       hw_render->color_init[0].op == VK_ATTACHMENT_LOAD_OP_LOAD) ||
+                      (partial_tiles && (!hw_render->color_init_count ||
+                                         hw_render->color_init[0].op != VK_ATTACHMENT_LOAD_OP_CLEAR)));
    uint32_t bg[16] = { 0 };
    unsigned bg_dwords = 4;
 
@@ -3560,6 +3618,7 @@ PVR_PER_ARCH(g9p_job_init)(struct pvr_cmd_buffer *cmd_buffer,
    }
    job->g9p.load = load;
    job->g9p.load_op = !hw_render->eot_surface_count ? VK_ATTACHMENT_LOAD_OP_CLEAR
+                      : load ? VK_ATTACHMENT_LOAD_OP_LOAD
                       : hw_render->color_init_count ? (int)hw_render->color_init[0].op
                                                     : G9P_LOAD_OP_NONE;
    if (!load)

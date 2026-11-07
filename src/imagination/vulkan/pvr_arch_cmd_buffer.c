@@ -73,6 +73,7 @@
 #include "util/macros.h"
 #include "util/u_dynarray.h"
 #include "util/u_math.h"
+#include "util/os_time.h"
 #include "util/u_pack_color.h"
 #include "vk_alloc.h"
 #include "vk_command_buffer.h"
@@ -9273,12 +9274,17 @@ void PVR_PER_ARCH(CmdDraw)(VkCommandBuffer commandBuffer,
          .offset = firstVertex,
       };
 
-      /* the shaders' base instance is 0 (g9p_compile.c) */
-      result = firstInstance ? vk_errorf(cmd_buffer, VK_ERROR_FEATURE_NOT_PRESENT,
-                                         "G9P: firstInstance not supported yet")
-                             : pvr_flush_push_descriptors(cmd_buffer, &state->gfx_desc_state);
+      /* the vertex shader's G9P_DRAW_PARAMS slot */
+      state->draw_state.base_instance = firstInstance;
+      result = pvr_flush_push_descriptors(cmd_buffer, &state->gfx_desc_state);
       if (result == VK_SUCCESS)
+      {
+         const int64_t g9p_t0 = os_time_get_nano();
+
          result = pvr_arch_g9p_cmd_draw(cmd_buffer, &draw);
+         cmd_buffer->g9p_draw_ns += os_time_get_nano() - g9p_t0;
+         cmd_buffer->g9p_draw_count++;
+      }
       if (result != VK_SUCCESS)
          vk_command_buffer_set_error(&cmd_buffer->vk, result);
       goto end_cmd_draw;
@@ -9345,12 +9351,17 @@ void PVR_PER_ARCH(CmdDrawIndexed)(VkCommandBuffer commandBuffer,
          .offset = vertexOffset,
       };
 
-      /* the shaders' base instance is 0 (g9p_compile.c) */
-      result = firstInstance ? vk_errorf(cmd_buffer, VK_ERROR_FEATURE_NOT_PRESENT,
-                                         "G9P: firstInstance not supported yet")
-                             : pvr_flush_push_descriptors(cmd_buffer, &state->gfx_desc_state);
+      /* the vertex shader's G9P_DRAW_PARAMS slot */
+      state->draw_state.base_instance = firstInstance;
+      result = pvr_flush_push_descriptors(cmd_buffer, &state->gfx_desc_state);
       if (result == VK_SUCCESS)
+      {
+         const int64_t g9p_t0 = os_time_get_nano();
+
          result = pvr_arch_g9p_cmd_draw(cmd_buffer, &draw);
+         cmd_buffer->g9p_draw_ns += os_time_get_nano() - g9p_t0;
+         cmd_buffer->g9p_draw_count++;
+      }
       if (result != VK_SUCCESS)
          vk_command_buffer_set_error(&cmd_buffer->vk, result);
       goto end_cmd_draw_indexed;
@@ -10698,6 +10709,11 @@ VkResult PVR_PER_ARCH(EndCommandBuffer)(VkCommandBuffer commandBuffer)
    result = pvr_arch_cmd_buffer_end_sub_cmd(cmd_buffer);
    if (result != VK_SUCCESS)
       pvr_cmd_buffer_set_error_unwarned(cmd_buffer, result);
+   if (cmd_buffer->g9p_draw_count && getenv("G9P_TIME"))
+      fprintf(stderr, "g9p: recorded %u draws in %" PRIu64 " us\n", cmd_buffer->g9p_draw_count,
+              cmd_buffer->g9p_draw_ns / 1000);
+   cmd_buffer->g9p_draw_ns = 0;
+   cmd_buffer->g9p_draw_count = 0;
 
    util_dynarray_fini(&state->query_indices);
 

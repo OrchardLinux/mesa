@@ -18,6 +18,7 @@
 
 #include "vk_device.h"
 #include "vk_device_memory.h"
+#include "vk_meta.h"
 #include "vk_physical_device.h"
 
 #include "wsi_common.h"
@@ -60,6 +61,10 @@ struct pvr_device {
    struct vk_device vk;
    struct pvr_instance *instance;
    struct pvr_physical_device *pdevice;
+
+   /* G9P: image blits and copies drawn by the GPU (vk_meta), see g9p_meta_blit() */
+   struct vk_meta_device meta;
+   bool meta_ready;
 
    struct pvr_winsys *ws;
    struct pvr_winsys_heaps heaps;

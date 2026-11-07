@@ -335,7 +335,20 @@ pvr_stage_mask(VkPipelineStageFlags2 stage_mask)
                      VK_PIPELINE_STAGE_2_BLIT_BIT |
                      VK_PIPELINE_STAGE_2_RESOLVE_BIT |
                      VK_PIPELINE_STAGE_2_CLEAR_BIT))
-      stages |= PVR_PIPELINE_STAGE_TRANSFER_BIT;
+      /*
+       * G9P draws image blits, copies and uploads as graphics jobs (vk_meta,
+       * pvr_arch_g9p_transfer.c): a transfer barrier orders those too. Without it a CPU
+       * readback after a GPU upload read the image before it was written. Only with those
+       * paths on (opt-in): otherwise every CPU copy waited for every graphics job.
+       */
+   {
+      static int gpu_transfers = -1;
+
+      if (gpu_transfers < 0)
+         gpu_transfers = getenv("G9P_GPU_BLIT") || getenv("G9P_GPU_UPLOAD");
+      stages |= PVR_PIPELINE_STAGE_TRANSFER_BIT |
+                (gpu_transfers ? PVR_PIPELINE_STAGE_GEOM_BIT | PVR_PIPELINE_STAGE_FRAG_BIT : 0);
+   }
 
    if (stage_mask & (VK_PIPELINE_STAGE_2_TRANSFORM_FEEDBACK_BIT_EXT))
       stages |= PVR_PIPELINE_STAGE_QUERY_BIT;

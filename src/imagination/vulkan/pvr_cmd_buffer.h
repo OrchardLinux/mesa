@@ -605,6 +605,10 @@ struct pvr_cmd_buffer {
 
    struct pvr_device *device;
 
+   /* G9P_TIME: CPU time spent recording draws, and how many */
+   uint64_t g9p_draw_ns;
+   uint32_t g9p_draw_count;
+
    /* Buffer usage flags */
    VkCommandBufferUsageFlags usage_flags;
 

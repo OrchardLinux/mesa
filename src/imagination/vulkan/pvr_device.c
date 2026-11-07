@@ -287,6 +287,9 @@ VkResult pvr_AllocateMemory(VkDevice _device,
        * If the import fails, we leave the file descriptor open.
        */
       close(fd_info->fd);
+      if (getenv("G9P_IMPLOG"))
+         fprintf(stderr, "g9pmem import %p bo %p size %" PRIu64 "\n", (void *)mem, (void *)mem->bo,
+                 mem->bo->size);
    } else {
       /* Align physical allocations to the page size of the heap that will be
        * used when binding device memory (see pvr_bind_memory()) to ensure the
@@ -395,6 +398,9 @@ void pvr_FreeMemory(VkDevice _device,
                                 VK_OBJECT_TYPE_DEVICE_MEMORY,
                                 (uintptr_t)mem, mem_type->heapIndex);
 
+   if (getenv("G9P_IMPLOG"))
+      fprintf(stderr, "g9pmem free %p bo %p size %" PRIu64 " imported %d mapped %d\n", (void *)mem,
+              (void *)mem->bo, mem->bo->size, mem->vk.import_handle_type != 0, mem->bo->map != NULL);
    /* From the Vulkan spec (§11.2.13. Freeing Device Memory):
     *   If a memory object is mapped at the time it is freed, it is implicitly
     *   unmapped.
@@ -557,12 +563,17 @@ VkResult pvr_bind_memory(struct pvr_device *device,
                                         virt_size,
                                         alignment,
                                         &vma);
-   if (result != VK_SUCCESS)
+   if (result != VK_SUCCESS) {
+      mesa_loge("pvr: no GPU address space for %" PRIu64 " bytes (alignment %" PRIu64 ")",
+                (uint64_t)virt_size, (uint64_t)alignment);
       goto err_out;
+   }
 
    result = device->ws->ops->vma_map(vma, mem->bo, offset, size, &dev_addr);
-   if (result != VK_SUCCESS)
+   if (result != VK_SUCCESS) {
+      mesa_loge("pvr: mapping %" PRIu64 " bytes into the GPU failed (%d)", (uint64_t)size, result);
       goto err_free_vma;
+   }
 
    *dev_addr_out = dev_addr;
    *vma_out = vma;
