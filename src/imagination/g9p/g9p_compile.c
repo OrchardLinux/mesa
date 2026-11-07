@@ -2643,6 +2643,66 @@ emit_intrinsic(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
       ctx->out->uses_workgroup_id = true;
       return true;
 
+   case nir_intrinsic_ssbo_atomic: {
+      /*
+       * Apple's device atomic (metal-tt, atomic_fetch_*_explicit): W0 8110 (add, sub, exchange),
+       * a110 (and, or, xor), 9110 (umin, imin, umax, imax), the variant in W1 bits 6-7; W1 the
+       * address pair (1 | pair << 2) << 8 and the result << 1, W2 8900 | a zero register << 1,
+       * W3 1102, W4 8000 | the data << 1; a wait after it
+       */
+      static const struct { nir_atomic_op op; uint16_t w0, v; } ops[] = {
+         { nir_atomic_op_iadd, 0x8110, 0 }, { nir_atomic_op_xchg, 0x8110, 2 },
+         { nir_atomic_op_iand, 0xa110, 0 }, { nir_atomic_op_ior, 0xa110, 1 },
+         { nir_atomic_op_ixor, 0xa110, 2 }, { nir_atomic_op_umin, 0x9110, 0 },
+         { nir_atomic_op_imin, 0x9110, 1 }, { nir_atomic_op_umax, 0x9110, 2 },
+         { nir_atomic_op_imax, 0x9110, 3 },
+      };
+      const nir_atomic_op op = nir_intrinsic_atomic_op(intr);
+      unsigned k = 0;
+
+      while (k < ARRAY_SIZE(ops) && ops[k].op != op)
+         k++;
+      if (ctx->stage != MESA_SHADER_COMPUTE || k == ARRAY_SIZE(ops) || intr->def.bit_size != 32) {
+         fprintf(stderr, "g9p: ssbo atomic %d in stage %d not supported yet\n", op, ctx->stage);
+         return false;
+      }
+      const int slot = buffer_slot(ctx, intr->src[0]);
+      int off = src_reg(ctx, nir_get_scalar(intr->src[1].ssa, 0));
+      int data = src_reg(ctx, nir_get_scalar(intr->src[2].ssa, 0));
+      int zero = const_reg(ctx, 0);
+
+      if (slot < 0 || off < 0 || data < 0 || zero < 0)
+         return false;
+      off = low_reg(ctx, off);
+      data = low_reg(ctx, data);
+      zero = low_reg(ctx, zero);
+      const int pair = alloc_pair(ctx);
+
+      if (off < 0 || data < 0 || zero < 0 || pair < 0)
+         return false;
+      ctx->temps |= BITFIELD64_RANGE(pair, 2);
+      g9p_addr(ctx->c, pair, 2 * slot, off, 0, false);
+      const int dst = alloc_low_temp(ctx);
+
+      if (dst < 0)
+         return false;
+      G9P_EMIT(ctx->c, ops[k].w0, (1 | pair << 2) << 8 | ops[k].v << 6 | dst << 1, 0x8900 | zero << 1,
+               0x1102, 0x8000 | data << 1);
+      g9p_wait(ctx->c);
+      release(ctx, &intr->instr);
+      {
+         const int r = alloc_reg(ctx);
+
+         if (r < 0)
+            return false;
+         g9p_alu2(ctx->c, G9P_OR, r, dst, dst, false);
+         ctx->reg[key(&intr->def, 0)] = r;
+      }
+      ctx->busy &= ~ctx->temps;
+      ctx->temps = 0;
+      return true;
+   }
+
    case nir_intrinsic_load_num_workgroups: {
       /* common-store dwords the dispatch fills (pvr_arch_g9p.c): x, y in one slot, z in another */
       const int xy = g9p_buffer_slot(ctx->out, G9P_NUM_WORKGROUPS, 0);
