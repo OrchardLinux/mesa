@@ -185,12 +185,23 @@ ds_plane(const struct surface *s, bool depth)
 }
 
 /* One aspect: the format pack functions have no depth/stencil conversions */
+static void copy_samples(const struct pvr_rect_mapping *m, const struct surface *src, const struct surface *dst);
+
 static void
 copy_ds_aspect(const struct pvr_rect_mapping *m, const struct surface *src,
                const struct surface *dst, bool depth)
 {
    const struct surface sp = ds_plane(src, depth), dp = ds_plane(dst, depth);
 
+   /* samples to resolve or scale: the plane's own format through copy_samples() */
+   if (src->samples != 1 || dst->samples != 1) {
+      struct surface a = sp, b = dp;
+
+      if (src->format == PIPE_FORMAT_Z32_FLOAT_S8X24_UINT)
+         a.format = b.format = depth ? PIPE_FORMAT_Z32_FLOAT : PIPE_FORMAT_S8_UINT;
+      copy_samples(m, &a, &b);
+      return;
+   }
    for (unsigned y = 0; y < m->dst_rect.extent.height; y++) {
       uint8_t *d = dp.base + row_offset(&dp, m->dst_rect.offset.y + y);
       const uint8_t *s = sp.base + row_offset(&sp, m->src_rect.offset.y + y);
