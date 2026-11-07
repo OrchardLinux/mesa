@@ -968,9 +968,13 @@ g9p_compile_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo 
          slot = MIN2(g9p_frag_coord_slot(vs_nir) + last_with_w, G9P_MAX_VARYINGS - 1);
       }
       /* Four samples with a coverage: the fragment program writes it (Zink: static state) */
+      /* only a pipeline that drops samples writes its coverage: that takes punch-through */
       const struct g9p_coverage coverage = { true };
       const struct g9p_coverage *coverage_ptr =
-         vk_state->ms && vk_state->ms->rasterization_samples == VK_SAMPLE_COUNT_4_BIT ? &coverage : NULL;
+         vk_state->ms && vk_state->ms->rasterization_samples == VK_SAMPLE_COUNT_4_BIT &&
+               ((vk_state->ms->sample_mask & 0xf) != 0xf || vk_state->ms->alpha_to_coverage_enable)
+            ? &coverage
+            : NULL;
       struct g9p_target targets[G9P_MAX_TARGETS] = { 0 };
 
       for (unsigned t = 0; vk_state->rp && t < MIN2(vk_state->rp->color_attachment_count, G9P_MAX_TARGETS); t++) {
@@ -2360,7 +2364,7 @@ emit_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state
                 /*
                  * Triangle merging off for samples iterated straight to the sampler: their
                  * gradients come from the triangle's own plane, and a neighbour's has
-                 * another when W varies (dEQP texture.mipmap.2d.projected). Computed
+                 * another when W varies (dEQP texture.mipmap.2d.projected, samplers). Computed
                  * coordinates and derivatives take their neighbours from helper pixels,
                  * which want merging (texture.units, shaders.derivate.*.texture). Rogue
                  * disables it for lines too.
