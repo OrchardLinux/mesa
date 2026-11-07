@@ -50,6 +50,12 @@ g9p_num_regs(void)
    return e ? MIN2(atoi(e), 63) : 30;
 }
 #define G9P_NUM_REGS g9p_num_regs()
+/*
+ * Registers for values: vertex shaders keep the mask stack in r15 (compile_back()), so
+ * r30-r31 hold values too there (G9P_REGS still overrides, for tests)
+ */
+#define VALUE_REGS(ctx) ((ctx)->stage == MESA_SHADER_VERTEX && (ctx)->st == 15 && !getenv("G9P_REGS") \
+                            ? 32u : G9P_NUM_REGS)
 #define G9P_MAX_LOOPS 64
 /* nir_tex_instr.backend_flags: a seamful cube's gradients, for the hardware */
 #define G9P_TEX_NATIVE_GRADIENTS 1
@@ -175,6 +181,7 @@ struct g9p_ctx {
    bool oom;          /* the last generate() ran out of registers */
    unsigned oom_ip;
 
+   nir_instr *cur_instr; /* the instruction being emitted (evict_low()) */
    uint64_t busy;   /* registers in use */
    uint64_t pinned; /* NIR registers: never released */
    uint64_t temps;  /* released after the current instruction */
@@ -288,7 +295,7 @@ alloc_reg(struct g9p_ctx *ctx)
     * r7-r14, stay free for what reaches r15 only (one_src(), alloc_pair()).
     */
    if (ctx->reserve_low && ctx->reserve_low != G9P_RESERVE_LOW_PAIR) {
-      for (unsigned r = 16; r < G9P_NUM_REGS; r++) {
+      for (unsigned r = 16; r < VALUE_REGS(ctx); r++) {
          if (!(ctx->busy & BITFIELD64_BIT(r))) {
             ctx->busy |= BITFIELD64_BIT(r);
             ctx->max_reg = MAX2(ctx->max_reg, r);
@@ -296,7 +303,7 @@ alloc_reg(struct g9p_ctx *ctx)
          }
       }
    }
-   for (unsigned r = 0; r < G9P_NUM_REGS; r++) {
+   for (unsigned r = 0; r < VALUE_REGS(ctx); r++) {
       if (ctx->reserve_low == G9P_RESERVE_LOW_PAIR ? (r >= 12 && r <= 14)
           : ctx->reserve_low && r >= (ctx->reserve_low > 1 ? 7 : 11) && r <= 14)
          continue;
@@ -310,12 +317,110 @@ alloc_reg(struct g9p_ctx *ctx)
    return -1;
 }
 
+static bool
+reads_def(nir_src *src, void *data)
+{
+   return src->ssa != data;
+}
+
+/*
+ * Make r@lo..r@lo+@n-1 free for something that must lie below r16 by moving the values
+ * there to free registers above r15 (OR reaches every register). Only values needed later,
+ * not read by the instruction being emitted, not pinned (a NIR register keeps its register
+ * across loops) and not temporaries. Instead of reserving low registers for the whole
+ * shader, which pushed small vertex shaders' values up to r29 (vertex tasks hold fewer
+ * vertices the more registers a shader uses).
+ */
+static bool
+evict_low(struct g9p_ctx *ctx, unsigned lo, unsigned n)
+{
+   uint64_t high_free = ~ctx->busy & BITFIELD64_RANGE(16, VALUE_REGS(ctx) - 16);
+   int keys[16];
+
+   if (ctx->c->fragment || lo + n > 16 || getenv("G9P_NO_EVICT"))
+      return false;
+   /* every register in the window: free, or one live value that can move */
+   for (unsigned r = lo; r < lo + n; r++) {
+      keys[r - lo] = -1;
+      if (!(ctx->busy & BITFIELD64_BIT(r)))
+         continue;
+      if ((ctx->pinned | ctx->temps) & BITFIELD64_BIT(r))
+         return false;
+      for (unsigned k = 0; k < ctx->num_keys; k++) {
+         if (ctx->reg[k] == (int)r && ctx->last_use[k] > ctx->ip) {
+            keys[r - lo] = k;
+            break;
+         }
+      }
+      if (keys[r - lo] < 0)
+         return false;
+      /* the value's def: a source of the current instruction stays */
+      nir_def *def = NULL;
+      nir_foreach_block(block, nir_cf_node_get_function(&ctx->cur_instr->block->cf_node)) {
+         nir_foreach_instr(instr, block) {
+            nir_def *d = nir_instr_def(instr);
+
+            if (d && d->index == (unsigned)keys[r - lo] / 4)
+               def = d;
+         }
+      }
+      /*
+       * Only a value of the current block: code already emitted for a loop's next round
+       * or an if's other branch expects one defined outside in its old register (dEQP
+       * indexing.tmp_array vertex cases failed and hung)
+       */
+      if (!def || nir_def_instr(def)->block != ctx->cur_instr->block ||
+          !nir_foreach_src(ctx->cur_instr, reads_def, def))
+         return false;
+      if (!high_free)
+         return false;
+      high_free &= high_free - 1;
+   }
+   high_free = ~ctx->busy & BITFIELD64_RANGE(16, VALUE_REGS(ctx) - 16);
+   for (unsigned r = lo; r < lo + n; r++) {
+      if (keys[r - lo] < 0)
+         continue;
+      const unsigned h = ffsll(high_free) - 1;
+
+      high_free &= ~BITFIELD64_BIT(h);
+      g9p_alu2(ctx->c, G9P_OR, h, r, r, false);
+      for (unsigned k = 0; k < ctx->num_keys; k++) {
+         if (ctx->reg[k] == (int)r && ctx->last_use[k] > ctx->ip)
+            ctx->reg[k] = h;
+      }
+      ctx->busy = (ctx->busy & ~BITFIELD64_BIT(r)) | BITFIELD64_BIT(h);
+      ctx->max_reg = MAX2(ctx->max_reg, h);
+   }
+   return true;
+}
+
+/* A window of @n registers below r16 made free by evict_low(), or -1 */
+static int
+evict_low_window(struct g9p_ctx *ctx, unsigned n)
+{
+   for (int r = 16 - n; r >= 0; r--) {
+      if (evict_low(ctx, r, n))
+         return r;
+   }
+   return -1;
+}
+
 /* A scratch register for an address index: its operand reaches r15 only too */
 static int
 alloc_low_temp(struct g9p_ctx *ctx)
 {
    for (unsigned r = 0; r < MIN2(16, G9P_NUM_REGS); r++) {
       if (!(ctx->busy & BITFIELD64_BIT(r))) {
+         ctx->busy |= BITFIELD64_BIT(r);
+         ctx->temps |= BITFIELD64_BIT(r);
+         ctx->max_reg = MAX2(ctx->max_reg, r);
+         return r;
+      }
+   }
+   {
+      const int r = evict_low_window(ctx, 1);
+
+      if (r >= 0) {
          ctx->busy |= BITFIELD64_BIT(r);
          ctx->temps |= BITFIELD64_BIT(r);
          ctx->max_reg = MAX2(ctx->max_reg, r);
@@ -332,6 +437,15 @@ alloc_low_range(struct g9p_ctx *ctx, unsigned n)
 {
    for (unsigned r = 0; r + n <= MIN2(16, G9P_NUM_REGS); r++) {
       if (!(ctx->busy & BITFIELD64_RANGE(r, n))) {
+         ctx->busy |= BITFIELD64_RANGE(r, n);
+         ctx->max_reg = MAX2(ctx->max_reg, r + n - 1);
+         return r;
+      }
+   }
+   {
+      const int r = evict_low_window(ctx, n);
+
+      if (r >= 0) {
          ctx->busy |= BITFIELD64_RANGE(r, n);
          ctx->max_reg = MAX2(ctx->max_reg, r + n - 1);
          return r;
@@ -380,6 +494,15 @@ alloc_pair(struct g9p_ctx *ctx)
          return r;
       }
    }
+   {
+      const int r = evict_low_window(ctx, 2);
+
+      if (r >= 0) {
+         ctx->busy |= BITFIELD64_RANGE(r, 2);
+         ctx->max_reg = MAX2(ctx->max_reg, r + 1);
+         return r;
+      }
+   }
    dump_busy(ctx);
    return -1;
 }
@@ -388,7 +511,7 @@ alloc_pair(struct g9p_ctx *ctx)
 static int
 alloc_range(struct g9p_ctx *ctx, unsigned n)
 {
-   for (unsigned r = 0; r + n <= G9P_NUM_REGS; r++) {
+   for (unsigned r = 0; r + n <= VALUE_REGS(ctx); r++) {
       if (!(ctx->busy & BITFIELD64_RANGE(r, n))) {
          ctx->busy |= BITFIELD64_RANGE(r, n);
          ctx->max_reg = MAX2(ctx->max_reg, r + n - 1);
@@ -1928,7 +2051,7 @@ emit_fb_fetch(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
    if (total > 4)
       total = (total + 1) & ~1u;
    release(ctx, &intr->instr);
-   for (unsigned r = 0; r + total <= G9P_NUM_REGS; r += 2) {
+   for (unsigned r = 0; r + total <= VALUE_REGS(ctx); r += 2) {
       if (!(ctx->busy & BITFIELD64_RANGE(r, total))) {
          pair = r;
          break;
@@ -3329,6 +3452,7 @@ emit_cf_list(struct g9p_ctx *ctx, struct exec_list *list)
                    nir_reg(ctx, ctx->decls[d]) < 0)
                   return false;
             }
+            ctx->cur_instr = instr;
             if (!emit_instr(ctx, instr)) {
                if (getenv("G9P_DEBUG") || !ctx->oom) {
                   fprintf(stderr, "g9p: cannot compile: ");
@@ -4447,6 +4571,42 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
    ctx.loop_index = 0;
    walk_liveness(&ctx, &impl->body, true);
 
+   /* G9P_PRESSURE: the most scalars live at once, from the liveness above */
+   if (getenv("G9P_PRESSURE")) {
+      unsigned *delta = rzalloc_array(mem_ctx, unsigned, ctx.ip + 2), *dec = rzalloc_array(mem_ctx, unsigned, ctx.ip + 2);
+      unsigned live = 0, peak = 0, peak_ip = 0, decls = 0;
+
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            nir_def *def = nir_instr_def(instr);
+
+            if (!def || instr->type == nir_instr_type_load_const || instr->type == nir_instr_type_undef)
+               continue;
+            const bool is_decl = nir_def_is_intrinsic(def) &&
+                                 nir_def_as_intrinsic(def)->intrinsic == nir_intrinsic_decl_reg;
+
+            for (unsigned c = 0; c < def->num_components; c++) {
+               const unsigned k = key(def, c);
+               const unsigned start = is_decl ? ctx.reg_first[def->index] : ctx.def_ip[def->index];
+
+               if (!ctx.last_use[k] || start == UINT_MAX || ctx.last_use[k] < start || ctx.last_use[k] > ctx.ip)
+                  continue;
+               delta[start]++;
+               dec[ctx.last_use[k] + 1]++;
+               decls += is_decl;
+            }
+         }
+      }
+      for (unsigned i = 0; i <= ctx.ip; i++) {
+         live += delta[i];
+         live -= MIN2(live, dec[i]);
+         if (live > peak)
+            peak = live, peak_ip = i;
+      }
+      fprintf(stderr, "g9p: pressure peak %u at instruction %u of %u (%u NIR register scalars)\n",
+              peak, peak_ip, ctx.ip, decls);
+   }
+
    /*
     * Twice: to find the register count, then with the mask stack after it.
     * Fragment shaders that run out of registers park the NIR register live
@@ -4467,7 +4627,7 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
    unsigned stuck = 0, last_oom_ip = UINT_MAX;
 
    if (stage == MESA_SHADER_VERTEX && !getenv("G9P_OLD_VS_ALLOC")) {
-      ctx.reserve_low = G9P_RESERVE_LOW_PAIR;
+      ctx.reserve_low = getenv("G9P_NO_EVICT") ? G9P_RESERVE_LOW_PAIR : 0;
       ctx.reserve_st_low = true;
    }
 
