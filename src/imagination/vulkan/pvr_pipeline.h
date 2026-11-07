@@ -188,6 +188,12 @@ struct pvr_g9p_graphics_state {
    } textures[16]; /* G9P_MAX_TEXTURES */
    /* the vertex shader's, and the size of its common store in dwords */
    unsigned vs_num_textures, vs_common_dwords;
+   /*
+    * the part of it the draw's first DMA fills (addresses, textures), then per buffer the
+    * dwords copied to g9p_vs_buf_base() onwards and their sum
+    */
+   unsigned vs_block_dwords, vs_uniform_dwords;
+   uint16_t vs_buf_dwords[40]; /* G9P_MAX_BUFFERS */
    /* transform feedback: the vertex shader also stores what it captures */
    bool has_xfb;
    /* the fragment shader writes gl_FragDepth */

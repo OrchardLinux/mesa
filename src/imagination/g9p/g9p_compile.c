@@ -1533,6 +1533,35 @@ emit_mem(struct g9p_ctx *ctx, nir_intrinsic_instr *intr, int slot, nir_scalar of
       return true;
    }
 
+   /*
+    * Vertex shaders: a buffer dword at a constant offset from the common store
+    * (g9p_vs_buf_base()): the draw copies it there. A memory load waits for its data, and the
+    * aquarium's fish shader made 265 of them per vertex.
+    */
+   if (ctx->stage == MESA_SHADER_VERTEX && !value && nir_scalar_is_const(offset) &&
+       !getenv("G9P_NO_VS_UNIFORMS")) {
+      const unsigned byte = base + nir_scalar_as_uint(offset);
+      unsigned before = 0;
+
+      for (int k = 0; k < slot; k++)
+         before += ctx->prev_dwords[k];
+      const unsigned vs_base = g9p_vs_buf_base(ctx->tex_total);
+
+      if (!(byte % 4) && before + byte / 4 < G9P_VS_BUF_DWORDS &&
+          vs_base + before + byte / 4 < G9P_VS_UNIFORM_LIMIT) {
+         const int zero = const_reg(ctx, 0);
+
+         ctx->out->buffers[slot].dwords = MAX2(ctx->out->buffers[slot].dwords, byte / 4 + 1);
+         release(ctx, &intr->instr);
+         data = alloc_reg(ctx);
+         if (zero < 0 || data < 0)
+            return false;
+         g9p_mov_uniform(ctx->c, data, vs_base + before + byte / 4, zero);
+         ctx->reg[key(&intr->def, 0)] = data;
+         return true;
+      }
+   }
+
    off = src_reg(ctx, offset);
    if (off < 0)
       return false;
@@ -4721,6 +4750,17 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
     * job). Reserved in the second pass.
     */
    if (stage == MESA_SHADER_VERTEX && ctx.reserve_st_low) {
+      st = MAX2(ctx.max_reg, 15);
+      /*
+       * Uniform dwords placed by the buffers' sizes of the pass before
+       * (g9p_vs_buf_base()): once more when this pass changed them
+       */
+      bool changed = false;
+
+      for (unsigned k = 0; k < ctx.out->num_buffers; k++)
+         changed |= ctx.out->buffers[k].dwords != ctx.prev_dwords[k];
+      if (changed && !generate(&ctx, impl, 15))
+         return false;
       st = MAX2(ctx.max_reg, 15);
    } else if (stage == MESA_SHADER_VERTEX && st > 15) {
       ctx.reserve_st_low = true;

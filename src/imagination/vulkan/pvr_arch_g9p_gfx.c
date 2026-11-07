@@ -1143,6 +1143,14 @@ g9p_compile_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo 
    state->vs_common_dwords = vs.num_textures
                                 ? g9p_tex_sampler(G9P_VS_TEX_BASE, vs.num_textures, vs.num_textures)
                                 : 2 * vs.num_buffers;
+   state->vs_block_dwords = state->vs_common_dwords;
+   state->vs_uniform_dwords = 0;
+   for (unsigned k = 0; k < vs.num_buffers; k++) {
+      state->vs_buf_dwords[k] = vs.buffers[k].dwords;
+      state->vs_uniform_dwords += vs.buffers[k].dwords;
+   }
+   if (state->vs_uniform_dwords)
+      state->vs_common_dwords = g9p_vs_buf_base(vs.num_textures) + state->vs_uniform_dwords;
    for (unsigned i = 0; i < vs.num_textures; i++) {
       state->vs_textures[i].set = vs.textures[i].set;
       state->vs_textures[i].binding = vs.textures[i].binding;
@@ -1167,6 +1175,10 @@ g9p_compile_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo 
    state->vs_point_size = point_size;
    state->uses_discard = fs.uses_discard;
    state->writes_depth = fs.writes_depth;
+   if (getenv("G9P_PASSLOG"))
+      fprintf(stderr, "g9p: pipeline %u: fbfetch %d native_blend %d discard %d depth %d coverage %d, fs %u regs, vs %u regs\n",
+              state->id, fs.uses_fbfetch, fs.native_blend, fs.uses_discard, fs.writes_depth,
+              fs.writes_coverage, fs.num_regs, vs.num_regs);
    state->uses_derivatives = fs.uses_derivatives;
    state->straight_samples = fs.straight_samples;
    state->writes_coverage = fs.writes_coverage;
@@ -1859,7 +1871,7 @@ upload_vs_uniforms(struct pvr_cmd_buffer *cmd_buffer,
 {
    unsigned sets[G9P_MAX_BUFFERS][2];
    uint32_t data[4];
-   uint64_t addr;
+   uint64_t addr, vs_addrs[G9P_MAX_BUFFERS] = { 0 };
    VkResult result;
 
    for (unsigned k = 0; k < state->num_buffers; k++) {
@@ -1878,6 +1890,7 @@ upload_vs_uniforms(struct pvr_cmd_buffer *cmd_buffer,
       if (result != VK_SUCCESS)
          return result;
       memcpy(block, addrs, 8 * state->num_buffers);
+      memcpy(vs_addrs, addrs, 8 * state->num_buffers);
       for (unsigned t = 0; t < state->vs_num_textures; t++) {
          const struct pvr_descriptor_set *set = desc->sets[state->vs_textures[t].set];
 
@@ -1899,7 +1912,20 @@ upload_vs_uniforms(struct pvr_cmd_buffer *cmd_buffer,
          }
       }
       result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, block,
-                                                  4 * state->vs_common_dwords, &bo);
+                                                  4 * state->vs_block_dwords, &bo);
+      if (result != VK_SUCCESS)
+         return result;
+      addr = bo->dev_addr.addr;
+      *block_map = pvr_bo_suballoc_get_map_addr(bo);
+   } else if (state->vs_uniform_dwords) {
+      struct pvr_suballoc_bo *bo;
+
+      result = buffer_addrs(cmd_buffer, state->num_buffers, sets,
+                            PVR_STAGE_ALLOCATION_VERTEX_GEOMETRY, vs_addrs);
+      if (result != VK_SUCCESS)
+         return result;
+      result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, vs_addrs,
+                                                  MAX2(8 * state->num_buffers, 8), &bo);
       if (result != VK_SUCCESS)
          return result;
       addr = bo->dev_addr.addr;
@@ -1910,12 +1936,59 @@ upload_vs_uniforms(struct pvr_cmd_buffer *cmd_buffer,
       if (result != VK_SUCCESS)
          return result;
    }
-   data[0] = addr;
-   data[1] = addr >> 32;
-   data[2] = doutd_ctrl(0, MAX2(state->vs_common_dwords, 2), true);
-   data[3] = 0;
-   return pvr_arch_cmd_buffer_upload_pds(cmd_buffer, data, ARRAY_SIZE(data), 16, NULL, 0,
-                                         0, 64, dma);
+   if (!state->vs_uniform_dwords) {
+      data[0] = addr;
+      data[1] = addr >> 32;
+      data[2] = doutd_ctrl(0, MAX2(state->vs_common_dwords, 2), true);
+      data[3] = 0;
+      return pvr_arch_cmd_buffer_upload_pds(cmd_buffer, data, ARRAY_SIZE(data), 16, NULL, 0,
+                                            0, 64, dma);
+   }
+
+   /*
+    * With uniform dwords: one DOUTD for the address block, then one per buffer copying its
+    * first dwords to g9p_vs_buf_base() onwards, in a program of the draw's own (as the
+    * fragment shader's, upload_textures())
+    */
+   uint64_t src[1 + G9P_MAX_BUFFERS + G9P_VS_BUF_DWORDS / 8];
+   uint32_t ctrl[1 + G9P_MAX_BUFFERS + G9P_VS_BUF_DWORDS / 8];
+   uint32_t pds_data[3 * (1 + G9P_MAX_BUFFERS + G9P_VS_BUF_DWORDS / 8) + 4] = { 0 };
+   uint32_t code[2 + G9P_MAX_BUFFERS + G9P_VS_BUF_DWORDS / 8];
+   unsigned n = 0, nc = 0, dest = g9p_vs_buf_base(state->vs_num_textures);
+
+   src[n] = addr;
+   ctrl[n++] = doutd_ctrl(0, MAX2(state->vs_block_dwords, 2), false);
+   for (unsigned k = 0; k < state->num_buffers; k++) {
+      if (!state->vs_buf_dwords[k])
+         continue;
+      /* in chunks: one DOUTD of 129 dwords left the vertex uniforms wrong (dEQP ubo) */
+      const unsigned chunk = getenv("G9P_VS_DMA_CHUNK") ? atoi(getenv("G9P_VS_DMA_CHUNK")) : 64;
+
+      for (unsigned d = 0; vs_addrs[k] && d < state->vs_buf_dwords[k]; d += chunk) {
+         src[n] = vs_addrs[k] + 4 * d;
+         ctrl[n++] = doutd_ctrl(dest + d, MIN2(chunk, state->vs_buf_dwords[k] - d), false);
+      }
+      dest += state->vs_buf_dwords[k];
+   }
+   ctrl[n - 1] |= BITFIELD_BIT(31);
+   if (getenv("G9P_VSU_LOG")) {
+      fprintf(stderr, "g9p: vs uniforms pipeline %u: %u buffers, block %u dwords:", state->id,
+              state->num_buffers, state->vs_block_dwords);
+      for (unsigned k = 0; k < state->num_buffers; k++)
+         fprintf(stderr, " [%u set %x b %u: %u dw @%" PRIx64 "]", k, state->buffers[k].set,
+                 state->buffers[k].binding, state->vs_buf_dwords[k], vs_addrs[k]);
+      fprintf(stderr, "\n");
+   }
+   for (unsigned i = 0; i < n; i++) {
+      pds_data[2 * i] = src[i];
+      pds_data[2 * i + 1] = src[i] >> 32;
+      pds_data[2 * n + i] = ctrl[i];
+      code[nc++] = g9p_pds_dout(G9P_DOUTD, i, G9P_PDS_DATA, 2 * n + i,
+                                i + 1 == n ? G9P_PDS_END : 0);
+   }
+   code[nc++] = g9p_pds_halt();
+   return pvr_arch_cmd_buffer_upload_pds(cmd_buffer, pds_data, ALIGN_POT(3 * n, 4), 16, code, nc,
+                                         16, 64, dma);
 }
 
 /*
@@ -2646,9 +2719,13 @@ emit_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state
       s0.usc_common_size = MAX2(DIV_ROUND_UP(4 * state->vs_common_dwords, 16), 2);
       s0.pds_data_size = DIV_ROUND_UP(PVR_DW_TO_BYTES(dma->data_size),
                                       ROGUE_VDMCTRL_PDS_STATE0_PDS_DATA_SIZE_UNIT_SIZE);
+      if (getenv("G9P_VS_DMA_UNITS"))
+         s0.pds_data_size = atoi(getenv("G9P_VS_DMA_UNITS"));
    }
    {
-      const uint32_t w[2] = { dma->data_offset, p->dma.code_offset };
+      /* a draw with vertex uniforms has its own DMA program (upload_vs_uniforms()) */
+      const uint32_t w[2] = { dma->data_offset,
+                              state->vs_uniform_dwords ? dma->code_offset : p->dma.code_offset };
 
       emit_words(csb, w, 2);
    }

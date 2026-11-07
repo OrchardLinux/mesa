@@ -43,6 +43,15 @@
  * fragment code does).
  */
 #define G9P_VS_TEX_BASE (2 * G9P_MAX_BUFFERS)
+/*
+ * Vertex shaders: the first dwords of each buffer they read at constant offsets, copied into
+ * the common store per draw from g9p_vs_buf_base() (the buffers in slot order,
+ * buffers[k].dwords each) and read as uniform operands instead of a memory load and a wait
+ * each
+ */
+#define G9P_VS_BUF_DWORDS 256
+/* uniform operands of vertex code reach dword 255 (dEQP ubo: from 240 on they read wrong) */
+#define G9P_VS_UNIFORM_LIMIT 256
 #define G9P_FS_BUF_DWORDS 512
 #define G9P_MAX_FS_RUNS 64
 /* The DMAs a fragment shader's textures take: three each, or one table for many */
@@ -59,6 +68,14 @@ static inline unsigned
 g9p_tex_sampler(unsigned base, unsigned n, unsigned t)
 {
    return base + 8 * n + 2 * t;
+}
+
+/* Where a vertex shader with @num_textures textures has its uniform dwords (G9P_VS_BUF_DWORDS) */
+static inline unsigned
+g9p_vs_buf_base(unsigned num_textures)
+{
+   return num_textures ? g9p_tex_sampler(G9P_VS_TEX_BASE, num_textures, num_textures)
+                       : G9P_VS_TEX_BASE;
 }
 
 static inline unsigned
