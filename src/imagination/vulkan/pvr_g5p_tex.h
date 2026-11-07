@@ -3,8 +3,8 @@
  * Apple's A9 GPU (G5P): image-view texture state and sampler words for the
  * pvr_* descriptors. Built only with -Dimagination-g5p-experimental=true.
  *
- * The shape follows G9P's g9p_pack_image_view()/g9p_pack_sampler() (Henrik
- * Klee, pvr_arch_g9p_gfx.c): upstream's image, view and sampler objects,
+ * The shape follows G9P's g9p_pack_image_view()/g9p_pack_sampler() (the
+ * G9P driver, pvr_arch_g9p_gfx.c): upstream's image, view and sampler objects,
  * with the hardware-facing words replaced by a G5P branch at their call
  * sites. The words themselves are pvr_g5p_tex_encode.h's (included by
  * pvr_arch_g5p_tex.c only: this header is reached from every shared file
