@@ -188,6 +188,12 @@ struct g9p_ctx {
    unsigned oom_ip;
 
    nir_instr *cur_instr; /* the instruction being emitted (evict_low()) */
+   /*
+    * Attribute loads in flight: their data registers and address pairs, until one wait
+    * (flush_loads()) before the first read of any of them, a non-ALU instruction or control
+    * flow. A wait after each load kept every vertex's loads one after another.
+    */
+   uint64_t pending_regs, pending_pairs;
    uint64_t busy;   /* registers in use */
    uint64_t pinned; /* NIR registers: never released */
    uint64_t temps;  /* released after the current instruction */
@@ -283,6 +289,16 @@ dump_busy(struct g9p_ctx *ctx)
       fprintf(stderr, "  r%d: store offset, data r%d\n", ctx->vs_stores[i].off, ctx->vs_stores[i].data);
 }
 
+static void
+flush_loads(struct g9p_ctx *ctx)
+{
+   if (!ctx->pending_regs && !ctx->pending_pairs)
+      return;
+   g9p_wait(ctx->c);
+   ctx->busy &= ~ctx->pending_pairs;
+   ctx->pending_regs = ctx->pending_pairs = 0;
+}
+
 /*
  * Vertex shaders' first attempt: only r12-r14 kept free for what must lie below r16 (an
  * address pair and a one-source operand's copy), values packed from r0 up. The retries
@@ -319,8 +335,26 @@ alloc_reg(struct g9p_ctx *ctx)
          return r;
       }
    }
+   if (ctx->pending_pairs) {
+      flush_loads(ctx);
+      return alloc_reg(ctx);
+   }
    dump_busy(ctx);
    return -1;
+}
+
+static bool
+src_not_pending(nir_src *src, void *data)
+{
+   struct g9p_ctx *ctx = data;
+
+   for (unsigned c = 0; c < src->ssa->num_components; c++) {
+      const int r = ctx->reg[key(src->ssa, c)];
+
+      if (r >= 0 && (ctx->pending_regs & BITFIELD64_BIT(r)))
+         return false;
+   }
+   return true;
 }
 
 static bool
@@ -345,6 +379,8 @@ evict_low(struct g9p_ctx *ctx, unsigned lo, unsigned n)
 
    if (ctx->c->fragment || lo + n > 16 || getenv("G9P_NO_EVICT"))
       return false;
+   if (ctx->pending_regs & BITFIELD64_RANGE(lo, n))
+      flush_loads(ctx);
    /* every register in the window: free, or one live value that can move */
    for (unsigned r = lo; r < lo + n; r++) {
       keys[r - lo] = -1;
@@ -423,6 +459,10 @@ alloc_low_temp(struct g9p_ctx *ctx)
          return r;
       }
    }
+   if (ctx->pending_pairs) {
+      flush_loads(ctx);
+      return alloc_low_temp(ctx);
+   }
    {
       const int r = evict_low_window(ctx, 1);
 
@@ -447,6 +487,10 @@ alloc_low_range(struct g9p_ctx *ctx, unsigned n)
          ctx->max_reg = MAX2(ctx->max_reg, r + n - 1);
          return r;
       }
+   }
+   if (ctx->pending_pairs) {
+      flush_loads(ctx);
+      return alloc_low_range(ctx, n);
    }
    {
       const int r = evict_low_window(ctx, n);
@@ -499,6 +543,10 @@ alloc_pair(struct g9p_ctx *ctx)
          ctx->max_reg = MAX2(ctx->max_reg, r + 1);
          return r;
       }
+   }
+   if (ctx->pending_pairs) {
+      flush_loads(ctx);
+      return alloc_pair(ctx);
    }
    {
       const int r = evict_low_window(ctx, 2);
@@ -651,6 +699,8 @@ park_def(nir_def *def, void *data)
 
       if (ctx->home[k] < 0 || r < 0 || (ctx->pinned & BITFIELD64_BIT(r)))
          continue;
+      if (ctx->pending_regs & BITFIELD64_BIT(r))
+         flush_loads(ctx);
       g9p_mov_to_high(ctx->c, ctx->home[k], r);
       ctx->busy &= ~BITFIELD64_BIT(r);
       ctx->reg[k] = -1;
@@ -1742,10 +1792,16 @@ emit_attrib_load(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
    if (data < 0)
       return false;
    g9p_mem_at(ctx->c, false, G9P_SIZE_U32, data, pair);
-   g9p_wait(ctx->c);
-   ctx->busy &= ~BITFIELD64_RANGE(pair, 2);
    ctx->busy |= BITFIELD64_BIT(data);
    ctx->reg[key(&intr->def, 0)] = data;
+   if (!getenv("G9P_NO_DEFER_LOADS")) {
+      /* waited for before its first read (flush_loads()); the pair stays busy until then */
+      ctx->pending_regs |= BITFIELD64_BIT(data);
+      ctx->pending_pairs |= BITFIELD64_RANGE(pair, 2);
+      return true;
+   }
+   g9p_wait(ctx->c);
+   ctx->busy &= ~BITFIELD64_RANGE(pair, 2);
    return true;
 }
 
@@ -3545,6 +3601,19 @@ emit_cf_list(struct g9p_ctx *ctx, struct exec_list *list)
                   return false;
             }
             ctx->cur_instr = instr;
+            /*
+             * Attribute loads in flight: waited for before an instruction reading one, and
+             * before anything but ALU ops and more attribute loads
+             */
+            if (ctx->pending_regs) {
+               const bool attrib = instr->type == nir_instr_type_intrinsic &&
+                  (nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_load_input ||
+                   nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_load_per_vertex_input);
+
+               if ((instr->type != nir_instr_type_alu && !attrib) ||
+                   !nir_foreach_src(instr, src_not_pending, ctx))
+                  flush_loads(ctx);
+            }
             if (!emit_instr(ctx, instr)) {
                if (getenv("G9P_DEBUG") || !ctx->oom) {
                   fprintf(stderr, "g9p: cannot compile: ");
@@ -3558,10 +3627,12 @@ emit_cf_list(struct g9p_ctx *ctx, struct exec_list *list)
          break;
       case nir_cf_node_if:
          ctx->ip++;
+         flush_loads(ctx);
          if (!emit_if(ctx, nir_cf_node_as_if(node)))
             return false;
          break;
       case nir_cf_node_loop:
+         flush_loads(ctx);
          if (!emit_loop(ctx, nir_cf_node_as_loop(node)))
             return false;
          break;
@@ -3606,6 +3677,7 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
    ctx->out->uses_discard = false;
    ctx->num_exit_jumps = 0;
    ctx->num_outputs = 0;
+   ctx->pending_regs = ctx->pending_pairs = 0;
    ctx->psize_reg = -1;
    for (unsigned i = 0; i < 4 * G9P_MAX_TARGETS; i++)
       ctx->colour[i] = -1;
@@ -3650,6 +3722,7 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
    ctx->num_frag_samples = 0;
    if (!emit_cf_list(ctx, &impl->body))
       return false;
+   flush_loads(ctx);
    if (ctx->c->fragment)
       helper_samples_end(ctx);
 
