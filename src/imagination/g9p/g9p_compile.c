@@ -204,7 +204,8 @@ struct g9p_ctx {
    unsigned prev_dwords[G9P_MAX_BUFFERS];
    BITSET_DECLARE(fs_used[G9P_MAX_BUFFERS], G9P_FS_BUF_DWORDS);
    uint16_t *fs_map;
-   bool flush_outputs;  /* vertex outputs written at once, for shaders that ran out */
+   bool flush_outputs;  /* vertex outputs written as they come */
+   bool repeat_loads;   /* an attempt after running out of registers */
    bool point_size;     /* a point pipeline's vertex shader: the size is the last output */
    int psize_reg;
    int vertex_reg, instance_reg; /* vertex shaders: r0-r1, or copies of them */
@@ -1623,7 +1624,7 @@ emit_mem(struct g9p_ctx *ctx, nir_intrinsic_instr *intr, int slot, nir_scalar of
       if (off < 0 || data < 0 || ctx->num_vs_stores == ARRAY_SIZE(ctx->vs_stores))
          return false;
       pin(ctx, off);
-      if (ctx->flush_outputs) {
+      if (ctx->repeat_loads) {
          /* out of registers before: the value waits above r31, out of everyone's way */
          const int high = 32 + ctx->num_homes + ctx->num_vs_high;
 
@@ -4253,6 +4254,67 @@ static _Thread_local bool g9p_no_schedule;
 static _Thread_local bool g9p_no_homes;
 /* vertex shaders: attribute loads moved next to their uses (g9p_compile_vertex() tries both) */
 static _Thread_local bool g9p_move_inputs;
+
+/*
+ * Vertex outputs right after their values, with emit_output() writing each
+ * one out when the next comes (flush_outputs): a value stored early frees its
+ * register, where stores gathered at the end (as Zink's shaders have them)
+ * kept every output live at once (the aquarium's fish: 28 registers, 8
+ * vertices per batch). Only stores of top-level blocks, after their sources.
+ */
+static bool
+hoist_vertex_outputs(nir_shader *nir)
+{
+   bool progress = false;
+
+   nir_foreach_function_impl (impl, nir) {
+      nir_index_instrs(impl);
+      nir_foreach_block (block, impl) {
+         if (block->cf_node.parent->type != nir_cf_node_function)
+            continue;
+         nir_foreach_instr_safe (instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+
+            if (intr->intrinsic != nir_intrinsic_store_output)
+               continue;
+            /* after the latest of its sources' definitions in this block */
+            nir_instr *after = NULL;
+            bool ok = true;
+
+            for (unsigned i = 0; i < nir_intrinsic_infos[intr->intrinsic].num_srcs; i++) {
+               nir_instr *def = nir_def_instr(intr->src[i].ssa);
+
+               if (def->block == block && (!after || after->index < def->index))
+                  after = def;
+            }
+            if (!after)
+               continue;
+            /* phis stay first in their block */
+            while (nir_instr_next(after) && nir_instr_next(after)->type == nir_instr_type_phi)
+               after = nir_instr_next(after);
+            if (nir_instr_next(after) == instr)
+               continue;
+            /* not past another store of the same output component */
+            for (nir_instr *it = nir_instr_next(after); it && it != instr; it = nir_instr_next(it)) {
+               if (it->type == nir_instr_type_intrinsic &&
+                   nir_instr_as_intrinsic(it)->intrinsic == nir_intrinsic_store_output &&
+                   nir_intrinsic_base(nir_instr_as_intrinsic(it)) == nir_intrinsic_base(intr) &&
+                   nir_intrinsic_component(nir_instr_as_intrinsic(it)) == nir_intrinsic_component(intr))
+                  ok = false;
+            }
+            if (!ok)
+               continue;
+            nir_instr_remove(instr);
+            nir_instr_insert_after(after, instr);
+            progress = true;
+         }
+      }
+      nir_progress(progress, impl, nir_metadata_control_flow);
+   }
+   return progress;
+}
 /* the homes an attempt may use: few first (r32-r63), all of them last */
 static _Thread_local unsigned g9p_max_homes = 92;
 
@@ -4623,7 +4685,12 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
              const struct g9p_vertex_attrib *attribs, unsigned frag_coord_slot,
              bool repeat_loads, bool point_size, void *mem_ctx)
 {
-   struct g9p_ctx ctx = { .point_size = point_size, .flush_outputs = repeat_loads };
+   /* G9P_LATE_OUTPUTS: outputs held to the end unless out of registers, as before */
+   /* not with transform feedback: its capture reads the outputs at the end */
+   const bool xfb = nir->xfb_info && nir->xfb_info->buffers_written;
+   struct g9p_ctx ctx = { .point_size = point_size, .repeat_loads = repeat_loads,
+                          .flush_outputs = repeat_loads ||
+                                           (!xfb && !getenv("G9P_LATE_OUTPUTS")) };
    nir_function_impl *impl;
    unsigned st;
 
@@ -4687,6 +4754,9 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
                 * (flush_loads()); G9P_MOVE_INPUTS: next to their uses as before
                 */
                (stage != MESA_SHADER_VERTEX || g9p_move_inputs ? nir_move_load_input : 0));
+   if (ctx.flush_outputs && stage == MESA_SHADER_VERTEX &&
+       !(nir->xfb_info && nir->xfb_info->buffers_written))
+      NIR_PASS(_, nir, hoist_vertex_outputs);
    NIR_PASS(_, nir, nir_convert_from_ssa, true, false);
    NIR_PASS(_, nir, wrap_loop_breaks);
    /*
