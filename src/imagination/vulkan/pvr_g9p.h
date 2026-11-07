@@ -57,6 +57,7 @@ void PVR_PER_ARCH(g9p_device_finish)(struct pvr_device *device);
 
 /* Copy a render's unaligned vertex bindings; before its job is submitted */
 void PVR_PER_ARCH(g9p_realign_vertex_bindings)(struct pvr_sub_cmd_gfx *sub_cmd);
+bool PVR_PER_ARCH(g9p_realign_needs_wait)(const struct pvr_sub_cmd_gfx *sub_cmd);
 
 VkResult PVR_PER_ARCH(g9p_compute_pipeline_compile)(
    struct pvr_device *device,

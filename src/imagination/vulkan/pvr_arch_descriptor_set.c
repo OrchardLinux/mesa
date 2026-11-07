@@ -35,6 +35,10 @@ write_buffer(const struct pvr_descriptor_set *set,
 
    VK_FROM_HANDLE(pvr_buffer, buffer, buffer_info->buffer);
 
+   if (binding->type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER &&
+       binding->type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC)
+      buffer->g9p_gpu_written = true;
+
    const pvr_dev_addr_t buffer_addr =
       PVR_DEV_ADDR_OFFSET(buffer->dev_addr, buffer_info->offset);
 
@@ -66,6 +70,10 @@ write_dynamic_buffer(struct pvr_descriptor_set *set,
    }
 
    VK_FROM_HANDLE(pvr_buffer, buffer, buffer_info->buffer);
+
+   if (binding->type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER &&
+       binding->type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC)
+      buffer->g9p_gpu_written = true;
 
    const pvr_dev_addr_t buffer_addr =
       PVR_DEV_ADDR_OFFSET(buffer->dev_addr, buffer_info->offset);
@@ -238,6 +246,9 @@ write_buffer_view(const struct pvr_descriptor_set *set,
 
    VK_FROM_HANDLE(pvr_buffer_view, buffer_view, _buffer_view);
    struct pvr_image_descriptor buffer_view_state = buffer_view->image_state;
+
+   if (is_texel_buffer && buffer_view->vk.buffer)
+      container_of(buffer_view->vk.buffer, struct pvr_buffer, vk)->g9p_gpu_written = true;
 
    if (is_texel_buffer &&
        !PVR_HAS_FEATURE(dev_info, tpu_extended_integer_lookup)) {

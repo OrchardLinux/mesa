@@ -1638,6 +1638,7 @@ struct g9p_realign {
    uint8_t *dst;
    uint64_t size, count;
    uint32_t stride, new_stride;
+   bool gpu_written; /* the source may be written by an earlier GPU job */
 };
 
 static void
@@ -1659,6 +1660,21 @@ PVR_PER_ARCH(g9p_realign_vertex_bindings)(struct pvr_sub_cmd_gfx *sub_cmd)
       realign_copy(r);
 }
 
+/*
+ * Whether the copies must wait for the jobs before: host writes are visible at
+ * submission and buffer transfers run on the CPU in order before this job, so
+ * only a source the GPU itself can write needs it.
+ */
+bool
+PVR_PER_ARCH(g9p_realign_needs_wait)(const struct pvr_sub_cmd_gfx *sub_cmd)
+{
+   util_dynarray_foreach (&sub_cmd->g9p_realigns, struct g9p_realign, r) {
+      if (r->gpu_written)
+         return true;
+   }
+   return false;
+}
+
 static VkResult
 realign_vertex_binding(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_vertex_binding *vb,
                        uint32_t stride, uint64_t *addr)
@@ -1676,6 +1692,9 @@ realign_vertex_binding(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_verte
 
    if (!src)
       return VK_SUCCESS; /* not mapped: as it is */
+   if (getenv("G9P_WAITLOG"))
+      fprintf(stderr, "g9p: realign addr 0x%" PRIx64 " stride %u size %" PRIu64 " copy %" PRIu64 "\n",
+              vb->buffer->dev_addr.addr + vb->offset, stride, size, copy_size);
    dst = calloc(1, copy_size);
    if (!dst)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -1692,6 +1711,7 @@ realign_vertex_binding(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_verte
       .count = count,
       .stride = stride,
       .new_stride = new_stride,
+      .gpu_written = vb->buffer->g9p_gpu_written || getenv("G9P_REALIGN_WAIT"),
    };
 
    /* a secondary's render joins its primary's job: no list of its own there */

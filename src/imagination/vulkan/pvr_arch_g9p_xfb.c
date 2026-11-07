@@ -110,6 +110,8 @@ PVR_PER_ARCH(g9p_xfb_bind)(struct pvr_cmd_buffer *cmd_buffer, uint32_t first, ui
       const VkDeviceSize off = offsets[i];
       const VkDeviceSize size = !sizes || sizes[i] == VK_WHOLE_SIZE ? buffer->vk.size - off : sizes[i];
       st->bind[first + i] = (struct g9p_xfb_range){ buffer, off, size };
+      if (buffer)
+         buffer->g9p_gpu_written = true;
    }
 }
 

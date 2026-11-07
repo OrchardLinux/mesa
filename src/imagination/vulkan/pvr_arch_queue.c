@@ -563,9 +563,12 @@ static VkResult pvr_process_graphics_cmd(struct pvr_device *device,
    if (util_dynarray_num_elements(&sub_cmd->g9p_realigns, char)) {
       struct vk_sync *wait = queue->next_job_wait_sync[PVR_JOB_TYPE_GEOM];
 
-      if (wait) {
+      if (wait && PVR_PER_ARCH(g9p_realign_needs_wait)(sub_cmd)) {
+         const int64_t tw = os_time_get_nano();
          VkResult result = vk_sync_wait(&device->vk, wait, 0, VK_SYNC_WAIT_COMPLETE, UINT64_MAX);
 
+         if (getenv("G9P_WAITLOG"))
+            fprintf(stderr, "g9p: wait realign %" PRId64 " us\n", (os_time_get_nano() - tw) / 1000);
          if (result != VK_SUCCESS)
             return result;
       }
@@ -573,6 +576,8 @@ static VkResult pvr_process_graphics_cmd(struct pvr_device *device,
    }
 
    if (util_dynarray_num_elements(&sub_cmd->g9p_fills, char)) {
+      const int64_t tw = os_time_get_nano();
+
       for (unsigned i = 0; i < ARRAY_SIZE(queue->last_job_signal_sync); i++) {
          struct vk_sync *s = queue->last_job_signal_sync[i];
 
@@ -583,6 +588,8 @@ static VkResult pvr_process_graphics_cmd(struct pvr_device *device,
                return result;
          }
       }
+      if (getenv("G9P_WAITLOG"))
+         fprintf(stderr, "g9p: wait fills %" PRId64 " us\n", (os_time_get_nano() - tw) / 1000);
       PVR_PER_ARCH(g9p_run_fills)(device, sub_cmd);
    }
 
@@ -1224,6 +1231,17 @@ static VkResult pvr_clear_last_submits_syncs(struct pvr_queue *queue)
    uint32_t wait_count = 0;
    VkResult result;
 
+   /*
+    * G9P: keep the last submission's syncs instead of waiting for them on the
+    * CPU: the next jobs and barriers wait for them on the GPU (a barrier's
+    * first scope reaches into earlier submissions), each is replaced when its
+    * job type signals again, and the kernel holds its own fence references.
+    * Waiting here made every submission wait for the previous one to finish.
+    * G9P_SERIAL_SUBMITS gives the old behaviour.
+    */
+   if (PVR_HAS_FEATURE(&queue->device->pdevice->dev_info, apple_g9p) &&
+       !getenv("G9P_SERIAL_SUBMITS"))
+      return VK_SUCCESS;
 
    for (uint32_t i = 0; i < PVR_JOB_TYPE_MAX; i++) {
       if (queue->next_job_wait_sync[i]) {
@@ -1410,7 +1428,10 @@ static VkResult pvr_driver_queue_submit_jobs(struct vk_queue *queue,
    struct pvr_device *device = driver_queue->device;
    VkResult result;
 
+   const int64_t g9p_tc = os_time_get_nano();
    result = pvr_clear_last_submits_syncs(driver_queue);
+   if (getenv("G9P_WAITLOG"))
+      fprintf(stderr, "g9p: wait last submit %" PRId64 " us\n", (os_time_get_nano() - g9p_tc) / 1000);
    if (result != VK_SUCCESS)
       return result;
 

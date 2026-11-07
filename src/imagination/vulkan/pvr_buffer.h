@@ -33,6 +33,8 @@ struct pvr_buffer {
    struct pvr_winsys_vma *vma;
    /* Device address the buffer is mapped to in device virtual address space */
    pvr_dev_addr_t dev_addr;
+   /* G9P: bound where the GPU can write it (storage descriptor, transform feedback) */
+   bool g9p_gpu_written;
 };
 
 #define PVR_BUFFER_VIEW_WIDTH 8192U
