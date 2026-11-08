@@ -81,20 +81,25 @@ g5p_surface_init(struct pvr_device *device, const struct pvr_transfer_cmd_surfac
    return out->base != NULL;
 }
 
-/* 2D Morton order over the padded size, y first (as G9P's twiddle()) */
+/* Spread the low 16 coordinate bits into even bit positions. G5P uses
+ * rectangular Morton order, with Y first, then the remaining major-axis bits.
+ * Keep this identical to the former bit-by-bit address calculation. */
+static unsigned
+g5p_spread(unsigned v)
+{
+   v = (v | (v << 8)) & 0x00ff00ff;
+   v = (v | (v << 4)) & 0x0f0f0f0f;
+   v = (v | (v << 2)) & 0x33333333;
+   return (v | (v << 1)) & 0x55555555;
+}
+
 static unsigned
 g5p_twiddle2d(unsigned x, unsigned y, unsigned w, unsigned h)
 {
-   const unsigned pw = util_next_power_of_two(MAX2(w, 1)), ph = util_next_power_of_two(MAX2(h, 1));
-   unsigned m = 0, bit = 0;
-
-   for (unsigned i = 0; (1u << i) < pw || (1u << i) < ph; i++) {
-      if ((1u << i) < ph)
-         m |= ((y >> i) & 1) << bit++;
-      if ((1u << i) < pw)
-         m |= ((x >> i) & 1) << bit++;
-   }
-   return m;
+   const unsigned bits = util_logbase2_ceil(MAX2(MIN2(w, h), 1));
+   const unsigned mask = (1u << bits) - 1;
+   return (g5p_spread(x & mask) << 1) | g5p_spread(y & mask) |
+          (((x | y) & ~mask) << bits);
 }
 
 /* The byte offset of element (x, y): a texel, or a block of a compressed surface */
@@ -396,6 +401,28 @@ g5p_copy(const struct pvr_rect_mapping *mapping, struct g5p_surface *src, struct
 
    if (!dw || !dh || !sw || !sh)
       return true;
+
+   /* Matching linear rows need no per-texel address calculation or format
+    * conversion. Plane components with interleaved storage retain the element
+    * path. Check the whole rectangle before the first write, including pitch
+    * padding and the stable mapping's last byte. Vulkan copies do not overlap. */
+   if (same && !src->twiddled && !dst->twiddled && !m->flip_x &&
+       sw == dw && sh == dh && src->cpp == src->bpp && dst->cpp == dst->bpp) {
+      const unsigned sx = m->src_rect.offset.x, sy = m->src_rect.offset.y;
+      const unsigned dx = m->dst_rect.offset.x, dy = m->dst_rect.offset.y;
+      if (sx >= src->width || sy >= src->height || sw > src->width - sx || sh > src->height - sy ||
+          dx >= dst->width || dy >= dst->height || dw > dst->width - dx || dh > dst->height - dy ||
+          !g5p_element(src, sx + sw - 1, sy + sh - 1) ||
+          !g5p_element(dst, dx + dw - 1, dy + dh - 1))
+         return false;
+      const size_t bytes = (size_t)dw * dst->bpp;
+      for (unsigned y = 0; y < dh; y++) {
+         const unsigned row = m->flip_y ? sh - 1 - y : y;
+         memcpy(dst->base + g5p_offset(dst, dx, dy + y),
+                src->base + g5p_offset(src, sx, sy + row), bytes);
+      }
+      return true;
+   }
 
    /* A scaled linear blit filters. Integer and depth/stencil formats have no linear filter in
     * Vulkan, and an unscaled blit samples exactly at texel centres: both stay element copies. */

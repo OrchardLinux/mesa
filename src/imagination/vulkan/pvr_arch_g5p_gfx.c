@@ -1523,7 +1523,10 @@ fs_uploads(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_pipeline *g, 
    bool any_copied = false;
    for (unsigned i = 0; i < n; i++)
       any_copied |= copied[i];
-   if (any_copied) {
+   /* Above twelve uploads the loader reads copied descriptors exclusively
+    * from the coalesced common-store staging buffer. Do not allocate a second,
+    * unreachable per-upload snapshot as well. */
+   if (any_copied && n <= 12) {
       result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, words, sizeof(words[0]) * n, &bo);
       if (result != VK_SUCCESS)
          return result;
