@@ -187,6 +187,26 @@ static inline struct g5p_ws_bo *to_bo(struct pvr_winsys_bo *bo) { return contain
 static inline struct g5p_ws_vma *to_vma(struct pvr_winsys_vma *v) { return container_of(v, struct g5p_ws_vma, base); }
 
 bool
+pvr_g5p_winsys_bo_range(struct pvr_winsys *base, uint64_t addr,
+                         uint64_t *va, uint64_t *size)
+{
+   struct g5p_ws *ws = to_ws(base);
+   bool found = false;
+
+   simple_mtx_lock(&ws->lock);
+   list_for_each_entry (struct g5p_ws_bo, bo, &ws->own_bos, link) {
+      if (addr >= bo->va && addr - bo->va < bo->kbo.size) {
+         *va = bo->va;
+         *size = bo->kbo.size;
+         found = true;
+         break;
+      }
+   }
+   simple_mtx_unlock(&ws->lock);
+   return found;
+}
+
+bool
 pvr_g5p_winsys_vma_cpu_addr(struct pvr_winsys_vma *vma,
                             uint64_t addr,
                             uint64_t size,

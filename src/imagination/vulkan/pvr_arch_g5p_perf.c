@@ -19,6 +19,7 @@
 #include "pvr_hw_pass.h"
 #include "pvr_image.h"
 #include "pvr_pipeline.h"
+#include "winsys/apple_g5p/pvr_g5p_winsys.h"
 
 static void
 note_write(struct g5p_perf_tail *t, const struct pvr_image_view *iview)
@@ -100,6 +101,7 @@ PVR_PER_ARCH(g5p_perf_job)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_r
 
 struct reads_ctx {
    struct pvr_g5p_perf_reads *r;
+   struct pvr_winsys *ws;
    uint64_t arena_lo, arena_hi; /* the arena: every heap of the apple_g5p winsys names it */
 };
 
@@ -111,13 +113,23 @@ note_read(struct reads_ctx *c, uint64_t va)
    if (!va || (va >= c->arena_lo && va < c->arena_hi))
       return;
    for (unsigned i = 0; i < r->count; i++)
-      if (r->va[i] == va)
+      if (va >= r->va[i] && va - r->va[i] < r->size[i])
          return;
    if (r->count == G5P_PERF_MAX_READS) {
       r->unknown = true;
       return;
    }
-   r->va[r->count++] = va;
+   /* Mark one address per BO. Counting every dynamic UBO/vertex offset as
+    * another resource overflowed the list even with only a few BOs in use,
+    * turning every later draw into an all-BO clean and implicit fence. A
+    * failed lookup stays conservative, including unrecognized view forms. */
+   uint64_t base, size;
+   if (!pvr_g5p_winsys_bo_range(c->ws, va, &base, &size)) {
+      r->unknown = true;
+      return;
+   }
+   r->va[r->count] = base;
+   r->size[r->count++] = size;
 }
 
 /* The address of a G5P image state (the A9's three-qword texture state the
@@ -196,7 +208,7 @@ PVR_PER_ARCH(g5p_perf_draw)(struct pvr_cmd_buffer *cmd_buffer, bool indexed)
       return;
    struct pvr_g5p_perf_reads *r = &cs->current_sub_cmd->gfx.job.g5p.reads;
    const struct pvr_winsys_heap *heap = cmd_buffer->device->heaps.general_heap;
-   struct reads_ctx c = { r, heap->base_addr.addr, heap->base_addr.addr + heap->size };
+   struct reads_ctx c = { r, cmd_buffer->device->ws, heap->base_addr.addr, heap->base_addr.addr + heap->size };
 
    if (r->unknown)
       return;

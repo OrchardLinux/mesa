@@ -24,6 +24,11 @@ VkResult pvr_g5p_winsys_create(int render_fd, int display_fd,
 /* The kernel takes 4-sample passes (TYPED_V3 and DRM_G5P_CAP_RENDER_MSAA) */
 bool pvr_g5p_winsys_msaa(struct pvr_winsys *ws);
 
+/* The backing BO of an application GPU address. The range is used only to
+ * deduplicate conservative read tracking, never to infer cache coherency. */
+bool pvr_g5p_winsys_bo_range(struct pvr_winsys *ws, uint64_t addr,
+                             uint64_t *base, uint64_t *size);
+
 /* Resolve a bound GPU address through the winsys's permanent BO mapping.
  * This never returns or changes the application's vkMapMemory mapping. */
 bool pvr_g5p_winsys_vma_cpu_addr(struct pvr_winsys_vma *vma,

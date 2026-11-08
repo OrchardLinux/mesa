@@ -22,6 +22,9 @@ struct pvr_g5p_perf_reads {
    uint32_t count;
    bool unknown; /* a read that isn't decoded: every own BO is listed */
    uint64_t va[G5P_PERF_MAX_READS];
+   /* BO ranges, not individual suballocation addresses. Draws often read
+    * hundreds of offsets in the same application memory allocation. */
+   uint64_t size[G5P_PERF_MAX_READS];
 };
 
 /* The tail the fragment stream carries after the pass: its size, or 0 when
