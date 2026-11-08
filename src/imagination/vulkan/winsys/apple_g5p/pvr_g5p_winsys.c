@@ -1188,10 +1188,48 @@ g5p_ws_render_enoent(struct g5p_ws *ws, const struct g5p_ws_context *c,
    }
 }
 
+/* ws->lock must remain held from this snapshot through the submit ioctl.
+ * Even a BO the job never uses may be listed by conservative read tracking;
+ * its owner may legally free it on another thread. Empty arena chunks can
+ * likewise be trimmed. Rebuild after any backpressure wait drops the lock. */
+static int
+g5p_ws_render_resources(struct g5p_ws *ws, const struct g5p_ws_perf_job *pj,
+                         struct drm_g5p_render_resource *res,
+                         unsigned *count, unsigned *nchunks)
+{
+   unsigned nres = 0;
+   ws->perf.last_omitted = 0;
+   if (ws->chunk_count + ws->own_count > DRM_G5P_RENDER_MAX_RESOURCES)
+      return -ENOMEM;
+   for (unsigned i = 0; i < ws->chunk_count; i++) {
+      uint64_t off, len;
+      if (g5p_ws_perf_chunk(&ws->perf, ws->chunks[i].va, ws->chunks[i].size, &off, &len))
+         res[nres++] = (struct drm_g5p_render_resource){
+            .handle = ws->chunks[i].handle, .offset = off, .va = ws->chunks[i].va + off, .size = len,
+            .kind = DRM_G5P_RENDER_ACCESS_READ | DRM_G5P_RENDER_ACCESS_WRITE | DRM_G5P_RENDER_ACCESS_CACHE};
+   }
+   for (unsigned i = 0; i < nres; i++)
+      g5p_ws_perf_resource(&ws->perf, &res[i], "arena");
+   *nchunks = nres;
+   list_for_each_entry (struct g5p_ws_bo, b, &ws->own_bos, link) {
+      /* 0: the job neither writes nor reads it (g5p_ws_perf.h): not listed, no maintenance, no fence */
+      const uint32_t kind = g5p_ws_perf_own_kind(&ws->perf, pj, b->va, b->kbo.size, b->kbo.shared);
+      if (kind) {
+         res[nres++] = (struct drm_g5p_render_resource){
+            .handle = b->kbo.handle, .va = b->va, .size = b->kbo.size, .kind = kind};
+         g5p_ws_perf_resource(&ws->perf, &res[nres - 1], b->data_only
+                                ? (b->dedicated_image ? "image-data" : "data")
+                                : (b->kbo.shared ? "shared" : "display"));
+      }
+   }
+   *count = nres;
+   return 0;
+}
+
 /* One G5P render: the fragment stream holds the TYPED_V3 pass
  * (pvr_arch_g5p_frag_stream); the job reads and writes inside the arena, every
- * chunk listed RW with the kernel's cache maintenance. Display BOs and imports
- * are not listed yet, so a pass that reaches one is refused by the kernel. */
+ * chunk listed RW with the kernel's cache maintenance. Own BOs are listed by
+ * the pass's read/write tracking, conservatively when tracking is incomplete. */
 static VkResult g5p_ws_render_submit(const struct pvr_winsys_render_ctx *ctx,
                                      const struct pvr_winsys_render_submit_info *info,
                                      const struct pvr_device_info *dev_info, struct vk_sync *geom,
@@ -1241,34 +1279,13 @@ static VkResult g5p_ws_render_submit(const struct pvr_winsys_render_ctx *ctx,
    struct g5p_ws_perf_job pj;
    g5p_ws_perf_job(&ws->perf, &pass, info->fragment.fw_stream + sizeof(pass),
                    info->fragment.fw_stream_len - sizeof(pass), &pj);
+   unsigned nchunks = 0;
    simple_mtx_lock(&ws->lock);
-   for (unsigned i = 0; i < ws->chunk_count; i++) {
-      uint64_t off, len;
-      if (g5p_ws_perf_chunk(&ws->perf, ws->chunks[i].va, ws->chunks[i].size, &off, &len))
-         res[nres++] = (struct drm_g5p_render_resource){
-            .handle = ws->chunks[i].handle, .offset = off, .va = ws->chunks[i].va + off, .size = len,
-            .kind = DRM_G5P_RENDER_ACCESS_READ | DRM_G5P_RENDER_ACCESS_WRITE | DRM_G5P_RENDER_ACCESS_CACHE};
-   }
-   for (unsigned i = 0; i < nres; i++)
-      g5p_ws_perf_resource(&ws->perf, &res[i], "arena");
-   const unsigned nchunks = nres;
-   if (ws->chunk_count + ws->own_count > ARRAY_SIZE(res)) {
+   r = g5p_ws_render_resources(ws, &pj, res, &nres, &nchunks);
+   if (r) {
       simple_mtx_unlock(&ws->lock);
-      return g5p_ws_refuse(VK_ERROR_OUT_OF_DEVICE_MEMORY, "%u own BOs: more than a job's %u resources",
-                           ws->own_count, (unsigned)ARRAY_SIZE(res) - ws->chunk_count);
+      return g5p_ws_refuse(VK_ERROR_OUT_OF_DEVICE_MEMORY, "too many render resources");
    }
-   list_for_each_entry (struct g5p_ws_bo, b, &ws->own_bos, link) {
-      /* 0: the job neither writes nor reads it (g5p_ws_perf.h): not listed, no maintenance, no fence */
-      const uint32_t kind = g5p_ws_perf_own_kind(&ws->perf, &pj, b->va, b->kbo.size, b->kbo.shared);
-      if (kind) {
-         res[nres++] = (struct drm_g5p_render_resource){
-            .handle = b->kbo.handle, .va = b->va, .size = b->kbo.size, .kind = kind};
-         g5p_ws_perf_resource(&ws->perf, &res[nres - 1], b->data_only
-                                ? (b->dedicated_image ? "image-data" : "data")
-                                : (b->kbo.shared ? "shared" : "display"));
-      }
-   }
-   simple_mtx_unlock(&ws->lock);
 
    /* waits (the two stages' waits), then the signal: the kernel takes one per job, so the fragment stage's is
     * signalled and the geometry stage's gets the same fence afterwards (a G5P job is one TA + 3D pass) */
@@ -1319,7 +1336,6 @@ static VkResult g5p_ws_render_submit(const struct pvr_winsys_render_ctx *ctx,
    }
    uint64_t job_id = 0;
    const uint64_t t0 = g5p_ws_perf_now();
-   simple_mtx_lock(&ws->lock);
    uint32_t local_signal = 0;
    if (!signal && drmSyncobjCreate(ws->base.render_fd, 0, &local_signal)) {
       simple_mtx_unlock(&ws->lock);
@@ -1353,6 +1369,11 @@ static VkResult g5p_ws_render_submit(const struct pvr_winsys_render_ctx *ctx,
       }
       if (os_time_get_nano() >= deadline) {
          r = -EBUSY;
+         break;
+      }
+      r = g5p_ws_render_resources(ws, &pj, res, &nres, &nchunks);
+      if (r) {
+         operation = "resource snapshot after backpressure";
          break;
       }
    }
