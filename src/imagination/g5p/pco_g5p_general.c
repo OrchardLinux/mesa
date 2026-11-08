@@ -433,6 +433,20 @@ static unsigned alloc_run(struct gctx *c, unsigned n, const char *why)
           util_bitcount64((c->busy | c->reserved) & BITFIELD64_MASK(NUM_DWORDS)), NUM_DWORDS);
 }
 
+/* Coupled vertex texture operands/results and the measured vertex math
+ * recipes use bank1, including scalar slots. The ordinary scalar allocator
+ * prefers bank0 in overflow mode, so its destination cannot encode this
+ * constraint. Never silently allocate a bank0 alias of a bank1 recipe word. */
+static unsigned alloc_bank1_run(struct gctx *c, unsigned n, const char *why)
+{
+   bool bank0 = c->vs_bank0, tex_bank0 = c->tex_bank0;
+   c->vs_bank0 = c->tex_bank0 = false;
+   unsigned reg = alloc_run(c, n, why);
+   c->vs_bank0 = bank0;
+   c->tex_bank0 = tex_bank0;
+   return reg;
+}
+
 /* The flown VS temps (g5p_gfx.h G5P_VS_TEMPS_FLOWN). A VS whose inputs
  * reach past them keeps its written registers below them where it can: the
  * DOUTU temps then cover only those, and the inputs stay in the unified
@@ -2533,7 +2547,7 @@ static void put_recipe(struct gctx *c, enum g5p_recipe r, unsigned d, unsigned x
       bool saved_bank = c->tex_bank0;
       c->tex_bank0 = false;
       unsigned count = r == G5P_RC_CEIL ? 1 : 2;
-      unsigned bridge = alloc_run(c, count, "vertex math bank1 bridge");
+      unsigned bridge = alloc_bank1_run(c, count, "vertex math bank1 bridge");
       c->tex_bank0 = saved_bank;
       uint8_t raw[G5P_USC_MAX];
       put(c, raw, g5p_usc_move(raw, H(c, bridge), H(c, x), 1, 0,
@@ -4704,14 +4718,14 @@ static void emit_vertex_qualified_texture(struct gctx *c, nir_tex_instr *t)
          move_into(c, direction + k, coord, k, "cube direction into bank0");
       c->tex_bank0 = saved_bank;
    }
-   unsigned block = alloc_run(c, 2 + third, "qualified vertex texture coordinates");
+   unsigned block = alloc_bank1_run(c, 2 + third, "qualified vertex texture coordinates");
    scratch |= BITFIELD64_RANGE(block, 2 + third);
    if (!cube) {
       vertex_qualified_copy(c, block, coord, 0);
       vertex_qualified_copy(c, block + 1, coord, 1);
    }
    if (array && !read) {
-      unsigned tmp = alloc_reg(c, -1);
+      unsigned tmp = alloc_bank1_run(c, 1, "qualified vertex scalar operand");
       scratch |= BITFIELD64_BIT(tmp);
       vertex_qualified_copy(c, tmp, coord, 2);
       put(c, raw, g5p_usc_binary_literal(raw, G5P_BIN_FADD, H(c,tmp), 0x3800, H(c,tmp), 1, 1, 0x11, true, -1),
@@ -4720,7 +4734,7 @@ static void emit_vertex_qualified_texture(struct gctx *c, nir_tex_instr *t)
    } else if (third && !cube) vertex_qualified_copy(c, block + 2, coord, 2);
    bool gradient = t->op == nir_texop_txd;
    int li = nir_tex_instr_src_index(t, nir_tex_src_lod);
-   unsigned level = buffer ? 0 : gradient ? alloc_run(c, 4, "qualified vertex derivatives") : alloc_reg(c, -1);
+   unsigned level = buffer ? 0 : gradient ? alloc_bank1_run(c, 4, "qualified vertex derivatives") : alloc_bank1_run(c, 1, "qualified vertex scalar operand");
    if (!buffer) scratch |= BITFIELD64_RANGE(level, gradient ? 4 : 1);
    if (gradient) {
       /* Native distinct literal gradients independently witness this order:
@@ -4746,7 +4760,7 @@ static void emit_vertex_qualified_texture(struct gctx *c, nir_tex_instr *t)
    unsigned extras = H(c,array ? block + 2 : level) + 1;
    unsigned offset_half = extras;
    if (compare) {
-      unsigned e = alloc_run(c, 1 + (packed >= 0), "qualified vertex compare reference/offset");
+      unsigned e = alloc_bank1_run(c, 1 + (packed >= 0), "qualified vertex compare reference/offset");
       scratch |= BITFIELD64_RANGE(e, 1 + (packed >= 0));
       vertex_qualified_copy(c, e, nir_get_tex_src(t, nir_tex_src_comparator), 0);
       extras = H(c,e);
@@ -4754,7 +4768,7 @@ static void emit_vertex_qualified_texture(struct gctx *c, nir_tex_instr *t)
    }
    if (packed >= 0 && gradient && !array) {
       /* Derivatives occupy full dwords; their high halves are not spare. */
-      unsigned e = alloc_reg(c, -1);
+      unsigned e = alloc_bank1_run(c, 1, "qualified vertex scalar operand");
       scratch |= BITFIELD64_BIT(e);
       extras = H(c,e);
       offset_half = extras;
@@ -4763,7 +4777,7 @@ static void emit_vertex_qualified_texture(struct gctx *c, nir_tex_instr *t)
       put(c, raw, xyz ? g5p_usc_half_immediate_xyz(raw, offset_half, packed, 1) :
                        g5p_usc_vertex_half_immediate(raw, offset_half, packed), "qualified vertex packed offset");
    unsigned nresult = compare ? 1 : 4;
-   unsigned dst = alloc_run(c, nresult, "qualified vertex texture result");
+   unsigned dst = alloc_bank1_run(c, nresult, "qualified vertex texture result");
    struct g5p_tex_ext x = {
       .dst_half=H(c,dst), .image_qword=b->image/2,
       .sampler_qword=(read ? c->fetch_sampler_common : b->sampler)/2,
