@@ -5446,6 +5446,16 @@ static void fs_output(struct gctx *c)
        * §11.14.1). More than one token is not that shape. */
       if (c->ndiscards + c->discard_always > 1)
          refuse(c, "discard in a program with a general blend epilogue needs one merged kill");
+      /* A kill before a general epilogue runs PUNCH_THROUGH with a general
+       * blend, base program or punch variant alike. r39-6.1 hard-hung the
+       * iPad in Aquarium with that form under depth writes (not bisected
+       * yet), so it is off unless PVR_G5P_PUNCH_BLEND=1 (the driver's punch
+       * variant switch); off, such a program is refused at pipeline
+       * creation, the r39-6 rule. */
+      const char *pb = getenv("PVR_G5P_PUNCH_BLEND");
+      if ((c->ndiscards || c->discard_always) && !(pb && !strcmp(pb, "1")))
+         refuse(c, "discard in a program with a general blend epilogue "
+                   "(general-blend punch-through off by default; PVR_G5P_PUNCH_BLEND=1 enables)");
       uint8_t buf[512];
       const char *err;
       struct g5p_blend_key bk = general_key(c->key);
