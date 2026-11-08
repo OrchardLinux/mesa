@@ -15,6 +15,7 @@
 
 #include "vk_enum_to_str.h"
 #include "vk_format.h"
+#include "vk_internal_exts.h"
 #include "vk_log.h"
 #include "vk_util.h"
 
@@ -51,13 +52,20 @@ g5p_view_state(const struct pvr_image_view *iview, uint64_t q[3])
       return "format without a texture key";
 
    const uint32_t key = pvr_g5p_tex_swizzle_key(f->key, &iview->vk.swizzle);
+   /* vk_meta's single-layer array views are sampled as 2D: its blit shader is
+    * lowered to 2D sampling (pvr_g5p_nir.c), and linear images have no array
+    * state */
+   const bool meta_2d = (iview->vk.create_flags & VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA) &&
+                        iview->vk.view_type == VK_IMAGE_VIEW_TYPE_2D_ARRAY && iview->vk.layer_count == 1 &&
+                        image->vk.image_type == VK_IMAGE_TYPE_2D;
+   const VkImageViewType view_type = meta_2d ? VK_IMAGE_VIEW_TYPE_2D : iview->vk.view_type;
 
    if (image->memlayout == PVR_MEMLAYOUT_LINEAR) {
       const struct pvr_mip_level *level = &plane->mip_levels[0];
       const uint64_t va = image->dev_addr.addr + plane->offset + level->offset +
                           iview->vk.base_array_layer * plane->layer_size;
 
-      if (iview->vk.view_type == VK_IMAGE_VIEW_TYPE_2D_ARRAY &&
+      if (view_type == VK_IMAGE_VIEW_TYPE_2D_ARRAY &&
           image->vk.image_type == VK_IMAGE_TYPE_2D && image->vk.samples == 1 &&
           image->vk.extent.width == 1 && image->vk.extent.height == 1 &&
           image->vk.array_layers == 1 && image->vk.mip_levels == 1 &&
@@ -74,7 +82,7 @@ g5p_view_state(const struct pvr_image_view *iview, uint64_t q[3])
          pvr_g5p_tex_twiddled(q, &v);
          return NULL;
       }
-      if (iview->vk.view_type != VK_IMAGE_VIEW_TYPE_2D || iview->vk.base_mip_level)
+      if (view_type != VK_IMAGE_VIEW_TYPE_2D || iview->vk.base_mip_level)
          return "array/3D/cube or mip view of a linear image (Apple samples those twiddled only)";
       if (va % 16 || level->pitch % 16)
          return "linear texture off a 16-byte base or 16-byte rows";
@@ -100,7 +108,7 @@ g5p_view_state(const struct pvr_image_view *iview, uint64_t q[3])
    const bool layered = image->vk.array_layers > 1 || image->vk.image_type == VK_IMAGE_TYPE_3D;
 
    v.big_layer = layered && plane->layer_size >= PVR_G5P_TEX_BIG_LAYER;
-   switch (iview->vk.view_type) {
+   switch (view_type) {
    case VK_IMAGE_VIEW_TYPE_2D:
       v.layout = PVR_G5P_TEX_LAYOUT_2D;
       break;

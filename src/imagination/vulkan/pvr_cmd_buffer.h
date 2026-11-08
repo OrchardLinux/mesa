@@ -152,6 +152,10 @@ struct pvr_dynamic_render_info {
 };
 
 struct pvr_sub_cmd_gfx {
+#if defined(PVR_APPLE_G5P)
+   /* a vk_meta blit's render pass: transfer work for barriers (pvr_arch_g5p_meta.c) */
+   bool g5p_transfer;
+#endif
    struct pvr_dynamic_render_info *dr_info;
    struct pvr_renderpass_hwsetup_render *hw_render;
    uint32_t attachment_count;

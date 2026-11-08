@@ -1360,6 +1360,9 @@ static bool
 g5p_topology(VkPrimitiveTopology t, uint32_t *hw, uint32_t *split, bool *lines)
 {
    *lines = false;
+   /* vk_meta's rectangle lists are two triangles per rectangle */
+   if ((uint32_t)t == (uint32_t)VK_PRIMITIVE_TOPOLOGY_META_RECT_LIST_MESA)
+      t = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
    switch (t) {
    case VK_PRIMITIVE_TOPOLOGY_POINT_LIST: /* split 512: Apple's g3b-points */
       *hw = ROGUE_VDMCTRL_PRIMITIVE_TOPOLOGY_POINT_LIST;

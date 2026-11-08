@@ -468,12 +468,81 @@ pad_color_slots(nir_shader *nir, unsigned color_targets)
    nir_index_ssa_defs(impl);
 }
 
+/* G5P renders layer 0 of single-layer views only (no layered rendering is
+ * exposed): a vertex shader's gl_Layer is dropped and a fragment shader's
+ * gl_Layer reads 0. vk_meta's rectangle and blit shaders use both. */
+static bool
+lower_layer_0(nir_builder *b, nir_intrinsic_instr *in, void *data)
+{
+   if (in->intrinsic == nir_intrinsic_store_output &&
+       nir_intrinsic_io_semantics(in).location == VARYING_SLOT_LAYER) {
+      nir_instr_remove(&in->instr);
+      return true;
+   }
+   if (in->intrinsic == nir_intrinsic_load_layer_id) {
+      b->cursor = nir_before_instr(&in->instr);
+      nir_def_replace(&in->def, nir_imm_int(b, 0));
+      return true;
+   }
+   return false;
+}
+
+/* vk_meta's blit samples a 2D-array view of one layer: sample it as 2D
+ * (pvr_arch_g5p_tex.c gives that view 2D state; linear images have no array
+ * state). The array index is always 0, since the view has one layer. */
+static bool
+meta_tex_2d(nir_builder *b, nir_instr *instr, void *data)
+{
+   if (instr->type != nir_instr_type_tex)
+      return false;
+   nir_tex_instr *tex = nir_instr_as_tex(instr);
+   const int c = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   if (!tex->is_array || tex->sampler_dim != GLSL_SAMPLER_DIM_2D || c < 0)
+      return false;
+   b->cursor = nir_before_instr(instr);
+   nir_src_rewrite(&tex->src[c].src, nir_trim_vector(b, tex->src[c].src.ssa, 2));
+   tex->is_array = false;
+   tex->coord_components = 2;
+   return true;
+}
+
+static void
+meta_blit_2d(nir_shader *nir)
+{
+   if (!nir->info.name || strncmp(nir->info.name, "vk-meta-blit", 12))
+      return;
+   nir_foreach_variable_with_modes(var, nir, nir_var_uniform) {
+      const struct glsl_type *t = glsl_without_array(var->type);
+      if (glsl_type_is_sampler(t) && glsl_sampler_type_is_array(t) &&
+          glsl_get_sampler_dim(t) == GLSL_SAMPLER_DIM_2D)
+         var->type = glsl_sampler_type(GLSL_SAMPLER_DIM_2D, false, false, glsl_get_sampler_result_type(t));
+   }
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_deref && nir_instr_as_deref(instr)->deref_type == nir_deref_type_var)
+               nir_instr_as_deref(instr)->type = nir_instr_as_deref(instr)->var->type;
+         }
+      }
+   }
+   nir_shader_instructions_pass(nir, meta_tex_2d, nir_metadata_control_flow, NULL);
+}
+
 /* The graphics lowerings of a prepared stage (the ICD's graphics_nir()) */
 static nir_shader *
 graphics_lower(nir_shader *nir, unsigned color_targets, bool *sample_mask, bool point_size, bool *psize_dropped)
 {
    const mesa_shader_stage stage = nir ? nir->info.stage : MESA_SHADER_NONE;
 
+   if (nir)
+      meta_blit_2d(nir);
+   if (nir && nir_shader_intrinsics_pass(nir, lower_layer_0, nir_metadata_control_flow, NULL)) {
+      nir->info.outputs_written &= ~BITFIELD64_BIT(VARYING_SLOT_LAYER);
+      BITSET_CLEAR(nir->info.system_values_read, SYSTEM_VALUE_LAYER_ID);
+      nir_opt_constant_folding(nir);
+      nir_opt_dce(nir);
+      nir_index_ssa_defs(nir_shader_get_entrypoint(nir));
+   }
    if (nir && stage == MESA_SHADER_VERTEX && !point_size && !xfb_captures(nir, VARYING_SLOT_PSIZ) &&
        nir_shader_intrinsics_pass(nir, drop_point_size, nir_metadata_control_flow, NULL)) {
       /* polygon mode POINT needs to know (pco_g5p_program::psize_dropped) */
@@ -631,7 +700,10 @@ compile_stage(const VkPipelineShaderStageCreateInfo *stage_info, bool half_outpu
     * module, vk_shader_module_handle_from_nir(): the clear quad's stages) */
    VK_FROM_HANDLE(vk_shader_module, module, stage_info->module);
    const VkShaderModuleCreateInfo *inline_ci = vk_find_struct_const(stage_info->pNext, SHADER_MODULE_CREATE_INFO);
-   const nir_shader *internal = module ? module->nir : NULL;
+   /* vk_meta's stages are NIR without a module (pvr_arch_g5p_meta.c) */
+   const VkPipelineShaderStageNirCreateInfoMESA *nir_ci =
+      vk_find_struct_const(stage_info->pNext, PIPELINE_SHADER_STAGE_NIR_CREATE_INFO_MESA);
+   const nir_shader *internal = module ? module->nir : nir_ci ? nir_ci->nir : NULL;
    const uint32_t *spv = NULL;
    size_t bytes = 0;
    if (module && !module->nir) {
@@ -663,7 +735,14 @@ compile_stage(const VkPipelineShaderStageCreateInfo *stage_info, bool half_outpu
    bool sample_mask = false;
    const bool point_size = stage == MESA_SHADER_VERTEX && link && link->point_size;
    bool psize_dropped = false;
-   nir_shader *nir = internal ? graphics_lower(g5p_nir_prepare(nir_shader_clone(NULL, internal)), color_targets,
+   nir_shader *clone = internal ? nir_shader_clone(NULL, internal) : NULL;
+   if (clone && !clone->options) {
+      /* vk_meta's NIR comes without compiler options: G5P's, as spirv_to_nir() gets */
+      static util_once_flag once = UTIL_ONCE_FLAG_INIT;
+      util_call_once(&once, g5p_init_options);
+      clone->options = stage == MESA_SHADER_VERTEX ? &g5p_vertex_options : &g5p_options;
+   }
+   nir_shader *nir = internal ? graphics_lower(g5p_nir_prepare(clone), color_targets,
                                                &sample_mask, point_size, &psize_dropped)
                               : graphics_nir(spv, bytes / 4, stage, entry, color_targets, &sample_mask, point_size,
                                              &psize_dropped);

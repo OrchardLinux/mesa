@@ -485,6 +485,8 @@ PVR_PER_ARCH(g5p_device_init)(struct pvr_device *device)
    simple_mtx_init(&device->g5p->clear_lock, mtx_plain);
 
    VkResult result = g5p_upload_programs(device, &device->g5p->programs);
+   if (result == VK_SUCCESS)
+      result = PVR_PER_ARCH(g5p_meta_init)(device);
    if (result != VK_SUCCESS)
       PVR_PER_ARCH(g5p_device_finish)(device);
    return result;
@@ -495,6 +497,8 @@ PVR_PER_ARCH(g5p_device_finish)(struct pvr_device *device)
 {
    if (!device->g5p)
       return;
+
+   PVR_PER_ARCH(g5p_meta_finish)(device);
 
    /* the clear quad's pipelines and their layout */
    const VkDevice vk_dev = pvr_device_to_handle(device);

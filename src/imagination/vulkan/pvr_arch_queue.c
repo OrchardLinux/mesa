@@ -262,6 +262,33 @@ static void pvr_update_job_syncs(struct pvr_device *device,
    queue->last_job_signal_sync[submitted_job_type] = new_signal_sync;
 }
 
+#if defined(PVR_APPLE_G5P)
+/* A sync that signals when both a and b (either may be NULL) have: a null
+ * job's syncobj transfer, no CPU wait (g5p_ws_null_job_submit()) */
+static VkResult
+g5p_merge_syncs(struct pvr_device *device, struct vk_sync *a, struct vk_sync *b, struct vk_sync **out)
+{
+   struct vk_sync_wait waits[2];
+   uint32_t n = 0;
+   VkResult result;
+
+   if (a)
+      waits[n++] = (struct vk_sync_wait){ .sync = a, .stage_mask = ~(VkPipelineStageFlags2)0 };
+   if (b)
+      waits[n++] = (struct vk_sync_wait){ .sync = b, .stage_mask = ~(VkPipelineStageFlags2)0 };
+   result = vk_sync_create(&device->vk, &device->pdevice->ws->syncobj_type, 0U, 0UL, out);
+   if (result != VK_SUCCESS)
+      return result;
+   const struct vk_sync_signal signal = { .sync = *out, .stage_mask = ~(VkPipelineStageFlags2)0 };
+   result = device->ws->ops->null_job_submit(device->ws, waits, n, (struct vk_sync_signal *)&signal);
+   if (result != VK_SUCCESS) {
+      vk_sync_destroy(&device->vk, *out);
+      *out = NULL;
+   }
+   return result;
+}
+#endif
+
 static VkResult
 pvr_process_graphics_cmd_for_view(struct pvr_device *device,
                                   struct pvr_queue *queue,
@@ -367,13 +394,30 @@ pvr_process_graphics_cmd_for_view(struct pvr_device *device,
       }
    }
 
+   struct vk_sync *frag_wait = queue->next_job_wait_sync[PVR_JOB_TYPE_FRAG];
+#if defined(PVR_APPLE_G5P)
+   /* a vk_meta blit's render (pvr_arch_g5p_meta.c) is transfer work: its
+    * fragments also wait for what barriers made transfers wait for */
+   struct vk_sync *g5p_frag_wait = NULL;
+   if (sub_cmd->g5p_transfer && queue->next_job_wait_sync[PVR_JOB_TYPE_TRANSFER]) {
+      result = g5p_merge_syncs(device, frag_wait, queue->next_job_wait_sync[PVR_JOB_TYPE_TRANSFER],
+                               &g5p_frag_wait);
+      if (result != VK_SUCCESS)
+         goto err_destroy_frag_sync;
+      frag_wait = g5p_frag_wait;
+   }
+#endif
    result =
       pvr_arch_render_job_submit(queue->gfx_ctx,
                                  &sub_cmd->job,
                                  queue->next_job_wait_sync[PVR_JOB_TYPE_GEOM],
-                                 queue->next_job_wait_sync[PVR_JOB_TYPE_FRAG],
+                                 frag_wait,
                                  geom_signal_sync,
                                  frag_signal_sync);
+#if defined(PVR_APPLE_G5P)
+   if (g5p_frag_wait)
+      vk_sync_destroy(&device->vk, g5p_frag_wait);
+#endif
 
    if (original_ctrl_stream_addr.addr > 0)
       job->ctrl_stream_addr = original_ctrl_stream_addr;
@@ -539,6 +583,18 @@ pvr_process_graphics_cmd_for_view(struct pvr_device *device,
 
    if (job->run_frag)
       pvr_update_job_syncs(device, queue, frag_signal_sync, PVR_JOB_TYPE_FRAG);
+
+#if defined(PVR_APPLE_G5P)
+   /* ... and later transfer-stage barriers wait for its fragments */
+   if (sub_cmd->g5p_transfer && job->run_frag) {
+      struct vk_sync *transfer_done;
+      result = g5p_merge_syncs(device, queue->last_job_signal_sync[PVR_JOB_TYPE_TRANSFER], frag_signal_sync,
+                               &transfer_done);
+      if (result != VK_SUCCESS)
+         return result;
+      pvr_update_job_syncs(device, queue, transfer_done, PVR_JOB_TYPE_TRANSFER);
+   }
+#endif
 
    /* FIXME: DoShadowLoadOrStore() */
 

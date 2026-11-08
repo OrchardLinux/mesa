@@ -36,6 +36,9 @@
 #include "pvr_entrypoints.h"
 #include "pvr_formats.h"
 #include "pvr_g9p.h"
+#if defined(PVR_APPLE_G5P)
+#include "pvr_g5p.h"
+#endif
 #include "pvr_hw_pass.h"
 #include "pvr_image.h"
 #include "pvr_job_transfer.h"
@@ -289,6 +292,12 @@ void pvr_rogue_CmdBlitImage2(VkCommandBuffer commandBuffer,
    if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p) &&
        pvr_arch_g9p_meta_blit(cmd_buffer, pBlitImageInfo))
       return;
+#if defined(PVR_APPLE_G5P)
+   /* G5P: a blit the A9 can sample and render is a render pass (pvr_arch_g5p_meta.c) */
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p) &&
+       pvr_arch_g5p_meta_blit(cmd_buffer, pBlitImageInfo))
+      return;
+#endif
 
    PVR_TRACE_BEGIN_TRANSFER(cmd_buffer, PVR_TRANSFER_OP_BLIT_IMAGE);
 
