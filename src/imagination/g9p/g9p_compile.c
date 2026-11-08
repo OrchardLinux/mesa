@@ -3892,7 +3892,9 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
          }
          if (!emit_colour(ctx))
             return false;
-         if (ctx->out->native_blend)
+         if (ctx->out->native_blend_add)
+            g9p_blend_add(ctx->c);
+         else if (ctx->out->native_blend)
             g9p_blend_src_over(ctx->c);
       }
       g9p_end_fragment(ctx->c, colour ? words : 0);
@@ -5722,6 +5724,23 @@ is_src_over(const nir_lower_blend_options *blend)
    return true;
 }
 
+/* additive blending, One / One on colour and alpha */
+static bool
+is_additive(const nir_lower_blend_options *blend)
+{
+   const nir_lower_blend_rt *rt = &blend->rt[0];
+   const nir_lower_blend_channel *ch[2] = { &rt->rgb, &rt->alpha };
+
+   if (blend->logicop_enable || rt->colormask != 0xf)
+      return false;
+   for (unsigned i = 0; i < 2; i++) {
+      if (ch[i]->func != PIPE_BLEND_ADD || ch[i]->src_factor != PIPE_BLENDFACTOR_ONE ||
+          ch[i]->dst_factor != PIPE_BLENDFACTOR_ONE)
+         return false;
+   }
+   return true;
+}
+
 /*
  * texelFetch of a 2D texture (Zink's blits): an explicit-level sample at
  * the texel's centre, (i + 0.5) / size, which reads that texel alone with
@@ -5806,9 +5825,12 @@ g9p_compile_fragment(nir_shader *nir, unsigned frag_coord_slot,
    if (coverage)
       lower_coverage(nir, coverage);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_keep_target, nir_metadata_control_flow, out);
-   out->native_blend = blend && is_src_over(blend) && out->output == G9P_OUTPUT_HALF2 &&
+   out->native_blend_add = blend && is_additive(blend) && !getenv("G9P_NO_NATIVE_ADD");
+   out->native_blend = blend && (is_src_over(blend) || out->native_blend_add) &&
+                       out->output == G9P_OUTPUT_HALF2 &&
                        !out->output_float && !targets[1].present && !targets[2].present &&
                        !targets[3].present && !getenv("G9P_NO_NATIVE_BLEND");
+   out->native_blend_add &= out->native_blend;
    if (blend && !out->native_blend) {
       NIR_PASS(_, nir, nir_lower_blend, blend);
       NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_blend_constant,

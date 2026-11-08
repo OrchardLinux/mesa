@@ -228,6 +228,7 @@ struct g9p_shader {
     * nir_lower_blend's f32 code
     */
    bool native_blend;
+   bool native_blend_add;  /* One / One instead of source-over */
 
    /* Fragment: the combined image samplers sampled, by common-store slot */
    unsigned num_textures;

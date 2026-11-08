@@ -81,7 +81,12 @@ PVR_PER_ARCH(g9p_device_init)(struct pvr_device *device)
    if (result != VK_SUCCESS)
       goto err_free_kick;
 
-   result = pvr_free_list_create(device, G9P_FREE_LIST_SIZE, G9P_FREE_LIST_SIZE, 0, 0,
+   /* G9P_FREE_LIST_MB: another parameter buffer size, for scenes that run out */
+   const uint32_t fl_size = getenv("G9P_FREE_LIST_MB")
+                               ? (uint32_t)atoi(getenv("G9P_FREE_LIST_MB")) * 1024u * 1024u
+                               : G9P_FREE_LIST_SIZE;
+
+   result = pvr_free_list_create(device, fl_size, fl_size, 0, 0,
                                  device->global_free_list, &device->g9p.free_list);
    if (result != VK_SUCCESS)
       goto err_free_fence;

@@ -653,6 +653,22 @@ g9p_blend_src_over(struct g9p_code *c)
    G9P_EMIT(c, 0x018a, 0x0103, 0x958e, 0x0186, 0x010c, 0x8000);
 }
 
+/*
+ * Additive blending (One / One): the source-over sequence with half 10 = 1.0
+ * instead of 1 - alpha, so half i = half (4 + i) x 1 + half i
+ */
+static inline void
+g9p_blend_add(struct g9p_code *c)
+{
+   G9P_EMIT(c, 0x211c, 0x2804);
+   G9P_EMIT(c, 0x004d);
+   g9p_mov_imm(c, 5, 0x3c00);
+   G9P_EMIT(c, 0x418e, 0x0100, 0x1588, 0x0180, 0x010c, 0x8000);
+   G9P_EMIT(c, 0x418e, 0x0101, 0x158a, 0x0182, 0x010c, 0x8000);
+   G9P_EMIT(c, 0x418e, 0x0102, 0x158c, 0x0184, 0x010c, 0x8000);
+   G9P_EMIT(c, 0x018a, 0x0103, 0x958e, 0x0186, 0x010c, 0x8000);
+}
+
 static inline void
 g9p_end_fragment(struct g9p_code *c, unsigned words)
 {
