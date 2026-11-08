@@ -1117,14 +1117,14 @@ static void scan_cf(struct gctx *c, struct exec_list *list, struct unsupported *
                      for (unsigned k = 0; k < nir_op_infos[ua->op].num_inputs; k++)
                         if (&ua->src[k].src == use)
                            for (unsigned j = 0; j < nir_ssa_alu_instr_src_components(ua, k); j++)
-                              if (ua->src[k].swizzle[j] > 1)
+                              if (ua->src[k].swizzle[j] == 2)
                                  ok = false;
                   } else {
                      ok = false;
                   }
                }
                if (!ok && !c->vs) {
-                  note(u, "load_frag_coord .z/.w (moves user varying slots; only .xy is measured)");
+                  note(u, "load_frag_coord .z (Z coefficient layout is not qualified)");
                   continue;
                }
                break;
@@ -1453,11 +1453,14 @@ static void plan_varyings(struct gctx *c)
    uint8_t interp[PCO_G5P_VARYING_SLOTS] = {0}, mask[PCO_G5P_VARYING_SLOTS] = {0};
    bool centroid[PCO_G5P_VARYING_SLOTS] = {0};
    uint32_t read = 0;
+   bool position_w = false;
    memset(c->vary_idx, -1, sizeof(c->vary_idx));
    foreach_instr_all(ins, c) {
       if (ins->type != nir_instr_type_intrinsic)
          continue;
       nir_intrinsic_instr *in = nir_instr_as_intrinsic(ins);
+      if (in->intrinsic == nir_intrinsic_load_frag_coord)
+         position_w |= V(c, &in->def, 3)->uses != 0;
       if (in->intrinsic != nir_intrinsic_load_interpolated_input && in->intrinsic != nir_intrinsic_load_input)
          continue;
       unsigned loc = nir_intrinsic_io_semantics(in).location;
@@ -1483,7 +1486,7 @@ static void plan_varyings(struct gctx *c)
    if (util_bitcount(read) > PCO_G5P_MAX_FS_VARYINGS)
       refuse(c, "%u varying locations read (%u vec4: the reported 64 components)", util_bitcount(read),
              PCO_G5P_MAX_FS_VARYINGS);
-   bool w = false;
+   bool w = position_w;
    u_foreach_bit(n, read)
       w |= interp[n] == PCO_G5P_INTERP_SMOOTH;
    /* the last location's last component must fit the u7 iterator slot */
@@ -2518,8 +2521,35 @@ static void put_recipe(struct gctx *c, enum g5p_recipe r, unsigned d, unsigned x
    const char *err = NULL;
    /* The vertex recipes are witnessed with every operand and temp in bank 1
     * (g5p_recipes.c); a bank-0 one has no witnessed form yet. */
-   if (c->vs && !(vbank(c, d) && vbank(c, x) && vbank(c, y) && vbank(c, t)))
-      refuse(c, "%s lowering: an operand in vertex bank 0 (no witnessed mixed-bank form)", g5p_recipe_name[r]);
+   if (c->vs && !(vbank(c, d) && vbank(c, x) && vbank(c, y) && vbank(c, t))) {
+      /* Keep the witnessed all-bank-1 math sequence. A bank-0
+       * temporary is copied across with the ordinary mixed-bank MOV;
+       * no SFU/FMA encoding or allocator limit changes are required. */
+      bool saved_bank = c->tex_bank0;
+      c->tex_bank0 = false;
+      unsigned count = r == G5P_RC_CEIL ? 1 : 2;
+      unsigned bridge = alloc_run(c, count, "vertex math bank1 bridge");
+      c->tex_bank0 = saved_bank;
+      uint8_t raw[G5P_USC_MAX];
+      put(c, raw, g5p_usc_move(raw, H(c, bridge), H(c, x), 1, 0,
+                              vhdr(c, 0x21, x, -1, -1)), "math operand into bank1");
+      bool minmax = r == G5P_RC_MIN || r == G5P_RC_MAX;
+      if (minmax)
+         put(c, raw, g5p_usc_move(raw, H(c, bridge + 1), H(c, y), 1, 0,
+                                 vhdr(c, 0x21, y, -1, -1)), "math second operand into bank1");
+      unsigned result = bridge + (r == G5P_RC_RSQ || r == G5P_RC_TRUNC);
+      unsigned n = g5p_recipe(r, buf, sizeof(buf), H(c, result), H(c, bridge),
+                              minmax ? H(c, bridge + 1) : 0, count > 1 ? H(c, bridge + 1) : 0,
+                              (flags & ~(G5P_RC_X_LIVE | G5P_RC_Y_LIVE)) | G5P_RC_VERTEX, &err);
+      if (!n)
+         refuse(c, "%s bank1 bridge: %s", g5p_recipe_name[r], err ? err : "encoder failure");
+      put(c, buf, n, "bank1 math recipe");
+      put(c, raw, g5p_usc_move(raw, H(c, d), H(c, result), vbank(c, d), 1,
+                              vhdr(c, 0x21, result, -1, -1)), "math result from bank1");
+      c->busy &= ~BITFIELD64_RANGE(bridge, count);
+      c->p->evidence |= PCO_G5P_EV_MATH;
+      return;
+   }
    unsigned n = g5p_recipe(r, buf, sizeof(buf), H(c, d), H(c, x), H(c, y), H(c, t),
                            flags | (c->vs ? G5P_RC_VERTEX : 0), &err);
    if (!n)
@@ -2914,6 +2944,10 @@ static void vs_fbin(struct gctx *c, nir_alu_instr *a)
       r[0] = r[1];
       r[1] = t;
    }
+   /* On the bank0 retry, use the ordinary mixed-bank register ALU rather
+    * than the shared form whose bank fields have not been witnessed. */
+   if (c->vs && c->vs_bank0 && vkind(c, r[0]) == VK_SHARED)
+      reg_of(c, r[0], "vertex uniform ALU materialization");
    if (vkind(c, r[0]) == VK_SHARED && (op == G5P_BIN_FMUL || dies(c, r[1]) || vkind(c, r[1]) != VK_REG)) {
       /* binary.shared: fmul {h11 x0 dc0 bg0|bg1}, fadd {h11 x0 dc0 bg1} */
       unsigned sd = V(c, r[0].def, r[0].comp)->imm;
@@ -3677,11 +3711,8 @@ static void vs_bitwise(struct gctx *c, nir_alu_instr *a)
       define(c, &a->def, dst);
       return;
    }
-   /* v_iand, v_ior, v_ixor: the register-pair form of v_iadd_rr. A
-    * common-store operand has no probed vertex form. */
-   if (vkind(c, r[0]) != VK_REG || vkind(c, r[1]) != VK_REG || is_const(c, r[0]) || is_const(c, r[1]))
-      refuse(c, "vertex %s with a uniform operand or a 1-bit literal (the register-pair and 32-bit literal forms "
-             "are probed)", nir_op_infos[a->op].name);
+   /* Materialize common-store operands with MOV before the witnessed
+    * register-pair operation. No shared-operand bitwise encoding is used. */
    unsigned reg[2] = {reg_of(c, r[0], "vertex bitwise"), reg_of(c, r[1], "vertex bitwise")};
    bool d0 = dies(c, r[0]), d1 = dies(c, r[1]);
    unsigned ia = d0 ? 1 : 0, ib = d0 ? 0 : 1;
@@ -4640,9 +4671,9 @@ static void vertex_qualified_copy(struct gctx *c, unsigned dst, nir_def *def, un
    struct ref r = resolve_value(c, def, component);
    if (r.neg || r.abs) refuse(c, "qualified vertex texture source modifier not witnessed");
    unsigned src = reg_of(c, r, "qualified vertex texture source");
-   vs_bank1_only(c, "qualified vertex texture copy", dst, src, -1, -1);
    uint8_t raw[G5P_USC_MAX];
-   put(c, raw, g5p_usc_move(raw, H(c, dst), H(c, src), 1, vgrp(c, r), 0x21), "qualified vertex texture copy");
+   put(c, raw, g5p_usc_move(raw, H(c, dst), H(c, src), vbank(c, dst), vgrp(c, r),
+                           vhdr(c, 0x21, src, -1, -1)), "qualified vertex texture copy");
 }
 
 static void emit_vertex_qualified_texture(struct gctx *c, nir_tex_instr *t)
@@ -4747,8 +4778,26 @@ static void emit_vertex_qualified_texture(struct gctx *c, nir_tex_instr *t)
    put(c, raw, g5p_usc_wait(raw,0), "wait");
    c->scratch |= scratch;
    for (unsigned k=0;k<nresult;k++) {
-      struct val *v=V(c,&t->def,k);v->state=VAL_REG;v->reg=dst+k;v->held=true;
+      struct val *v=V(c,&t->def,k);
+      if (c->vs_bank0) {
+         /* The coupled sample writes bank1. Park used components in
+          * individual bank0 registers after WDF; SSA components do not
+          * require a contiguous run. Release the temporary sample tuple. */
+         if (!v->uses)
+            continue;
+         int parked = alloc_bank0(c);
+         if (parked < 0)
+            refuse(c, "vertex texture result: no bank0 register for component %u", k);
+         put(c, raw, g5p_usc_move(raw, H(c, parked), H(c, dst + k), 0, 1, 0x21),
+             "vertex texture result to bank0");
+         v->reg = parked;
+      } else {
+         v->reg = dst+k;
+      }
+      v->state=VAL_REG;v->held=true;
    }
+   if (c->vs_bank0)
+      c->busy &= ~BITFIELD64_RANGE(dst, nresult);
    c->p->evidence |= PCO_G5P_EV_TEX_TYPES;
 }
 
@@ -5010,6 +5059,21 @@ static void hoist_iterators(struct gctx *c)
           nir_instr_as_intrinsic(ins)->intrinsic == nir_intrinsic_load_frag_coord)
          fc = nir_instr_as_intrinsic(ins);
    bool fc_used = fc && (V(c, &fc->def, 0)->uses || V(c, &fc->def, 1)->uses);
+   bool fc_w = fc && V(c, &fc->def, 3)->uses;
+   if (fc_w) {
+      /* f_raster_pos_w: native position W reads coefficient set zero,
+       * followed by WDF. plan_varyings reserves W even for a shader with
+       * no smooth user input. Z has a different layout and stays refused.
+       * The token has no counter-1 form, so issue it first. */
+      drc_take(c, &d);
+      unsigned r = alloc_reg(c, -1);
+      put(c, raw, g5p_usc_position_zw(raw, 2 * r, false, false, -1), "raster position W");
+      struct val *v = V(c, &fc->def, 3);
+      v->state = VAL_REG;
+      v->reg = r;
+      v->held = true;
+      c->p->evidence |= PCO_G5P_EV_FRAGCOORD;
+   }
    unsigned reads = 0;
    foreach_instr_all(ins, c)
       if (ins->type == nir_instr_type_intrinsic && is_varying_load(nir_instr_as_intrinsic(ins)) &&
@@ -5017,7 +5081,7 @@ static void hoist_iterators(struct gctx *c)
          reads += varying_reads(c, nir_instr_as_intrinsic(ins));
    /* The raster position read has no witnessed counter-1 form: it goes
     * first when the batch spills onto counter 1, else last (round 18). */
-   bool fc_first = fc_used && reads + 1 > 8;
+   bool fc_first = fc_used && reads + 1 + fc_w > 8;
    if (fc_first) {
       drc_take(c, &d);
       c->fragcoord = alloc_run(c, 2, "gl_FragCoord");
@@ -5379,13 +5443,16 @@ static unsigned vs_out_reg(struct gctx *c, struct ref r)
    c->alloc_out = true;
    unsigned reg = reg_of(c, r, "vertex output");
    struct val *v = V(c, r.def, r.comp);
-   if (!vbank(c, reg) && (v->state == VAL_CONST || v->state == VAL_SHARED)) {
+   if (!vbank(c, reg)) {
       uint8_t raw[G5P_USC_MAX];
       unsigned b1 = alloc_reg(c, -1);
       if (v->state == VAL_CONST)
          put(c, raw, g5p_usc_immediate(raw, H(c, b1), v->imm, vbank(c, b1), -1), "movi (output)");
-      else
+      else if (v->state == VAL_SHARED)
          put(c, raw, g5p_usc_mov_shared(raw, H(c, b1), v->imm, vbank(c, b1)), "mov.shared (output)");
+      else
+         put(c, raw, g5p_usc_move(raw, H(c, b1), H(c, reg), 1, 0,
+                                 vhdr(c, 0x21, reg, -1, -1)), "bank0 value into bank1 output");
       c->scratch |= BITFIELD64_BIT(b1);
       reg = b1;
    }
@@ -5404,7 +5471,8 @@ static void vs_output(struct gctx *c)
       if (c->vout[i].at >= 0)
          continue; /* written eagerly */
       order[n] = i;
-      reg[i] = c->vs_bank0 ? vs_out_reg(c, c->vout[i].r) : reg_of(c, c->vout[i].r, "vertex output");
+      if (!c->vs_bank0)
+         reg[i] = reg_of(c, c->vout[i].r, "vertex output");
       n++;
    }
    if (!n)
@@ -5412,8 +5480,13 @@ static void vs_output(struct gctx *c)
    util_qsort_r(order, n, sizeof(order[0]), vout_order, c);
    /* Native ordinary vertex samples export bank0 with the non-temp VOUT
     * form; other values retain the bank1 form. */
-   for (unsigned i = 0; i + 1 < n; i++)
+   for (unsigned i = 0; i + 1 < n; i++) {
+      if (c->vs_bank0)
+         reg[order[i]] = vs_out_reg(c, c->vout[order[i]].r);
       put(c, raw, g5p_usc_vout(raw, H(c, reg[order[i]]), c->vout[order[i]].slot, vbank(c, reg[order[i]]), false), "vertex output");
+      if (c->vs_bank0)
+         free_scratch(c);
+   }
    /* Characterized convention: branch to the 64-byte block holding the
     * final output/end-task, padding in between. */
    unsigned target = align(c->size + 6, 64);
@@ -5421,6 +5494,8 @@ static void vs_output(struct gctx *c)
    while (c->size < target)
       put(c, raw, g5p_usc_special(raw, false), "padding");
    unsigned last = order[n - 1];
+   if (c->vs_bank0)
+      reg[last] = vs_out_reg(c, c->vout[last].r);
    put(c, raw, g5p_usc_vout(raw, H(c, reg[last]), c->vout[last].slot, vbank(c, reg[last]), true), "last vertex output");
 }
 
@@ -5651,7 +5726,7 @@ static bool lower(nir_shader *nir)
  *  - straight-over SrcAlpha/OneMinusSrcAlpha colour with One/OneMinusSrcAlpha
  *    alpha: the source is pre-multiplied in f32, then the same epilogue.
  * Everything else is refused with the factors. VkBlendFactor numbering. */
-enum { BF_ZERO = 0, BF_ONE = 1, BF_SRC_ALPHA = 6, BF_ONE_MINUS_SRC_ALPHA = 7 };
+enum { BF_ZERO = 0, BF_ONE = 1, BF_ONE_MINUS_SRC_COLOR = 3, BF_SRC_ALPHA = 6, BF_ONE_MINUS_SRC_ALPHA = 7 };
 
 static unsigned blend_mode(struct gctx *c, const struct pco_g5p_fs_key *k)
 {
@@ -6029,10 +6104,23 @@ static void fuse_ffma(struct gctx *c, nir_shader *nir)
 }
 
 /* After lower(): the select, scalar like the rest of the program. */
+static bool zero_source_preserves_destination(unsigned op, unsigned dst)
+{
+   /* For transparent black, the source term is zero. These destination
+    * factors are exactly one, for RGB and alpha. SUBTRACT and MIN/MAX do
+    * not have this identity and must retain the explicit refusal. */
+   /* VkBlendOp numbering: Add=0, ReverseSubtract=2. */
+   return (op == 0 || op == 2) &&
+          (dst == BF_ONE || dst == BF_ONE_MINUS_SRC_COLOR || dst == BF_ONE_MINUS_SRC_ALPHA);
+}
+
 static void select_discards(struct gctx *c, nir_shader *nir)
 {
    bool progress = false;
-   if (c->vs || (c->blend != BLEND_PREMULT && c->blend != BLEND_STRAIGHT_OVER))
+   bool general_identity = c->blend == BLEND_GENERAL && !c->key->mrt_blend_state &&
+      zero_source_preserves_destination(c->key->op_rgb, c->key->dst_rgb) &&
+      zero_source_preserves_destination(c->key->op_a, c->key->dst_a);
+   if (c->vs || (c->blend != BLEND_PREMULT && c->blend != BLEND_STRAIGHT_OVER && !general_identity))
       return;
    NIR_PASS(progress, nir, discards_to_select);
    c->p->discard_select = progress;
@@ -6335,7 +6423,12 @@ static void cf_out_of_ssa(nir_shader *nir)
    /* Preserve divergent register webs: treating every out-of-SSA register
     * as uniform would incorrectly admit a loop with varying trip counts. */
    if (derivatives)
-      nir_divergence_analysis(nir);
+      /* Derivatives require quad uniformity, not subgroup uniformity.
+       * A flat fragment input is constant for a primitive, including its
+       * helper pixels. Use NIR's primitive-local analysis only here; do not
+       * change the shader's subgroup divergence options. Preserve this
+       * information in the out-of-SSA register webs below. */
+      nir_custom_divergence_analysis(nir, nir_divergence_single_prim_per_subgroup);
    NIR_PASS(_, nir, nir_convert_from_ssa, true, derivatives);
    NIR_PASS(_, nir, nir_trivialize_registers);
    /* The common nested-break simplifier creates an unannotated flag
@@ -6347,7 +6440,7 @@ static void cf_out_of_ssa(nir_shader *nir)
    NIR_PASS(_, nir, hoist_break_work);
    NIR_PASS(_, nir, nir_opt_dce);
    if (derivatives)
-      nir_divergence_analysis(nir);
+      nir_custom_divergence_analysis(nir, nir_divergence_single_prim_per_subgroup);
 }
 
 bool pco_g5p_compile_general(nir_shader *nir, bool half_output, const uint8_t *attrib_components,
