@@ -5415,11 +5415,17 @@ static void fs_output(struct gctx *c)
       c->max_dword = MAX2(c->max_dword, 7); /* destination halves 4..7, 1-alpha in half 12 */
       c->p->evidence |= PCO_G5P_EV_BLEND;
    } else if (c->blend == BLEND_GENERAL) {
-      /* No hardware discard in a destination-reading program: the select of
-       * discards_to_select() only holds for source-over, and a hardware
-       * discard in the TRANSLUCENT pass lost other objects' colour in 32x32
-       * tiles on A10. */
-      if (c->ndiscards || c->discard_always)
+      /* No hardware discard in a destination-reading program run
+       * TRANSLUCENT: that lost other objects' colour in 32x32 tiles on A10.
+       * The punch-through variant (key->punch: every discard merged into one
+       * feedback token by merge_discards()) runs PUNCH_THROUGH instead, the
+       * driver's pass rule for a discarding program that reads the tile.
+       * That is Apple's form: A9 f_discard under SourceAlpha/One general
+       * blending with a D32F_S8 attachment compiles to one `04 61` before
+       * the epilogue, kill mode 1 (firefox-wr3 apple/discard; getShaderPass-
+       * Info, perf60-fillrate.md §11.14.1). The variant is only placed for
+       * draws under depth/stencil whose base program selected its discards. */
+      if ((c->ndiscards || c->discard_always) && !(c->key->punch && c->ndiscards + c->discard_always == 1))
          refuse(c, "discard in a program with a general blend epilogue");
       uint8_t buf[512];
       const char *err;

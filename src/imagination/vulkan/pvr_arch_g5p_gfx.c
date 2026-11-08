@@ -953,6 +953,38 @@ g5p_pipeline_build_punch(struct pvr_device *device,
    return result;
 }
 
+/* Every refusal a draw could meet because of its programs is decided here,
+ * at pipeline creation, never while recording: a refused draw fails the
+ * whole command buffer (vkEndCommandBuffer), and Zink then drops the batch
+ * (Aquarium on r39-6: no water/background, 3 fps). The draw selects the
+ * punch variant from the dynamic depth/stencil state (g5p_draw()); this
+ * takes every state the pipeline allows: a dynamic enable may be on, a
+ * depth write needs the depth test, and a stencil test may write. */
+static VkResult
+g5p_pipeline_check_draw_variants(struct pvr_device *device,
+                                 const struct vk_graphics_pipeline_state *state,
+                                 const struct pvr_g5p_pipeline *g)
+{
+   if (state->rs && !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_RS_RASTERIZER_DISCARD_ENABLE) &&
+       state->rs->rasterizer_discard_enable)
+      return VK_SUCCESS;
+   const bool depth = !state->rp || state->rp->depth_attachment_format != VK_FORMAT_UNDEFINED;
+   const bool stencil = !state->rp || state->rp->stencil_attachment_format != VK_FORMAT_UNDEFINED;
+   const struct vk_depth_stencil_state *ds = state->ds;
+#define G5P_DYN_DS(x) BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_DS_##x)
+   const bool depth_test = depth && (G5P_DYN_DS(DEPTH_TEST_ENABLE) || (ds && ds->depth.test_enable));
+   const bool depth_write = depth_test && (G5P_DYN_DS(DEPTH_WRITE_ENABLE) || (ds && ds->depth.write_enable));
+   const bool stencil_test = stencil && (G5P_DYN_DS(STENCIL_TEST_ENABLE) || (ds && ds->stencil.test_enable));
+#undef G5P_DYN_DS
+   const bool testing = depth_test || stencil_test, writing = depth_write || stencil_test;
+   const bool needs_punch = (testing && g->fs_discard_tokens > 1) || (writing && g->fs_discard_select);
+   if (needs_punch && !g->punch)
+      return G5P_REFUSE(device, "pipeline: discard under depth/stencil requires an unsupported punch-through variant");
+   if (testing && (g->fs_discard || needs_punch) && g->samples != 1)
+      return G5P_REFUSE(device, "pipeline: discard under multisample depth/stencil is not hardware-qualified");
+   return VK_SUCCESS;
+}
+
 VkResult
 PVR_PER_ARCH(g5p_graphics_pipeline_compile)(struct pvr_device *device,
                                             const VkGraphicsPipelineCreateInfo *create_info,
@@ -974,6 +1006,8 @@ PVR_PER_ARCH(g5p_graphics_pipeline_compile)(struct pvr_device *device,
       return result;
    }
    result = g5p_pipeline_build_punch(device, create_info, vk_state, g);
+   if (result == VK_SUCCESS)
+      result = g5p_pipeline_check_draw_variants(device, vk_state, g);
    if (result != VK_SUCCESS) {
       g5p_pipeline_free(device, g);
       return result;
@@ -998,6 +1032,8 @@ PVR_PER_ARCH(g5p_graphics_pipeline_compile)(struct pvr_device *device,
       free(xfs.code);
       if (result == VK_SUCCESS && x->xfb_layout.buffers)
          result = g5p_pipeline_build_punch(device, create_info, vk_state, x);
+      if (result == VK_SUCCESS && x->xfb_layout.buffers)
+         result = g5p_pipeline_check_draw_variants(device, vk_state, x);
       if (result == VK_SUCCESS && x->xfb_layout.buffers) {
          g->xfb = x;
       } else {
