@@ -28,6 +28,8 @@
 #include "util/log.h"
 #include "util/texcompress_etc.h"
 #include "util/u_math.h"
+#include "util/os_time.h"
+#include <unistd.h>
 
 #include "pvr_cmd_buffer.h"
 #include "pvr_device.h"
@@ -573,16 +575,26 @@ PVR_PER_ARCH(g5p_transfer_submit)(struct pvr_device *device, struct pvr_sub_cmd_
                                   struct vk_sync *wait_sync, struct vk_sync *signal_sync)
 {
    VkResult result;
+   const char *perf = getenv("PVR_G5P_PERF_LOG");
+   const bool log = perf && strtoul(perf, NULL, 0) >= 2;
+   const uint64_t start = log ? os_time_get_nano() : 0;
 
    if (wait_sync) {
       result = vk_sync_wait(&device->vk, wait_sync, 0, VK_SYNC_WAIT_COMPLETE, UINT64_MAX);
       if (result != VK_SUCCESS)
          return result;
    }
+   const uint64_t ready = log ? os_time_get_nano() : 0;
+   unsigned commands = 0;
    list_for_each_entry (struct pvr_transfer_cmd, cmd, sub_cmd->transfer_cmds, link) {
+      commands++;
       if (!g5p_run(device, cmd))
          return vk_errorf(device, VK_ERROR_DEVICE_LOST,
                           "G5P transfer surface exceeds its stable BO mapping");
    }
+   if (log)
+      fprintf(stderr, "G5P perf transfer pid=%ld start_ns=%" PRIu64 " wait_us=%" PRIu64
+              " cpu_us=%" PRIu64 " commands=%u\n", (long)getpid(), start,
+              (ready - start) / 1000, (os_time_get_nano() - ready) / 1000, commands);
    return vk_sync_signal(&device->vk, signal_sync, 0);
 }

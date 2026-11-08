@@ -1394,9 +1394,14 @@ static VkResult g5p_ws_render_submit(const struct pvr_winsys_render_ctx *ctx,
    if (busy_retries)
       mesa_logw("apple_g5p render: backpressure context=%u retries=%u accepted=%u job=%" PRIu64 " result=%d",
                 c->context, busy_retries, accepted, job_id, r);
+   if (ws->perf.log >= 2)
+      fprintf(stderr, "G5P perf submit pid=%ld context=%u job=%" PRIu64 " start_ns=%" PRIu64
+              " elapsed_us=%" PRIu64 " width=%u height=%u flags=%#x vdm=%u retries=%u result=%d\n",
+              (long)getpid(), c->context, job_id, t0, (g5p_ws_perf_now() - t0) / 1000,
+              rt->width, rt->height, pass.base.flags, pass.base.vdm_size, busy_retries, r);
    if (local_signal) drmSyncobjDestroy(ws->base.render_fd, local_signal);
-   simple_mtx_unlock(&ws->lock);
    g5p_ws_perf_account(&ws->perf, res, nres, nchunks, t0);
+   simple_mtx_unlock(&ws->lock);
    if (ws->arena_log) {
       simple_mtx_lock(&ws->lock);
       if (++ws->arena_submits % 120 == 0 || t0 >= ws->arena_stats_after) {

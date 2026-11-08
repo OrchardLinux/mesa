@@ -941,6 +941,10 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
       }
    }
    memcpy(g->background, bgnd, sizeof(g->background));
+   const char *perf = getenv("PVR_G5P_PERF_LOG");
+   if (perf && strtoul(perf, NULL, 0) >= 2)
+      fprintf(stderr, "G5P perf pass width=%u height=%u load=%u partial=%u continuation=%u stores=%u\n",
+              g->width, g->height, load, partial, sub_cmd->barrier_load, hw_render->eot_surface_count);
    g->eot[0] = eot_data.data_offset;
    g->eot[1] = p->eot.code_offset;
    g->eot[2] = g5p_mrt_eot_info(nt);
