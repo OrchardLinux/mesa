@@ -7195,6 +7195,232 @@ static bool split_vertex_texture_live_range(struct gctx *c)
    return true;
 }
 
+/* Vertex pressure retry: a select whose condition combines compares with
+ * iand/ior/inot keeps that boolean, and each compare it combines, in a
+ * register of its own (plan_bools() fuses a compare only when every use is
+ * a select/b2f/discard condition). WebRender's ps_quad_blend tests one
+ * op-table index four ways and selects 20 colour-matrix outputs through
+ * iand/ior chains of those tests: 13 dwords of booleans were live at the
+ * refused point. Nesting the selects instead,
+ *    bcsel(iand(a, b), x, y) = bcsel(a, bcsel(b, x, y), y)
+ *    bcsel(ior(a, b), x, y)  = bcsel(a, x, bcsel(b, x, y))
+ *    bcsel(inot(a), x, y)    = bcsel(a, y, x)
+ *    b2f32/b2i32(c)          = bcsel(c, 1, 0)   (c one of those)
+ * leaves every condition a plain compare, which then takes the existing
+ * fused compare+select recipe (round 19, hardware-proven) at each use. The
+ * result is exact for any x/y, including NaN and integer payloads; only the
+ * number of compare/select instructions grows, bounded below. No new
+ * opcode, operand form or bank use is introduced. */
+static bool bool_combiner(nir_def *d)
+{
+   nir_alu_instr *a = alu_of(d);
+   return d->bit_size == 1 && d->num_components == 1 && a &&
+          (a->op == nir_op_iand || a->op == nir_op_ior || a->op == nir_op_inot);
+}
+
+static bool nest_bool_selects(struct gctx *c)
+{
+   NIR_PASS(_, c->nir, nir_lower_alu_to_scalar, NULL, NULL);
+   bool any = false;
+   for (unsigned budget = 1024, progress = 1; progress && budget;) {
+      progress = 0;
+      nir_builder b = nir_builder_create(c->impl);
+      nir_foreach_block(block, c->impl) {
+         nir_foreach_instr_safe(ins, block) {
+            if (ins->type != nir_instr_type_alu || !budget)
+               continue;
+            nir_alu_instr *s = nir_instr_as_alu(ins);
+            if (s->def.num_components != 1)
+               continue;
+            const bool to_float = s->op == nir_op_b2f32, to_int = s->op == nir_op_b2i32;
+            if (s->op != nir_op_bcsel && !to_float && !to_int)
+               continue;
+            /* the scalar condition itself (a one-bit def has one channel) */
+            nir_def *cond = s->src[0].src.ssa;
+            if (cond->num_components != 1 || !bool_combiner(cond))
+               continue;
+            b.cursor = nir_before_instr(ins);
+            nir_alu_instr *op = alu_of(cond);
+            nir_def *x, *y;
+            if (s->op == nir_op_bcsel) {
+               x = nir_ssa_for_alu_src(&b, s, 1);
+               y = nir_ssa_for_alu_src(&b, s, 2);
+            } else {
+               x = to_float ? nir_imm_float(&b, 1.0f) : nir_imm_int(&b, 1);
+               y = to_float ? nir_imm_float(&b, 0.0f) : nir_imm_int(&b, 0);
+            }
+            nir_def *p = nir_ssa_for_alu_src(&b, op, 0), *r;
+            if (op->op == nir_op_inot) {
+               r = nir_bcsel(&b, p, y, x);
+            } else {
+               nir_def *q = nir_ssa_for_alu_src(&b, op, 1);
+               r = op->op == nir_op_iand ? nir_bcsel(&b, p, nir_bcsel(&b, q, x, y), y)
+                                         : nir_bcsel(&b, p, x, nir_bcsel(&b, q, x, y));
+            }
+            nir_def_rewrite_uses(&s->def, r);
+            nir_instr_remove(ins);
+            progress = 1;
+            any = true;
+            budget--;
+         }
+      }
+   }
+   if (any) {
+      bool progress;
+      do {
+         progress = false;
+         NIR_PASS(progress, c->nir, nir_opt_dce);
+         NIR_PASS(progress, c->nir, nir_opt_cse);
+      } while (progress);
+   }
+   return any;
+}
+
+/* Vertex pressure retry: a bottom-up list order for a straight-line,
+ * side-effect-free vertex program (any topological order of its single
+ * block is the same program). Output stores (and the final jump) stay last
+ * in their original order. Walking up from them, each step places the
+ * instruction whose result dies there for the fewest newly live operand
+ * dwords: its own dwords free (a value read only by output stores holds
+ * none: eager outputs are written right after their producer), each operand
+ * not yet live costs its dwords; one-bit compares cost nothing (fused into
+ * each select). Ties keep the original order. A flattened select tree's arm
+ * values thus land right before their select instead of hundreds of
+ * instructions above it (WebRender ps_quad_blend: 64 of 64 vertex dwords
+ * live before). Only the order of existing instructions changes; every
+ * value, operation, operand form and bank rule is unchanged. */
+struct psched {
+   nir_instr *ins;
+   bool placed;
+};
+
+struct psrcs { nir_def *d[32]; unsigned n; };
+static bool psched_src(nir_src *src, void *data)
+{
+   struct psrcs *ps = data;
+   if (ps->n < ARRAY_SIZE(ps->d))
+      ps->d[ps->n++] = src->ssa;
+   return true;
+}
+
+static int psched_dwords(nir_def *d)
+{
+   return d->bit_size == 1 ? 0 : d->num_components * DIV_ROUND_UP(d->bit_size, 32);
+}
+
+static bool schedule_min_pressure(struct gctx *c)
+{
+   if (!exec_list_is_singular(&c->impl->body) || impl_has_side_effects(c->impl))
+      return false;
+   nir_block *block = nir_start_block(c->impl);
+   nir_index_ssa_defs(c->impl);
+   unsigned n = 0;
+   nir_foreach_instr(ins, block)
+      n++;
+   struct psched *s = calloc(n, sizeof(*s));
+   int *users = calloc(c->impl->ssa_alloc, sizeof(int)); /* in-block readers not yet placed */
+   bool *live = calloc(c->impl->ssa_alloc, sizeof(bool));
+   bool *stored = calloc(c->impl->ssa_alloc, sizeof(bool));
+   nir_instr **order = calloc(n, sizeof(*order));
+   if (!s || !users || !live || !stored || !order) {
+      free(s); free(users); free(live); free(stored); free(order);
+      return false;
+   }
+   unsigned i = 0;
+   nir_foreach_instr(ins, block) {
+      s[i].ins = ins;
+      ins->index = i++;
+   }
+#define PS_TAIL(ins) ((ins)->type == nir_instr_type_jump || ((ins)->type == nir_instr_type_intrinsic && \
+                      nir_instr_as_intrinsic(ins)->intrinsic == nir_intrinsic_store_output))
+   for (i = 0; i < n; i++) {
+      nir_def *d = nir_instr_def(s[i].ins);
+      if (!d)
+         continue;
+      bool only = !list_is_empty(&d->uses);
+      nir_foreach_use_including_if(u, d) {
+         if (nir_src_is_if(u)) {
+            only = false;
+            continue;
+         }
+         nir_instr *ui = nir_src_use_instr(u);
+         if (ui->block == block)
+            users[d->index]++;
+         only &= PS_TAIL(ui);
+      }
+      stored[d->index] = only;
+   }
+   /* bottom-up: the stores and the jump keep their order at the end */
+   unsigned left = n;
+   unsigned pos = n;
+   for (int k = n - 1; k >= 0; k--) {
+      if (!PS_TAIL(s[k].ins))
+         continue;
+      s[k].placed = true;
+      order[--pos] = s[k].ins;
+      left--;
+      struct psrcs ps = {0};
+      nir_foreach_src(s[k].ins, psched_src, &ps);
+      for (unsigned q = 0; q < ps.n; q++) {
+         users[ps.d[q]->index]--;
+         if (!stored[ps.d[q]->index])
+            live[ps.d[q]->index] = true;
+      }
+   }
+   bool changed = false;
+   while (left) {
+      int best = -1, best_score = INT_MIN;
+      for (i = 0; i < n; i++) {
+         if (s[i].placed)
+            continue;
+         nir_def *d = nir_instr_def(s[i].ins);
+         if (d && users[d->index] > 0)
+            continue; /* a reader is not placed yet */
+         int score = d && live[d->index] ? psched_dwords(d) : 0;
+         struct psrcs ps = {0};
+         nir_foreach_src(s[i].ins, psched_src, &ps);
+         for (unsigned q = 0; q < ps.n; q++) {
+            nir_def *o = ps.d[q];
+            bool dup = false;
+            for (unsigned r = 0; r < q; r++)
+               dup |= ps.d[r] == o;
+            if (!dup && !live[o->index] && nir_def_instr(o)->type != nir_instr_type_load_const)
+               score -= psched_dwords(o);
+         }
+         /* ties: the latest original instruction first (original order kept) */
+         if (score > best_score || (score == best_score && (int)i > best)) {
+            best_score = score;
+            best = i;
+         }
+      }
+      assert(best >= 0);
+      if (best < 0)
+         break;
+      nir_instr *ins = s[best].ins;
+      s[best].placed = true;
+      left--;
+      order[--pos] = ins;
+      nir_def *d = nir_instr_def(ins);
+      if (d)
+         live[d->index] = false;
+      struct psrcs ps = {0};
+      nir_foreach_src(ins, psched_src, &ps);
+      for (unsigned q = 0; q < ps.n; q++) {
+         users[ps.d[q]->index]--;
+         live[ps.d[q]->index] = true;
+      }
+   }
+#undef PS_TAIL
+   for (i = 0; i < n; i++)
+      changed |= order[i] != s[i].ins;
+   if (changed)
+      for (i = 0; i < n; i++)
+         nir_instr_move(nir_after_block(block), order[i]);
+   free(s); free(users); free(live); free(stored); free(order);
+   nir_index_instrs(c->impl);
+   return changed;
+}
+
 static void reindex_pressure_retry(struct gctx *c)
 {
    nir_index_ssa_defs(c->impl);
@@ -7337,6 +7563,16 @@ static bool compile_general_link(nir_shader *nir, bool half_output, const uint8_
    if (!c->lastput || !c->home)
       refuse(c, "out of memory");
    memset(c->home, -1, c->impl->ssa_alloc * 4);
+   /* Qualification only (numeric runner's forced-order arm): give every
+    * straight-line vertex program the last retry's select nesting and
+    * pressure order up front, so the oracles that already pass on G5P also
+    * exercise that transform. Never set in production. */
+   if (c->vs && !c->cf && getenv("PVR_G5P_VS_FORCE_PRESSURE_ORDER") &&
+       strcmp(getenv("PVR_G5P_VS_FORCE_PRESSURE_ORDER"), "0")) {
+      const bool nested = nest_bool_selects(c), ordered = schedule_min_pressure(c);
+      reindex_pressure_retry(c);
+      fprintf(stderr, "G5P pressure: VS forced nested selects=%d pressure order=%d\n", nested, ordered);
+   }
    ok = two_pass(c);
    if (!ok && !c->vs && strstr(out->refusal, "register pressure")) {
       /* Retry: constants and uniforms re-read per use (round 19). */
@@ -7432,6 +7668,21 @@ homes_retry:
       ok = two_pass(c);
       if (ok && getenv("PVR_G5P_PRESSURE_LOG"))
          fprintf(stderr, "G5P pressure: VS explicit-LOD live-range splits=%u\n", split + 1);
+   }
+   /* Last vertex retry, only for a program every step above refused:
+    * select nesting, then a pressure-driven order of the same instructions. */
+   if (!ok && c->vs && !c->cf && strstr(out->refusal, "register pressure")) {
+      const bool nested = nest_bool_selects(c);
+      const bool ordered = schedule_min_pressure(c);
+      if (nested || ordered) {
+         reindex_pressure_retry(c);
+         codegen_reset(c);
+         c->vs_bank0 = c->remat = c->eager_vout = true;
+         c->compact_vs = !impl_has_side_effects(c->impl);
+         ok = two_pass(c);
+         if (ok && getenv("PVR_G5P_PRESSURE_LOG"))
+            fprintf(stderr, "G5P pressure: VS nested selects=%d pressure order=%d\n", nested, ordered);
+      }
    }
 done:
    free(c->decls);
