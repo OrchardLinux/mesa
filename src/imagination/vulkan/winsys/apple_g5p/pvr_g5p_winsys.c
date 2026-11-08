@@ -1144,14 +1144,20 @@ g5p_ws_cover(const struct drm_g5p_render_resource *res, unsigned n,
 /* No CPU/GPU memory reads on the failure path. The kernel rejected the job;
  * only the immutable submission snapshot is safe and useful to report. */
 static void
-g5p_ws_render_enoent(const struct g5p_ws *ws, const struct g5p_ws_context *c,
-                     uint32_t rt, const struct drm_g5p_render_pass_v3 *pass,
-                     const struct drm_g5p_render_resource *res, unsigned n)
+g5p_ws_render_enoent(struct g5p_ws *ws, const struct g5p_ws_context *c,
+                     const struct g5p_ws_rt *rt, const struct drm_g5p_render_pass_v3 *pass,
+                     const struct drm_g5p_render_resource *res, unsigned n,
+                     const struct drm_g5p_sync *syncs, unsigned nsyncs)
 {
+   fprintf(stderr, "apple_g5p render ENOENT: pid=%ld drm_fd=%d sync_fd=%d dataset=%p handle=%u context=%u shared=%p shared_handle=%u shared_context=%u shared_users=%u pooled=%u size=%ux%u samples=%u layers=%u last_sync=%u\n",
+           (long)getpid(), ws->drm.fd, ws->base.render_fd, (const void *)rt, rt->handle, rt->context,
+           (void *)rt->shared, rt->shared ? rt->shared->handle : 0, rt->shared ? rt->shared->context : 0,
+           rt->shared ? rt->shared->users : 0, rt->shared && rt->shared->in_pool,
+           rt->width, rt->height, rt->samples, rt->layers, c->last);
    const uint64_t bytes = (uint64_t)pass->base.vdm_size + G5P_WS_VDM_GUARD;
    fprintf(stderr, "apple_g5p render ENOENT: context=%u rt=%u stream=%#" PRIx64
            "+%" PRIu64 " (commands=%u guard=%u) range=%d program=%#" PRIx64 "+%u range=%d\n",
-           c->context, rt, (uint64_t)pass->base.vdm_va, bytes,
+           c->context, rt->handle, (uint64_t)pass->base.vdm_va, bytes,
            pass->base.vdm_size, G5P_WS_VDM_GUARD,
            g5p_ws_cover(res, n, pass->base.vdm_va, bytes),
            (uint64_t)pass->ta_program_va, pass->ta_program_size,
@@ -1164,10 +1170,22 @@ g5p_ws_render_enoent(const struct g5p_ws *ws, const struct g5p_ws_context *c,
          fprintf(stderr, "apple_g5p render ENOENT: task[%u][%u]=%#" PRIx64 "+16 range=%d\n",
                  i, j, va[j], g5p_ws_cover(res, n, va[j], 16));
    }
-   for (unsigned i = 0; i < n; i++)
+   for (unsigned i = 0; i < n; i++) {
+      struct g5p_drm_bo bo = {.handle = res[i].handle};
+      uint64_t offset;
+      const int lookup = g5p_drm_bo_mmap_offset(&ws->drm, &bo, &offset);
       fprintf(stderr, "apple_g5p render ENOENT: range[%u] handle=%u va=%#" PRIx64
-              " size=%#" PRIx64 " offset=%#" PRIx64 " access=%#x\n", i, res[i].handle,
-              (uint64_t)res[i].va, (uint64_t)res[i].size, (uint64_t)res[i].offset, res[i].kind);
+              " size=%#" PRIx64 " offset=%#" PRIx64 " access=%#x lookup=%d\n", i, res[i].handle,
+              (uint64_t)res[i].va, (uint64_t)res[i].size, (uint64_t)res[i].offset, res[i].kind, lookup);
+   }
+   for (unsigned i = 0; i < nsyncs; i++) {
+      int fd = -1;
+      const int ret = drmSyncobjHandleToFD(ws->base.render_fd, syncs[i].handle, &fd);
+      const int lookup = ret ? -errno : 0;
+      if (!ret) close(fd);
+      fprintf(stderr, "apple_g5p render ENOENT: sync[%u] handle=%u point=%" PRIu64 " flags=%#x lookup=%d\n",
+              i, syncs[i].handle, (uint64_t)syncs[i].point, syncs[i].flags, lookup);
+   }
 }
 
 /* One G5P render: the fragment stream holds the TYPED_V3 pass
@@ -1340,7 +1358,7 @@ static VkResult g5p_ws_render_submit(const struct pvr_winsys_render_ctx *ctx,
    }
    if (r == -ENOENT && !c->reported_render_enoent) {
       c->reported_render_enoent = true;
-      g5p_ws_render_enoent(ws, c, rt_handle, &pass, res, nres);
+      g5p_ws_render_enoent(ws, c, rt, &pass, res, nres, syncs, n);
    }
    if (!r) {
       accepted = true;
