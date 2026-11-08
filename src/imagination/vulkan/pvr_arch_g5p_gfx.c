@@ -822,7 +822,7 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
 
    /* PDS: the coefficient program (the device HALT without varyings) */
    unsigned varying_data_dwords = 0;
-   if (fs->num_varyings) {
+   if (fs->num_varyings || fs->w_set) {
       unsigned code_dwords;
       varying_data_dwords = varying_program(fs, vs, data, code, &code_dwords);
       result = pvr_gpu_upload_pds(device, data, varying_data_dwords, 16, code, code_dwords, 16, 64, &g->varying);
@@ -885,7 +885,7 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
          s1.pds_uniformsize = g->fs_num_uploads ? DIV_ROUND_UP(4 * g->fs_num_dmas,
                                                                ROGUE_TA_STATE_PDS_SIZEINFO1_PDS_UNIFORMSIZE_UNIT_SIZE)
                                                 : 1;
-         if (fs->num_varyings) {
+         if (fs->num_varyings || fs->w_set) {
             s1.pds_varyingsize = DIV_ROUND_UP(varying_data_dwords, 4);
             /* coefficient sets: W, then four per varying (4 dwords each) */
             s1.usc_varyingsize = DIV_ROUND_UP(4 * ((fs->w_set ? 1 : 0) + 4 * fs->num_varyings), 16);
@@ -900,7 +900,7 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
                                              ROGUE_TA_STATE_PDS_SIZEINFO2_USC_SHAREDSIZE_UNIT_SIZE);
       }
       pvr_csb_pack (&w[5], TA_STATE_PDS_VARYINGBASE, vb) {
-         vb.addr = PVR_DEV_ADDR(fs->num_varyings ? g->varying.data_offset : dp->halt.code_offset);
+         vb.addr = PVR_DEV_ADDR(fs->num_varyings || fs->w_set ? g->varying.data_offset : dp->halt.code_offset);
       }
       result = pvr_gpu_upload(device, device->heaps.general_heap, w, 24, 16, &g->static_frag);
       if (result != VK_SUCCESS)
