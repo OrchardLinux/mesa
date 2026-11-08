@@ -1619,6 +1619,23 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
    result = pvr_arch_cmd_buffer_start_sub_cmd(cmd_buffer, PVR_SUB_CMD_TYPE_GRAPHICS);
    if (result != VK_SUCCESS)
       return result;
+   /* Reserve one full CSB block for the next draw and end-of-pass words.
+    * A G5P draw emits < 256 bytes of VDM (PPP payloads live elsewhere).
+    * Counting full blocks overestimates the flattened length, including
+    * relocation slack. This also provides old-kernel compatibility without
+    * changing the application's render pass. */
+   struct pvr_csb *stream = &cs->current_sub_cmd->gfx.control_stream;
+   const uint64_t occupied = (uint64_t)list_length(&stream->pvr_bo_list) *
+                             PVR_CMD_BUFFER_CSB_BO_SIZE;
+   if (occupied + PVR_CMD_BUFFER_CSB_BO_SIZE > device->ws->max_vdm_bytes) {
+      if (getenv("PVR_G5P_WS_LOG"))
+         fprintf(stderr, "g5p vdm: continue with LOAD at limit %u\n", device->ws->max_vdm_bytes);
+      result = pvr_cmd_buffer_insert_mid_frag_barrier_event(cmd_buffer,
+                                                           PVR_PIPELINE_STAGE_FRAG_BIT,
+                                                           PVR_PIPELINE_STAGE_GEOM_BIT);
+      if (result != VK_SUCCESS)
+         return result;
+   }
    g5p_record_ds_usage(&cs->current_sub_cmd->gfx, dyn);
    /* Starting the sub-command establishes the actual DS attachment even
     * for a discarding first draw after CLEAR. Select before any shader-specific

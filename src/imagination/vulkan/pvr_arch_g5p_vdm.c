@@ -12,7 +12,7 @@
  * (Apple's own render streams carry STREAM_LINK `80000001 <addr>`, the same
  * encoding; docs/gpu/experiments/frida-agx-findings.md), but our kernel takes
  * a pass's stream as one range: [vdm_va, vdm_va + vdm_size) inside one
- * listed resource, at most DRM_G5P_RENDER_MAX_VDM_BYTES, with the stream's
+ * listed resource, at most GET_RENDER_INFO.max_vdm_bytes, with the stream's
  * STREAM_TERMINATE as its last dword at vdm_va + vdm_end - 4
  * (render-user-validate.h g5p_ru_pass3_check(), g5p_ru_pass3_content()).
  *
@@ -25,7 +25,7 @@
  * crossed a block boundary was moved whole by pvr_csb, and a STREAM_LINK
  * with return to a secondary stream returns to the dword after it, wherever
  * that is). Only the chaining links, which jump to the next block, are left
- * out. A stream longer than the kernel's limit is refused by name.
+ * out. The draw path continues with LOAD before the negotiated limit.
  */
 
 #include <inttypes.h>
@@ -38,6 +38,8 @@
 #include "pvr_bo.h"
 #include "pvr_cmd_buffer.h"
 #include "pvr_csb.h"
+#include "pvr_device.h"
+#include "winsys/pvr_winsys.h"
 #include "pvr_g5p_vdm.h"
 #include "winsys/apple_g5p/apple_g5p_drm.h"
 
@@ -93,9 +95,10 @@ PVR_PER_ARCH(g5p_vdm_stream)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr
                                i + 1);
       total += (uint64_t)len;
    }
-   if (total > DRM_G5P_RENDER_MAX_VDM_BYTES)
+   const uint32_t limit = cmd_buffer->device->ws->max_vdm_bytes;
+   if (total > limit)
       return G5P_VDM_REFUSE(cmd_buffer, "a control stream of %" PRIu64 " bytes in %u blocks (the kernel takes %u)",
-                            total, blocks, DRM_G5P_RENDER_MAX_VDM_BYTES);
+                            total, blocks, limit);
 
    const size_t size = total + ROGUE_VDMCTRL_GUARD_SIZE_DEFAULT;
    uint8_t *flat = calloc(1, size);

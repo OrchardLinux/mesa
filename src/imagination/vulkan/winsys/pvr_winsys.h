@@ -457,6 +457,9 @@ struct pvr_winsys {
    uint64_t page_size;
    uint32_t log2_page_size;
 
+   /* G5P GET_RENDER_INFO admission bound; zero on other winsyses. */
+   uint32_t max_vdm_bytes;
+
    const struct vk_sync_type *sync_types[3];
    struct vk_sync_type syncobj_type;
    struct vk_sync_timeline_type timeline_syncobj_type;

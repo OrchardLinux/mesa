@@ -829,10 +829,14 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
    /* the null target holds nothing to keep: no colour LOAD whatever the area */
    const bool partial = !null_target && (area->offset.x || area->offset.y || area->extent.width != g->width ||
                                          area->extent.height != g->height);
-   bool load = partial;
+   /* A size-limited continuation stores then loads the previous pass,
+    * including its original CLEAR. Never clear the continuation again. */
+   bool load = partial || (!null_target && sub_cmd->barrier_load);
+   if (sub_cmd->barrier_load && !null_target && n != 1)
+      return G5P_REFUSE(cmd_buffer, "VDM continuation needs one loadable colour target");
    for (unsigned i = 0; i < hw_render->color_init_count; i++) {
       const unsigned t = i; /* color_init follows the EOT surfaces' order */
-      if (partial && hw_render->color_init[i].op == VK_ATTACHMENT_LOAD_OP_CLEAR)
+      if (partial && !sub_cmd->barrier_load && hw_render->color_init[i].op == VK_ATTACHMENT_LOAD_OP_CLEAR)
          return G5P_REFUSE(cmd_buffer, "a CLEAR of colour attachment %u in a partial render area (%d,%d %ux%u of "
                            "%ux%u): no clear of the area alone", t, area->offset.x, area->offset.y,
                            area->extent.width, area->extent.height, g->width, g->height);

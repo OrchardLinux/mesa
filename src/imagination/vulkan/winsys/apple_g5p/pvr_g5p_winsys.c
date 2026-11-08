@@ -1539,6 +1539,16 @@ VkResult pvr_g5p_winsys_create(int render_fd, int display_fd, const VkAllocation
       return g5p_ws_fail(VK_ERROR_INCOMPATIBLE_DRIVER, "%s", bad);
    }
 
+   /* Old kernels report 64 KiB through this same ABI. Bound host uploads
+    * even if a future kernel offers a larger range. */
+   if (ri->max_vdm_bytes < DRM_G5P_RENDER_MAX_VDM_BYTES || (ri->max_vdm_bytes & 3)) {
+      g5p_ws_destroy(&ws->base);
+      return g5p_ws_fail(VK_ERROR_INCOMPATIBLE_DRIVER, "invalid max_vdm_bytes");
+   }
+   ws->base.max_vdm_bytes = MIN2(ri->max_vdm_bytes, 1u << 20);
+   if (getenv("PVR_G5P_WS_LOG"))
+      fprintf(stderr, "apple_g5p winsys: max_vdm_bytes=%u\n", ws->base.max_vdm_bytes);
+
    ws->base.syncobj_type = vk_drm_syncobj_get_type(render_fd);
    ws->base.sync_types[0] = &ws->base.syncobj_type;
    ws->base.sync_types[1] = NULL;
