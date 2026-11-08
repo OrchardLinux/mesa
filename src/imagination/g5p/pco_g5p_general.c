@@ -5739,8 +5739,8 @@ static bool lower_vs_fsqrt_instr(nir_builder *b, nir_alu_instr *a, void *data)
    return true;
 }
 
-/* Speculate only side-effect-free arithmetic and immutable raster/uniform
- * inputs when establishing the operand of a hoisted derivative. No phi,
+/* Speculate only side-effect-free arithmetic and raster inputs when
+ * establishing the operand of a hoisted derivative. No phi,
  * texture, register-web or mutable-memory value is reconstructed. */
 struct derivative_speculate { nir_block *before; unsigned *budget; };
 static bool derivative_operand_speculable(nir_def *d, nir_block *before, unsigned *budget);
@@ -5764,12 +5764,11 @@ static bool derivative_operand_speculable(nir_def *d, nir_block *before, unsigne
       case nir_intrinsic_load_barycentric_pixel:
       case nir_intrinsic_load_barycentric_centroid:
       case nir_intrinsic_load_frag_coord:
-      case nir_intrinsic_load_push_constant:
-      case nir_intrinsic_load_ubo:
-      case nir_intrinsic_vulkan_resource_index:
-      case nir_intrinsic_load_vulkan_descriptor:
          break;
       default:
+         /* Immutability does not make speculative memory safe: a branch
+          * can guard an out-of-range UBO index. Already-dominating loads
+          * were accepted above; never move branch-local memory reads. */
          return false;
       }
    } else if (ins->type != nir_instr_type_alu && ins->type != nir_instr_type_load_const) {

@@ -42,3 +42,7 @@ oracle for the still-refused Z boundary, not an enabled feature. All accept
 Actual G5P pixels remain pending. General blend kills use the driver's
 existing PUNCH_THROUGH ISP rule and one merged kill token; TRANSLUCENT is
 never substituted for a shader that retains a real kill.
+
+Branch-local UBO/descriptor reads must not move across a bounds guard, even
+though the resource is immutable. varying_guarded_ubo.frag must retain the
+named divergent-derivative refusal. Already-dominating loads are unchanged.
