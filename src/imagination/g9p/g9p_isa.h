@@ -654,19 +654,67 @@ g9p_blend_src_over(struct g9p_code *c)
 }
 
 /*
- * Additive blending (One / One): the source-over sequence with half 10 = 1.0
- * instead of 1 - alpha, so half i = half (4 + i) x 1 + half i
+ * Other blends Apple's compiler appends the same way (the colour in halves
+ * 0-3, the tile read into halves 4-7; tools/isa/explore-blend.py with the
+ * same factors on colour and alpha), after `211c 2804` `004d`
+ */
+enum g9p_blend {
+   G9P_BLEND_NONE,
+   G9P_BLEND_SRC_OVER, /* One, OneMinusSourceAlpha: g9p_blend_src_over() */
+   G9P_BLEND_ALPHA,    /* SourceAlpha, OneMinusSourceAlpha */
+   G9P_BLEND_ADD,      /* One, One */
+   G9P_BLEND_ADD_ALPHA, /* SourceAlpha, One */
+   G9P_BLEND_REPLACE,  /* One, Zero: only with the alpha kept */
+};
+
+/*
+ * @keep_alpha: a write mask without alpha (Zink's for an RGB surface): after
+ * the blend, half 3 (r1's high half) cleared and the tile's alpha, half 7,
+ * added to it with the half add of the One / One sequence
  */
 static inline void
-g9p_blend_add(struct g9p_code *c)
+g9p_blend_keep_alpha(struct g9p_code *c)
 {
+   g9p_mov_imm(c, 6, 0x0000ffff);
+   g9p_alu2(c, G9P_AND, 1, 1, 6, false);
+   G9P_EMIT(c, 0x0189, 0x0103, 0x878e, 0x0104, 0x8000);
+}
+
+static inline void
+g9p_blend(struct g9p_code *c, enum g9p_blend kind, bool keep_alpha)
+{
+   if (kind == G9P_BLEND_SRC_OVER) {
+      g9p_blend_src_over(c);
+      if (keep_alpha)
+         g9p_blend_keep_alpha(c);
+      return;
+   }
    G9P_EMIT(c, 0x211c, 0x2804);
    G9P_EMIT(c, 0x004d);
-   g9p_mov_imm(c, 5, 0x3c00);
-   G9P_EMIT(c, 0x418e, 0x0100, 0x1588, 0x0180, 0x010c, 0x8000);
-   G9P_EMIT(c, 0x418e, 0x0101, 0x158a, 0x0182, 0x010c, 0x8000);
-   G9P_EMIT(c, 0x418e, 0x0102, 0x158c, 0x0184, 0x010c, 0x8000);
-   G9P_EMIT(c, 0x018a, 0x0103, 0x958e, 0x0186, 0x010c, 0x8000);
+   switch (kind) {
+   case G9P_BLEND_ALPHA:
+      G9P_EMIT(c, 0x418e, 0x0100, 0x0788, 0x0180, 0x0114, 0x8000);
+      G9P_EMIT(c, 0x418e, 0x0101, 0x078a, 0x0182, 0x0114, 0x8000);
+      G9P_EMIT(c, 0x418e, 0x0102, 0x078c, 0x0184, 0x0114, 0x8000);
+      G9P_EMIT(c, 0x0189, 0x0103, 0x878e, 0x0114, 0x800c);
+      break;
+   case G9P_BLEND_ADD:
+      G9P_EMIT(c, 0x0189, 0x0100, 0x8188, 0x0104, 0x8000);
+      G9P_EMIT(c, 0x0189, 0x0101, 0x838a, 0x0104, 0x8000);
+      G9P_EMIT(c, 0x0189, 0x0102, 0x858c, 0x0104, 0x8000);
+      G9P_EMIT(c, 0x0189, 0x0103, 0x878e, 0x0104, 0x8000);
+      break;
+   case G9P_BLEND_ADD_ALPHA:
+      G9P_EMIT(c, 0x018e, 0x0100, 0x8106, 0x0188, 0x010c, 0x2000);
+      G9P_EMIT(c, 0x018e, 0x0101, 0x8306, 0x018a, 0x010c, 0x2000);
+      G9P_EMIT(c, 0x018e, 0x0102, 0x8506, 0x018c, 0x010c, 0x2000);
+      G9P_EMIT(c, 0x0189, 0x0103, 0x8f86, 0x010c, 0x203c);
+      break;
+   default:
+      break;
+   }
+   if (keep_alpha)
+      g9p_blend_keep_alpha(c);
 }
 
 static inline void

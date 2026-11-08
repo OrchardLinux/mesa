@@ -3892,10 +3892,8 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
          }
          if (!emit_colour(ctx))
             return false;
-         if (ctx->out->native_blend_add)
-            g9p_blend_add(ctx->c);
-         else if (ctx->out->native_blend)
-            g9p_blend_src_over(ctx->c);
+         if (ctx->out->native_blend)
+            g9p_blend(ctx->c, ctx->out->native_blend_kind, ctx->out->native_keep_alpha);
       }
       g9p_end_fragment(ctx->c, colour ? words : 0);
       break;
@@ -5708,37 +5706,40 @@ lower_blend_constant(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return true;
 }
 
-static bool
-is_src_over(const nir_lower_blend_options *blend)
+/*
+ * A blend Apple's appended sequences do (g9p_blend()): the same on colour and
+ * alpha with every channel written, or any alpha with a mask of R, G and B
+ * (@keep_alpha), as Zink's for an RGB surface
+ */
+static enum g9p_blend
+native_blend_kind(const nir_lower_blend_options *blend, bool *keep_alpha)
 {
    const nir_lower_blend_rt *rt = &blend->rt[0];
-   const nir_lower_blend_channel *ch[2] = { &rt->rgb, &rt->alpha };
+   const nir_lower_blend_channel *c = &rt->rgb, *a = &rt->alpha;
+   static const struct {
+      enum pipe_blendfactor src, dst;
+      enum g9p_blend kind;
+   } table[] = {
+      { PIPE_BLENDFACTOR_ONE, PIPE_BLENDFACTOR_INV_SRC_ALPHA, G9P_BLEND_SRC_OVER },
+      { PIPE_BLENDFACTOR_SRC_ALPHA, PIPE_BLENDFACTOR_INV_SRC_ALPHA, G9P_BLEND_ALPHA },
+      { PIPE_BLENDFACTOR_ONE, PIPE_BLENDFACTOR_ONE, G9P_BLEND_ADD },
+      { PIPE_BLENDFACTOR_SRC_ALPHA, PIPE_BLENDFACTOR_ONE, G9P_BLEND_ADD_ALPHA },
+      { PIPE_BLENDFACTOR_ONE, PIPE_BLENDFACTOR_ZERO, G9P_BLEND_REPLACE },
+   };
 
-   if (blend->logicop_enable || rt->colormask != 0xf)
-      return false;
-   for (unsigned i = 0; i < 2; i++) {
-      if (ch[i]->func != PIPE_BLEND_ADD || ch[i]->src_factor != PIPE_BLENDFACTOR_ONE ||
-          ch[i]->dst_factor != PIPE_BLENDFACTOR_INV_SRC_ALPHA)
-         return false;
+   *keep_alpha = rt->colormask == 0x7 && !getenv("G9P_NO_NATIVE_MASK");
+   if (blend->logicop_enable || (rt->colormask != 0xf && !*keep_alpha) ||
+       c->func != PIPE_BLEND_ADD ||
+       (!*keep_alpha && (a->func != PIPE_BLEND_ADD || c->src_factor != a->src_factor ||
+                         c->dst_factor != a->dst_factor)))
+      return G9P_BLEND_NONE;
+   for (unsigned i = 0; i < ARRAY_SIZE(table); i++) {
+      if (c->src_factor == table[i].src && c->dst_factor == table[i].dst &&
+          (table[i].kind != G9P_BLEND_REPLACE || *keep_alpha) &&
+          (table[i].kind == G9P_BLEND_SRC_OVER || !getenv("G9P_NO_NATIVE_ADD")))
+         return table[i].kind;
    }
-   return true;
-}
-
-/* additive blending, One / One on colour and alpha */
-static bool
-is_additive(const nir_lower_blend_options *blend)
-{
-   const nir_lower_blend_rt *rt = &blend->rt[0];
-   const nir_lower_blend_channel *ch[2] = { &rt->rgb, &rt->alpha };
-
-   if (blend->logicop_enable || rt->colormask != 0xf)
-      return false;
-   for (unsigned i = 0; i < 2; i++) {
-      if (ch[i]->func != PIPE_BLEND_ADD || ch[i]->src_factor != PIPE_BLENDFACTOR_ONE ||
-          ch[i]->dst_factor != PIPE_BLENDFACTOR_ONE)
-         return false;
-   }
-   return true;
+   return G9P_BLEND_NONE;
 }
 
 /*
@@ -5825,12 +5826,21 @@ g9p_compile_fragment(nir_shader *nir, unsigned frag_coord_slot,
    if (coverage)
       lower_coverage(nir, coverage);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_keep_target, nir_metadata_control_flow, out);
-   out->native_blend_add = blend && is_additive(blend) && !getenv("G9P_NO_NATIVE_ADD");
-   out->native_blend = blend && (is_src_over(blend) || out->native_blend_add) &&
+   out->native_blend_kind = blend ? native_blend_kind(blend, &out->native_keep_alpha)
+                                  : G9P_BLEND_NONE;
+   out->native_blend = out->native_blend_kind != G9P_BLEND_NONE &&
                        out->output == G9P_OUTPUT_HALF2 &&
                        !out->output_float && !targets[1].present && !targets[2].present &&
                        !targets[3].present && !getenv("G9P_NO_NATIVE_BLEND");
-   out->native_blend_add &= out->native_blend;
+   if (blend && !out->native_blend && getenv("G9P_PASSLOG")) {
+      const nir_lower_blend_rt *rt = &blend->rt[0];
+
+      fprintf(stderr, "g9p: blend in the shader: rgb %d %d %d alpha %d %d %d mask %#x logicop %d output %d float %d targets %d%d%d\n",
+              rt->rgb.func, rt->rgb.src_factor, rt->rgb.dst_factor, rt->alpha.func,
+              rt->alpha.src_factor, rt->alpha.dst_factor, rt->colormask, blend->logicop_enable,
+              out->output, out->output_float, targets[1].present, targets[2].present,
+              targets[3].present);
+   }
    if (blend && !out->native_blend) {
       NIR_PASS(_, nir, nir_lower_blend, blend);
       NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_blend_constant,

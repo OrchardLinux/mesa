@@ -228,7 +228,8 @@ struct g9p_shader {
     * nir_lower_blend's f32 code
     */
    bool native_blend;
-   bool native_blend_add;  /* One / One instead of source-over */
+   uint8_t native_blend_kind;  /* enum g9p_blend */
+   bool native_keep_alpha;     /* the write mask leaves alpha: the tile's stays */
 
    /* Fragment: the combined image samplers sampled, by common-store slot */
    unsigned num_textures;
