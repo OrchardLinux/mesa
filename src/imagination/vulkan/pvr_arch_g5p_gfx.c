@@ -931,6 +931,22 @@ g5p_pipeline_build_punch(struct pvr_device *device,
 {
    if (g->fs_discard_tokens < 2 && !g->fs_discard_select)
       return VK_SUCCESS;
+   /* Device bisect knobs (default on). PVR_G5P_PUNCH_BLEND=0: no punch
+    * variant for a general-blend program (r39-6.1's new form);
+    * PVR_G5P_PUNCH=0: no punch variant at all. Without the variant,
+    * g5p_pipeline_check_draw_variants() refuses the pipeline at creation
+    * when a depth/stencil state could need it, as r39-3 refused it. */
+   static int punch_all = -1, punch_blend = -1;
+   if (punch_all < 0) {
+      const char *a = getenv("PVR_G5P_PUNCH"), *b = getenv("PVR_G5P_PUNCH_BLEND");
+      punch_all = !(a && !strcmp(a, "0"));
+      punch_blend = !(b && !strcmp(b, "0"));
+      if (!punch_all || !punch_blend)
+         fprintf(stderr, "G5P: punch-through variants disabled: %s\n",
+                 !punch_all ? "all (PVR_G5P_PUNCH=0)" : "general blend (PVR_G5P_PUNCH_BLEND=0)");
+   }
+   if (!punch_all || (!punch_blend && g->fs_blend_mode == 4 /* general */))
+      return VK_SUCCESS;
    struct pvr_g5p_pipeline *p =
       vk_zalloc(&device->vk.alloc, sizeof(*p), 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
    if (!p)
