@@ -61,6 +61,7 @@
 #include "g5p_ws_perf.h"
 #include "pvr_g5p_winsys.h"
 
+#define G5P_WS_VDM_GUARD 64u /* Rogue VDM read-ahead padding, vdm.xml */
 #define G5P_WS_PAGE 16384ull
 #define G5P_WS_CHUNK (64ull << 20)         /* the kernel's largest BO */
 #define G5P_WS_MAX_CHUNKS 64                /* at least 2 MiB per chunk after the first; 128 MiB default, 256 MiB kernel cap */
@@ -808,6 +809,7 @@ struct g5p_ws_context {
    uint32_t last;
    struct list_head targets; /* kernel datasets, keyed by dimensions/samples/layers */
    uint64_t rt_creates, rt_reuses;
+   bool reported_render_enoent; /* ws->lock: one range report per kernel context */
 };
 
 /* A wrapper is a reference, not another kernel context/RT-pool owner. */
@@ -1124,6 +1126,50 @@ static void g5p_ws_dump_doutd(const struct g5p_ws *ws, const char *what, uint32_
 
 /* A submit refusal, on stderr too (vk_errorf() is silent in release builds) */
 
+/* Match the kernel's single-range containment rule without adding addresses:
+ * malformed or wrapping intervals cannot appear covered. */
+static int
+g5p_ws_cover(const struct drm_g5p_render_resource *res, unsigned n,
+             uint64_t va, uint64_t size)
+{
+   if (!size || va > UINT64_MAX - size)
+      return -1;
+   for (unsigned i = 0; i < n; i++)
+      if (va >= res[i].va && va - res[i].va <= res[i].size &&
+          size <= res[i].size - (va - res[i].va))
+         return i;
+   return -1;
+}
+
+/* No CPU/GPU memory reads on the failure path. The kernel rejected the job;
+ * only the immutable submission snapshot is safe and useful to report. */
+static void
+g5p_ws_render_enoent(const struct g5p_ws *ws, const struct g5p_ws_context *c,
+                     uint32_t rt, const struct drm_g5p_render_pass_v3 *pass,
+                     const struct drm_g5p_render_resource *res, unsigned n)
+{
+   const uint64_t bytes = (uint64_t)pass->base.vdm_size + G5P_WS_VDM_GUARD;
+   fprintf(stderr, "apple_g5p render ENOENT: context=%u rt=%u stream=%#" PRIx64
+           "+%" PRIu64 " (commands=%u guard=%u) range=%d program=%#" PRIx64 "+%u range=%d\n",
+           c->context, rt, (uint64_t)pass->base.vdm_va, bytes,
+           pass->base.vdm_size, G5P_WS_VDM_GUARD,
+           g5p_ws_cover(res, n, pass->base.vdm_va, bytes),
+           (uint64_t)pass->ta_program_va, pass->ta_program_size,
+           g5p_ws_cover(res, n, pass->ta_program_va, pass->ta_program_size));
+   for (unsigned i = 0; i < 2; i++) {
+      const uint64_t va[] = {ws->render.pds_base + pass->base.context_pds[i][2],
+                             ws->render.pds_base + pass->base.context_pds[i][5],
+                             ws->render.pds_base + pass->base.resume_pds[i][2]};
+      for (unsigned j = 0; j < ARRAY_SIZE(va); j++)
+         fprintf(stderr, "apple_g5p render ENOENT: task[%u][%u]=%#" PRIx64 "+16 range=%d\n",
+                 i, j, va[j], g5p_ws_cover(res, n, va[j], 16));
+   }
+   for (unsigned i = 0; i < n; i++)
+      fprintf(stderr, "apple_g5p render ENOENT: range[%u] handle=%u va=%#" PRIx64
+              " size=%#" PRIx64 " offset=%#" PRIx64 " access=%#x\n", i, res[i].handle,
+              (uint64_t)res[i].va, (uint64_t)res[i].size, (uint64_t)res[i].offset, res[i].kind);
+}
+
 /* One G5P render: the fragment stream holds the TYPED_V3 pass
  * (pvr_arch_g5p_frag_stream); the job reads and writes inside the arena, every
  * chunk listed RW with the kernel's cache maintenance. Display BOs and imports
@@ -1291,6 +1337,10 @@ static VkResult g5p_ws_render_submit(const struct pvr_winsys_render_ctx *ctx,
          r = -EBUSY;
          break;
       }
+   }
+   if (r == -ENOENT && !c->reported_render_enoent) {
+      c->reported_render_enoent = true;
+      g5p_ws_render_enoent(ws, c, rt_handle, &pass, res, nres);
    }
    if (!r) {
       accepted = true;
