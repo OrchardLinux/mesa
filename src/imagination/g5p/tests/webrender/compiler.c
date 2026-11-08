@@ -40,6 +40,7 @@ int main(int argc, char **argv)
    bool ok = pvr_g5p_compile_stage(&stage, true, 1, NULL, &key, NULL, &out);
    free(spv);
    if (!ok) { fprintf(stderr,"REFUSED %s\n",out.refusal); return 77; }
+   printf("METADATA w_set=%u varyings=%u discard_tokens=%u discard_select=%u\n",out.w_set,out.num_varyings,out.discard_tokens,out.discard_select);
    f=fopen(argv[3],"wb"); if (!f) return 2;
    bool wrote=fwrite(out.code,1,out.size,f)==out.size; fclose(f); free(out.code);
    return wrote ? 0 : 2;

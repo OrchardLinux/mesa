@@ -1508,12 +1508,9 @@ static void plan_varyings(struct gctx *c)
    bool smooth = false;
    u_foreach_bit(n, read)
       smooth |= interp[n] == PCO_G5P_INTERP_SMOOTH;
-   /* r39-4 on A9: position-w-smooth is exact, but the same probe with
-    * only flat/no user inputs fails 3072 channels. A W DOUTI alone does
-    * not establish the TA's RHW payload. Keep the measured smooth path;
-    * reject the unqualified interface before emitting any USC or PDS. */
-   if (position_w && !smooth)
-      refuse(c, "load_frag_coord .w without smooth user varyings (A9 numeric mismatch; TA RHW layout unqualified)");
+   /* Read NIR's component mask here: backend uses are populated by liveness()
+    * only after this plan. Reading V(...)->uses here left W-only programs
+    * without a coefficient DOUTI despite emitting the native W iterator. */
    bool w = position_w || smooth;
    /* the last location's last component must fit the u7 iterator slot */
    if ((w ? 1 : 0) + 4 * util_bitcount(read) > 128)
