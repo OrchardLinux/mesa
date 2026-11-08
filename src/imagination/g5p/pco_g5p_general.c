@@ -37,6 +37,7 @@
 
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_builder.h"
+#include "compiler/nir/nir_schedule.h"
 #include "g5p_texel_nir.h"
 #include "g5p_texel_backend.h"
 #include "util/half_float.h"
@@ -65,7 +66,6 @@
 #define LAST_END (INT_MAX - 1) /* read by the output block */
 #define DISCARD_AT (INT_MAX - 2) /* read by the deferred discards, before the output */
 #define G5P_MAX_LOOPS 32
-#define G5P_MAX_DECLS 64
 #define G5P_MAX_EXITS 64
 
 enum val_state { VAL_NONE, VAL_REG, VAL_CONST, VAL_SHARED, VAL_HOME /* reg: r32..r127 */ };
@@ -237,6 +237,7 @@ struct gctx {
    const struct pco_g5p_vs_link *link;
    unsigned psize_dword; /* a point pipeline's point size: the last output dword */
    bool eager_vout; /* VS temps retry: each output written as soon as its value is final */
+   bool compact_vs; /* last retry: compact movable bank1 values between instructions */
    bool vs_bank0;   /* VS pressure retry: temps in bank 0, outputs in bank 1 (vs-two-bank-allocator.md) */
    nir_intrinsic_instr *vend_store; /* eager: the output component written by the final vend */
    unsigned vend_comp;
@@ -267,15 +268,15 @@ struct gctx {
    bool cf;
    struct { int start, end; } loops[G5P_MAX_LOOPS];
    unsigned nloops;
-   nir_def *decls[G5P_MAX_DECLS]; /* NIR registers (out of SSA) */
-   bool decl_out[G5P_MAX_DECLS];  /* vertex: a register whose value an output stores (bank 1) */
-   int decl_first[G5P_MAX_DECLS];  /* their allocation point */
+   nir_def **decls; /* NIR registers (out of SSA) */
+   bool *decl_out;  /* vertex: a register whose value an output stores (bank 1) */
+   int *decl_first;  /* their allocation point */
    unsigned ndecls;
    unsigned st;       /* mask-stack register (dword): the one after the program's own */
    int st_last;       /* count pass: index of the last stack operation */
    bool reserve_st31; /* pressure retry: keep r31 free for the mask stack */
    /* per codegen pass */
-   bool decl_held[G5P_MAX_DECLS];
+   bool *decl_held;
    bool stack_used;   /* a stack operation was put: pushes read the register */
    unsigned cf_depth; /* if/loop nesting of the instruction being put */
    unsigned pushes;   /* if levels pushed since the innermost loop began */
@@ -1246,6 +1247,12 @@ static int decl_slot(struct gctx *c, nir_def *d)
 static bool vs_feeds_output(struct gctx *c, nir_def *d);
 static void plan_decls(struct gctx *c)
 {
+   c->decls = calloc(c->impl->ssa_alloc, sizeof(*c->decls));
+   c->decl_out = calloc(c->impl->ssa_alloc, sizeof(*c->decl_out));
+   c->decl_first = calloc(c->impl->ssa_alloc, sizeof(*c->decl_first));
+   c->decl_held = calloc(c->impl->ssa_alloc, sizeof(*c->decl_held));
+   if (!c->decls || !c->decl_out || !c->decl_first || !c->decl_held)
+      refuse(c, "out of memory");
    foreach_instr_all(ins, c) {
       if (ins->type != nir_instr_type_intrinsic ||
           nir_instr_as_intrinsic(ins)->intrinsic != nir_intrinsic_decl_reg)
@@ -1253,9 +1260,7 @@ static void plan_decls(struct gctx *c)
       nir_intrinsic_instr *in = nir_instr_as_intrinsic(ins);
       if (nir_intrinsic_num_components(in) != 1 || nir_intrinsic_num_array_elems(in) ||
           (nir_intrinsic_bit_size(in) != 32 && nir_intrinsic_bit_size(in) != 1))
-         refuse(c, "NIR register: only scalar 32-bit and boolean registers");
-      if (c->ndecls == G5P_MAX_DECLS)
-         refuse(c, "more than %u NIR registers", G5P_MAX_DECLS);
+         refuse(c, "NIR register: only scalar 32-bit and boolean registers (got %ux%u)", nir_intrinsic_num_components(in), nir_intrinsic_bit_size(in));
       c->decl_first[c->ndecls] = INT_MAX;
       c->decl_out[c->ndecls] = false;
       c->decls[c->ndecls++] = &in->def;
@@ -4777,6 +4782,17 @@ static void emit_vertex_qualified_texture(struct gctx *c, nir_tex_instr *t)
    put(c, raw, g5p_usc_sample_ext(raw,&x), "qualified vertex sample/read recipe");
    put(c, raw, g5p_usc_wait(raw,0), "wait");
    c->scratch |= scratch;
+   if (c->vs_bank0) {
+      /* All TPU operands have been consumed and WDF has retired the read.
+       * Release the recipe tuple and dying SSA sources before parking its
+       * results. Loop-extended last uses remain held by mark(). */
+      free_scratch(c);
+      for (unsigned i = 0; i < t->num_srcs; i++)
+         for (unsigned k = 0; k < t->src[i].src.ssa->num_components; k++) {
+            struct ref r = resolve_value(c, t->src[i].src.ssa, k);
+            free_dying(c, &r, 1);
+         }
+   }
    for (unsigned k=0;k<nresult;k++) {
       struct val *v=V(c,&t->def,k);
       if (c->vs_bank0) {
@@ -4786,8 +4802,15 @@ static void emit_vertex_qualified_texture(struct gctx *c, nir_tex_instr *t)
          if (!v->uses)
             continue;
          int parked = alloc_bank0(c);
-         if (parked < 0)
-            refuse(c, "vertex texture result: no bank0 register for component %u", k);
+         /* A full bank0 is not a failure when this word already has a
+          * valid bank1 home. Retain that word and release only the other
+          * lanes of the completed sample tuple. */
+         if (parked < 0) {
+            v->state = VAL_REG;
+            v->reg = dst + k;
+            v->held = true;
+            continue;
+         }
          put(c, raw, g5p_usc_move(raw, H(c, parked), H(c, dst + k), 0, 1, 0x21),
              "vertex texture result to bank0");
          v->reg = parked;
@@ -4796,8 +4819,13 @@ static void emit_vertex_qualified_texture(struct gctx *c, nir_tex_instr *t)
       }
       v->state=VAL_REG;v->held=true;
    }
-   if (c->vs_bank0)
-      c->busy &= ~BITFIELD64_RANGE(dst, nresult);
+   if (c->vs_bank0) {
+      for (unsigned k = 0; k < nresult; k++) {
+         struct val *v = V(c, &t->def, k);
+         if (!v->held || v->reg != dst + k)
+            c->busy &= ~BITFIELD64_BIT(dst + k);
+      }
+   }
    c->p->evidence |= PCO_G5P_EV_TEX_TYPES;
 }
 
@@ -5445,7 +5473,10 @@ static unsigned vs_out_reg(struct gctx *c, struct ref r)
    struct val *v = V(c, r.def, r.comp);
    if (!vbank(c, reg)) {
       uint8_t raw[G5P_USC_MAX];
+      bool bank0 = c->vs_bank0;
+      c->vs_bank0 = false;
       unsigned b1 = alloc_reg(c, -1);
+      c->vs_bank0 = bank0;
       if (v->state == VAL_CONST)
          put(c, raw, g5p_usc_immediate(raw, H(c, b1), v->imm, vbank(c, b1), -1), "movi (output)");
       else if (v->state == VAL_SHARED)
@@ -5484,8 +5515,15 @@ static void vs_output(struct gctx *c)
       if (c->vs_bank0)
          reg[order[i]] = vs_out_reg(c, c->vout[order[i]].r);
       put(c, raw, g5p_usc_vout(raw, H(c, reg[order[i]]), c->vout[order[i]].slot, vbank(c, reg[order[i]]), false), "vertex output");
-      if (c->vs_bank0)
+      if (c->vs_bank0) {
+         struct ref r = c->vout[order[i]].r;
+         bool again = false;
+         for (unsigned j = i + 1; j < n; j++)
+            again |= r.def == c->vout[order[j]].r.def && r.comp == c->vout[order[j]].r.comp;
+         if (!again)
+            drop(c, V(c, r.def, r.comp));
          free_scratch(c);
+      }
    }
    /* Characterized convention: branch to the 64-byte block holding the
     * final output/end-task, padding in between. */
@@ -5545,12 +5583,12 @@ static bool needs_flatten(nir_shader *nir)
    return !exec_list_is_singular(&impl->body) || !exec_list_is_empty(&impl->locals);
 }
 
-static bool flatten(nir_shader *nir)
+static bool flatten_limit(nir_shader *nir, unsigned limit)
 {
    if (!needs_flatten(nir))
       return false;
    bool progress;
-   const nir_opt_peephole_select_options sel = {.limit = UINT_MAX, .indirect_load_ok = true,
+   const nir_opt_peephole_select_options sel = {.limit = limit, .indirect_load_ok = true,
                                                 .expensive_alu_ok = true, .discard_ok = true};
    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
    NIR_PASS(_, nir, nir_lower_indirect_derefs_to_if_else_trees, nir_var_function_temp, UINT32_MAX);
@@ -5568,6 +5606,11 @@ static bool flatten(nir_shader *nir)
       NIR_PASS(progress, nir, nir_opt_remove_phis);
    } while (progress);
    return true;
+}
+
+static bool flatten(nir_shader *nir)
+{
+   return flatten_limit(nir, UINT_MAX);
 }
 
 /* Vertex tasks commit only the 4-byte global store: the 16-byte form is
@@ -5650,7 +5693,7 @@ static bool lower_vs_fsqrt_instr(nir_builder *b, nir_alu_instr *a, void *data)
    return true;
 }
 
-static bool lower(nir_shader *nir)
+static bool lower(nir_shader *nir, bool preserve_cf)
 {
    bool progress;
    /* Projective sampling (GLSL textureProj/texture2DProj, Mesa's fixed-function
@@ -5676,7 +5719,7 @@ static bool lower(nir_shader *nir)
    pvr_g5p_tbo_lower(nir);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const, nir_address_format_32bit_offset);
    NIR_PASS(_, nir, nir_lower_flrp, 32, false);
-   bool flattened = flatten(nir);
+   bool flattened = flatten_limit(nir, preserve_cf ? 0 : UINT_MAX);
    if (nir->info.stage == MESA_SHADER_VERTEX) {
       const nir_lower_mem_access_bit_sizes_options mem = {
          .callback = mem_access_size_align,
@@ -6641,12 +6684,43 @@ static void emit_loop(struct gctx *c, nir_loop *l)
    stack_op(c, G5P_ST_POP, false, 2);
 }
 
+/* Compact only between NIR instructions: emitters keep physical operand
+ * numbers in local variables while building a recipe. Scratch, reserved and
+ * untracked persistent address registers cannot move. All held SSA aliases
+ * of a moved word are updated together. Only the measured bank1 MOV is used. */
+static void compact_vertex_bank1(struct gctx *c)
+{
+   uint8_t raw[G5P_USC_MAX];
+   for (unsigned src = 1; src < NUM_DWORDS; src++) {
+      if (!((c->busy & ~c->reserved & ~c->scratch) & BITFIELD64_BIT(src)))
+         continue;
+      bool owned = false;
+      for (unsigned i = 0; i < c->nvals; i++)
+         owned |= c->vals[i].held && c->vals[i].reg == src;
+      if (!owned)
+         continue;
+      unsigned dst;
+      for (dst = 0; dst < src && ((c->busy | c->reserved) & BITFIELD64_BIT(dst)); dst++)
+         ;
+      if (dst == src)
+         continue;
+      put(c, raw, g5p_usc_move(raw, 2 * dst, 2 * src, 1, 1, 0x21), "compact bank1 value");
+      for (unsigned i = 0; i < c->nvals; i++)
+         if (c->vals[i].held && c->vals[i].reg == src)
+            c->vals[i].reg = dst;
+      c->busy = (c->busy & ~BITFIELD64_BIT(src)) | BITFIELD64_BIT(dst);
+      c->max_written = MAX2(c->max_written, dst + 1);
+   }
+}
+
 static void emit_block(struct gctx *c, nir_block *block)
 {
    nir_foreach_instr(ins, block) {
       c->now = ins->index;
       if (c->ndecls)
          decl_alloc(c, c->now);
+      if (c->vs && c->vs_bank0 && c->compact_vs)
+         compact_vertex_bank1(c);
       switch (ins->type) {
       case nir_instr_type_alu:
          emit_alu(c, nir_instr_as_alu(ins));
@@ -6715,7 +6789,8 @@ static bool codegen(struct gctx *c)
       c->vals[i].last = -1;
    for (unsigned i = 0; i < c->impl->ssa_alloc; i++)
       c->rh_half[i] = -1;
-   memset(c->decl_held, 0, sizeof(c->decl_held));
+   if (c->ndecls)
+      memset(c->decl_held, 0, c->ndecls * sizeof(*c->decl_held));
    c->stack_used = false;
    c->cf_depth = c->nexits = c->pushes = 0;
    plan_saturate(c);
@@ -6806,6 +6881,9 @@ static bool codegen(struct gctx *c)
       out->evidence |= PCO_G5P_EV_VARYINGS;
    out->side_effects = impl_has_side_effects(c->impl);
    out->refusal[0] = 0;
+   if (getenv("PVR_G5P_PRESSURE_LOG"))
+      fprintf(stderr, "G5P pressure: stage=%s remat=%u compact=%u eager=%u cf=%u homes=%u bank0=%u bank1=%u\n",
+              c->vs ? "vs" : "fs", c->remat, c->compact_vs, c->eager_vout, c->cf, c->nhomes, c->max_bank0, c->max_dword);
    return true;
 }
 
@@ -6921,9 +6999,9 @@ bool pco_g5p_compile_general_key(nir_shader *nir, bool half_output, const uint8_
    return pco_g5p_compile_general_link(nir, half_output, attrib_components, key, NULL, out);
 }
 
-bool pco_g5p_compile_general_link(nir_shader *nir, bool half_output, const uint8_t *attrib_components,
+static bool compile_general_link(nir_shader *nir, bool half_output, const uint8_t *attrib_components,
                                   const struct pco_g5p_fs_key *key, const struct pco_g5p_vs_link *link,
-                                  struct pco_g5p_program *out)
+                                  struct pco_g5p_program *out, bool preserve_cf)
 {
    static const struct pco_g5p_fs_key default_key = {.write_mask = 0xf};
    memset(out, 0, sizeof(*out));
@@ -6991,7 +7069,7 @@ bool pco_g5p_compile_general_link(nir_shader *nir, bool half_output, const uint8
    out->blend_mode = c->blend == BLEND_REPLACE ? 0 : c->blend;
    if (!c->vs && c->key->color_output != PCO_G5P_COLOR_F16 && c->key->write_mask != 0xf)
       out->blend_mode = BLEND_GENERAL; /* destination read requires TRANSLUCENT ISP */
-   if (lower(nir))
+   if (lower(nir, preserve_cf))
       out->evidence |= PCO_G5P_EV_FLATTEN;
    fuse_ffma(c, nir);
    if (!c->vs && cf_left(nir))
@@ -7016,6 +7094,8 @@ bool pco_g5p_compile_general_link(nir_shader *nir, bool half_output, const uint8
    if (cf_left(nir)) {
       c->cf = true;
       out->evidence |= PCO_G5P_EV_CF;
+      if (preserve_cf)
+         NIR_PASS(_, nir, nir_lower_all_phis_to_scalar);
       cf_out_of_ssa(nir);
       /* Vertex control flow (Apple's v_loop, v_brk, v_ifelse, v_nested): the
        * loop state, the compares and the mask stack in bank 0, the values of
@@ -7065,7 +7145,7 @@ bool pco_g5p_compile_general_link(nir_shader *nir, bool half_output, const uint8
       struct pco_g5p_program first = *out;
       bool first_ok = ok;
       codegen_reset(c);
-      c->eager_vout = true;
+      c->eager_vout = !c->cf;
       ok = two_pass(c);
       if (first_ok && (!ok || out->temps >= first.temps)) {
          if (ok)
@@ -7083,9 +7163,22 @@ bool pco_g5p_compile_general_link(nir_shader *nir, bool half_output, const uint8
    for (unsigned eager = 0; c->vs && !ok && eager < 2 && strstr(out->refusal, "register pressure"); eager++) {
       codegen_reset(c);
       c->vs_bank0 = true;
-      c->eager_vout = eager;
+      c->remat = true;
+      c->eager_vout = eager && !c->cf;
       ok = two_pass(c);
    }
+   if (c->vs && !ok && strstr(out->refusal, "register pressure")) {
+      codegen_reset(c);
+      c->vs_bank0 = c->remat = true;
+      c->compact_vs = !impl_has_side_effects(c->impl);
+      c->eager_vout = !c->cf;
+      ok = two_pass(c);
+   }
+   /* Scheduling changes only programs already refused for pressure. It
+    * runs after flattening/out-of-SSA and never across a CF boundary here.
+    * No opcode, register bank or hardware resource limit is added. */
+   bool scheduled = false;
+homes_retry:
    /* Still out of registers: one more home above r31 per attempt. */
    while (!ok && !c->vs && strstr(out->refusal, "register pressure") && c->nhomes < G5P_MAX_HOMES) {
       int victim = pick_home(c);
@@ -7095,7 +7188,28 @@ bool pco_g5p_compile_general_link(nir_shader *nir, bool half_output, const uint8
       codegen_reset(c);
       ok = two_pass(c);
    }
+   if (!ok && !scheduled && !c->cf && strstr(out->refusal, "register pressure")) {
+      scheduled = true;
+      const nir_schedule_options options = {.threshold = c->vs ? 48 : 24, .fallback = true};
+      nir_schedule(nir, &options);
+      nir_index_instrs(c->impl);
+      memset(c->home, -1, c->nvals);
+      c->nhomes = 0;
+      codegen_reset(c);
+      c->remat = true;
+      c->lazy_iter = !c->vs;
+      if (c->vs) {
+         c->vs_bank0 = c->eager_vout = true;
+         c->compact_vs = !impl_has_side_effects(c->impl);
+      }
+      ok = two_pass(c);
+      goto homes_retry;
+   }
 done:
+   free(c->decls);
+   free(c->decl_out);
+   free(c->decl_first);
+   free(c->decl_held);
    free(c->vals);
    free(c->sat_folded);
    free(c->saturate);
@@ -7105,5 +7219,22 @@ done:
    free(c->home);
    free(c->code);
    free(c);
+   return ok;
+}
+
+bool pco_g5p_compile_general_link(nir_shader *nir, bool half_output, const uint8_t *attrib_components,
+                                  const struct pco_g5p_fs_key *key, const struct pco_g5p_vs_link *link,
+                                  struct pco_g5p_program *out)
+{
+   /* Flattening every branch can make mutually exclusive values live
+    * together. Retry the original fragment control flow only on pressure;
+    * the existing scalar register/mask-stack lowering handles the branches.
+    * Keep all phis scalar in that retry, including texture-result phis. */
+   nir_shader *original = nir->info.stage == MESA_SHADER_FRAGMENT && cf_left(nir)
+                             ? nir_shader_clone(NULL, nir) : NULL;
+   bool ok = compile_general_link(nir, half_output, attrib_components, key, link, out, false);
+   if (!ok && original && strstr(out->refusal, "register pressure"))
+      ok = compile_general_link(original, half_output, attrib_components, key, link, out, true);
+   ralloc_free(original);
    return ok;
 }
