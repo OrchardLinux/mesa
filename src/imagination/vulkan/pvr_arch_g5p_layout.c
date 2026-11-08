@@ -378,6 +378,163 @@ g5p_linear_sample(struct g5p_surface *src, const struct pvr_rect_mapping *m, uns
    return true;
 }
 
+/* Whether util's unpack/pack round trip from one format to the other only
+ * moves whole bytes: four 8-bit array channels of one type in the linear
+ * colour space on both sides, every destination channel taken from a source
+ * channel. UNORM and pure integers only: an SNORM -128 becomes -127 through
+ * float, and sRGB encoding is not assumed to round-trip. map[] gives, for
+ * each destination byte, the source byte. */
+static bool
+g5p_byte_permutation(enum pipe_format from, enum pipe_format to, uint8_t map[4])
+{
+   const struct util_format_description *f[2] = { util_format_description(from), util_format_description(to) };
+
+   if (!f[0] || !f[1])
+      return false;
+
+   const struct util_format_channel_description *type = &f[0]->channel[0];
+
+   if (type->type == UTIL_FORMAT_TYPE_UNSIGNED ? !type->normalized && !type->pure_integer :
+       type->type != UTIL_FORMAT_TYPE_SIGNED || !type->pure_integer)
+      return false;
+   for (unsigned i = 0; i < 2; i++) {
+      if (f[i]->layout != UTIL_FORMAT_LAYOUT_PLAIN || !f[i]->is_array || f[i]->block.bits != 32 ||
+          f[i]->block.width != 1 || f[i]->block.height != 1 || f[i]->block.depth != 1 ||
+          f[i]->nr_channels != 4 || f[i]->colorspace != UTIL_FORMAT_COLORSPACE_RGB)
+         return false;
+      for (unsigned c = 0; c < 4; c++) {
+         const struct util_format_channel_description *ch = &f[i]->channel[c];
+
+         if (ch->size != 8 || ch->shift % 8 || ch->type != type->type ||
+             ch->normalized != type->normalized || ch->pure_integer != type->pure_integer)
+            return false;
+      }
+   }
+   for (unsigned j = 0; j < 4; j++) {
+      unsigned c = 0;
+
+      while (c < 4 && f[1]->swizzle[c] != j)
+         c++;
+      if (c == 4 || f[0]->swizzle[c] > PIPE_SWIZZLE_W)
+         return false;
+      map[f[1]->channel[j].shift / 8] = f[0]->channel[f[0]->swizzle[c]].shift / 8;
+   }
+   return true;
+}
+
+/* An unscaled colour conversion. util's per-texel entry points look the
+ * formats up (with a call_once) on every call, which made a 1024x1024
+ * RGBA8 -> BGRA8 blit cost ~55 ms on the A9. Resolve the conversion once:
+ * a byte permutation per texel, or else chunks of a row gathered, converted
+ * by one unpack and one pack call each (the same util functions), and
+ * scattered.
+ *
+ * Linear and Morton offsets both increase with x and with y, so the
+ * rectangle's last element is its largest offset: checking the first and
+ * last element against the surface and its stable mapping, as g5p_element()
+ * does per element, bounds every element in between. */
+#define G5P_CONVERT_CHUNK 256
+
+struct g5p_walk {
+   uint8_t *base;
+   size_t bpp, stride;
+   unsigned bits, mask;
+   bool twiddled;
+};
+
+static void
+g5p_walk_init(const struct g5p_surface *s, struct g5p_walk *w)
+{
+   w->base = s->base + s->component_offset;
+   w->bpp = s->bpp;
+   w->stride = s->stride;
+   w->twiddled = s->twiddled;
+   w->bits = util_logbase2_ceil(MAX2(MIN2(s->twiddle_width, s->twiddle_height), 1));
+   w->mask = (1u << w->bits) - 1;
+}
+
+/* g5p_offset() split into column and row terms. Inside the surface only the
+ * major axis has bits above the mask, so the interleaved low bits and the
+ * shifted high bits are disjoint and the two terms add. */
+static inline size_t
+g5p_walk_x(const struct g5p_walk *w, unsigned x)
+{
+   if (w->twiddled)
+      return (size_t)((g5p_spread(x & w->mask) << 1) | ((x & ~w->mask) << w->bits)) * w->bpp;
+   return (size_t)x * w->bpp;
+}
+
+static inline size_t
+g5p_walk_y(const struct g5p_walk *w, unsigned y)
+{
+   if (w->twiddled)
+      return (size_t)(g5p_spread(y & w->mask) | ((y & ~w->mask) << w->bits)) * w->bpp;
+   return (size_t)y * w->stride * w->bpp;
+}
+
+static bool
+g5p_rect_bounded(struct g5p_surface *s, const VkRect2D *r)
+{
+   return (uint64_t)r->offset.x + r->extent.width <= s->width &&
+          (uint64_t)r->offset.y + r->extent.height <= s->height &&
+          g5p_element(s, r->offset.x, r->offset.y) &&
+          g5p_element(s, r->offset.x + r->extent.width - 1, r->offset.y + r->extent.height - 1);
+}
+
+static bool
+g5p_convert(const struct pvr_rect_mapping *m, struct g5p_surface *src, struct g5p_surface *dst)
+{
+   const unsigned w = m->dst_rect.extent.width, h = m->dst_rect.extent.height;
+   const unsigned ox = m->src_rect.offset.x, oy = m->src_rect.offset.y;
+   const unsigned dx = m->dst_rect.offset.x, dy = m->dst_rect.offset.y;
+   const struct util_format_unpack_description *unpack = util_format_unpack_description(src->format);
+   uint8_t map[4] = { 0, 1, 2, 3 };
+   const bool permute = g5p_byte_permutation(src->format, dst->format, map);
+   size_t scol[G5P_CONVERT_CHUNK], dcol[G5P_CONVERT_CHUNK];
+   uint8_t packed[G5P_CONVERT_CHUNK * 16];
+   uint32_t texels[G5P_CONVERT_CHUNK * 4];
+   struct g5p_walk s, d;
+
+   assert(src->bpp <= 16 && dst->bpp <= 16);
+   if (!g5p_rect_bounded(src, &m->src_rect) || !g5p_rect_bounded(dst, &m->dst_rect))
+      return false;
+   g5p_walk_init(src, &s);
+   g5p_walk_init(dst, &d);
+   /* little-endian bytes: destination byte b is source byte map[b] */
+   const unsigned shift[4] = { 8 * map[0], 8 * map[1], 8 * map[2], 8 * map[3] };
+   for (unsigned x0 = 0; x0 < w; x0 += G5P_CONVERT_CHUNK) {
+      const unsigned n = MIN2(G5P_CONVERT_CHUNK, w - x0);
+
+      for (unsigned i = 0; i < n; i++) {
+         scol[i] = g5p_walk_x(&s, ox + (m->flip_x ? w - 1 - (x0 + i) : x0 + i));
+         dcol[i] = g5p_walk_x(&d, dx + x0 + i);
+      }
+      for (unsigned y = 0; y < h; y++) {
+         const uint8_t *srow = s.base + g5p_walk_y(&s, oy + (m->flip_y ? h - 1 - y : y));
+         uint8_t *drow = d.base + g5p_walk_y(&d, dy + y);
+
+         if (permute) {
+            for (unsigned i = 0; i < n; i++) {
+               uint32_t v, out;
+
+               memcpy(&v, srow + scol[i], 4);
+               out = ((v >> shift[0]) & 0xff) | ((v >> shift[1]) & 0xff) << 8 |
+                     ((v >> shift[2]) & 0xff) << 16 | ((v >> shift[3]) & 0xff) << 24;
+               memcpy(drow + dcol[i], &out, 4);
+            }
+            continue;
+         }
+         for (unsigned i = 0; i < n; i++)
+            memcpy(packed + i * src->bpp, srow + scol[i], src->bpp);
+         unpack->unpack_rgba(texels, packed, n);
+         util_format_pack_rgba(dst->format, packed, texels, n);
+         for (unsigned i = 0; i < n; i++)
+            memcpy(drow + dcol[i], packed + i * dst->bpp, dst->bpp);
+      }
+   }
+   return true;
+}
+
 static bool
 g5p_copy(const struct pvr_rect_mapping *mapping, struct g5p_surface *src, struct g5p_surface *dst, bool linear)
 {
@@ -440,6 +597,18 @@ g5p_copy(const struct pvr_rect_mapping *mapping, struct g5p_surface *src, struct
          }
       }
       return true;
+   }
+
+   if (!decode && !same && sw == dw && sh == dh && !src->blocks && !dst->blocks &&
+       src->cpp == src->bpp && dst->cpp == dst->bpp && src->bpp <= 16 && dst->bpp <= 16 &&
+       !util_format_is_depth_or_stencil(src->format) && !util_format_is_depth_or_stencil(dst->format) &&
+       (!src->twiddled || (src->twiddle_width == src->width && src->twiddle_height == src->height)) &&
+       (!dst->twiddled || (dst->twiddle_width == dst->width && dst->twiddle_height == dst->height))) {
+      const struct util_format_unpack_description *u = util_format_unpack_description(src->format);
+      const struct util_format_pack_description *p = util_format_pack_description(dst->format);
+
+      if (u && u->unpack_rgba && p && (p->pack_rgba_float || p->pack_rgba_uint || p->pack_rgba_sint))
+         return g5p_convert(m, src, dst);
    }
 
    for (unsigned y = 0; y < dh; y++) {
@@ -530,12 +699,16 @@ g5p_copy_aspects(const struct pvr_rect_mapping *mapping, struct g5p_surface *src
 }
 
 static bool
-g5p_run(struct pvr_device *device, const struct pvr_transfer_cmd *cmd)
+g5p_run(struct pvr_device *device, const struct pvr_transfer_cmd *cmd, bool log)
 {
    struct g5p_surface dst;
 
    if (!g5p_surface_init(device, &cmd->dst, &dst))
       return false;
+   if (log && (cmd->flags & PVR_TRANSFER_CMD_FLAGS_FILL))
+      fprintf(stderr, "G5P perf transfer-cmd fill dst=%s %ux%u twiddled=%d scissor=%ux%u\n",
+              util_format_short_name(dst.format), dst.width, dst.height, dst.twiddled,
+              cmd->scissor.extent.width, cmd->scissor.extent.height);
    if (cmd->flags & PVR_TRANSFER_CMD_FLAGS_FILL) {
       if (dst.image && vk_format_is_depth_or_stencil(dst.image->vk.format)) {
          const struct pvr_g5p_ds_format *f = pvr_g5p_ds_format(dst.image->vk.format);
@@ -556,6 +729,15 @@ g5p_run(struct pvr_device *device, const struct pvr_transfer_cmd *cmd)
 
       if (!g5p_surface_init(device, &source->surface, &src))
          return false;
+      if (log) {
+         const VkRect2D *r = source->mapping_count ? &source->mappings[0].dst_rect : &cmd->scissor;
+         fprintf(stderr, "G5P perf transfer-cmd copy src=%s %ux%u twiddled=%d dst=%s %ux%u twiddled=%d "
+                 "mappings=%u first=%dx%d linear=%d\n",
+                 util_format_short_name(src.format), src.width, src.height, src.twiddled,
+                 util_format_short_name(dst.format), dst.width, dst.height, dst.twiddled,
+                 source->mapping_count, (int)r->extent.width, (int)r->extent.height,
+                 source->filter == PVR_FILTER_LINEAR);
+      }
       if (!source->mapping_count) {
          /* the whole destination scissor, 1:1 */
          const struct pvr_rect_mapping m = { .src_rect = cmd->scissor, .dst_rect = cmd->scissor };
@@ -588,7 +770,7 @@ PVR_PER_ARCH(g5p_transfer_submit)(struct pvr_device *device, struct pvr_sub_cmd_
    unsigned commands = 0;
    list_for_each_entry (struct pvr_transfer_cmd, cmd, sub_cmd->transfer_cmds, link) {
       commands++;
-      if (!g5p_run(device, cmd))
+      if (!g5p_run(device, cmd, log))
          return vk_errorf(device, VK_ERROR_DEVICE_LOST,
                           "G5P transfer surface exceeds its stable BO mapping");
    }
