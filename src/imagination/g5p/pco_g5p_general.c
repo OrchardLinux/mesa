@@ -223,6 +223,9 @@ struct gctx {
    struct g5p_mrt_out_plan mrt;
    struct ref out[G5P_MRT_MAX_HALVES];
    bool out_written[G5P_MRT_MAX_HALVES];
+   struct ref secondary[4];
+   bool secondary_written[4];
+   bool has_secondary;
    bool has_depth;
    struct ref depth;
    uint8_t slot_written[G5P_MRT_FS_SLOTS]; /* component mask stored per FRAG_RESULT_DATA slot */
@@ -1742,6 +1745,15 @@ static void liveness(struct gctx *c)
                bool now = c->eager_vout && base >= 0 && !(in == c->vend_store && k == c->vend_comp);
                struct ref r = resolve_value(c, in->src[0].ssa, k);
                mark(c, r, now ? (int)nir_def_instr(r.def)->index : LAST_END);
+            } else if (nir_intrinsic_io_semantics(in).dual_source_blend_index) {
+               if (loc != FRAG_RESULT_DATA0 || c->mrt.targets != 1 || comp + k >= 4 ||
+                   c->key->color_output != PCO_G5P_COLOR_F16)
+                  refuse(c, "dual-source output requires one f16 colour attachment");
+               struct ref r = resolve_float(c, in->src[0].ssa, k);
+               c->secondary[comp + k] = r;
+               c->secondary_written[comp + k] = true;
+               c->has_secondary = true;
+               mark(c, r, LAST_END);
             } else if (loc == FRAG_RESULT_DEPTH) {
                if (!c->key->depth_feedback)
                   refuse(c, "fragment depth export awaits A9 qualification");
@@ -5356,6 +5368,16 @@ static void fs_output(struct gctx *c)
       put(c, raw, g5p_usc_special(raw, true), "end");
       return;
    }
+   if (c->has_secondary) {
+      c->now = LAST_END - 1;
+      for (unsigned k = 0; k < 4; k++) {
+         if (!c->secondary_written[k])
+            refuse(c, "dual-source output needs all four channels");
+         emit_times_one(c, c->secondary[k], true, 8 + k, NULL);
+         free_scratch(c);
+      }
+      c->now = LAST_END;
+   }
    if (!c->narrow_tex && !c->narrow_iter) {
       for (unsigned k = 0; k < G5P_MRT_HALVES_PER_TARGET * c->mrt.targets; k++) {
          uint16_t h;
@@ -5414,16 +5436,16 @@ static void fs_output(struct gctx *c)
    } else if (c->blend == BLEND_GENERAL) {
       /* No hardware discard in a destination-reading program run
        * TRANSLUCENT: that lost other objects' colour in 32x32 tiles on A10.
-       * The punch-through variant (key->punch: every discard merged into one
-       * feedback token by merge_discards()) runs PUNCH_THROUGH instead, the
-       * driver's pass rule for a discarding program that reads the tile.
-       * That is Apple's form: A9 f_discard under SourceAlpha/One general
-       * blending with a D32F_S8 attachment compiles to one `04 61` before
-       * the epilogue, kill mode 1 (firefox-wr3 apple/discard; getShaderPass-
-       * Info, perf60-fillrate.md §11.14.1). The variant is only placed for
-       * draws under depth/stencil whose base program selected its discards. */
-      if ((c->ndiscards || c->discard_always) && !(c->key->punch && c->ndiscards + c->discard_always == 1))
-         refuse(c, "discard in a program with a general blend epilogue");
+       * A general-blend program's discards are merged into one feedback token
+       * (merge_discards(), base and punch variant alike) and the driver runs
+       * it PUNCH_THROUGH, its pass rule for a discarding program that reads
+       * the tile, keeping depth/stencil writes. That is Apple's form: A9
+       * f_discard under SourceAlpha/One general blending with a D32F_S8
+       * attachment compiles to one `04 61` before the epilogue, kill mode 1
+       * (firefox-wr3 apple/discard; getShaderPassInfo, perf60-fillrate.md
+       * §11.14.1). More than one token is not that shape. */
+      if (c->ndiscards + c->discard_always > 1)
+         refuse(c, "discard in a program with a general blend epilogue needs one merged kill");
       uint8_t buf[512];
       const char *err;
       struct g5p_blend_key bk = general_key(c->key);
@@ -5717,6 +5739,117 @@ static bool lower_vs_fsqrt_instr(nir_builder *b, nir_alu_instr *a, void *data)
    return true;
 }
 
+/* Speculate only side-effect-free arithmetic and immutable raster/uniform
+ * inputs when establishing the operand of a hoisted derivative. No phi,
+ * texture, register-web or mutable-memory value is reconstructed. */
+struct derivative_speculate { nir_block *before; unsigned *budget; };
+static bool derivative_operand_speculable(nir_def *d, nir_block *before, unsigned *budget);
+static bool derivative_speculate_src(nir_src *src, void *data)
+{
+   struct derivative_speculate *s = data;
+   return derivative_operand_speculable(src->ssa, s->before, s->budget);
+}
+static bool derivative_operand_speculable(nir_def *d, nir_block *before, unsigned *budget)
+{
+   nir_instr *ins = nir_def_instr(d);
+   if (nir_block_dominates(ins->block, before))
+      return true;
+   if (!*budget)
+      return false;
+   --*budget;
+   if (ins->type == nir_instr_type_intrinsic) {
+      switch (nir_instr_as_intrinsic(ins)->intrinsic) {
+      case nir_intrinsic_load_input:
+      case nir_intrinsic_load_interpolated_input:
+      case nir_intrinsic_load_barycentric_pixel:
+      case nir_intrinsic_load_barycentric_centroid:
+      case nir_intrinsic_load_frag_coord:
+      case nir_intrinsic_load_push_constant:
+      case nir_intrinsic_load_ubo:
+      case nir_intrinsic_vulkan_resource_index:
+      case nir_intrinsic_load_vulkan_descriptor:
+         break;
+      default:
+         return false;
+      }
+   } else if (ins->type != nir_instr_type_alu && ins->type != nir_instr_type_load_const) {
+      return false;
+   }
+   struct derivative_speculate state = { before, budget };
+   return nir_foreach_src(ins, derivative_speculate_src, &state);
+}
+
+struct derivative_move { nir_builder *b; nir_block *before; };
+static void move_derivative_operand(nir_builder *b, nir_def *d, nir_block *before);
+static bool derivative_move_src(nir_src *src, void *data)
+{
+   struct derivative_move *s = data;
+   move_derivative_operand(s->b, src->ssa, s->before);
+   return true;
+}
+static void move_derivative_operand(nir_builder *b, nir_def *d, nir_block *before)
+{
+   nir_instr *ins = nir_def_instr(d);
+   if (nir_block_dominates(ins->block, before))
+      return;
+   struct derivative_move state = { b, before };
+   nir_foreach_src(ins, derivative_move_src, &state);
+   nir_instr_move(b->cursor, ins);
+   b->cursor = nir_after_instr(ins);
+}
+
+static bool hoist_branch_derivatives(nir_shader *nir)
+{
+   if (nir->info.stage != MESA_SHADER_FRAGMENT)
+      return false;
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   bool derivatives = false;
+   nir_foreach_block(block, impl)
+      nir_foreach_instr(ins, block)
+         if (ins->type == nir_instr_type_intrinsic)
+            derivatives |= is_deriv(nir_instr_as_intrinsic(ins)->intrinsic);
+   if (!derivatives)
+      return false;
+   nir_custom_divergence_analysis(nir, nir_divergence_single_prim_per_subgroup);
+   nir_metadata_require(impl, nir_metadata_dominance);
+   bool progress = false;
+   nir_foreach_block_safe(block, impl) {
+      nir_foreach_instr_safe(ins, block) {
+         if (ins->type != nir_instr_type_intrinsic ||
+             !is_deriv(nir_instr_as_intrinsic(ins)->intrinsic))
+            continue;
+         nir_if *outer = NULL;
+         bool divergent_loop = false;
+         for (nir_cf_node *node = block->cf_node.parent; node; node = node->parent) {
+            if (node->type == nir_cf_node_if && nir_cf_node_as_if(node)->condition.ssa->divergent)
+               outer = nir_cf_node_as_if(node);
+            if (node->type == nir_cf_node_loop)
+               divergent_loop |= nir_loop_is_divergent(nir_cf_node_as_loop(node));
+         }
+         if (!outer || divergent_loop)
+            continue;
+         /* A loop-carried source can be affected by earlier varying
+          * continues even if its trip count is uniform. Do not speculate
+          * within such a loop; only hoist to a point outside all loops. */
+         bool in_loop = false;
+         for (nir_cf_node *node = outer->cf_node.parent; node; node = node->parent)
+            in_loop |= node->type == nir_cf_node_loop;
+         if (in_loop)
+            continue;
+         nir_block *before = nir_cf_node_as_block(nir_cf_node_prev(&outer->cf_node));
+         nir_def *arg = nir_instr_as_intrinsic(ins)->src[0].ssa;
+         unsigned budget = 256;
+         if (!derivative_operand_speculable(arg, before, &budget))
+            continue;
+         nir_builder b = nir_builder_at(nir_before_cf_node(&outer->cf_node));
+         move_derivative_operand(&b, arg, before);
+         nir_instr_move(b.cursor, ins);
+         progress = true;
+      }
+   }
+   return nir_progress(progress, impl, nir_metadata_control_flow);
+}
+
 static bool lower(nir_shader *nir, bool preserve_cf)
 {
    bool progress;
@@ -5853,6 +5986,8 @@ static bool rewrite_output(nir_builder *b, nir_intrinsic_instr *in, void *data)
    struct blend_rw *w = data;
    if (in->intrinsic != nir_intrinsic_store_output ||
        nir_intrinsic_io_semantics(in).location != FRAG_RESULT_DATA0 + w->target)
+      return false;
+   if (nir_intrinsic_io_semantics(in).dual_source_blend_index)
       return false;
    if (w->drop) {
       nir_instr_remove(&in->instr);
@@ -6743,7 +6878,7 @@ static void emit_block(struct gctx *c, nir_block *block)
       c->now = ins->index;
       if (c->ndecls)
          decl_alloc(c, c->now);
-      if (c->vs && c->vs_bank0 && c->compact_vs)
+      if (c->vs && c->vs_bank0 && c->compact_vs && !c->cf)
          compact_vertex_bank1(c);
       switch (ins->type) {
       case nir_instr_type_alu:
@@ -6850,6 +6985,8 @@ static bool codegen(struct gctx *c)
       plan_common(c);
       plan_fs_output(c);
       c->reserved = BITFIELD64_RANGE(0, c->mrt.words); /* packed colour halves, o0..o(2N-1) */
+      if (c->has_secondary)
+         c->reserved |= BITFIELD64_RANGE(4, 2); /* source1 halves 8..11 */
       if (c->cf && c->reserve_st31)
          c->reserved |= BITFIELD64_BIT(NUM_DWORDS - 1);
       c->cube_gradient = false;
@@ -6861,7 +6998,7 @@ static bool codegen(struct gctx *c)
       }
       if (c->cube_gradient)
          c->reserved |= BITFIELD64_RANGE(0, 9);
-      c->max_dword = MAX2(c->mrt.words, c->cube_gradient ? 9 : 0);
+      c->max_dword = MAX3(c->mrt.words, c->has_secondary ? 6 : 0, c->cube_gradient ? 9 : 0);
       c->max_written = MAX2(c->max_written, c->cube_gradient ? 9 : 0);
       if (c->cf && !c->count_pass)
          c->reserved |= BITFIELD64_BIT(c->st); /* the mask stack, above every register of the count pass */
@@ -6947,6 +7084,8 @@ static void codegen_reset(struct gctx *c)
    memset(c->narrow_sat, 0, sizeof(c->narrow_sat));
    memset(c->out, 0, sizeof(c->out));
    memset(c->out_written, 0, sizeof(c->out_written));
+   c->has_secondary = false;
+   memset(c->secondary_written, 0, sizeof(c->secondary_written));
    c->has_depth = false;
    memset(&c->depth, 0, sizeof(c->depth));
    memset(c->slot_written, 0, sizeof(c->slot_written));
@@ -7015,6 +7154,59 @@ static bool two_pass(struct gctx *c)
    codegen_reset(c);
    c->count_pass = false;
    return codegen(c);
+}
+
+/* A read-only straight-line vertex program can reissue an explicit-LOD
+ * sample/fetch at its consumers. Keep the exact coordinates, descriptors,
+ * LOD and texture operation. This trades bandwidth for live result words;
+ * it is never used in a shader with storage writes or execution-dependent
+ * derivatives. No private backing or new instruction tuple is needed. */
+static bool split_vertex_texture_live_range(struct gctx *c)
+{
+   nir_tex_instr *victim = NULL;
+   int farthest = c->now;
+   foreach_instr_all(ins, c) {
+      if (ins->type != nir_instr_type_tex)
+         continue;
+      nir_tex_instr *t = nir_instr_as_tex(ins);
+      if (t->op != nir_texop_txf && t->op != nir_texop_txl)
+         continue;
+      unsigned uses = 0;
+      nir_foreach_use(use, &t->def)
+         uses++;
+      if (uses < 2 || uses > 32)
+         continue;
+      for (unsigned k = 0; k < t->def.num_components; k++) {
+         struct val *v = V(c, &t->def, k);
+         if (v->held && v->last > farthest) {
+            farthest = v->last;
+            victim = t;
+         }
+      }
+   }
+   if (!victim)
+      return false;
+   nir_foreach_use_safe(use, &victim->def) {
+      nir_instr *consumer = nir_src_use_instr(use);
+      nir_instr *clone = nir_instr_clone(c->nir, &victim->instr);
+      nir_instr_insert_before(consumer, clone);
+      nir_src_rewrite(use, nir_instr_def(clone));
+   }
+   NIR_PASS(_, c->nir, nir_opt_dce);
+   return true;
+}
+
+static void reindex_pressure_retry(struct gctx *c)
+{
+   nir_index_ssa_defs(c->impl);
+   nir_index_instrs(c->impl);
+   free(c->lastput);
+   free(c->home);
+   c->lastput = malloc(c->impl->ssa_alloc * 4 * sizeof(int));
+   c->home = malloc(c->impl->ssa_alloc * 4);
+   if (!c->lastput || !c->home)
+      refuse(c, "out of memory");
+   memset(c->home, -1, c->impl->ssa_alloc * 4);
 }
 
 bool pco_g5p_compile_general_key(nir_shader *nir, bool half_output, const uint8_t *attrib_components,
@@ -7095,12 +7287,13 @@ static bool compile_general_link(nir_shader *nir, bool half_output, const uint8_
       out->blend_mode = BLEND_GENERAL; /* destination read requires TRANSLUCENT ISP */
    if (lower(nir, preserve_cf))
       out->evidence |= PCO_G5P_EV_FLATTEN;
+   NIR_PASS(_, nir, hoist_branch_derivatives);
    fuse_ffma(c, nir);
    if (!c->vs && cf_left(nir))
       cf_discards(nir);
    if (c->vs || !c->key->punch)
       select_discards(c, nir);
-   if (!c->vs && c->key->punch) {
+   if (!c->vs && (c->key->punch || c->blend == BLEND_GENERAL)) {
       bool progress = false;
       NIR_PASS(progress, nir, merge_discards);
       if (progress) {
@@ -7217,7 +7410,7 @@ homes_retry:
       const nir_schedule_options options = {.threshold = c->vs ? 48 : 24, .fallback = true};
       nir_schedule(nir, &options);
       nir_index_instrs(c->impl);
-      memset(c->home, -1, c->nvals);
+      memset(c->home, -1, c->impl->ssa_alloc * 4);
       c->nhomes = 0;
       codegen_reset(c);
       c->remat = true;
@@ -7228,6 +7421,18 @@ homes_retry:
       }
       ok = two_pass(c);
       goto homes_retry;
+   }
+   for (unsigned split = 0; !ok && c->vs && !c->cf && split < 16 &&
+                             strstr(out->refusal, "register pressure") &&
+                             !impl_has_side_effects(c->impl); split++) {
+      if (!split_vertex_texture_live_range(c))
+         break;
+      reindex_pressure_retry(c);
+      codegen_reset(c);
+      c->vs_bank0 = c->remat = c->eager_vout = c->compact_vs = true;
+      ok = two_pass(c);
+      if (ok && getenv("PVR_G5P_PRESSURE_LOG"))
+         fprintf(stderr, "G5P pressure: VS explicit-LOD live-range splits=%u\n", split + 1);
    }
 done:
    free(c->decls);

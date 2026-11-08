@@ -12,7 +12,7 @@
 
 static struct g5p_blend_key current;
 static unsigned tested, evaluated, fallback;
-static double source[4], destination[4], constants[4];
+static double source[4], destination[4], constants[4], secondary[4];
 static unsigned max_bytes,max_half;
 static unsigned current_mask = 0xf;
 static unsigned current_target, current_targets = 1;
@@ -29,6 +29,8 @@ static double factor_ref(unsigned f,unsigned l)
    case 7:return 1-source[3];case 8:return destination[3];case 9:return 1-destination[3];
    case 10:return constants[l];case 11:return 1-constants[l];case 12:return constants[3];
    case 13:return 1-constants[3];case 14:return l==3?1:fmin(source[3],1-destination[3]);
+   case 15:return secondary[l];case 16:return 1-secondary[l];
+   case 17:return secondary[3];case 18:return 1-secondary[3];
    default:abort();
    }
 }
@@ -59,6 +61,8 @@ static void g5p_blend_test_program(const struct bctx *c,const struct g5p_blend_i
          source[l]=sample==0?(double)(l+1)/8:sample==1?(double)(7-l)/8:(l==3?0:1);
          destination[l]=sample==0?(double)(7-l)/16:sample==1?(double)(l+2)/16:(l==3?1:0);
          constants[l]=sample==0?(double)(2*l+1)/8:sample==1?clamp((double)l-1):0.375;
+         secondary[l]=sample==0?(double)(5-l)/8:sample==1?(double)(l+1)/8:(l==3?0.5:1);
+         if(current_targets==1)h[8+l]=secondary[l];
          h[4*current_target+l]=info->zero_lanes&(1u<<l)?0:source[l];
       }
       for(unsigned v=0;v<c->nn;v++)if(c->n[v].op==B_RAW)h[c->n[v].half]=destination[c->n[v].lane];
@@ -105,6 +109,7 @@ int main(int argc,char **argv)
    bool dump=argc==3&&(!strcmp(argv[1],"--dump")||maskdump);
    FILE *file=dump?fopen(argv[2],"wb"):NULL;
    if(dump&&!file)return 2;
+   bool dual=argc==2&&!strcmp(argv[1],"--dual");
    bool mrt=argc==2&&!strcmp(argv[1],"--mrt");
    unsigned stride=(dump||mrt)?137:1;
    if(mrt) {
@@ -121,8 +126,10 @@ int main(int argc,char **argv)
    for(current_target=0;current_target<current_targets;current_target++)
    for(unsigned mask=masks?0:15;mask<16;mask++) {
    current_mask=mask;
-   for(unsigned rgb=0;rgb<1125;rgb+=mrt?17:1)for(unsigned alpha=0;alpha<1125;alpha+=stride) {
-      current=(struct g5p_blend_key){rgb%15,(rgb/15)%15,rgb/225,alpha%15,(alpha/15)%15,alpha/225};
+   unsigned factors=dual?19:15, equations=5*factors*factors;
+   for(unsigned rgb=0;rgb<equations;rgb+=mrt?17:1)for(unsigned alpha=0;alpha<equations;alpha+=stride) {
+      current=(struct g5p_blend_key){rgb%factors,(rgb/factors)%factors,rgb/(factors*factors),alpha%factors,(alpha/factors)%factors,alpha/(factors*factors)};
+      if(dual && current.src_rgb<15 && current.dst_rgb<15 && current.src_a<15 && current.dst_a<15)continue;
       uint8_t code[2048];struct g5p_blend_info info;const char *err;
       unsigned n=mrt?g5p_blend_target(code,sizeof(code),&current,0,current_mask,current_target,current_targets,&info,&err)
                     :g5p_blend_masked(code,sizeof(code),&current,0,current_mask,&info,&err);

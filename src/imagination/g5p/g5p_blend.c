@@ -24,6 +24,8 @@
  *       instruction; header 0x41 when that source is slot B and A is not
  *       group 0.
  * The colour is in halves 0..3 (saturated f16), the tile read goes to half 4.
+ * Dual-source colour, when referenced, is in halves 8..11; the same f16
+ * ALU builds its factors. It has no additional hardware export operation.
  * The blend constants are four f32 common dwords from `const_base`.
  */
 #include "g5p_usc.h"
@@ -31,7 +33,7 @@
 #include <stdio.h>
 #include <string.h>
 
-enum { F_ZERO, F_ONE, F_SC, F_OMSC, F_DC, F_OMDC, F_SA, F_OMSA, F_DA, F_OMDA, F_CC, F_OMCC, F_CA, F_OMCA, F_SAS };
+enum { F_ZERO, F_ONE, F_SC, F_OMSC, F_DC, F_OMDC, F_SA, F_OMSA, F_DA, F_OMDA, F_CC, F_OMCC, F_CA, F_OMCA, F_SAS, F_S1C, F_OMS1C, F_S1A, F_OMS1A };
 enum { O_ADD, O_SUB, O_RSUB, O_MIN, O_MAX };
 
 enum bop {
@@ -167,6 +169,10 @@ static struct fv factor(struct bctx *c, unsigned f, unsigned l)
    case F_OMCC: return V(onemc(c, c->const_base + l));
    case F_CA: return (struct fv){V_COMMON, -1, c->const_base + 3};
    case F_OMCA: return V(onemc(c, c->const_base + 3));
+   case F_S1C: return V(src(c, 8 + l));
+   case F_OMS1C: return V(onem(c, src(c, 8 + l)));
+   case F_S1A: return V(src(c, 11));
+   case F_OMS1A: return V(onem(c, src(c, 11)));
    case F_SAS:
       if (l == 3)
          return (struct fv){V_ONE};
@@ -411,7 +417,7 @@ static unsigned blend_build(uint8_t *out, unsigned max, const struct g5p_blend_k
          fd[l] = F_ONE;
          op[l] = O_ADD;
       }
-      if (fs[l] > F_SAS || fd[l] > F_SAS || op[l] > O_MAX) {
+      if (fs[l] > F_OMS1A || fd[l] > F_OMS1A || op[l] > O_MAX) {
          snprintf(c->err, sizeof(c->err), "blend factors %u/%u op %u: outside VkBlendFactor/VkBlendOp core",
                   fs[l], fd[l], op[l]);
          *err = c->err;
@@ -539,6 +545,9 @@ static unsigned blend_build(uint8_t *out, unsigned max, const struct g5p_blend_k
       if (holder[l] < 0)
          holder[l] = -2; /* a source channel nothing reads: still emitted if passed through */
    unsigned top = any_raw ? 7 : 3;
+   for (unsigned h = 8; h < 12; h++)
+      if (holder[h] >= 0)
+         top = h;
    for (unsigned i = 0; i < c->ni; i++) {
       int fi = base + i;
       int v = c->ins[i].node;
