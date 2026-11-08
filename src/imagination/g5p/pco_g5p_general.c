@@ -1479,7 +1479,7 @@ static void plan_varyings(struct gctx *c)
          continue;
       nir_intrinsic_instr *in = nir_instr_as_intrinsic(ins);
       if (in->intrinsic == nir_intrinsic_load_frag_coord)
-         position_w |= V(c, &in->def, 3)->uses != 0;
+         position_w |= nir_def_components_read(&in->def) & BITFIELD_BIT(3);
       if (in->intrinsic != nir_intrinsic_load_interpolated_input && in->intrinsic != nir_intrinsic_load_input)
          continue;
       unsigned loc = nir_intrinsic_io_semantics(in).location;
@@ -1505,9 +1505,16 @@ static void plan_varyings(struct gctx *c)
    if (util_bitcount(read) > PCO_G5P_MAX_FS_VARYINGS)
       refuse(c, "%u varying locations read (%u vec4: the reported 64 components)", util_bitcount(read),
              PCO_G5P_MAX_FS_VARYINGS);
-   bool w = position_w;
+   bool smooth = false;
    u_foreach_bit(n, read)
-      w |= interp[n] == PCO_G5P_INTERP_SMOOTH;
+      smooth |= interp[n] == PCO_G5P_INTERP_SMOOTH;
+   /* r39-4 on A9: position-w-smooth is exact, but the same probe with
+    * only flat/no user inputs fails 3072 channels. A W DOUTI alone does
+    * not establish the TA's RHW payload. Keep the measured smooth path;
+    * reject the unqualified interface before emitting any USC or PDS. */
+   if (position_w && !smooth)
+      refuse(c, "load_frag_coord .w without smooth user varyings (A9 numeric mismatch; TA RHW layout unqualified)");
+   bool w = position_w || smooth;
    /* the last location's last component must fit the u7 iterator slot */
    if ((w ? 1 : 0) + 4 * util_bitcount(read) > 128)
       refuse(c, "%u varying locations with W exceed the u7 iterator slot", util_bitcount(read));
