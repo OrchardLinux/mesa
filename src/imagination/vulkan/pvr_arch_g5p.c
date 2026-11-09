@@ -945,15 +945,28 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
       }
    }
    memcpy(g->background, bgnd, sizeof(g->background));
-   const char *perf = getenv("PVR_G5P_PERF_LOG");
-   if (perf && strtoul(perf, NULL, 0) >= 2)
-      fprintf(stderr, "G5P perf pass width=%u height=%u load=%u partial=%u continuation=%u stores=%u\n",
-              g->width, g->height, load, partial, sub_cmd->barrier_load, hw_render->eot_surface_count);
    g->eot[0] = eot_data.data_offset;
    g->eot[1] = p->eot.code_offset;
    g->eot[2] = g5p_mrt_eot_info(nt);
    /* what the render writes, for the winsys's resource list (pvr_g5p_perf.h) */
    pvr_arch_g5p_perf_job(cmd_buffer, hw_render, &g->reads, &g->perf);
+   g->perf.width = g->width;
+   g->perf.height = g->height;
+   g->perf.surfaces = hw_render->eot_surface_count;
+   g->perf.color_load = partial || sub_cmd->barrier_load || load ? VK_ATTACHMENT_LOAD_OP_LOAD :
+      hw_render->color_init_count ? hw_render->color_init[0].op : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+   g->perf.color_store = !null_target;
+   g->perf.zload = job->ds.load.d;
+   g->perf.zstore = job->ds.store.d;
+   g->perf.sload = job->ds.load.s;
+   g->perf.sstore = job->ds.store.s;
+   if (!null_target) {
+      const struct pvr_image_view *iv = info->attachments[hw_render->eot_surfaces[0].attachment_idx];
+      const struct pvr_image *im = pvr_image_view_get_image(iv);
+      const struct pvr_image_plane *pl = pvr_single_plane_const(im);
+      g->perf.eot_va = im->dev_addr.addr + pl->offset +
+         pl->mip_levels[iv->vk.base_mip_level].offset + iv->vk.base_array_layer * pl->layer_size;
+   }
    g->enabled = true;
    return VK_SUCCESS;
 }

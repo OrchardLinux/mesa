@@ -66,10 +66,21 @@ g5p_ws_perf_job(struct g5p_ws_perf *p, const struct drm_g5p_render_pass_v3 *pass
    p->last_noclear = false;
    p->last_reads = false;
    p->last_omitted = 0;
-   if (!p->on || !tail || tail_len != sizeof(t))
+   memset(&p->last_pass, 0, sizeof(p->last_pass));
+   if (!tail || tail_len != sizeof(t))
       return;
    memcpy(&t, tail, sizeof(t));
-   if (t.magic != G5P_PERF_TAIL_MAGIC || !(t.flags & G5P_PERF_WRITES_KNOWN) || t.writes > G5P_PERF_MAX_WRITES)
+   if (t.magic != G5P_PERF_TAIL_MAGIC)
+      return;
+   if (p->log) {
+      p->last_pass = t;
+      const struct g5p_perf_tail *prev = &p->previous_pass;
+      if (t.eot_va && t.eot_va == prev->eot_va && t.width == prev->width &&
+          t.height == prev->height && t.color_load == 0 /* LOAD */ && prev->color_store)
+         p_atomic_inc(&p->merge_candidates);
+      p->previous_pass = t;
+   }
+   if (!p->on || !(t.flags & G5P_PERF_WRITES_KNOWN) || t.writes > G5P_PERF_MAX_WRITES)
       return;
    p->last_noclear = t.flags & G5P_PERF_NO_CLEAR;
    for (unsigned i = 0; i < t.writes; i++)
@@ -176,8 +187,14 @@ g5p_ws_perf_account(struct g5p_ws_perf *p, const struct drm_g5p_render_resource 
    if (p->log >= 2)
       fprintf(stderr,
               "G5P perf job res=%u chunks=%u own=%u own_written=%u omitted=%u writes_known=%d reads_known=%d vdm=%u pre=%" PRIu64 " post=%" PRIu64
-              " arena_lo=+%#" PRIx64 " submit_us=%" PRIu64 "\n",
-              n, chunks, n - chunks, own_w, p->last_omitted, p->last_known, p->last_reads, p->last_vdm, pre, post, p->arena_lo - p->arena_va, ns / 1000);
+              " arena_lo=+%#" PRIx64 " submit_us=%" PRIu64
+              " width=%u height=%u eot_surfaces=%u color_load=%s color_store=%u"
+              " zload=%u zstore=%u sload=%u sstore=%u eot_va=0x%016" PRIx64 "\n",
+              n, chunks, n - chunks, own_w, p->last_omitted, p->last_known, p->last_reads, p->last_vdm, pre, post, p->arena_lo - p->arena_va, ns / 1000,
+              p->last_pass.width, p->last_pass.height, p->last_pass.surfaces,
+              p->last_pass.color_load == 0 ? "LOAD" : p->last_pass.color_load == 1 ? "CLEAR" : "DONTCARE",
+              p->last_pass.color_store, p->last_pass.zload, p->last_pass.zstore,
+              p->last_pass.sload, p->last_pass.sstore, p->last_pass.eot_va);
 
    /* the summary: totals over the last G5P_PERF_SUMMARY_JOBS jobs (approximate under concurrent submits) */
    p_atomic_add(&p->arena_pre_bytes, arena_pre);
@@ -209,10 +226,11 @@ g5p_ws_perf_account(struct g5p_ws_perf *p, const struct drm_g5p_render_resource 
    fprintf(stderr,
            "G5P perf summary jobs=%" PRIu64 " res=%s per_job: pre_kib=%" PRIu64 " post_kib=%" PRIu64
            " own=%.1f own_written=%.1f omitted=%.1f writes_known=%" PRIu64 "/%u reads_known=%" PRIu64 " drawless=%" PRIu64 " (no clear %" PRIu64 ") submit_us=%" PRIu64 " arena_used_kib=%" PRIu64 " arena_pre_kib=%" PRIu64 " arena_post_kib=%" PRIu64
-           " own_pre_kib=%" PRIu64 " own_post_kib=%" PRIu64 "\n",
+           " own_pre_kib=%" PRIu64 " own_post_kib=%" PRIu64 " merge_candidates=%" PRIu64 "\n",
            jobs, p->on ? "narrow" : "whole", pb / 1024 / G5P_PERF_SUMMARY_JOBS, qb / 1024 / G5P_PERF_SUMMARY_JOBS,
            (double)ol / G5P_PERF_SUMMARY_JOBS, (double)ow / G5P_PERF_SUMMARY_JOBS, (double)om / G5P_PERF_SUMMARY_JOBS, wk,
            G5P_PERF_SUMMARY_JOBS, rk, dl, dn,
            sn / 1000 / G5P_PERF_SUMMARY_JOBS, (p->arena_end - p->arena_lo) / 1024, ap / 1024 / G5P_PERF_SUMMARY_JOBS, aq / 1024 / G5P_PERF_SUMMARY_JOBS,
-           (pb - ap) / 1024 / G5P_PERF_SUMMARY_JOBS, (qb - aq) / 1024 / G5P_PERF_SUMMARY_JOBS);
+           (pb - ap) / 1024 / G5P_PERF_SUMMARY_JOBS, (qb - aq) / 1024 / G5P_PERF_SUMMARY_JOBS,
+           p_atomic_xchg(&p->merge_candidates, 0));
 }

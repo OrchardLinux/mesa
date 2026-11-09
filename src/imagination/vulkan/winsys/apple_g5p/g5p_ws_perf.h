@@ -67,11 +67,15 @@
 /* every read of the job outside the arena is in the reads list */
 #define G5P_PERF_READS_KNOWN (1u << 2)
 
-/* After the pass in the fragment fw_stream (104 bytes: the room the 640-byte
- * stream leaves after the 536-byte pass): the base addresses of the images
+/* After the pass in the fragment fw_stream: pass-counting metadata and
+ * the base addresses of the images
  * the job writes, and where the addresses it reads are (any address inside a
  * BO marks that BO) */
 struct g5p_perf_tail {
+   uint32_t width, height;
+   uint64_t eot_va;
+   uint8_t surfaces, color_load, color_store;
+   uint8_t zload, zstore, sload, sstore;
    uint32_t magic;
    uint16_t flags;    /* G5P_PERF_* */
    uint8_t writes;    /* entries of write_va */
@@ -87,6 +91,8 @@ struct g5p_ws_perf {
    bool reads_on;            /* PVR_G5P_PERF_READS != 0 */
    uint64_t arena_lo; /* the lowest slice address handed out so far; arena_end before the first */
    bool on;           /* PVR_G5P_PERF_RES != 0 */
+   struct g5p_perf_tail last_pass, previous_pass;
+   uint64_t merge_candidates;
    unsigned log;      /* PVR_G5P_PERF_LOG */
    /* PVR_G5P_PERF_LOG: totals since the last summary line */
    uint64_t jobs, pre_bytes, post_bytes, own_listed, own_written, submit_ns, writes_known, drawless, drawless_noclear,

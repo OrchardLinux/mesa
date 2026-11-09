@@ -175,6 +175,8 @@ static struct g5p_blend_key general_key(const struct pco_g5p_fs_key *k)
 }
 
 struct gctx {
+   uint64_t tex_pending, tex_coord_pending;
+   unsigned tex_batch;
    nir_shader *nir;
    nir_function_impl *impl;
    bool vs, half_output;
@@ -329,6 +331,23 @@ static void put(struct gctx *c, const uint8_t *raw, unsigned n, const char *what
    c->nput++;
 }
 
+/* Counter 0 is shared with other asynchronous reads. Keep sample operands
+ * reserved until completion, including coordinates whose SSA lifetime ended. */
+static void tex_flush(struct gctx *c)
+{
+   if (!c->tex_batch)
+      return;
+   uint8_t raw[G5P_USC_MAX];
+   put(c, raw, g5p_usc_wait(raw, 0), "wait");
+   c->busy &= ~c->tex_coord_pending;
+   for (unsigned i = 0; i < c->nvals; i++)
+      if (c->vals[i].held)
+         c->busy |= BITFIELD64_BIT(c->vals[i].reg);
+   c->busy |= c->scratch;
+   c->tex_pending = c->tex_coord_pending = 0;
+   c->tex_batch = 0;
+}
+
 /* ---- vertex register banks (docs/gpu/vs-two-bank-allocator.md) ----
  * A vertex register below VS_BANK0 is bank 1 (the attributes, outputs and
  * unified store; every vertex temp so far); VS_BANK0 + i is bank 0 r<i>, the
@@ -386,7 +405,7 @@ static void vs_bank1_only(struct gctx *c, const char *what, int r0, int r1, int 
 static int alloc_bank0(struct gctx *c)
 {
    for (unsigned r = VS_BANK0; r < VS_BANK0 + NUM_DWORDS; r++)
-      if (!((c->busy | c->reserved) & BITFIELD64_BIT(r))) {
+      if (!((c->busy | c->reserved | c->tex_coord_pending | c->tex_pending) & BITFIELD64_BIT(r))) {
          c->busy |= BITFIELD64_BIT(r);
          c->max_bank0 = MAX2(c->max_bank0, r - VS_BANK0 + 1);
          return r;
@@ -399,7 +418,7 @@ static unsigned alloc_run(struct gctx *c, unsigned n, const char *why)
    if (c->vs && c->tex_bank0) {
       for (unsigned r = VS_BANK0; r + n <= VS_BANK0 + NUM_DWORDS; r++) {
          uint64_t mask = BITFIELD64_RANGE(r, n);
-         if (!((c->busy | c->reserved) & mask)) {
+         if (!((c->busy | c->reserved | c->tex_coord_pending | c->tex_pending) & mask)) {
             c->busy |= mask;
             c->max_bank0 = MAX2(c->max_bank0, r - VS_BANK0 + n);
             return r;
@@ -418,7 +437,7 @@ static unsigned alloc_run(struct gctx *c, unsigned n, const char *why)
    }
    for (unsigned r = 0; r + n <= NUM_DWORDS; r++) {
       uint64_t mask = BITFIELD64_RANGE(r, n);
-      if (!((c->busy | c->reserved) & mask)) {
+      if (!((c->busy | c->reserved | c->tex_coord_pending | c->tex_pending) & mask)) {
          c->busy |= mask;
          c->max_dword = MAX2(c->max_dword, r + n);
          c->max_written = MAX2(c->max_written, r + n);
@@ -432,8 +451,12 @@ static unsigned alloc_run(struct gctx *c, unsigned n, const char *why)
       refuse(c, "register pressure: %s needs %u dword(s), %u of %u in use in each vertex bank", why, n, NUM_DWORDS,
              NUM_DWORDS);
    }
+   if (c->tex_pending) {
+      tex_flush(c);
+      return alloc_run(c, n, why);
+   }
    refuse(c, "register pressure: %s needs %u dword(s), %u of %u in use", why, n,
-          util_bitcount64((c->busy | c->reserved) & BITFIELD64_MASK(NUM_DWORDS)), NUM_DWORDS);
+          util_bitcount64((c->busy | c->reserved | c->tex_coord_pending | c->tex_pending) & BITFIELD64_MASK(NUM_DWORDS)), NUM_DWORDS);
 }
 
 /* Coupled vertex texture operands/results and the measured vertex math
@@ -466,9 +489,9 @@ static unsigned alloc_reg(struct gctx *c, int prefer)
    if (c->alloc_out && prefer >= (int)VS_BANK0)
       prefer = -1;
    if (c->vs && prefer >= VS_WRITE_REGS && prefer < (int)VS_BANK0 &&
-       (~(c->busy | c->reserved) & BITFIELD64_MASK(prefer)))
+       (~(c->busy | c->reserved | c->tex_coord_pending | c->tex_pending) & BITFIELD64_MASK(prefer)))
       prefer = -1;
-   if (prefer >= 0 && !((c->busy | c->reserved) & BITFIELD64_BIT(prefer))) {
+   if (prefer >= 0 && !((c->busy | c->reserved | c->tex_coord_pending | c->tex_pending) & BITFIELD64_BIT(prefer))) {
       c->busy |= BITFIELD64_BIT(prefer);
       if (prefer >= (int)VS_BANK0) {
          c->max_bank0 = MAX2(c->max_bank0, (unsigned)prefer - VS_BANK0 + 1);
@@ -559,8 +582,12 @@ static struct ref resolve_value(struct gctx *c, nir_def *d, unsigned comp)
    for (;;) {
       struct ref r = resolve_plain(d, comp);
       nir_alu_instr *a = alu_of(r.def);
-      if (!(a && a->op == nir_op_fsat && c->sat_folded[r.def->index]))
+      if (!(a && a->op == nir_op_fsat && c->sat_folded[r.def->index])) {
+         if (c->tex_pending && V(c, r.def, r.comp)->held &&
+             (c->tex_pending & BITFIELD64_BIT(V(c, r.def, r.comp)->reg)))
+            tex_flush(c);
          return r;
+      }
       comp = a->src[0].swizzle[r.comp];
       d = a->src[0].src.ssa;
    }
@@ -581,6 +608,9 @@ static struct ref resolve_float(struct gctx *c, nir_def *d, unsigned comp)
       } else if (a && a->op == nir_op_fabs) {
          abs = true;
       } else if (!(a && a->op == nir_op_fsat && c->sat_folded[d->index])) {
+         if (c->tex_pending && V(c, d, comp)->held &&
+             (c->tex_pending & BITFIELD64_BIT(V(c, d, comp)->reg)))
+            tex_flush(c);
          return (struct ref){d, comp, neg, abs};
       }
       comp = a->src[0].swizzle[comp];
@@ -2286,6 +2316,8 @@ static void park(struct gctx *c, nir_instr *ins)
       int h = c->home ? c->home[d->index * 4 + k] : -1;
       if (h < 0)
          continue;
+      if (c->tex_pending & BITFIELD64_BIT(v->reg))
+         tex_flush(c);
       uint8_t raw[G5P_USC_MAX];
       put(c, raw, g5p_usc_alu2_wide(raw, G5P_OP_OR, h, v->reg, 0, v->reg, 0), "move to a home above r31");
       drop(c, v);
@@ -2315,6 +2347,8 @@ static int pick_home(struct gctx *c)
 static unsigned reg_of(struct gctx *c, struct ref r, const char *what)
 {
    struct val *v = V(c, r.def, r.comp);
+   if (v->held && (c->tex_pending & BITFIELD64_BIT(v->reg)))
+      tex_flush(c);
    if (v->held)
       return v->reg;
    uint8_t raw[G5P_USC_MAX];
@@ -4029,6 +4063,7 @@ struct drc {
 
 static void drc_flush(struct gctx *c, struct drc *d)
 {
+   tex_flush(c);
    uint8_t raw[G5P_USC_MAX];
    if (d->n[0])
       put(c, raw, g5p_usc_wait(raw, 0), "wait");
@@ -4040,6 +4075,7 @@ static void drc_flush(struct gctx *c, struct drc *d)
 /* Counter of the next read (true: counter 1); a full batch is waited for first. */
 static bool drc_take(struct gctx *c, struct drc *d)
 {
+   tex_flush(c);
    if (d->n[0] == 8 && d->n[1] == 8)
       drc_flush(c, d);
    if (d->n[0] < 8) {
@@ -4169,7 +4205,7 @@ static void emit_dyn_ubo(struct gctx *c, nir_intrinsic_instr *in)
       drop(c, V(c, ix.def, ix.comp));
    unsigned pair = 0;
    for (pair = 0; pair + 2 <= NUM_DWORDS; pair += 2)
-      if (!((c->busy | c->reserved) & BITFIELD64_RANGE(pair, 2)))
+      if (!((c->busy | c->reserved | c->tex_coord_pending | c->tex_pending) & BITFIELD64_RANGE(pair, 2)))
          break;
    if (pair + 2 > NUM_DWORDS)
       refuse(c, "register pressure: an address pair");
@@ -4177,7 +4213,7 @@ static void emit_dyn_ubo(struct gctx *c, nir_intrinsic_instr *in)
    put(c, raw, g5p_usc_address_add_shift(raw, 2 * pair, common, 2 * index, shift, kill, c->vs), "addr.add_shift");
    unsigned dst = 0;
    for (dst = 0; dst + n <= NUM_DWORDS; dst += n)
-      if (!((c->busy | c->reserved) & BITFIELD64_RANGE(dst, n)))
+      if (!((c->busy | c->reserved | c->tex_coord_pending | c->tex_pending) & BITFIELD64_RANGE(dst, n)))
          break;
    if (dst + n > NUM_DWORDS)
       refuse(c, "register pressure: load_ubo needs %u aligned dword(s)", n);
@@ -4223,7 +4259,7 @@ static void emit_memory_ubo(struct gctx *c, nir_intrinsic_instr *in,
       unsigned pair;
 
       for (pair = 0; pair + 2 <= NUM_DWORDS; pair += 2)
-         if (!((c->busy | c->reserved) & BITFIELD64_RANGE(pair, 2)))
+         if (!((c->busy | c->reserved | c->tex_coord_pending | c->tex_pending) & BITFIELD64_RANGE(pair, 2)))
             break;
       if (pair + 2 > NUM_DWORDS)
          refuse(c, "memory UBO load: register pressure for address pair");
@@ -4867,6 +4903,8 @@ static void emit_vertex_qualified_texture(struct gctx *c, nir_tex_instr *t)
 
 static void emit_tex(struct gctx *c, nir_tex_instr *t)
 {
+   if (c->tex_batch == 4 || c->vs || !plain_tex(t) || size_query(t) || c->narrow_tex == t)
+      tex_flush(c);
    if (size_query(t)) {
       emit_size(c, t);
       return;
@@ -4885,6 +4923,7 @@ static void emit_tex(struct gctx *c, nir_tex_instr *t)
    bool narrow = c->narrow_tex == t;
    unsigned coord;
    if (slot >= 0) {
+      tex_flush(c);
       coord = narrow ? 0 : alloc_run(c, 2, "texture coordinate");
       put(c, raw, g5p_usc_coord_iterator(raw, 2 * coord, slot, 2), "coordinate iterator");
    } else {
@@ -4910,13 +4949,15 @@ static void emit_tex(struct gctx *c, nir_tex_instr *t)
                        .coord_control = true, .dim = G5P_TEX_2D, .narrow = narrow};
    unsigned dst = 0;
    if (!narrow) {
-      if (slot >= 0)
-         c->busy &= ~BITFIELD64_RANGE(coord, 2);
       dst = alloc_run(c, 4, "texture result");
    }
    s.dst_half = 2 * dst;
    put(c, raw, g5p_usc_sample(raw, &s), "texture sample");
-   put(c, raw, g5p_usc_wait(raw, 0), "wait");
+   c->tex_coord_pending |= BITFIELD64_RANGE(coord, 2);
+   c->tex_pending |= BITFIELD64_RANGE(dst, 4);
+   c->tex_batch++;
+   if (narrow)
+      tex_flush(c);
    c->p->evidence |= narrow ? PCO_G5P_EV_TEX_CAPTURE : PCO_G5P_EV_TEX_F32;
    if (narrow)
       return;
@@ -5304,6 +5345,7 @@ static void fs_prologue(struct gctx *c)
  * of the 0.0/1.0 condition against 0.0 feeding `04 61`, or `04 68`. */
 static void fs_discards(struct gctx *c)
 {
+   tex_flush(c);
    uint8_t raw[G5P_USC_MAX];
    c->p->discard_tokens = c->ndiscards + c->discard_always;
    for (unsigned i = 0; i < c->ndiscards; i++) {
@@ -5327,6 +5369,7 @@ static void fs_discards(struct gctx *c)
 
 static void fs_output(struct gctx *c)
 {
+   tex_flush(c);
    uint8_t raw[G5P_USC_MAX];
    c->now = DISCARD_AT;
    if (c->has_depth) {
@@ -6852,6 +6895,7 @@ static void emit_if_else(struct gctx *c, nir_if *nif, bool sense)
 
 static void emit_if(struct gctx *c, nir_if *nif)
 {
+   tex_flush(c);
    unsigned side, shape = break_shape(nif, &side);
    bool sense;
    /* Apple breaks only at the loop's own level; an arm emitted inline after
@@ -6882,6 +6926,7 @@ static void emit_if(struct gctx *c, nir_if *nif)
 
 static void emit_loop(struct gctx *c, nir_loop *l)
 {
+   tex_flush(c);
    c->now = nir_loop_first_block(l)->start_ip;
    decl_alloc(c, c->now);
    stack_op(c, G5P_ST_LOOP, false, 2);
@@ -6916,7 +6961,7 @@ static void compact_vertex_bank1(struct gctx *c)
       if (!owned)
          continue;
       unsigned dst;
-      for (dst = 0; dst < src && ((c->busy | c->reserved) & BITFIELD64_BIT(dst)); dst++)
+      for (dst = 0; dst < src && ((c->busy | c->reserved | c->tex_coord_pending | c->tex_pending) & BITFIELD64_BIT(dst)); dst++)
          ;
       if (dst == src)
          continue;
@@ -6933,6 +6978,8 @@ static void emit_block(struct gctx *c, nir_block *block)
 {
    nir_foreach_instr(ins, block) {
       c->now = ins->index;
+      if (ins->type == nir_instr_type_intrinsic || ins->type == nir_instr_type_jump)
+         tex_flush(c);
       if (c->ndecls)
          decl_alloc(c, c->now);
       if (c->vs && c->vs_bank0 && c->compact_vs && !c->cf)
@@ -6966,6 +7013,8 @@ static void emit_block(struct gctx *c, nir_block *block)
       release(c, c->now);
       park(c, ins);
    }
+   /* Drain before the block's mask-stack operations and branch offsets. */
+   tex_flush(c);
 }
 
 static void emit_list(struct gctx *c, struct exec_list *list)
@@ -7479,6 +7528,85 @@ static bool schedule_min_pressure(struct gctx *c)
    return changed;
 }
 
+/* Bring independent plain samples together before their consumers. Only
+ * pure coordinate ALU/constant/deref dependencies move, within a block and
+ * without crossing an intrinsic or another kind of texture operation. */
+struct tex_schedule {
+   nir_instr *first, **deps;
+   unsigned n, cap;
+   bool *moved;
+};
+
+static bool tex_schedule_src(nir_src *src, void *data)
+{
+   struct tex_schedule *s = data;
+   nir_instr *i = nir_def_instr(src->ssa);
+   if (i->block != s->first->block || i->index < s->first->index || s->moved[i->index])
+      return true;
+   if (i->type != nir_instr_type_alu && i->type != nir_instr_type_load_const &&
+       i->type != nir_instr_type_deref)
+      return false;
+   for (unsigned j = 0; j < s->n; j++)
+      if (s->deps[j] == i)
+         return true;
+   if (!nir_foreach_src(i, tex_schedule_src, s) || s->n == s->cap)
+      return false;
+   s->deps[s->n++] = i;
+   return true;
+}
+
+static void schedule_texture_batches(struct gctx *c)
+{
+   if (c->vs)
+      return;
+   unsigned count = nir_index_instrs(c->impl);
+   nir_instr **original = calloc(count, sizeof(*original));
+   nir_instr **deps = calloc(count, sizeof(*deps));
+   bool *moved = calloc(count, sizeof(*moved));
+   if (!original || !deps || !moved) {
+      free(original); free(deps); free(moved);
+      refuse(c, "out of memory scheduling samples");
+   }
+   nir_foreach_block(block, c->impl) {
+      unsigned n = 0;
+      nir_foreach_instr(i, block)
+         original[n++] = i;
+      nir_instr *first = NULL, *cursor = NULL;
+      unsigned batch = 0;
+      for (unsigned k = 0; k < n; k++) {
+         nir_instr *i = original[k];
+         if (i->type == nir_instr_type_tex && plain_tex(nir_instr_as_tex(i)) &&
+             !size_query(nir_instr_as_tex(i))) {
+            if (!first || batch == 4) {
+               first = cursor = i;
+               batch = 1;
+               continue;
+            }
+            struct tex_schedule ts = {first, deps, 0, count, moved};
+            if (!nir_foreach_src(i, tex_schedule_src, &ts)) {
+               first = cursor = i;
+               batch = 1;
+               continue;
+            }
+            for (unsigned j = 0; j < ts.n; j++) {
+               nir_instr_move(nir_after_instr(cursor), deps[j]);
+               moved[deps[j]->index] = true;
+               cursor = deps[j];
+            }
+            nir_instr_move(nir_after_instr(cursor), i);
+            cursor = i;
+            batch++;
+         } else if (i->type != nir_instr_type_alu && i->type != nir_instr_type_load_const &&
+                    i->type != nir_instr_type_deref) {
+            first = cursor = NULL;
+            batch = 0;
+         }
+      }
+   }
+   free(original); free(deps); free(moved);
+   nir_index_instrs(c->impl);
+}
+
 static void reindex_pressure_retry(struct gctx *c)
 {
    nir_index_ssa_defs(c->impl);
@@ -7631,6 +7759,7 @@ static bool compile_general_link(nir_shader *nir, bool half_output, const uint8_
       reindex_pressure_retry(c);
       fprintf(stderr, "G5P pressure: VS forced nested selects=%d pressure order=%d\n", nested, ordered);
    }
+   schedule_texture_batches(c);
    ok = two_pass(c);
    if (!ok && !c->vs && strstr(out->refusal, "register pressure")) {
       /* Retry: constants and uniforms re-read per use (round 19). */
