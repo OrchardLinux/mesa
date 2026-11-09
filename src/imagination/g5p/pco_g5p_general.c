@@ -3025,18 +3025,21 @@ static void vs_fbin(struct gctx *c, nir_alu_instr *a)
       define(c, &a->def, dst);
       return;
    }
-   if (vkind(c, r[0]) == VK_SHARED && vkind(c, r[1]) == VK_SHARED)
+   /* On the bank0 retry, use the ordinary mixed-bank register ALU rather
+    * than the shared form whose bank fields have not been witnessed. Decide
+    * it here: reg_of() returns instruction-local scratch on the pressure
+    * retry (remat) and in control flow, which leaves vkind() VK_SHARED, so
+    * materializing first does not keep the shared form out. */
+   const bool inline_ok = !c->vs_bank0;
+   if (inline_ok && vkind(c, r[0]) == VK_SHARED && vkind(c, r[1]) == VK_SHARED)
       reg_of(c, r[1], "uniform operand"); /* mov.shared to a temp */
    if (vkind(c, r[1]) == VK_SHARED) {
       struct ref t = r[0];
       r[0] = r[1];
       r[1] = t;
    }
-   /* On the bank0 retry, use the ordinary mixed-bank register ALU rather
-    * than the shared form whose bank fields have not been witnessed. */
-   if (c->vs && c->vs_bank0 && vkind(c, r[0]) == VK_SHARED)
-      reg_of(c, r[0], "vertex uniform ALU materialization");
-   if (vkind(c, r[0]) == VK_SHARED && (op == G5P_BIN_FMUL || dies(c, r[1]) || vkind(c, r[1]) != VK_REG)) {
+   if (inline_ok && vkind(c, r[0]) == VK_SHARED &&
+       (op == G5P_BIN_FMUL || dies(c, r[1]) || vkind(c, r[1]) != VK_REG)) {
       /* binary.shared: fmul {h11 x0 dc0 bg0|bg1}, fadd {h11 x0 dc0 bg1} */
       unsigned sd = V(c, r[0].def, r[0].comp)->imm;
       c->hi_inline += sd >= 32;
