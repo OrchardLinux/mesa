@@ -1499,8 +1499,9 @@ struct zink_video_format_prop {
 #define ZINK_OBJ_CACHE_BUCKET_BITS 10
 
 struct zink_screen {
-   bool precise_sync;
+   /* Must stay first: zink_screen() casts a pipe_screen pointer directly. */
    struct pipe_screen base;
+   bool precise_sync;
 
    const char *vendor_name;
    const char *device_name;
