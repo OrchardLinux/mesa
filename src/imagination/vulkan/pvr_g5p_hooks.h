@@ -234,6 +234,28 @@
 #define PVR_G5P_HOOK_memory_released(device, image, vma, bytes)             \
    if (PVR_HAS_FEATURE(&(device)->pdevice->dev_info, apple_g5p) && (vma))    \
       pvr_g5p_winsys_bound((device)->ws, image, -(int64_t)(bytes));
+/* pvr_arch_pass.c, a legacy VkRenderPass's resolve: the A9 has no
+ * gs_rta_support, so the pass stored the 4x source for a transfer resolve
+ * (two EOT surfaces, which G5P refuses: "the pipeline writes 1 colour
+ * targets, the pass has 2"). The reason for that rule, layered render
+ * target clears deferred until after the PBE wrote, cannot occur: G5P
+ * renders one layer per job. Dynamic rendering (Zink) never had the rule.
+ * PVR_G5P_MSAA_PBE_RESOLVE=0: the rule back, for an A/B. */
+#if defined(PVR_APPLE_G5P)
+#   include <stdlib.h>
+#   include <string.h>
+static inline bool
+pvr_g5p_legacy_pbe_resolve(void)
+{
+   const char *e = getenv("PVR_G5P_MSAA_PBE_RESOLVE");
+   return !e || strcmp(e, "0");
+}
+#endif
+#define PVR_G5P_HOOK_pbe_resolve(dev_info, attachment)                      \
+   if (PVR_HAS_FEATURE(dev_info, apple_g5p) && pvr_g5p_legacy_pbe_resolve())  \
+      (attachment)->is_pbe_downscalable =                                   \
+         pvr_arch_format_is_pbe_downscalable(dev_info,                      \
+                                             (attachment)->vk_format);
 
 /* pvr_arch_xfb.c, vkCmdBind/Begin/EndTransformFeedbackEXT(): G5P records
  * its own events (pvr_g5p_xfb.h); Rogue's stream-out programs and End's

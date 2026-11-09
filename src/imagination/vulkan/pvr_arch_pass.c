@@ -866,7 +866,7 @@ PVR_PER_ARCH(CreateRenderPass2)(VkDevice _device,
          PVR_HAS_FEATURE(dev_info, gs_rta_support) &&
          pvr_arch_format_is_pbe_downscalable(&device->pdevice->dev_info,
                                              attachment->vk_format);
-
+      PVR_G5P_HOOK(pbe_resolve, dev_info, attachment)
       if (attachment->sample_count > pass->max_sample_count)
          pass->max_sample_count = attachment->sample_count;
    }
