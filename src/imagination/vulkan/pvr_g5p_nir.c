@@ -39,6 +39,8 @@ static void
 g5p_init_options(void)
 {
    g5p_options = *pco_nir_options();
+   /* Apple's A9 compiler fully unrolls up to 96 trips (lane-b-alu-codegen-spec.md §2). */
+   g5p_options.max_unroll_iterations = 96;
    /* G5P has a measured native FMA; do not inherit PCO's decomposition. */
    g5p_options.float_mul_add32 = nir_float_muladd_support_has_ffma;
    /* Selects are compare/write + inverse MOV pairs (no fused fcsel_*), and
@@ -61,6 +63,7 @@ g5p_init_options(void)
    g5p_options.lower_bitfield_extract = true;
    g5p_options.lower_bitfield_insert = true;
    g5p_vertex_options = g5p_options;
+   g5p_vertex_options.max_unroll_iterations = 16;
    /* The isolated Apple iv_reg_pop/reverse witnesses qualify native VS
     * register forms too. Do not lower them to SWAR multiplies. */
 }

@@ -102,9 +102,8 @@ struct pco_g5p_fs_key {
     * those scenes keep their bytes). PVR_G5P_GROUPS=last-read turns it on. */
    bool last_read_groups;
    /* Fuse an fmul and the fadds it feeds into ffmas (G9P's fusion), with
-    * last_read_groups only. Off by default so proven programs keep their
-    * bytes; PVR_G5P_FUSE=ffma turns it on. Captured shapes are not
-    * affected. */
+    * last_read_groups only. Default on for fragment pipeline keys;
+    * PVR_G5P_FUSE=0 disables it. Captured shapes are not affected. */
    bool fuse_ffma;
    /* Colour attachments written by the program: 0 = 1. 1, 2 and 4 are the
     * homogeneous 8-bit RGBA sets with an Apple witness (g5p_mrt_out.h). */
@@ -270,6 +269,7 @@ bool pco_g5p_compile_general_link(nir_shader *nir, bool half_output, const uint8
 /* PVR_G5P_FS_DYN_UBO=1: fragment register-indexed UBO loads are compiled
  * (index clamped to the block) instead of refused. */
 bool pco_g5p_fs_dyn_ubo(void);
+bool pco_g5p_fuse_ffma(void);
 bool pco_g5p_blend_general(void);
 
 #endif

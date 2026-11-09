@@ -4109,6 +4109,12 @@ bool pco_g5p_fs_dyn_ubo(void)
    return !(e && !strcmp(e, "0"));
 }
 
+bool pco_g5p_fuse_ffma(void)
+{
+   const char *e = getenv("PVR_G5P_FUSE");
+   return !(e && !strcmp(e, "0"));
+}
+
 /* The index is clamp_dyn_ubo's umin(i, last), a constant bound inside the block. */
 static bool clamped_index(struct ref ix)
 {
@@ -5639,6 +5645,49 @@ static bool needs_flatten(nir_shader *nir)
    return !exec_list_is_singular(&impl->body) || !exec_list_is_empty(&impl->locals);
 }
 
+/* Apply Apple's scalar operation budget before NIR's unroll passes. */
+static void g5p_loop_budget_list(struct exec_list *list)
+{
+   foreach_list_typed(nir_cf_node, node, node, list) {
+      if (node->type == nir_cf_node_if) {
+         nir_if *nif = nir_cf_node_as_if(node);
+         g5p_loop_budget_list(&nif->then_list);
+         g5p_loop_budget_list(&nif->else_list);
+      } else if (node->type == nir_cf_node_loop) {
+         nir_loop *loop = nir_cf_node_as_loop(node);
+         if (loop->info && loop->info->max_trip_count) {
+            uint64_t ops = 0;
+            nir_foreach_block_in_cf_node(block, node) {
+               nir_foreach_instr(instr, block) {
+                  if (instr->type == nir_instr_type_alu) {
+                     nir_alu_instr *alu = nir_instr_as_alu(instr);
+                     if (!nir_op_is_vec_or_mov(alu->op))
+                        ops += alu->def.num_components;
+                  } else if (instr->type == nir_instr_type_intrinsic ||
+                             instr->type == nir_instr_type_tex) {
+                     ops++;
+                  }
+               }
+            }
+            if ((uint64_t)loop->info->max_trip_count * (ops + 1) > 480)
+               loop->control = nir_loop_control_dont_unroll;
+         }
+         g5p_loop_budget_list(&loop->body);
+      }
+   }
+}
+
+static void g5p_loop_budget(nir_shader *nir)
+{
+   if (nir->info.stage != MESA_SHADER_FRAGMENT)
+      return;
+   nir_foreach_function_impl(impl, nir) {
+      nir_metadata_require(impl, nir_metadata_block_index);
+      nir_loop_analyze_impl(impl, nir_var_function_temp, false);
+      g5p_loop_budget_list(&impl->body);
+   }
+}
+
 static bool flatten_limit(nir_shader *nir, unsigned limit)
 {
    if (!needs_flatten(nir))
@@ -5649,6 +5698,7 @@ static bool flatten_limit(nir_shader *nir, unsigned limit)
    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
    NIR_PASS(_, nir, nir_lower_indirect_derefs_to_if_else_trees, nir_var_function_temp, UINT32_MAX);
    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+   g5p_loop_budget(nir);
    do {
       progress = false;
       NIR_PASS(progress, nir, nir_opt_copy_prop);
@@ -6255,7 +6305,7 @@ static bool discards_to_select(nir_shader *nir)
  * (fadd(contract) of an fmul only fadds read -> ffma), and that pass
  * doesn't run here. This runs just that rule, on the scalar program,
  * for an fmul whose every reader is a contractable 32-bit fadd, so the
- * fmul goes away. Only with the key's fuse_ffma (PVR_G5P_FUSE=ffma), so
+ * fmul goes away. Only with the key's fuse_ffma (default on for FS), so
  * the programs proven on hardware keep their bytes until fusion is flown,
  * and only with last-read groups: then an operand's group bit is set on
  * its last read alone (vgrp()), so a fused addend that is read again

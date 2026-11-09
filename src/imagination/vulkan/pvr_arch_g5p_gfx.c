@@ -539,6 +539,7 @@ g5p_check_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo *c
     * automatic since Mesa117).
     */
    key->last_read_groups = true;
+   key->fuse_ffma = pco_g5p_fuse_ffma();
    const char *why = pvr_arch_g5p_blend_fs_key(s, colors, key);
    if (why)
       return G5P_REFUSE(device, "colour blend state: %s", why);

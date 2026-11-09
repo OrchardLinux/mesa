@@ -41,7 +41,7 @@ two generations are identical for every form compared so far.
 | Part | G9P source commits | Where here |
 |---|---|---|
 | Discards in blending programs become a select | `7013b551398`, `7a64e1d1bf4` | `pco_g5p_general.c` |
-| Multiply-add fusion (behind `PVR_G5P_FUSE=ffma`) | `28cdfceab8e` | `pco_g5p_general.c` |
+| Multiply-add fusion (default on, `PVR_G5P_FUSE=0` disables) | `28cdfceab8e` | `pco_g5p_general.c` |
 | If/else and loops on the execution-mask stack; their encoders | `d91427625ff` | `pco_g5p_general.c`, `g5p_usc.c` |
 | Registers above r31 (homes) and their moves | `d1ab45daed3` | `pco_g5p_general.c`, `g5p_usc.c` |
 
