@@ -4,11 +4,11 @@
  * Only g5p_drm_transport.[ch] issues ioctls; this file is the memory model.
  *
  * Memory. Our kernel edits a context's VM only while the context is idle, and
- * pins at most 256 MiB per VM in BOs of at most 64 MiB. So this winsys keeps
+ * pins at most 768 MiB per VM in BOs of at most 64 MiB (GET_INFO.max_bo_size). So this winsys keeps
  * an arena: a range of GPU VA at the kernel's code base (pds_base ==
- * usc_base), reserved up front for PVR_G5P_ARENA_MIB and committed in
- * READ|WRITE|EXEC chunks as it fills (the first at the first slice, 512 KiB minimum; then 2 MiB minimum,
- * demand sized), each
+ * usc_base), reserved up front for the heap size (PVR_G5P_ARENA_MIB overrides) and committed in
+ * READ|WRITE|EXEC chunks as it fills (the first at the first slice, 512 KiB minimum; then demand sized, at
+ * least 2 MiB and an eighth of what is committed, so that the chunks reach the heap size), each
  * CPU-mapped at its place in one reservation. Pinned memory is what a process
  * uses, not the maximum (g5p_ws_arena_grow()). Every BO is a slice of it, taken at buffer_create:
  * its CPU and GPU addresses are fixed from then on. Because the whole arena
@@ -21,8 +21,9 @@
  * slice; the only VM_BIND after creation is a new chunk's. vma_unmap and heap_free give the
  * reservation back.
  *
- * Display BOs and dma-buf imports are their own kernel BOs, bound in a window
- * above the arena (a VM edit: the context must be idle).
+ * Display BOs, dma-buf imports and application allocations of 2 MiB and more are their own kernel BOs, bound
+ * in a window above the arena (a VM edit: the context must be idle). One larger than the kernel's largest BO is
+ * several kernel BOs, contiguous in GPU VA and in one CPU reservation (g5p_ws_own_create()).
  *
  * Not here yet: render, compute and transfer submission (the G5P job streams
  * and their typed records come with the draw hooks), and cache maintenance at
@@ -41,6 +42,7 @@
 #include "hwdef/rogue_hw_utils.h"
 #include "util/list.h"
 #include "util/macros.h"
+#include "util/os_misc.h"
 #include "util/os_time.h"
 #include "util/simple_mtx.h"
 #include "util/u_atomic.h"
@@ -64,18 +66,25 @@
 #define G5P_WS_VDM_GUARD 64u /* Rogue VDM read-ahead padding, vdm.xml */
 #define G5P_WS_PAGE 16384ull
 #define G5P_WS_CHUNK (64ull << 20)         /* the kernel's largest BO */
-#define G5P_WS_MAX_CHUNKS 64                /* at least 2 MiB per chunk after the first; 128 MiB default, 256 MiB kernel cap */
-#define G5P_WS_ARENA_DEFAULT (128ull << 20) /* the most the arena grows to; PVR_G5P_ARENA_MIB overrides */
+#define G5P_WS_MAX_CHUNKS 64                /* chunks grow with the arena (g5p_ws_arena_grow()): ~41 reach 768 MiB */
+/* The most one VM pins (the kernel's G5P_MAX_PINNED_BYTES, drivers/gpu/apple-g5p/drm-validate.h; not in the
+ * UAPI yet): the heap and the arena are bounded by it. The device-wide budget (render_pinned_mib, 1 GiB) is
+ * shared by all clients. */
+#define G5P_WS_VM_PIN_MAX (768ull << 20)
+#define G5P_WS_ARENA_FALLBACK (128ull << 20) /* the arena's bound when the RAM size is unknown */
 #define G5P_WS_ARENA_FIRST (512ull << 10) /* the first chunk; PVR_G5P_ARENA_FIRST_MIB overrides */
 #define G5P_WS_CHUNK_FLOOR (2ull << 20)    /* every later chunk: demand, at least this */
-#define G5P_WS_DEDICATED_SIZE (1ull << 30) /* VA window for display BOs and imports */
+#define G5P_WS_CHUNK_GROWTH 8              /* ... and at least 1/8 of the committed arena */
+/* VA window for own BOs (display buffers, imports, application data): the kernel maps at most 1 GiB per VM
+ * (G5P_MAX_VM_BYTES), so twice that leaves room for fragmentation. VA only: nothing is committed for it. */
+#define G5P_WS_DEDICATED_SIZE (2ull << 30)
 /* Render programs are 32-bit USC/PDS offsets from the code base, so no code window is larger. The kernel's
  * (GET_RENDER_INFO.code_window) bounds the arena; GET_EXEC_INFO.window_size (0x34000) is the older compute path's
  * and does not bound render programs. */
 #define G5P_WS_MAX_CODE_WINDOW (1ull << 32)
 /* The pvr_* heaps are address bookkeeping only (see the top of this file): heap_alloc reserves a range, and
  * vma_map then gives the bound BO's own address. So their bookkeeping range is not the arena's size: every bind of
- * a heap reserves its whole size there, own BOs (display buffers, imports: the 1 GiB window) included, and an
+ * a heap reserves its whole size there, own BOs (display buffers, imports: the 2 GiB window) included, and an
  * arena-sized range capped everything bound at once at 64 MiB (zink10's nested Hyprland: vkBindImageMemory failed
  * with the arena and the window still free). heap->size stays the arena's. */
 #define G5P_WS_BOOKKEEPING (1ull << 40)
@@ -99,7 +108,8 @@ struct g5p_ws {
     * no slice spans two chunks (the kernel takes a stream or a program inside one listed range); the slices heap
     * holds only committed chunks. */
    uint64_t arena_va, arena_size;
-   uint64_t arena_max;      /* the most the chunks may total (PVR_G5P_ARENA_MIB) */
+   uint64_t arena_max;      /* the most the chunks may total (the heap size; PVR_G5P_ARENA_MIB) */
+   uint64_t heap_size;      /* the RAM share, bounded by G5P_WS_VM_PIN_MAX (pvr_g5p_winsys_heap_size()) */
    uint64_t arena_first;    /* the first chunk's floor (PVR_G5P_ARENA_FIRST_MIB), committed at the first slice */
    uint64_t arena_next;     /* the offset of the next chunk */
    uint64_t arena_committed; /* bytes in chunks */
@@ -143,6 +153,11 @@ struct g5p_ws_bo {
    bool own; /* an own kernel BO (display buffer or import) */
    struct g5p_drm_bo kbo;
    struct list_head link; /* in g5p_ws::own_bos, while own */
+   /* An own allocation larger than the kernel's largest BO: this BO is its first part, next_part the following
+    * ones (each its own kbo, listed in own_bos, so a job names every part). [span_va, +span_size) is the whole
+    * allocation, for every part: hazard tracking takes one allocation as one range (bo_range). */
+   struct g5p_ws_bo *next_part;
+   uint64_t span_va, span_size;
    bool placed; /* bo->map is a placed mapping (VK_EXT_map_memory_placed), not cpu */
    int refs;
 };
@@ -186,6 +201,13 @@ pvr_g5p_winsys_msaa(struct pvr_winsys *ws)
 static inline struct g5p_ws_bo *to_bo(struct pvr_winsys_bo *bo) { return container_of(bo, struct g5p_ws_bo, base); }
 static inline struct g5p_ws_vma *to_vma(struct pvr_winsys_vma *v) { return container_of(v, struct g5p_ws_vma, base); }
 
+uint64_t
+pvr_g5p_winsys_heap_size(struct pvr_winsys *base, uint64_t ram_share)
+{
+   /* the drirc share (heap_memory_percent) when there is one, else the winsys's own (arena init) */
+   return ram_share ? MIN2(ram_share, G5P_WS_VM_PIN_MAX) : to_ws(base)->heap_size;
+}
+
 bool
 pvr_g5p_winsys_bo_range(struct pvr_winsys *base, uint64_t addr,
                          uint64_t *va, uint64_t *size)
@@ -196,8 +218,8 @@ pvr_g5p_winsys_bo_range(struct pvr_winsys *base, uint64_t addr,
    simple_mtx_lock(&ws->lock);
    list_for_each_entry (struct g5p_ws_bo, bo, &ws->own_bos, link) {
       if (addr >= bo->va && addr - bo->va < bo->kbo.size) {
-         *va = bo->va;
-         *size = bo->kbo.size;
+         *va = bo->span_size ? bo->span_va : bo->va;
+         *size = bo->span_size ? bo->span_size : bo->kbo.size;
          found = true;
          break;
       }
@@ -448,9 +470,11 @@ static int g5p_ws_arena_grow(struct g5p_ws *ws, uint64_t need, uint64_t alignmen
 {
    if (ws->chunk_count == G5P_WS_MAX_CHUNKS || ws->arena_committed >= ws->arena_max)
       return -ENOSPC;
-   /* Bounded demand, not geometric commitment: a transient large allocation must not
-    * double every later chunk. The VA, not extra physical memory, provides alignment. */
-   uint64_t bytes = MAX2(need, min_bytes);
+   /* Bounded demand, not doubling: a transient large allocation must not double every later chunk. But a
+    * 2 MiB floor alone capped the arena at 64 chunks of 2 MiB (STK: ~1 MiB allocations failed at 128 MiB), so a
+    * chunk is also at least 1/8 of the committed arena: at most 1/8 committed and not yet used. The VA, not
+    * extra physical memory, provides alignment. */
+   uint64_t bytes = MAX3(need, min_bytes, ws->chunk_count ? ws->arena_committed / G5P_WS_CHUNK_GROWTH : 0);
    bytes = MIN3(align64(bytes, G5P_WS_PAGE), G5P_WS_CHUNK, ws->arena_max - ws->arena_committed);
    const uint64_t off = align64(ws->arena_va + ws->arena_next, alignment) - ws->arena_va;
    if (bytes < need || off > ws->arena_size || bytes > ws->arena_size - off)
@@ -559,37 +583,128 @@ static struct g5p_ws_bo *g5p_ws_bo_new(struct g5p_ws *ws, uint64_t size)
    return b;
 }
 
-/* An own kernel BO in the dedicated window (a VM edit: the kernel refuses it
- * while a job of the context is queued or running). */
+/* One kernel BO of an own allocation at va; at cpu (MAP_FIXED over the caller's PROT_NONE reservation) when the
+ * allocation has several parts. A failed create unmapped its MAP_FIXED range: the reservation is put back before
+ * the next try, so that no other mapping can take the hole. */
+static int g5p_ws_own_part_create(struct g5p_ws *ws, struct g5p_drm_bo *k, uint64_t va, uint64_t size, uint8_t *cpu)
+{
+   const int r = g5p_drm_bo_create_at_cpu(&ws->drm, k, va, size, DRM_G5P_BO_READ | DRM_G5P_BO_WRITE, cpu);
+   if (r && cpu)
+      mmap(cpu, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE, -1, 0);
+   return r;
+}
+
+/* Releases the kernel BOs of an own allocation (each UNMAP a VM edit, waiting for the render jobs like the
+ * others) and frees the part records after the first; the caller has taken them off own_bos. The VA goes back to
+ * the window only if every part was released. Lock not held. */
+static void g5p_ws_own_release(struct g5p_ws *ws, struct g5p_ws_bo *b)
+{
+   bool released = true;
+   for (struct g5p_ws_bo *p = b, *next; p; p = next) {
+      next = p->next_part;
+      int r = 0;
+      unsigned waits = 0;
+      if (p->kbo.handle)
+         G5P_WS_VM_RETRY(ws, r, waits, g5p_drm_bo_destroy(&ws->drm, &p->kbo));
+      if (r) {
+         released = false;
+         fprintf(stderr, "apple_g5p winsys: own BO at %#" PRIx64 " of %" PRIu64 " bytes not released (%s, %u waits): "
+                 "its VA stays reserved\n", p->va, p->kbo.size, strerror(-r), waits);
+      }
+      if (p != b)
+         vk_free(ws->base.alloc, p);
+   }
+   b->next_part = NULL;
+   simple_mtx_lock(&ws->lock);
+   if (released) {
+      util_vma_heap_free(&ws->dedicated, b->va, b->alloc_size);
+      if (b->data_only) {
+         ws->data_live -= b->alloc_size;
+         ws->data_count--;
+      }
+   }
+   simple_mtx_unlock(&ws->lock);
+}
+
+/* An own allocation in the dedicated window (a VM edit: the kernel refuses it while a job of the context is
+ * queued or running). One kernel BO, or, above the kernel's largest BO (GET_INFO.max_bo_size, 64 MiB), parts of
+ * at most that size at consecutive VAs, CPU-mapped at consecutive places of one reservation: one allocation to
+ * the driver, with one GPU and one CPU address (glmark2 refract's 85 MiB allocation was refused whole). */
 static VkResult g5p_ws_own_create(struct g5p_ws *ws, uint64_t size, uint64_t alignment, unsigned data, struct g5p_ws_bo *b)
 {
    const uint64_t alloc = align64(size, G5P_WS_PAGE);
+   const uint64_t part_max = ROUND_DOWN_TO(MIN2(ws->drm.info.max_bo_size, G5P_WS_CHUNK), G5P_WS_PAGE);
+   if (!part_max)
+      return g5p_ws_fail(VK_ERROR_OUT_OF_DEVICE_MEMORY, "own BO of %" PRIu64 " bytes: no kernel BO size", alloc);
    simple_mtx_lock(&ws->lock);
    uint64_t va = util_vma_heap_alloc(&ws->dedicated, alloc, MAX2(alignment, G5P_WS_PAGE));
    simple_mtx_unlock(&ws->lock);
    if (!va)
       return g5p_ws_fail(VK_ERROR_OUT_OF_DEVICE_MEMORY, "own BO of %" PRIu64 " bytes: the %" PRIu64
-                         " MiB window for display buffers and imports is full", alloc, (uint64_t)(G5P_WS_DEDICATED_SIZE >> 20));
-   int r;
+                         " MiB window for display buffers, imports and data is full", alloc,
+                         (uint64_t)(G5P_WS_DEDICATED_SIZE >> 20));
+   b->own = true;
+   b->va = va;
+   b->alloc_size = alloc;
+   b->span_va = va;
+   b->span_size = alloc;
+
+   uint8_t *cpu = NULL;
+   if (alloc > part_max) {
+      cpu = mmap(NULL, alloc, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+      if (cpu == MAP_FAILED) {
+         simple_mtx_lock(&ws->lock);
+         util_vma_heap_free(&ws->dedicated, va, alloc);
+         simple_mtx_unlock(&ws->lock);
+         return vk_error(NULL, VK_ERROR_OUT_OF_HOST_MEMORY);
+      }
+   }
+
+   struct g5p_ws_bo *part = b, **link = &b->next_part;
+   uint64_t off = 0;
+   int r = 0;
    unsigned waits = 0;
-   G5P_WS_VM_RETRY(ws, r, waits,
-                   g5p_drm_bo_create(&ws->drm, &b->kbo, va, alloc, DRM_G5P_BO_READ | DRM_G5P_BO_WRITE));
+   while (off < alloc) {
+      const uint64_t bytes = MIN2(alloc - off, part_max);
+      if (part != b) {
+         part = g5p_ws_bo_new(ws, bytes);
+         if (!part) {
+            r = -ENOMEM;
+            break;
+         }
+         part->own = true;
+         part->va = va + off;
+         part->alloc_size = bytes;
+         part->span_va = va;
+         part->span_size = alloc;
+         *link = part;
+         link = &part->next_part;
+      }
+      G5P_WS_VM_RETRY(ws, r, waits, g5p_ws_own_part_create(ws, &part->kbo, va + off, bytes, cpu ? cpu + off : NULL));
+      if (r)
+         break;
+      off += bytes;
+      part = NULL; /* the next one is a new record */
+   }
    if (r) {
-      simple_mtx_lock(&ws->lock);
-      util_vma_heap_free(&ws->dedicated, va, alloc);
-      simple_mtx_unlock(&ws->lock);
+      /* the parts made so far, then the rest of the reservation (each made part unmapped its own range) */
+      g5p_ws_own_release(ws, b);
+      if (cpu && off < alloc)
+         munmap(cpu + off, alloc - off);
       if (r == -EBUSY)
          return g5p_ws_fail(VK_ERROR_OUT_OF_DEVICE_MEMORY,
                             "own BO of %" PRIu64 " bytes refused: the VM stayed busy (%u waits for the render jobs, "
                             "%lld ms): not out of memory", alloc, waits, G5P_WS_BUSY_NS / 1000000);
-      return g5p_ws_fail(VK_ERROR_OUT_OF_DEVICE_MEMORY, "own BO of %" PRIu64 " bytes: %s", alloc, strerror(-r));
+      return g5p_ws_fail(VK_ERROR_OUT_OF_DEVICE_MEMORY, "own BO of %" PRIu64 " bytes (part at +%#" PRIx64 "): %s",
+                         alloc, off, strerror(-r));
    }
-   b->own = true;
-   b->va = va;
-   b->cpu = b->kbo.map;
-   b->alloc_size = alloc;
-   b->data_only = data != 0;
+   b->cpu = cpu ? cpu : b->kbo.map;
+   b->data_only = data != 0; /* counted by g5p_ws_own_list() */
    b->dedicated_image = data == 2;
+   for (struct g5p_ws_bo *p = b->next_part; p; p = p->next_part) {
+      p->cpu = p->kbo.map;
+      g5p_ws_own_list(ws, p);
+   }
    g5p_ws_own_list(ws, b);
    return VK_SUCCESS;
 }
@@ -720,25 +835,15 @@ static void g5p_ws_buffer_destroy(struct pvr_winsys_bo *bo)
       return;
    simple_mtx_lock(&ws->lock);
    if (b->own) {
-      const uint64_t va = b->va;
-      list_del(&b->link);
-      ws->own_count--;
-      simple_mtx_unlock(&ws->lock);
-      /* the UNMAP is a VM edit: it waits for the render jobs like the others (the BO is off the job lists) */
-      int r;
-      unsigned waits = 0;
-      G5P_WS_VM_RETRY(ws, r, waits, g5p_drm_bo_destroy(&ws->drm, &b->kbo));
-      simple_mtx_lock(&ws->lock);
-      if (r)
-         fprintf(stderr, "apple_g5p winsys: own BO at %#" PRIx64 " of %" PRIu64 " bytes not released (%s, %u waits): "
-                 "its VA stays reserved\n", va, b->alloc_size, strerror(-r), waits);
-      else {
-         util_vma_heap_free(&ws->dedicated, va, b->alloc_size);
-         if (b->data_only) {
-            ws->data_live -= b->alloc_size;
-            ws->data_count--;
-         }
+      /* every part off the job lists first; the UNMAPs are VM edits that wait for the render jobs */
+      for (struct g5p_ws_bo *p = b; p; p = p->next_part) {
+         list_del(&p->link);
+         ws->own_count--;
       }
+      simple_mtx_unlock(&ws->lock);
+      g5p_ws_own_release(ws, b);
+      vk_free(ws->base.alloc, b);
+      return;
    } else {
       util_vma_heap_free(&ws->slices, b->va, b->alloc_size);
       ws->arena_live -= b->alloc_size;
@@ -756,6 +861,9 @@ static VkResult g5p_ws_buffer_get_fd(struct pvr_winsys_bo *bo, int *const fd_out
    struct g5p_ws_bo *b = to_bo(bo);
    if (!b->own) /* a slice is part of an arena BO: it cannot be a dma-buf of its own */
       return vk_error(NULL, VK_ERROR_FEATURE_NOT_PRESENT);
+   if (b->next_part) /* several kernel BOs: one dma-buf cannot name them (exportable memory above max_bo_size) */
+      return g5p_ws_refuse(VK_ERROR_FEATURE_NOT_PRESENT, "export of a %" PRIu64 " byte allocation of several kernel BOs",
+                           b->alloc_size);
    int r = g5p_drm_bo_export(&to_ws(bo->ws)->drm, &b->kbo, fd_out);
    return r ? vk_errorf(NULL, VK_ERROR_OUT_OF_DEVICE_MEMORY, "apple_g5p: export: %s", strerror(-r)) : VK_SUCCESS;
 }
@@ -775,6 +883,23 @@ static VkResult g5p_ws_buffer_map(struct pvr_winsys_bo *bo, void *addr)
    }
    const struct g5p_drm_bo *k = NULL;
    uint64_t in_bo = 0;
+   if (b->own && b->next_part) {
+      /* several kernel BOs: each at its place in addr (MAP_FIXED, over the application's reservation) */
+      for (struct g5p_ws_bo *p = b; p; p = p->next_part) {
+         uint64_t poff;
+         if (g5p_drm_bo_mmap_offset(&ws->drm, &p->kbo, &poff))
+            return g5p_ws_refuse(VK_ERROR_MEMORY_MAP_FAILED, "placed map at %p: no mmap offset (part at +%#" PRIx64 ")",
+                                 addr, p->va - b->va);
+         void *m = mmap((uint8_t *)addr + (p->va - b->va), p->kbo.size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED,
+                        ws->drm.fd, poff);
+         if (m == MAP_FAILED)
+            return g5p_ws_refuse(VK_ERROR_MEMORY_MAP_FAILED, "placed map at %p (part at +%#" PRIx64 "): %s", addr,
+                                 p->va - b->va, strerror(errno));
+      }
+      bo->map = addr;
+      b->placed = true;
+      return VK_SUCCESS;
+   }
    if (b->own) {
       if (b->kbo.shared && b->base.is_imported)
          return g5p_ws_refuse(VK_ERROR_MEMORY_MAP_FAILED, "placed map of an imported dma-buf");
@@ -1600,13 +1725,18 @@ static const struct pvr_winsys_ops g5p_ws_ops = {
 static VkResult g5p_ws_arena_init(struct g5p_ws *ws)
 {
    const char *e = getenv("PVR_G5P_ARENA_MIB"), *f = getenv("PVR_G5P_ARENA_FIRST_MIB");
-   uint64_t max = e ? strtoull(e, NULL, 10) << 20 : G5P_WS_ARENA_DEFAULT;
+   /* The heap (a share of RAM, bounded by what one VM pins): the arena's bound, not its commitment. Zink
+    * suballocates everything under 2 MiB here, so a fixed 128 MiB failed STK's ~1 MiB allocations long before
+    * the heap was used. */
+   const uint64_t ram_share = os_get_gpu_heap_size(OS_GPU_HEAP_SIZE_HEURISTIC, NULL);
+   ws->heap_size = ram_share ? MIN2(ram_share, G5P_WS_VM_PIN_MAX) : G5P_WS_ARENA_FALLBACK;
+   uint64_t max = e ? strtoull(e, NULL, 10) << 20 : ws->heap_size;
    max = align64(MAX2(max, G5P_WS_PAGE), G5P_WS_PAGE);
    uint64_t first = f ? strtoull(f, NULL, 10) << 20 : G5P_WS_ARENA_FIRST;
    first = MIN2(align64(MAX2(first, G5P_WS_PAGE), G5P_WS_PAGE), max);
    /* the VA: every chunk plus one page after each */
    const uint64_t size = 2 * max + G5P_WS_MAX_CHUNKS * G5P_WS_PAGE;
-   if (max > (256ull << 20) || size > ws->render.code_window)
+   if (max > G5P_WS_VM_PIN_MAX || size > ws->render.code_window)
       return g5p_ws_fail(VK_ERROR_INITIALIZATION_FAILED, "arena of %" PRIu64 " MiB is too large",
                        max >> 20);
 
@@ -1725,7 +1855,7 @@ VkResult pvr_g5p_winsys_create(int render_fd, int display_fd, const VkAllocation
    }
    if (getenv("PVR_G5P_WS_LOG"))
       fprintf(stderr, "apple_g5p winsys: arena [%#" PRIx64 ", +%" PRIu64 " MiB) in %u BOs, code window %#" PRIx64
-              ", dedicated [%#" PRIx64 ", +1 GiB), render profiles %#x\n", ws->arena_va, ws->arena_size >> 20,
+              ", dedicated [%#" PRIx64 ", +2 GiB), render profiles %#x\n", ws->arena_va, ws->arena_size >> 20,
               ws->chunk_count, (uint64_t)ri->code_window, (uint64_t)(ws->arena_va + ri->code_window), ri->profiles);
    *ws_out = &ws->base;
    return VK_SUCCESS;

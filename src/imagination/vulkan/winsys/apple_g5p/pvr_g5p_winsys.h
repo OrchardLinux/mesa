@@ -24,6 +24,11 @@ VkResult pvr_g5p_winsys_create(int render_fd, int display_fd,
 /* The kernel takes 4-sample passes (TYPED_V3 and DRM_G5P_CAP_RENDER_MSAA) */
 bool pvr_g5p_winsys_msaa(struct pvr_winsys *ws);
 
+/* The device-local heap: ram_share (the RAM share Mesa's unified-memory
+ * drivers report, os_get_gpu_heap_size()), bounded by what the kernel pins in
+ * one VM (G5P_WS_VM_PIN_MAX). The arena may grow to the same bound. */
+uint64_t pvr_g5p_winsys_heap_size(struct pvr_winsys *ws, uint64_t ram_share);
+
 /* The backing BO of an application GPU address. The range is used only to
  * deduplicate conservative read tracking, never to infer cache coherency. */
 bool pvr_g5p_winsys_bo_range(struct pvr_winsys *ws, uint64_t addr,
