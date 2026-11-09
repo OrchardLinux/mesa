@@ -5,6 +5,7 @@
  * -Dimagination-g5p-experimental=true.
  */
 
+#include <stdlib.h>
 #include <string.h>
 
 #include "vulkan/vulkan_core.h"
@@ -192,6 +193,17 @@ note_set(struct reads_ctx *c, const struct pvr_descriptor_set *set)
    }
 }
 
+static bool
+reads_memo_on(void)
+{
+   static int on = -1;
+   if (on < 0) {
+      const char *v = getenv("PVR_G5P_READS_MEMO");
+      on = !(v && !strcmp(v, "0"));
+   }
+   return on;
+}
+
 /*
  * Everything a draw can read outside the arena: the descriptors of every set
  * its pipeline layout names (the backend loads uniforms, buffer addresses and
@@ -207,6 +219,9 @@ PVR_PER_ARCH(g5p_perf_draw)(struct pvr_cmd_buffer *cmd_buffer, bool indexed)
    if (!cs->current_sub_cmd || cs->current_sub_cmd->type != PVR_SUB_CMD_TYPE_GRAPHICS)
       return;
    struct pvr_g5p_perf_reads *r = &cs->current_sub_cmd->gfx.job.g5p.reads;
+   __typeof__(cs->current_sub_cmd->gfx.job.g5p.reads_memo) *m =
+      &cs->current_sub_cmd->gfx.job.g5p.reads_memo;
+   const bool memo_on = reads_memo_on();
    const struct pvr_winsys_heap *heap = cmd_buffer->device->heaps.general_heap;
    struct reads_ctx c = { r, cmd_buffer->device->ws, heap->base_addr.addr, heap->base_addr.addr + heap->size };
 
@@ -222,18 +237,38 @@ PVR_PER_ARCH(g5p_perf_draw)(struct pvr_cmd_buffer *cmd_buffer, bool indexed)
       r->unknown = true;
       return;
    }
+   if (pipeline != m->pipeline) {
+      memset(m->set, 0, sizeof(m->set));
+      m->pipeline = pipeline;
+   }
    const struct vk_pipeline_layout *layout = pipeline->base.layout;
    for (unsigned s = 0; layout && s < layout->set_count && s < PVR_MAX_DESCRIPTOR_SETS && !r->unknown; s++) {
       const struct pvr_descriptor_set *set = cs->gfx_desc_state.sets[s];
       /* a set the layout names but nothing binds: the draw path refuses an upload from it */
-      if (set && set->layout && set->mapping)
+      if (set && set->layout && set->mapping) {
+         if (memo_on && set == m->set[s] &&
+             !(cs->gfx_desc_state.push_set &&
+               set == &cs->gfx_desc_state.push_set->instantiate_set))
+            continue;
          note_set(&c, set);
+         m->set[s] = set;
+      }
    }
    for (unsigned f = 0; f < g->fetch_count; f++) {
-      const struct pvr_vertex_binding *vb = &cs->vertex_bindings[g->fetch_list[f].binding];
-      if (vb->buffer)
+      const unsigned b = g->fetch_list[f].binding;
+      const struct pvr_vertex_binding *vb = &cs->vertex_bindings[b];
+      if (memo_on && vb->buffer && m->vb[b] == vb->buffer->dev_addr.addr)
+         continue;
+      if (vb->buffer) {
          note_read(&c, vb->buffer->dev_addr.addr);
+         m->vb[b] = vb->buffer->dev_addr.addr;
+      }
    }
-   if (indexed && cs->index_buffer_binding.buffer)
-      note_read(&c, cs->index_buffer_binding.buffer->dev_addr.addr);
+   if (indexed && cs->index_buffer_binding.buffer) {
+      const uint64_t addr = cs->index_buffer_binding.buffer->dev_addr.addr;
+      if (!memo_on || m->ib != addr) {
+         note_read(&c, addr);
+         m->ib = addr;
+      }
+   }
 }
