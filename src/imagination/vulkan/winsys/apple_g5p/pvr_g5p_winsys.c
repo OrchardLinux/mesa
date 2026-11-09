@@ -66,7 +66,7 @@
 #define G5P_WS_VDM_GUARD 64u /* Rogue VDM read-ahead padding, vdm.xml */
 #define G5P_WS_PAGE 16384ull
 #define G5P_WS_CHUNK (64ull << 20)         /* the kernel's largest BO */
-#define G5P_WS_MAX_CHUNKS 64                /* chunks grow with the arena (g5p_ws_arena_grow()): ~41 reach 768 MiB */
+#define G5P_WS_MAX_CHUNKS 128               /* chunks grow with the arena (g5p_ws_arena_grow()): ~66 reach 768 MiB */
 /* The most one VM pins (the kernel's G5P_MAX_PINNED_BYTES, drivers/gpu/apple-g5p/drm-validate.h; not in the
  * UAPI yet): the heap and the arena are bounded by it. The device-wide budget (render_pinned_mib, 1 GiB) is
  * shared by all clients. */
@@ -75,6 +75,7 @@
 #define G5P_WS_ARENA_FIRST (512ull << 10) /* the first chunk; PVR_G5P_ARENA_FIRST_MIB overrides */
 #define G5P_WS_CHUNK_FLOOR (2ull << 20)    /* every later chunk: demand, at least this */
 #define G5P_WS_CHUNK_GROWTH 8              /* ... and at least 1/8 of the committed arena */
+#define G5P_WS_CHUNK_GROWTH_MAX (16ull << 20) /* ... up to this; PVR_G5P_ARENA_CHUNK_MIB overrides (64: before) */
 /* VA window for own BOs (display buffers, imports, application data): the kernel maps at most 1 GiB per VM
  * (G5P_MAX_VM_BYTES), so twice that leaves room for fragmentation. VA only: nothing is committed for it. */
 #define G5P_WS_DEDICATED_SIZE (2ull << 30)
@@ -111,6 +112,7 @@ struct g5p_ws {
    uint64_t arena_max;      /* the most the chunks may total (the heap size; PVR_G5P_ARENA_MIB) */
    uint64_t heap_size;      /* the RAM share, bounded by G5P_WS_VM_PIN_MAX (pvr_g5p_winsys_heap_size()) */
    uint64_t arena_first;    /* the first chunk's floor (PVR_G5P_ARENA_FIRST_MIB), committed at the first slice */
+   uint64_t arena_growth_max; /* the most a chunk grows by the arena's size (G5P_WS_CHUNK_GROWTH_MAX) */
    uint64_t arena_next;     /* the offset of the next chunk */
    uint64_t arena_committed; /* bytes in chunks */
    uint64_t arena_live, arena_peak, arena_allocs, arena_reused; /* slice bytes, high-water, allocation/reuse counts */
@@ -472,9 +474,11 @@ static int g5p_ws_arena_grow(struct g5p_ws *ws, uint64_t need, uint64_t alignmen
       return -ENOSPC;
    /* Bounded demand, not doubling: a transient large allocation must not double every later chunk. But a
     * 2 MiB floor alone capped the arena at 64 chunks of 2 MiB (STK: ~1 MiB allocations failed at 128 MiB), so a
-    * chunk is also at least 1/8 of the committed arena: at most 1/8 committed and not yet used. The VA, not
+    * chunk is also at least 1/8 of the committed arena: at most 1/8 committed and not yet used, and no more
+    * than G5P_WS_CHUNK_GROWTH_MAX of it (1/8 of a 768 MiB arena was a 64 MiB chunk for one slice). The VA, not
     * extra physical memory, provides alignment. */
-   uint64_t bytes = MAX3(need, min_bytes, ws->chunk_count ? ws->arena_committed / G5P_WS_CHUNK_GROWTH : 0);
+   uint64_t bytes = MAX3(need, min_bytes,
+                         ws->chunk_count ? MIN2(ws->arena_committed / G5P_WS_CHUNK_GROWTH, ws->arena_growth_max) : 0);
    bytes = MIN3(align64(bytes, G5P_WS_PAGE), G5P_WS_CHUNK, ws->arena_max - ws->arena_committed);
    const uint64_t off = align64(ws->arena_va + ws->arena_next, alignment) - ws->arena_va;
    if (bytes < need || off > ws->arena_size || bytes > ws->arena_size - off)
@@ -1740,6 +1744,8 @@ static VkResult g5p_ws_arena_init(struct g5p_ws *ws)
       return g5p_ws_fail(VK_ERROR_INITIALIZATION_FAILED, "arena of %" PRIu64 " MiB is too large",
                        max >> 20);
 
+   const char *growth = getenv("PVR_G5P_ARENA_CHUNK_MIB");
+   ws->arena_growth_max = growth ? strtoull(growth, NULL, 10) << 20 : G5P_WS_CHUNK_GROWTH_MAX;
    ws->arena_log = getenv("PVR_G5P_ARENA_LOG") != NULL;
    ws->arena_va = ws->drm.exec.usc_base;
    ws->arena_size = size;
