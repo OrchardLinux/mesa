@@ -225,6 +225,16 @@
    if (PVR_HAS_FEATURE(&(device)->pdevice->dev_info, apple_g5p))             \
       pvr_g5p_memory_dedicated(requirements);
 
+/* A VkBuffer (image 0) or VkImage (image 1) binds memory (counted before
+ * the bind, which fails only when the heap's bookkeeping is full) or is
+ * destroyed with memory bound: the winsys's PVR_G5P_ARENA_LOG statistics. */
+#define PVR_G5P_HOOK_memory_bound(device, image, vma, bytes)                \
+   if (PVR_HAS_FEATURE(&(device)->pdevice->dev_info, apple_g5p) && !(vma))   \
+      pvr_g5p_winsys_bound((device)->ws, image, (int64_t)(bytes));
+#define PVR_G5P_HOOK_memory_released(device, image, vma, bytes)             \
+   if (PVR_HAS_FEATURE(&(device)->pdevice->dev_info, apple_g5p) && (vma))    \
+      pvr_g5p_winsys_bound((device)->ws, image, -(int64_t)(bytes));
+
 /* pvr_arch_xfb.c, vkCmdBind/Begin/EndTransformFeedbackEXT(): G5P records
  * its own events (pvr_g5p_xfb.h); Rogue's stream-out programs and End's
  * render split (a colour LOAD) are not used.

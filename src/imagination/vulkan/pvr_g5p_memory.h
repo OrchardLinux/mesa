@@ -9,18 +9,42 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <vulkan/vulkan_core.h>
 
-#define PVR_G5P_DATA_THRESHOLD (2ull << 20)
+/* From this size an application allocation is data: a slice of the winsys's
+ * data chunks (or a kernel BO of its own), which goes back to the kernel when
+ * it is freed. Below it, it shares the code arena, whose chunks are only
+ * released from the tail. Zink suballocates up to 1 MiB itself, from 2 MiB
+ * parents, so with 1 MiB every allocation Zink makes for more than a page of
+ * small buffers is data: at 2 MiB, 512x512 RGBA8 mip chains (1.4 MiB, most of
+ * a game's textures) filled the code arena. PVR_G5P_DATA_KIB overrides. */
+#define PVR_G5P_DATA_THRESHOLD (1ull << 20)
 /* A private winsys type, selected only by pvr_AllocateMemory's G5P hook.
  * G9P's GPU/DISPLAY enum and internal pvr_bo_alloc callers are unchanged. */
 #define PVR_G5P_BO_TYPE_DATA ((enum pvr_winsys_bo_type)2)
 #define PVR_G5P_BO_TYPE_IMAGE_DATA ((enum pvr_winsys_bo_type)3)
 
+/* winsys/apple_g5p/pvr_g5p_winsys.h, for the memory_bound hook */
+struct pvr_winsys;
+void pvr_g5p_winsys_bound(struct pvr_winsys *ws, bool image, int64_t bytes);
+
+static inline uint64_t
+pvr_g5p_memory_threshold(void)
+{
+   static uint64_t threshold; /* read once; a race only reads it twice */
+   if (!threshold) {
+      const char *e = getenv("PVR_G5P_DATA_KIB");
+      const uint64_t kib = e ? strtoull(e, NULL, 10) : 0;
+      threshold = kib ? kib << 10 : PVR_G5P_DATA_THRESHOLD;
+   }
+   return threshold;
+}
+
 static inline bool
 pvr_g5p_memory_is_large(uint64_t size)
 {
-   return size >= PVR_G5P_DATA_THRESHOLD;
+   return size >= pvr_g5p_memory_threshold();
 }
 
 static inline bool

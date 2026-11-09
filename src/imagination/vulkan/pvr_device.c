@@ -638,7 +638,7 @@ VkResult pvr_BindBufferMemory2(VkDevice _device,
    for (i = 0; i < bindInfoCount; i++) {
       VK_FROM_HANDLE(pvr_device_memory, mem, pBindInfos[i].memory);
       VK_FROM_HANDLE(pvr_buffer, buffer, pBindInfos[i].buffer);
-
+      PVR_G5P_HOOK(memory_bound, device, false, buffer->vma, buffer->vk.size)
       VkResult result = pvr_bind_memory(device,
                                         mem,
                                         pBindInfos[i].memoryOffset,
@@ -837,7 +837,7 @@ void pvr_DestroyBuffer(VkDevice _device,
 
    if (!buffer)
       return;
-
+   PVR_G5P_HOOK(memory_released, device, false, buffer->vma, buffer->vk.size)
    if (buffer->vma)
       pvr_unbind_memory(device, buffer->vma);
 

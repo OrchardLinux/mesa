@@ -29,6 +29,11 @@ bool pvr_g5p_winsys_msaa(struct pvr_winsys *ws);
  * one VM (G5P_WS_VM_PIN_MAX). The arena may grow to the same bound. */
 uint64_t pvr_g5p_winsys_heap_size(struct pvr_winsys *ws, uint64_t ram_share);
 
+/* A VkBuffer or VkImage bound (bytes > 0) or released (bytes < 0) memory:
+ * counted for the PVR_G5P_ARENA_LOG statistics only, which then tell the
+ * application's images from its buffers (Zink's upload staging). */
+void pvr_g5p_winsys_bound(struct pvr_winsys *ws, bool image, int64_t bytes);
+
 /* The backing BO of an application GPU address. The range is used only to
  * deduplicate conservative read tracking, never to infer cache coherency. */
 bool pvr_g5p_winsys_bo_range(struct pvr_winsys *ws, uint64_t addr,

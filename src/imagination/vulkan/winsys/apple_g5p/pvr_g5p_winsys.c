@@ -79,6 +79,12 @@
 /* VA window for own BOs (display buffers, imports, application data): the kernel maps at most 1 GiB per VM
  * (G5P_MAX_VM_BYTES), so twice that leaves room for fragmentation. VA only: nothing is committed for it. */
 #define G5P_WS_DEDICATED_SIZE (2ull << 30)
+/* Application data (pvr_g5p_memory.h) is carved from data chunks: read/write kernel BOs of this size in the window
+ * above. A job names kernel BOs, at most DRM_G5P_RENDER_MAX_RESOURCES (256) of them, and Zink's suballocator asks
+ * for 2 MiB at a time: one kernel BO per allocation put a client with 512 MiB of textures past that limit, and
+ * every render of it was refused (SuperTuxKart: 281 BOs of 2 MiB). An allocation of more than half a chunk stays a
+ * kernel BO of its own. PVR_G5P_DATA_CHUNK_MIB overrides; 0: one kernel BO per allocation, as before. */
+#define G5P_WS_DATA_CHUNK (8ull << 20)
 /* Render programs are 32-bit USC/PDS offsets from the code base, so no code window is larger. The kernel's
  * (GET_RENDER_INFO.code_window) bounds the arena; GET_EXEC_INFO.window_size (0x34000) is the older compute path's
  * and does not bound render programs. */
@@ -116,7 +122,7 @@ struct g5p_ws {
    uint64_t arena_next;     /* the offset of the next chunk */
    uint64_t arena_committed; /* bytes in chunks */
    uint64_t arena_live, arena_peak, arena_allocs, arena_reused; /* slice bytes, high-water, allocation/reuse counts */
-   bool arena_log; /* optional allocation accounting; no per-allocation logging by default */
+   unsigned arena_log; /* PVR_G5P_ARENA_LOG: 1 the statistics lines, 2 also one line per data slice; 0 by default */
    uint8_t *arena_cpu;
    uint64_t *arena_used;    /* one bit per page of [arena_va, +arena_size): handed out before (memset on reuse) */
    struct g5p_drm_bo chunks[G5P_WS_MAX_CHUNKS];
@@ -136,6 +142,19 @@ struct g5p_ws {
    struct list_head own_bos;
    unsigned own_count;
    bool vma_heaps_ready; /* slices and dedicated are initialized */
+
+   /* data chunks (G5P_WS_DATA_CHUNK): own BOs, so a job names them like any other; an application allocation is
+    * a slice of one. An empty chunk is released, except one kept as a spare: a client that frees and allocates
+    * at a chunk's edge must not unmap and map a kernel BO each time (a VM edit, which waits for the render jobs) */
+   uint64_t data_chunk; /* a chunk's bytes; 0: off */
+   struct list_head data_chunks;
+   struct g5p_ws_bo *data_spare;
+   uint64_t data_slice_live, data_slice_peak;
+   unsigned data_slice_count;
+   int64_t data_stats_after;
+   /* PVR_G5P_ARENA_LOG: what the application's VkBuffers and VkImages have bound (pvr_g5p_winsys_bound()) */
+   int64_t bound_bytes[2];
+   int32_t bound_count[2];
 
    /* One kernel render context per VM, shared by all engine wrappers. */
    struct g5p_ws_context *context;
@@ -162,6 +181,14 @@ struct g5p_ws_bo {
    uint64_t span_va, span_size;
    bool placed; /* bo->map is a placed mapping (VK_EXT_map_memory_placed), not cpu */
    int refs;
+   /* A data chunk (an own BO, in g5p_ws::data_chunks by data_link): the free ranges of its VA and its live
+    * slices. A data slice: its chunk, and data_link in the chunk's slices. All under g5p_ws::lock. */
+   bool data_chunk;
+   struct g5p_ws_bo *parent;
+   struct list_head data_link;
+   struct list_head data_slices;
+   unsigned data_slices_live;
+   struct util_vma_heap data_heap;
 };
 
 static void g5p_ws_own_list(struct g5p_ws *ws, struct g5p_ws_bo *b)
@@ -203,11 +230,32 @@ pvr_g5p_winsys_msaa(struct pvr_winsys *ws)
 static inline struct g5p_ws_bo *to_bo(struct pvr_winsys_bo *bo) { return container_of(bo, struct g5p_ws_bo, base); }
 static inline struct g5p_ws_vma *to_vma(struct pvr_winsys_vma *v) { return container_of(v, struct g5p_ws_vma, base); }
 
+/* PVR_G5P_HEAP_MIB: the heap the device reports, for measurements. A client sizes its caches and its flush
+ * thresholds from it (Zink: a batch may hold 80 % of it in resources that are already destroyed). */
+static uint64_t
+g5p_ws_heap_bound(uint64_t ram_share)
+{
+   const char *e = getenv("PVR_G5P_HEAP_MIB");
+   const uint64_t mib = e ? strtoull(e, NULL, 10) : 0;
+   if (mib)
+      ram_share = mib << 20;
+   return MIN2(ram_share, G5P_WS_VM_PIN_MAX);
+}
+
 uint64_t
 pvr_g5p_winsys_heap_size(struct pvr_winsys *base, uint64_t ram_share)
 {
    /* the drirc share (heap_memory_percent) when there is one, else the winsys's own (arena init) */
-   return ram_share ? MIN2(ram_share, G5P_WS_VM_PIN_MAX) : to_ws(base)->heap_size;
+   const uint64_t size = g5p_ws_heap_bound(ram_share);
+   return size ? size : to_ws(base)->heap_size;
+}
+
+void
+pvr_g5p_winsys_bound(struct pvr_winsys *base, bool image, int64_t bytes)
+{
+   struct g5p_ws *ws = to_ws(base);
+   p_atomic_add(&ws->bound_bytes[image], bytes);
+   p_atomic_add(&ws->bound_count[image], bytes < 0 ? -1 : 1);
 }
 
 bool
@@ -220,6 +268,18 @@ pvr_g5p_winsys_bo_range(struct pvr_winsys *base, uint64_t addr,
    simple_mtx_lock(&ws->lock);
    list_for_each_entry (struct g5p_ws_bo, bo, &ws->own_bos, link) {
       if (addr >= bo->va && addr - bo->va < bo->kbo.size) {
+         if (bo->data_chunk) {
+            /* the application's allocation, not the chunk it shares with others: two images of one chunk are
+             * no hazard for each other. An address in no live slice is not known. */
+            list_for_each_entry (struct g5p_ws_bo, s, &bo->data_slices, data_link)
+               if (addr >= s->va && addr - s->va < s->alloc_size) {
+                  *va = s->va;
+                  *size = s->alloc_size;
+                  found = true;
+                  break;
+               }
+            break;
+         }
          *va = bo->span_size ? bo->span_va : bo->va;
          *size = bo->span_size ? bo->span_size : bo->kbo.size;
          found = true;
@@ -517,6 +577,16 @@ static void g5p_ws_arena_stats(struct g5p_ws *ws, const char *why)
            " peak_kib=%" PRIu64 " data_live_kib=%" PRIu64 " data_peak_kib=%" PRIu64 " data_bos=%u reclaimed_kib=%" PRIu64 " allocs=%" PRIu64 " reused_pages=%" PRIu64 " chunks=%u max_kib=%" PRIu64 "\n",
            (long)getpid(), ws->drm.fd, why, ws->arena_committed >> 10, ws->arena_live >> 10, ws->arena_peak >> 10, ws->data_live >> 10, ws->data_peak >> 10, ws->data_count, ws->arena_reclaimed >> 10,
            ws->arena_allocs, ws->arena_reused, ws->chunk_count, ws->arena_max >> 10);
+   /* data_live_kib above is what the data BOs commit (chunks and whole BOs). Here: what the application's
+    * allocations ask of the chunks, every kernel BO a job may name (256 at most), and the bytes its VkImages
+    * and VkBuffers have bound: under Zink the buffers are vertex data and upload staging. */
+   fprintf(stderr, "apple_g5p winsys: data stats pid=%ld fd=%d why=%s slices=%u slice_live_kib=%" PRIu64
+           " slice_peak_kib=%" PRIu64 " chunk_kib=%" PRIu64 " kernel_bos=%u images=%d image_kib=%" PRId64
+           " buffers=%d buffer_kib=%" PRId64 "\n",
+           (long)getpid(), ws->drm.fd, why, ws->data_slice_count, ws->data_slice_live >> 10,
+           ws->data_slice_peak >> 10, ws->data_chunk >> 10, ws->chunk_count + ws->own_count,
+           (int)p_atomic_read(&ws->bound_count[1]), (int64_t)p_atomic_read(&ws->bound_bytes[1]) >> 10,
+           (int)p_atomic_read(&ws->bound_count[0]), (int64_t)p_atomic_read(&ws->bound_bytes[0]) >> 10);
 }
 
 /* A slice [va, va + size) is handed out (lock held): zero the pages handed out before; a page never handed out
@@ -713,6 +783,105 @@ static VkResult g5p_ws_own_create(struct g5p_ws *ws, uint64_t size, uint64_t ali
    return VK_SUCCESS;
 }
 
+/* ---- application data: slices of data chunks (G5P_WS_DATA_CHUNK) ---- */
+
+/* lock held: the slice [va, +alloc) of chunk c is b's */
+static void g5p_ws_data_slice_take(struct g5p_ws *ws, struct g5p_ws_bo *c, uint64_t va, uint64_t alloc, unsigned data,
+                                   struct g5p_ws_bo *b)
+{
+   b->va = va;
+   b->cpu = c->cpu + (va - c->va);
+   b->alloc_size = alloc;
+   b->parent = c;
+   b->data_only = true;
+   b->dedicated_image = data == 2;
+   list_addtail(&b->data_link, &c->data_slices);
+   c->data_slices_live++;
+   if (ws->data_spare == c)
+      ws->data_spare = NULL;
+   ws->data_slice_live += alloc;
+   ws->data_slice_peak = MAX2(ws->data_slice_peak, ws->data_slice_live);
+   ws->data_slice_count++;
+   if (ws->arena_log > 1)
+      fprintf(stderr, "apple_g5p winsys: data slice pid=%ld fd=%d chunk=%u size_kib=%" PRIu64 " slices=%u live_kib=%" PRIu64
+              " dedicated_image=%u\n", (long)getpid(), ws->drm.fd, c->kbo.handle, alloc >> 10, ws->data_slice_count,
+              ws->data_slice_live >> 10, b->dedicated_image);
+   /* a loading loop submits no render: the statistics on every 64th slice, and once a second while slices come */
+   if (ws->arena_log) {
+      const int64_t t = os_time_get_nano();
+      if (ws->data_slice_count % 64 == 0 || t >= ws->data_stats_after) {
+         ws->data_stats_after = t + 1000000000ll;
+         g5p_ws_arena_stats(ws, "data");
+      }
+   }
+}
+
+/* A slice for an application allocation, in the first chunk with room (the oldest first, so that the newer ones
+ * empty); a new chunk when none has. The chunk's create is a VM edit (g5p_ws_own_create()) and is made without the
+ * lock: another thread may fill the new chunk first, hence the second try. A chunk the kernel refuses (the VM's pin
+ * limit, with less than a chunk left) is not the end: the allocation is then a kernel BO of its own size. */
+static VkResult g5p_ws_data_slice_create(struct g5p_ws *ws, uint64_t size, uint64_t alignment, unsigned data,
+                                         struct g5p_ws_bo *b)
+{
+   const uint64_t alloc = align64(size, G5P_WS_PAGE), align = MAX2(alignment, G5P_WS_PAGE);
+   for (unsigned attempt = 0;; attempt++) {
+      simple_mtx_lock(&ws->lock);
+      list_for_each_entry (struct g5p_ws_bo, c, &ws->data_chunks, data_link) {
+         const uint64_t va = util_vma_heap_alloc(&c->data_heap, alloc, align);
+         if (va) {
+            g5p_ws_data_slice_take(ws, c, va, alloc, data, b);
+            simple_mtx_unlock(&ws->lock);
+            return VK_SUCCESS;
+         }
+      }
+      simple_mtx_unlock(&ws->lock);
+      if (attempt == 2)
+         break;
+      struct g5p_ws_bo *c = g5p_ws_bo_new(ws, ws->data_chunk);
+      if (!c)
+         return vk_error(NULL, VK_ERROR_OUT_OF_HOST_MEMORY);
+      /* a chunk from its first moment in own_bos (pvr_g5p_winsys_bo_range()) */
+      c->data_chunk = true;
+      list_inithead(&c->data_slices);
+      if (g5p_ws_own_create(ws, ws->data_chunk, G5P_WS_PAGE, 1, c) != VK_SUCCESS) {
+         vk_free(ws->base.alloc, c);
+         break;
+      }
+      util_vma_heap_init(&c->data_heap, c->va, c->alloc_size);
+      simple_mtx_lock(&ws->lock);
+      list_addtail(&c->data_link, &ws->data_chunks);
+      simple_mtx_unlock(&ws->lock);
+   }
+   return g5p_ws_own_create(ws, size, alignment, data, b);
+}
+
+/* lock held, and released here: the slice goes back to its chunk. An empty chunk is released (a VM edit, without
+ * the lock) unless it becomes the spare. */
+static void g5p_ws_data_slice_destroy(struct g5p_ws *ws, struct g5p_ws_bo *b)
+{
+   struct g5p_ws_bo *c = b->parent, *release = NULL;
+   util_vma_heap_free(&c->data_heap, b->va, b->alloc_size);
+   list_del(&b->data_link);
+   ws->data_slice_live -= b->alloc_size;
+   ws->data_slice_count--;
+   if (!--c->data_slices_live) {
+      if (ws->data_spare && ws->data_spare != c) {
+         release = c;
+         list_del(&c->data_link);
+         list_del(&c->link);
+         ws->own_count--;
+      } else {
+         ws->data_spare = c;
+      }
+   }
+   simple_mtx_unlock(&ws->lock);
+   if (release) {
+      util_vma_heap_finish(&release->data_heap);
+      g5p_ws_own_release(ws, release);
+      vk_free(ws->base.alloc, release);
+   }
+}
+
 static VkResult g5p_ws_buffer_create(struct pvr_winsys *ws_, uint64_t size, uint64_t alignment,
                                      enum pvr_winsys_bo_type type, uint32_t flags, struct pvr_winsys_bo **bo_out)
 {
@@ -722,8 +891,11 @@ static VkResult g5p_ws_buffer_create(struct pvr_winsys *ws_, uint64_t size, uint
       return vk_error(NULL, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    VkResult r = VK_SUCCESS;
-   if (type == PVR_WINSYS_BO_TYPE_DISPLAY || type == PVR_G5P_BO_TYPE_DATA || type == PVR_G5P_BO_TYPE_IMAGE_DATA) {
-      r = g5p_ws_own_create(ws, size, alignment, type == PVR_G5P_BO_TYPE_IMAGE_DATA ? 2 : type == PVR_G5P_BO_TYPE_DATA, b);
+   const unsigned data = type == PVR_G5P_BO_TYPE_IMAGE_DATA ? 2 : type == PVR_G5P_BO_TYPE_DATA;
+   if (data && align64(size, G5P_WS_PAGE) <= ws->data_chunk / 2) {
+      r = g5p_ws_data_slice_create(ws, size, alignment, data, b);
+   } else if (type == PVR_WINSYS_BO_TYPE_DISPLAY || data) {
+      r = g5p_ws_own_create(ws, size, alignment, data, b);
    } else {
       const uint64_t alloc = align64(size, G5P_WS_PAGE), align = MAX2(alignment, G5P_WS_PAGE);
       simple_mtx_lock(&ws->lock);
@@ -848,6 +1020,10 @@ static void g5p_ws_buffer_destroy(struct pvr_winsys_bo *bo)
       g5p_ws_own_release(ws, b);
       vk_free(ws->base.alloc, b);
       return;
+   } else if (b->parent) {
+      g5p_ws_data_slice_destroy(ws, b); /* unlocks */
+      vk_free(ws->base.alloc, b);
+      return;
    } else {
       util_vma_heap_free(&ws->slices, b->va, b->alloc_size);
       ws->arena_live -= b->alloc_size;
@@ -908,6 +1084,10 @@ static VkResult g5p_ws_buffer_map(struct pvr_winsys_bo *bo, void *addr)
       if (b->kbo.shared && b->base.is_imported)
          return g5p_ws_refuse(VK_ERROR_MEMORY_MAP_FAILED, "placed map of an imported dma-buf");
       k = &b->kbo;
+   } else if (b->parent) {
+      /* a data slice: its chunk at the slice's offset (the chunk lives as long as its slices) */
+      k = &b->parent->kbo;
+      in_bo = b->va - b->parent->va;
    } else {
       for (unsigned i = 0; i < ws->chunk_count && !k; i++)
          if (b->va >= ws->chunks[i].va && b->va + b->alloc_size <= ws->chunks[i].va + ws->chunks[i].size) {
@@ -1387,7 +1567,8 @@ g5p_ws_render_resources(struct g5p_ws *ws, const struct g5p_ws_perf_job *pj,
 {
    unsigned nres = 0;
    ws->perf.last_omitted = 0;
-   if (ws->chunk_count + ws->own_count > DRM_G5P_RENDER_MAX_RESOURCES)
+   /* what the job names is bounded, not what the VM holds: an own BO the job does not touch is not listed */
+   if (ws->chunk_count > DRM_G5P_RENDER_MAX_RESOURCES)
       return -ENOMEM;
    for (unsigned i = 0; i < ws->chunk_count; i++) {
       uint64_t off, len;
@@ -1403,6 +1584,8 @@ g5p_ws_render_resources(struct g5p_ws *ws, const struct g5p_ws_perf_job *pj,
       /* 0: the job neither writes nor reads it (g5p_ws_perf.h): not listed, no maintenance, no fence */
       const uint32_t kind = g5p_ws_perf_own_kind(&ws->perf, pj, b->va, b->kbo.size, b->kbo.shared);
       if (kind) {
+         if (nres == DRM_G5P_RENDER_MAX_RESOURCES)
+            return -ENOMEM;
          res[nres++] = (struct drm_g5p_render_resource){
             .handle = b->kbo.handle, .va = b->va, .size = b->kbo.size, .kind = kind};
          g5p_ws_perf_resource(&ws->perf, &res[nres - 1], b->data_only
@@ -1472,7 +1655,8 @@ static VkResult g5p_ws_render_submit(const struct pvr_winsys_render_ctx *ctx,
    r = g5p_ws_render_resources(ws, &pj, res, &nres, &nchunks);
    if (r) {
       simple_mtx_unlock(&ws->lock);
-      return g5p_ws_refuse(VK_ERROR_OUT_OF_DEVICE_MEMORY, "too many render resources");
+      return g5p_ws_refuse(VK_ERROR_OUT_OF_DEVICE_MEMORY, "too many render resources (%u arena chunks and %u own BOs; "
+                           "a job names at most %u)", ws->chunk_count, ws->own_count, DRM_G5P_RENDER_MAX_RESOURCES);
    }
 
    /* waits (the two stages' waits), then the signal: the kernel takes one per job, so the fragment stage's is
@@ -1682,6 +1866,12 @@ static void g5p_ws_destroy(struct pvr_winsys *ws_)
       g5p_ws_arena_stats(ws, "destroy");
    for (unsigned i = 0; i < ws->chunk_count; i++)
       (void)g5p_drm_bo_destroy(&ws->drm, &ws->chunks[i]);
+   /* the spare data chunk, and any the application left slices in */
+   list_for_each_entry_safe (struct g5p_ws_bo, c, &ws->data_chunks, data_link) {
+      util_vma_heap_finish(&c->data_heap);
+      (void)g5p_drm_bo_destroy(&ws->drm, &c->kbo);
+      vk_free(ws->base.alloc, c);
+   }
    if (ws->arena_cpu)
       munmap(ws->arena_cpu, ws->arena_size);
    free(ws->arena_used);
@@ -1733,7 +1923,9 @@ static VkResult g5p_ws_arena_init(struct g5p_ws *ws)
     * suballocates everything under 2 MiB here, so a fixed 128 MiB failed STK's ~1 MiB allocations long before
     * the heap was used. */
    const uint64_t ram_share = os_get_gpu_heap_size(OS_GPU_HEAP_SIZE_HEURISTIC, NULL);
-   ws->heap_size = ram_share ? MIN2(ram_share, G5P_WS_VM_PIN_MAX) : G5P_WS_ARENA_FALLBACK;
+   ws->heap_size = g5p_ws_heap_bound(ram_share);
+   if (!ws->heap_size)
+      ws->heap_size = G5P_WS_ARENA_FALLBACK;
    uint64_t max = e ? strtoull(e, NULL, 10) << 20 : ws->heap_size;
    max = align64(MAX2(max, G5P_WS_PAGE), G5P_WS_PAGE);
    uint64_t first = f ? strtoull(f, NULL, 10) << 20 : G5P_WS_ARENA_FIRST;
@@ -1744,9 +1936,15 @@ static VkResult g5p_ws_arena_init(struct g5p_ws *ws)
       return g5p_ws_fail(VK_ERROR_INITIALIZATION_FAILED, "arena of %" PRIu64 " MiB is too large",
                        max >> 20);
 
-   const char *growth = getenv("PVR_G5P_ARENA_CHUNK_MIB");
+   const char *log = getenv("PVR_G5P_ARENA_LOG"), *growth = getenv("PVR_G5P_ARENA_CHUNK_MIB");
+   const char *data = getenv("PVR_G5P_DATA_CHUNK_MIB");
+   ws->arena_log = log ? MAX2(strtoul(log, NULL, 10), 1) : 0;
    ws->arena_growth_max = growth ? strtoull(growth, NULL, 10) << 20 : G5P_WS_CHUNK_GROWTH_MAX;
-   ws->arena_log = getenv("PVR_G5P_ARENA_LOG") != NULL;
+   /* whole pages, at most a kernel BO; under two pages there is nothing to share */
+   ws->data_chunk = data ? strtoull(data, NULL, 10) << 20 : G5P_WS_DATA_CHUNK;
+   ws->data_chunk = ROUND_DOWN_TO(MIN3(ws->data_chunk, ws->drm.info.max_bo_size, G5P_WS_CHUNK), G5P_WS_PAGE);
+   if (ws->data_chunk < 2 * G5P_WS_PAGE)
+      ws->data_chunk = 0;
    ws->arena_va = ws->drm.exec.usc_base;
    ws->arena_size = size;
    ws->arena_max = max;
@@ -1793,6 +1991,7 @@ VkResult pvr_g5p_winsys_create(int render_fd, int display_fd, const VkAllocation
       return vk_error(NULL, VK_ERROR_OUT_OF_HOST_MEMORY);
    simple_mtx_init(&ws->lock, mtx_plain);
    list_inithead(&ws->own_bos);
+   list_inithead(&ws->data_chunks);
    ws->base.ops = &g5p_ws_ops;
    ws->base.alloc = alloc;
    ws->base.render_fd = render_fd;
