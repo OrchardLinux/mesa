@@ -1,4 +1,5 @@
 #include "zink_batch.h"
+#include <inttypes.h>
 #include "util/timespec.h"
 #include "zink_context.h"
 #include "zink_descriptors.h"
@@ -806,18 +807,24 @@ submit_queue(void *data, void *gdata, int thread_index)
          num_si--;
    }
 
+   /* A command buffer whose recording failed cannot be submitted, but this batch has already promised its
+    * semaphores: the swapchain present semaphore (kopper's present waits on it), the dma-buf export semaphores,
+    * the user signal semaphores and the timeline value of batch_id. Skipping the submit left those binary
+    * semaphores with no signal operation, and the next wait on one (the present's) blocked in the kernel
+    * forever. So the batch is still submitted, without its command buffers: its waits are consumed and every
+    * signal happens; the batch is device-lost, which the context reports (a guilty reset). */
    VkResult result;
+   bool recorded = true;
    if (bs->has_work) {
       VRAM_ALLOC_LOOP(result,
          VKSCR(EndCommandBuffer)(bs->cmdbuf),
          if (result != VK_SUCCESS) {
             mesa_loge("ZINK: vkEndCommandBuffer failed (%s)", vk_Result_to_str(result));
-            bs->is_device_lost = true;
-            goto end;
+            recorded = false;
          }
       );
    }
-   if (bs->has_reordered_work) {
+   if (recorded && bs->has_reordered_work) {
       VkMemoryBarrier mb;
       mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
       mb.pNext = NULL;
@@ -834,20 +841,24 @@ submit_queue(void *data, void *gdata, int thread_index)
          VKSCR(EndCommandBuffer)(bs->reordered_cmdbuf),
          if (result != VK_SUCCESS) {
             mesa_loge("ZINK: vkEndCommandBuffer failed (%s)", vk_Result_to_str(result));
-            bs->is_device_lost = true;
-            goto end;
+            recorded = false;
          }
       );
    }
-   if (bs->has_unsync) {
+   if (recorded && bs->has_unsync) {
       VRAM_ALLOC_LOOP(result,
          VKSCR(EndCommandBuffer)(bs->unsynchronized_cmdbuf),
          if (result != VK_SUCCESS) {
             mesa_loge("ZINK: vkEndCommandBuffer failed (%s)", vk_Result_to_str(result));
-            bs->is_device_lost = true;
-            goto end;
+            recorded = false;
          }
       );
+   }
+   if (!recorded) {
+      mesa_loge("ZINK: batch %" PRIu64 " dropped: its semaphores are signalled without its command buffers; "
+                "the context is lost", batch_id);
+      bs->is_device_lost = true;
+      si[ZINK_SUBMIT_CMDBUF].commandBufferCount = 0;
    }
 
    simple_mtx_lock(screen->queue_lock);
@@ -946,7 +957,6 @@ submit_queue(void *data, void *gdata, int thread_index)
 
    /* submit_count is incremented together with fence.submitted below */
    count_submit = true;
-end:
    /* wake unflushed-usage waiters */
    mtx_lock(&bs->usage.mtx);
    u_cnd_monotonic_broadcast(&bs->usage.flush);
