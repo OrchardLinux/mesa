@@ -175,6 +175,7 @@ static struct g5p_blend_key general_key(const struct pco_g5p_fs_key *k)
 }
 
 struct gctx {
+   unsigned hi_inline;
    uint64_t tex_pending, tex_coord_pending;
    unsigned tex_batch;
    nir_shader *nir;
@@ -2905,15 +2906,33 @@ static void emit_bool_alu(struct gctx *c, nir_alu_instr *a)
  * an operand that is read again is never marked as a last read. */
 enum vkind { VK_SHARED, VK_REG };
 
-/* Inline shared ALU sources are witnessed only below dword 32. The high index
- * bit (byte 2) is witnessed on the shared MOV (sources 2..33) and on texture
- * LOD sources, never on an ALU source; the first vertex shader that read
- * sh32/sh33 inline wedged the TA (docs/gpu/experiments/vertex-temps.md, vk).
- * A higher dword is moved into a register first. */
+/* PVR_G5P_VS_INLINE_UNIFORMS: unset or not "0" = 256 (Apple's limit),
+ * "0" = 32 (the previous limit). */
+static unsigned vs_inline_limit(void)
+{
+   static int limit = -1;
+   if (limit < 0) {
+      const char *value = getenv("PVR_G5P_VS_INLINE_UNIFORMS");
+      limit = value && !strcmp(value, "0") ? 32 : 256;
+   }
+   return limit;
+}
+
+/* Inline shared ALU sources are witnessed through dword 255 for fma.shared_a
+ * (multiplicand A, register addend: vsuni-probes.py) and float binary.shared
+ * (fadd/fmul: scripts/gpu/henrik-port/vsuni-binop-probes.py).
+ * The sh32 TA wedge was the loader's common-store size (vertex-temps.md,
+ * round 3, fixed by 5069bd6a02b). Every other shared form keeps dwords >= 32
+ * out of the instruction through vs_hi(). */
 static enum vkind vkind(struct gctx *c, struct ref r)
 {
    struct val *v = V(c, r.def, r.comp);
-   return v->state == VAL_SHARED && !v->held && v->imm < 32 ? VK_SHARED : VK_REG;
+   return v->state == VAL_SHARED && !v->held && v->imm < vs_inline_limit() ? VK_SHARED : VK_REG;
+}
+
+static bool vs_hi(struct gctx *c, struct ref r)
+{
+   return vkind(c, r) == VK_SHARED && V(c, r.def, r.comp)->imm >= 32;
 }
 
 static unsigned vs_dst(struct gctx *c, const struct ref *r, unsigned n)
@@ -3020,6 +3039,7 @@ static void vs_fbin(struct gctx *c, nir_alu_instr *a)
    if (vkind(c, r[0]) == VK_SHARED && (op == G5P_BIN_FMUL || dies(c, r[1]) || vkind(c, r[1]) != VK_REG)) {
       /* binary.shared: fmul {h11 x0 dc0 bg0|bg1}, fadd {h11 x0 dc0 bg1} */
       unsigned sd = V(c, r[0].def, r[0].comp)->imm;
+      c->hi_inline += sd >= 32;
       unsigned br = reg_of(c, r[1], "uniform ALU");
       unsigned bg = dies(c, r[1]);
       unsigned dst = vs_dst(c, r, 2);
@@ -3111,6 +3131,10 @@ static void vs_ffma(struct gctx *c, nir_alu_instr *a)
    bool register_fma = r[0].neg || r[0].abs || r[1].neg || r[1].abs || r[2].neg || r[2].abs;
    register_fma |= (vkind(c, r[0]) == VK_SHARED || vkind(c, r[1]) == VK_SHARED) &&
                    vkind(c, r[2]) == VK_REG && !dies(c, r[2]);
+   /* Dwords >= 32 only as fma.shared_a's multiplicand (v_u80all);
+    * shared_ac and the 0x58 shared addend are witnessed below 32 only. */
+   register_fma |= vs_hi(c, r[2]) ||
+                   ((vs_hi(c, r[0]) || vs_hi(c, r[1])) && vkind(c, r[2]) == VK_SHARED);
    if (!register_fma && vkind(c, r[0]) == VK_SHARED && vkind(c, r[1]) == VK_SHARED)
       reg_of(c, r[1], "uniform operand"); /* mov.shared to a temp */
    if (vkind(c, r[1]) == VK_SHARED) {
@@ -3132,6 +3156,7 @@ static void vs_ffma(struct gctx *c, nir_alu_instr *a)
           "uniform FMA (shared A/C)");
       c->p->evidence |= PCO_G5P_EV_VS_SHARED;
    } else if (sa) {
+      c->hi_inline += V(c, r[0].def, r[0].comp)->imm >= 32;
       /* fma.shared_a (A*B+C): {h19 x0 dc0 bg1 cg1} or {h59 x4 dc0 bg0 cg1} */
       unsigned br = reg_of(c, r[1], "uniform FMA"), cr = reg_of(c, r[2], "uniform FMA");
       bool db = dies(c, r[1]), dc = dies(c, r[2]);
@@ -3848,7 +3873,7 @@ static void vs_minsub(struct gctx *c, nir_alu_instr *a)
       return;
    }
    for (unsigned i = 0; i < 2; i++) {
-      if (vkind(c, r[i]) != VK_SHARED || vkind(c, r[1 - i]) != VK_REG)
+      if (vkind(c, r[i]) != VK_SHARED || vkind(c, r[1 - i]) != VK_REG || vs_hi(c, r[i]))
          continue;
       unsigned sd = V(c, r[i].def, r[i].comp)->imm;
       struct ref x = r[1 - i];
@@ -3962,7 +3987,7 @@ static void vs_int(struct gctx *c, nir_alu_instr *a)
       return;
    }
    for (unsigned i = 0; i < 2; i++) {
-      if (vkind(c, r[i]) != VK_SHARED || vkind(c, r[1 - i]) != VK_REG)
+      if (vkind(c, r[i]) != VK_SHARED || vkind(c, r[1 - i]) != VK_REG || vs_hi(c, r[i]))
          continue;
       struct ref x = r[1 - i];
       unsigned sd = V(c, r[i].def, r[i].comp)->imm;
@@ -7148,9 +7173,14 @@ static bool codegen(struct gctx *c)
       out->evidence |= PCO_G5P_EV_VARYINGS;
    out->side_effects = impl_has_side_effects(c->impl);
    out->refusal[0] = 0;
-   if (getenv("PVR_G5P_PRESSURE_LOG"))
-      fprintf(stderr, "G5P pressure: stage=%s remat=%u compact=%u eager=%u cf=%u homes=%u bank0=%u bank1=%u\n",
-              c->vs ? "vs" : "fs", c->remat, c->compact_vs, c->eager_vout, c->cf, c->nhomes, c->max_bank0, c->max_dword);
+   if (getenv("PVR_G5P_PRESSURE_LOG")) {
+      uint32_t hash;
+      memcpy(&hash, c->nir->info.source_blake3, sizeof(hash));
+      fprintf(stderr, "G5P pressure: stage=%s remat=%u compact=%u eager=%u cf=%u homes=%u bank0=%u bank1=%u "
+                      "size=%u hi_inline=%u blake3=%08x\n",
+              c->vs ? "vs" : "fs", c->remat, c->compact_vs, c->eager_vout, c->cf, c->nhomes, c->max_bank0, c->max_dword,
+              c->size, c->hi_inline, hash);
+   }
    return true;
 }
 
