@@ -118,6 +118,7 @@ reset_batch_state_internal(struct zink_screen *screen, struct zink_batch_state *
    bs->video_params = VK_NULL_HANDLE;
 
    bs->resource_size = 0;
+   bs->staging_size = 0;
    bs->signal_semaphore = VK_NULL_HANDLE;
    bs->sparse_semaphore = VK_NULL_HANDLE;
    util_dynarray_clear(&bs->wait_semaphore_stages);

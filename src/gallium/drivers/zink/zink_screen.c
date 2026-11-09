@@ -4037,6 +4037,14 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
 
    screen->total_video_mem = get_video_mem(screen);
    screen->clamp_video_mem = screen->total_video_mem * 0.8;
+   /* A texture upload leaves its staging buffer referenced by the batch, and the suballocator cannot reuse it
+    * until that batch completes. The oom flush above only counts it against 80% of the device's memory, so a
+    * loading loop (uploads, no draws) kept every staging buffer it ever made: on a 768MiB unified-memory heap,
+    * up to 614MiB of them next to the textures. Dead staging gets its own, much smaller limit:
+    * ZINK_STAGING_FLUSH_MIB, default 1/32 of the device-local memory within [16, 256]MiB; 0 disables it.
+    */
+   screen->clamp_staging_mem = (uint64_t)debug_get_num_option("ZINK_STAGING_FLUSH_MIB",
+                                  CLAMP(screen->total_video_mem / 32, 16ull << 20, 256ull << 20) >> 20) << 20;
    if (!os_get_total_physical_memory(&screen->total_mem)) {
       if (!screen->driver_name_is_inferred)
          mesa_loge("ZINK: failed to get total physical memory");
