@@ -2486,10 +2486,13 @@ PVR_PER_ARCH(g9p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer,
  * never finishes and the geometry job hangs, sooner with more instances
  * (pvr-tri, 1000 instances x 300 renders, 3 runs each: 8 registers x 32 and
  * 14 x 4/8/16 pass, 14 x 32 hangs by render 17; iPadOS's 8-register shaders
- * keep 0). Kept at 256 register-instances, a power of two.
+ * keep 0). Kept at 256 register-instances. Not rounded down to a power of two
+ * (20 registers: 12, not 8; the field WebGL sample 38 -> 42 fps), except with
+ * transform feedback, whose separate-buffer captures hung the geometry job
+ * with 12 (dEQP transform_feedback.basic_types.separate.*).
  */
 static uint32_t
-vs_max_instances(unsigned regs)
+vs_max_instances(unsigned regs, bool xfb)
 {
    const unsigned allocated = 2 * DIV_ROUND_UP(MAX2(regs, 8), 2);
    /*
@@ -2497,8 +2500,8 @@ vs_max_instances(unsigned regs)
     * the geometry job, and passed with 4 (dEQP indexing with homes, 2026-11-08)
     */
    const unsigned n = getenv("G9P_VS_MAXINST") ? (unsigned)atoi(getenv("G9P_VS_MAXINST"))
-                      : getenv("G9P_VS_NPOT") ? MIN2(MAX2(256 / allocated, 4), 32)
-                                              : 1u << util_logbase2(MAX2(256 / allocated, 4));
+                      : !xfb ? MIN2(MAX2(256 / allocated, 4), 32)
+                             : 1u << util_logbase2(MAX2(256 / allocated, 4));
 
    if (getenv("G9P_VS_REGLOG"))
       fprintf(stderr, "g9p: vertex shader %u registers, %u instances\n", regs, n);
@@ -2721,7 +2724,7 @@ emit_draw(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics_state
    {
       const uint32_t w[4] = { 0x44000000 | cam, kick->code_offset, state->vs_outputs,
                               (vector > 64 ? BITFIELD_BIT(30) : 0) |
-                                 vs_max_instances(state->vs_regs) << 25 |
+                                 vs_max_instances(state->vs_regs, state->has_xfb) << 25 |
                                  DIV_ROUND_UP(MAX2(state->vs_regs, 8), 2) << 10 | 2 << 6 | 1 };
 
       emit_words(csb, w, 4);
