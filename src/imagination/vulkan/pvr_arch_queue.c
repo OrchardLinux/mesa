@@ -35,6 +35,9 @@
 #include "pvr_rt_dataset.h"
 
 #include <assert.h>
+#include <inttypes.h>
+#include <stdlib.h>
+#include <string.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -67,6 +70,28 @@
 #include "vk_sync.h"
 #include "vk_sync_dummy.h"
 #include "vk_util.h"
+
+static bool pvr_g5p_env_on(const char *name)
+{
+   const char *value = getenv(name);
+   return value && strcmp(value, "0");
+}
+
+static bool pvr_g5p_serial_submits(void)
+{
+   static int enabled = -1;
+   if (enabled < 0)
+      enabled = pvr_g5p_env_on("PVR_G5P_SERIAL_SUBMITS");
+   return enabled;
+}
+
+static bool pvr_g5p_waitlog(void)
+{
+   static int enabled = -1;
+   if (enabled < 0)
+      enabled = pvr_g5p_env_on("PVR_G5P_WAITLOG");
+   return enabled;
+}
 
 static inline enum pvr_winsys_ctx_priority
 pvr_winsys_from_vk_queue_priority(const VkQueueGlobalPriority priority)
@@ -1299,6 +1324,15 @@ static VkResult pvr_process_cmd_buffer(struct pvr_device *device,
 
 static VkResult pvr_clear_last_submits_syncs(struct pvr_queue *queue)
 {
+   /* Keep the last submission's syncs instead of waiting for them on the CPU.
+    * The next jobs and barriers wait for them on the GPU: a barrier's first
+    * scope reaches into earlier submissions. pvr_update_job_syncs replaces each
+    * sync when its job type signals again; the kernel holds its own fence refs.
+    * PVR_G5P_SERIAL_SUBMITS=1 restores the old behaviour. */
+   if (PVR_HAS_FEATURE(&queue->device->pdevice->dev_info, apple_g5p) &&
+       !pvr_g5p_serial_submits())
+      return VK_SUCCESS;
+
    struct vk_sync_wait waits[PVR_JOB_TYPE_MAX * 2];
    uint32_t wait_count = 0;
    VkResult result;
@@ -1377,7 +1411,7 @@ static VkResult pvr_process_queue_signals(struct pvr_queue *queue,
                                           struct vk_sync_signal *signals,
                                           uint32_t signal_count)
 {
-   struct vk_sync_wait signal_waits[PVR_JOB_TYPE_MAX];
+   struct vk_sync_wait signal_waits[PVR_JOB_TYPE_MAX * 2];
    struct pvr_device *device = queue->device;
    VkResult result;
 
@@ -1388,6 +1422,16 @@ static VkResult pvr_process_queue_signals(struct pvr_queue *queue,
       uint32_t wait_count = 0;
 
       for (uint32_t i = 0; i < PVR_JOB_TYPE_MAX; i++) {
+         /* Include waits left by job types that ran no job, even when the
+          * signal stage mask does not include that type. */
+         if (queue->next_job_wait_sync[i]) {
+            signal_waits[wait_count++] = (struct vk_sync_wait){
+               .sync = queue->next_job_wait_sync[i],
+               .stage_mask = ~(VkPipelineStageFlags2)0,
+               .wait_value = 0,
+            };
+         }
+
          /* Exception for query jobs since that's something internal,
           * so the user provided syncs won't ever have it as a source stage.
           */

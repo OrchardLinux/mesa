@@ -385,19 +385,31 @@ static void g5p_ws_vma_unmap(struct pvr_winsys_vma *vma)
 
 /* ---- buffers ---- */
 
+static bool g5p_ws_waitlog(void)
+{
+   static int enabled = -1;
+   if (enabled < 0)
+      enabled = getenv("PVR_G5P_WAITLOG") != NULL;
+   return enabled;
+}
+
 /* One wait of a VM edit the kernel refused with EBUSY: every live render context's last job, the lock not held */
 static int g5p_ws_wait_jobs(struct g5p_ws *ws, int64_t deadline);
 
 /* A VM edit (own BO create, import, destroy) that the kernel refuses with EBUSY while a render job of this file
  * is queued (g5p_render_vm_idle(): "G5P VM_BIND busy=render-idle" in dmesg): wait for the jobs and try again, for
  * G5P_WS_BUSY_NS at most. The lock must not be held. */
-#define G5P_WS_VM_RETRY(ws, r, waits, call)                                                                     \
-   do {                                                                                                         \
-      const int64_t deadline_ = os_time_get_nano() + G5P_WS_BUSY_NS;                                           \
-      while (((r) = (call)) == -EBUSY && os_time_get_nano() < deadline_) {                                      \
-         g5p_ws_wait_jobs((ws), deadline_);                                                                     \
-         (waits)++;                                                                                             \
-      }                                                                                                         \
+#define G5P_WS_VM_RETRY(ws, r, waits, call)                                                                 \
+   do {                                                                                                     \
+      const int64_t deadline_ = os_time_get_nano() + G5P_WS_BUSY_NS;                                        \
+      while (((r) = (call)) == -EBUSY && os_time_get_nano() < deadline_) {                                  \
+         const int64_t start_ = os_time_get_nano();                                                         \
+         g5p_ws_wait_jobs((ws), deadline_);                                                                 \
+         if (g5p_ws_waitlog())                                                                              \
+            fprintf(stderr, "G5P wait: vm-edit %lld us\n",                                                  \
+                    (long long)((os_time_get_nano() - start_) / 1000));                                     \
+         (waits)++;                                                                                         \
+      }                                                                                                     \
    } while (0)
 /* ---- the arena: committed on demand ---- */
 
@@ -1381,7 +1393,11 @@ static VkResult g5p_ws_render_submit(const struct pvr_winsys_render_ctx *ctx,
                    c->context, rt_handle, ws->render.max_queued_jobs);
       busy_retries++;
       simple_mtx_unlock(&ws->lock);
+      const int64_t wait_start = os_time_get_nano();
       r = g5p_ws_wait_jobs(ws, deadline);
+      if (g5p_ws_waitlog())
+         fprintf(stderr, "G5P wait: backpressure %lld us\n",
+                 (long long)((os_time_get_nano() - wait_start) / 1000));
       simple_mtx_lock(&ws->lock);
       if (r) {
          operation = "backpressure fence wait";
