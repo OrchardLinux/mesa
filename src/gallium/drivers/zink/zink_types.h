@@ -1620,6 +1620,8 @@ struct zink_screen {
    uint64_t total_video_mem;
    uint64_t clamp_video_mem;
    uint64_t clamp_staging_mem; // a batch holding this much dead upload staging is flushed; 0 = never
+   int64_t trim_interval; // usecs between zink_bo_trim() calls at the end of a frame; 0 = never
+   int64_t last_trim;
    uint64_t total_mem;
    uint64_t mapped_vram;
 

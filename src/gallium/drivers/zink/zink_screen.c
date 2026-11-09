@@ -4043,6 +4043,8 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
     * up to 614MiB of them next to the textures. Dead staging gets its own, much smaller limit:
     * ZINK_STAGING_FLUSH_MIB, default 1/32 of the device-local memory within [16, 256]MiB; 0 disables it.
     */
+   /* ZINK_TRIM_MS: how often the end of a frame gives idle allocator memory back (zink_bo_trim()); 0 = never */
+   screen->trim_interval = debug_get_num_option("ZINK_TRIM_MS", 1000) * 1000;
    screen->clamp_staging_mem = (uint64_t)debug_get_num_option("ZINK_STAGING_FLUSH_MIB",
                                   CLAMP(screen->total_video_mem / 32, 16ull << 20, 256ull << 20) >> 20) << 20;
    if (!os_get_total_physical_memory(&screen->total_mem)) {

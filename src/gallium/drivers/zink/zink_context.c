@@ -4830,6 +4830,15 @@ zink_flush(struct pipe_context *pctx,
       ctx->hud.frame_submits_current = 0;
    }
 
+   /* any flush will do: an application that only uploads and flushes has no frames */
+   if (screen->trim_interval) {
+      int64_t now = os_time_get();
+      if (now - p_atomic_read_relaxed(&screen->last_trim) >= screen->trim_interval) {
+         p_atomic_set(&screen->last_trim, now);
+         zink_bo_trim(screen);
+      }
+   }
+
    if (pfence) {
       struct zink_tc_fence *mfence;
 
