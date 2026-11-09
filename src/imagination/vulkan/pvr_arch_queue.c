@@ -98,6 +98,18 @@ static bool pvr_g5p_deplog(void)
    return enabled;
 }
 
+#ifdef PVR_APPLE_G5P
+static bool pvr_g5p_barrier_skip_done(void)
+{
+   static int on = -1;
+   if (on < 0) {
+      const char *v = getenv("PVR_G5P_BARRIER_SKIP_DONE");
+      on = !(v && !strcmp(v, "0"));
+   }
+   return on;
+}
+#endif
+
 static bool pvr_g5p_waitonly_local(void)
 {
    static int enabled = -1;
@@ -326,6 +338,7 @@ static void pvr_update_job_syncs(struct pvr_device *device,
    }
 
 #ifdef PVR_APPLE_G5P
+   queue->g5p_src_done[submitted_job_type] = false;
    if (queue->g5p_sem_wait[submitted_job_type]) {
       vk_sync_destroy(&device->vk, queue->g5p_sem_wait[submitted_job_type]);
       queue->g5p_sem_wait[submitted_job_type] = NULL;
@@ -1115,13 +1128,27 @@ pvr_process_event_cmd_barrier(struct pvr_device *device,
             ~(PVR_PIPELINE_STAGE_ALL_BITS | PVR_PIPELINE_STAGE_QUERY_BIT)));
 
    u_foreach_bit (stage, src_mask) {
-      if (queue->last_job_signal_sync[stage]) {
-         wait_syncs[src_wait_count++] = (struct vk_sync_wait){
-            .sync = queue->last_job_signal_sync[stage],
-            .stage_mask = ~(VkPipelineStageFlags2)0,
-            .wait_value = 0,
-         };
+      struct vk_sync *s = queue->last_job_signal_sync[stage];
+      if (!s)
+         continue;
+#ifdef PVR_APPLE_G5P
+      /* G5P: a source whose work already completed orders nothing; skip it
+       * instead of building a syncobj per dst stage around a signalled fence.
+       * The cache is per stage and cleared when the sync is replaced. */
+      if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p) && pvr_g5p_barrier_skip_done()) {
+         if (queue->g5p_src_done[stage])
+            continue;
+         if (vk_sync_wait(&device->vk, s, 0, VK_SYNC_WAIT_COMPLETE, 0) == VK_SUCCESS) {
+            queue->g5p_src_done[stage] = true;
+            continue;
+         }
       }
+#endif
+      wait_syncs[src_wait_count++] = (struct vk_sync_wait){
+         .sync = s,
+         .stage_mask = ~(VkPipelineStageFlags2)0,
+         .wait_value = 0,
+      };
    }
 
    /* No previous src jobs that need finishing so no need for a barrier. */
@@ -1612,6 +1639,9 @@ static VkResult pvr_clear_last_submits_syncs(struct pvr_queue *queue)
       if (queue->last_job_signal_sync[i]) {
          vk_sync_destroy(&queue->device->vk, queue->last_job_signal_sync[i]);
          queue->last_job_signal_sync[i] = NULL;
+#ifdef PVR_APPLE_G5P
+         queue->g5p_src_done[i] = false;
+#endif
       }
    }
 

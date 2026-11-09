@@ -42,6 +42,8 @@ struct pvr_queue {
    struct vk_sync *last_job_signal_sync[PVR_JOB_TYPE_MAX];
    struct vk_sync *next_job_wait_sync[PVR_JOB_TYPE_MAX];
 #ifdef PVR_APPLE_G5P
+   /* last_job_signal_sync[i] is known complete (zero-timeout wait succeeded); cleared whenever it is replaced */
+   bool g5p_src_done[PVR_JOB_TYPE_MAX];
    struct pvr_g5p_inflight {
       struct vk_sync *done;
       bool known;
