@@ -998,6 +998,10 @@ g9p_compile_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo 
       result = stage_nir(device, pipeline, vs_info, mem_ctx, &vs_nir);
       if (result == VK_SUCCESS)
          result = stage_nir(device, pipeline, fs_info, mem_ctx, &fs_nir);
+         /* G9P_NIRLOG=id (debug): that pipeline's fragment shader as it arrives */
+         if (result == VK_SUCCESS && getenv("G9P_NIRLOG") &&
+             (unsigned)atoi(getenv("G9P_NIRLOG")) == state->id)
+            nir_print_shader(fs_nir, stderr);
       if (result != VK_SUCCESS)
          goto out;
       vs_xfb = vs_nir->xfb_info;
@@ -2276,9 +2280,21 @@ static VkResult emit_draw(struct pvr_cmd_buffer *cmd_buffer,
                           const struct g9p_draw_programs *dp, const struct pvr_g9p_draw *draw,
                           VkPrimitiveTopology topology);
 
+static VkResult g9p_cmd_draw_now(struct pvr_cmd_buffer *cmd_buffer,
+                                 const struct pvr_g9p_draw *draw);
+
 VkResult
 PVR_PER_ARCH(g9p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer,
                            const struct pvr_g9p_draw *draw)
+{
+   /* a merged render that may have to split before this draw */
+   pvr_arch_g9p_merge_check_draw(cmd_buffer,
+                                 draw_state(cmd_buffer, &cmd_buffer->state.gfx_pipeline->g9p));
+   return g9p_cmd_draw_now(cmd_buffer, draw);
+}
+
+static VkResult
+g9p_cmd_draw_now(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_draw *draw)
 {
    struct pvr_cmd_buffer_state *cs = &cmd_buffer->state;
    const struct pvr_graphics_pipeline *pipeline = cs->gfx_pipeline;

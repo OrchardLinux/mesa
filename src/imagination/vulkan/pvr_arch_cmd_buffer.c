@@ -2809,6 +2809,9 @@ VkResult pvr_arch_cmd_buffer_start_sub_cmd(struct pvr_cmd_buffer *cmd_buffer,
    if (vk_command_buffer_has_error(&cmd_buffer->vk))
       return vk_command_buffer_get_record_result(&cmd_buffer->vk);
 
+   if (cmd_buffer->state.g9p_merge.pending && getenv("G9P_RPLOG"))
+      fprintf(stderr, "g9p: rp merge ended by sub-command %d\n", type);
+   pvr_arch_g9p_merge_flush(cmd_buffer);
    pvr_cmd_buffer_update_barriers(cmd_buffer, type);
 
    /* TODO: Add proper support for joining consecutive event sub_cmd? */
@@ -5003,6 +5006,10 @@ static inline uint64_t pvr_render_pass_info_get_scratch_buffer_size(
       info->rstate->height);
 }
 
+static bool g9p_merge_compatible(const struct pvr_cmd_buffer *cmd_buffer,
+                                 const VkRenderingInfo *info);
+static void g9p_merge_record(struct pvr_cmd_buffer *cmd_buffer, const VkRenderingInfo *info);
+
 void PVR_PER_ARCH(CmdBeginRendering)(VkCommandBuffer commandBuffer,
                                      const VkRenderingInfo *pRenderingInfo)
 {
@@ -5017,6 +5024,77 @@ void PVR_PER_ARCH(CmdBeginRendering)(VkCommandBuffer commandBuffer,
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
 
    /* TODO: Check not in renderpass? */
+
+   /* G9P_RPLOG (debug): each dynamic render's attachments as the app asks */
+   if (getenv("G9P_RPLOG")) {
+      fprintf(stderr, "g9p: rp cb %p %ux%u flags %#x:", (void *)cmd_buffer,
+              pRenderingInfo->renderArea.extent.width,
+              pRenderingInfo->renderArea.extent.height, pRenderingInfo->flags);
+      for (uint32_t i = 0; i < pRenderingInfo->colorAttachmentCount; i++) {
+         const VkRenderingAttachmentInfo *a = &pRenderingInfo->pColorAttachments[i];
+         VK_FROM_HANDLE(pvr_image_view, iv, a->imageView);
+         VK_FROM_HANDLE(pvr_image_view, rv, a->resolveImageView);
+
+         if (!iv)
+            continue;
+         fprintf(stderr, " c%u img %p", i, (void *)iv->vk.image);
+         fprintf(stderr, " %ux%u x%u load %d store %d resolve %d%s", iv->vk.extent.width,
+                 iv->vk.extent.height, iv->vk.image->samples, a->loadOp, a->storeOp,
+                 a->resolveMode, rv ? (rv->vk.image->external_handle_types ? "->ext" : "->img") : "");
+      }
+      if (pRenderingInfo->pDepthAttachment && pRenderingInfo->pDepthAttachment->imageView) {
+         const VkRenderingAttachmentInfo *a = pRenderingInfo->pDepthAttachment;
+         VK_FROM_HANDLE(pvr_image_view, iv, a->imageView);
+
+         fprintf(stderr, " depth x%u load %d store %d resolve %d", iv->vk.image->samples,
+                 a->loadOp, a->storeOp, a->resolveMode);
+      }
+      fprintf(stderr, "\n");
+   }
+
+   if (state->g9p_merge.pending) {
+      if (g9p_merge_compatible(cmd_buffer, pRenderingInfo)) {
+         state->g9p_merge.pending = false;
+         if (state->g9p_merge.barrier_held) {
+            /* to split at a draw that samples an open attachment */
+            state->g9p_merge.continued = true;
+            state->g9p_merge.next = *pRenderingInfo;
+            state->g9p_merge.next.pNext = NULL;
+            for (uint32_t i = 0; i < pRenderingInfo->colorAttachmentCount; i++) {
+               state->g9p_merge.next_color[i] = pRenderingInfo->pColorAttachments[i];
+               state->g9p_merge.next_color[i].pNext = NULL;
+            }
+            state->g9p_merge.next.pColorAttachments = state->g9p_merge.next_color;
+            if (pRenderingInfo->pDepthAttachment) {
+               state->g9p_merge.next_depth = *pRenderingInfo->pDepthAttachment;
+               state->g9p_merge.next_depth.pNext = NULL;
+               state->g9p_merge.next.pDepthAttachment = &state->g9p_merge.next_depth;
+            }
+            if (pRenderingInfo->pStencilAttachment) {
+               state->g9p_merge.next_stencil = *pRenderingInfo->pStencilAttachment;
+               state->g9p_merge.next_stencil.pNext = NULL;
+               state->g9p_merge.next.pStencilAttachment = &state->g9p_merge.next_stencil;
+            }
+            state->g9p_merge.next_barrier = (VkMemoryBarrier2){
+               .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+               .srcStageMask = state->g9p_merge.src_stages,
+               .srcAccessMask = state->g9p_merge.src_access,
+               .dstStageMask = state->g9p_merge.dst_stages,
+               .dstAccessMask = state->g9p_merge.dst_access,
+            };
+         }
+         state->g9p_merge.barrier_held = false;
+         state->g9p_merge.src_stages = state->g9p_merge.dst_stages = 0;
+         state->g9p_merge.src_access = state->g9p_merge.dst_access = 0;
+         state->current_sub_cmd->is_suspend = false;
+         if (getenv("G9P_RPLOG"))
+            fprintf(stderr, "g9p: rp merged into the open render\n");
+         return;
+      }
+      if (getenv("G9P_RPLOG"))
+         fprintf(stderr, "g9p: rp merge refused\n");
+      PVR_PER_ARCH(g9p_merge_flush)(cmd_buffer);
+   }
 
    suspend = pRenderingInfo->flags & VK_RENDERING_SUSPENDING_BIT_KHR;
    resume = pRenderingInfo->flags & VK_RENDERING_RESUMING_BIT_KHR;
@@ -5040,6 +5118,7 @@ void PVR_PER_ARCH(CmdBeginRendering)(VkCommandBuffer commandBuffer,
    }
 
    state->render_pass_info.dr_info = dr_info;
+   g9p_merge_record(cmd_buffer, pRenderingInfo);
    state->render_pass_info.hw_render = &dr_info->hw_render;
    state->render_pass_info.render_area = (VkRect2D){
       .extent = pRenderingInfo->renderArea.extent,
@@ -5139,18 +5218,258 @@ static VkResult
 pvr_resolve_unemitted_resolve_attachments(struct pvr_cmd_buffer *cmd_buffer,
                                           struct pvr_render_pass_info *info);
 
+static void pvr_end_rendering_now(struct pvr_cmd_buffer *cmd_buffer);
+
+static bool pvr_g9p_merge_enabled(const struct pvr_cmd_buffer *cmd_buffer)
+{
+   static int on = -1;
+
+   /* on unless G9P_NO_MERGE */
+   if (on < 0)
+      on = getenv("G9P_NO_MERGE") == NULL;
+   return on && PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g9p);
+}
+
+/* End a dynamic render kept open for merging, before anything that is not its continuation */
+void PVR_PER_ARCH(g9p_merge_flush)(struct pvr_cmd_buffer *cmd_buffer)
+{
+   struct pvr_cmd_buffer_state *state = &cmd_buffer->state;
+
+   if (!state->g9p_merge.pending)
+      return;
+   state->g9p_merge.pending = false;
+   if (state->current_sub_cmd)
+      state->current_sub_cmd->is_suspend = false;
+   pvr_end_rendering_now(cmd_buffer);
+   if (state->g9p_merge.barrier_held) {
+      const VkMemoryBarrier2 b = {
+         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+         .srcStageMask = state->g9p_merge.src_stages,
+         .srcAccessMask = state->g9p_merge.src_access,
+         .dstStageMask = state->g9p_merge.dst_stages,
+         .dstAccessMask = state->g9p_merge.dst_access,
+      };
+      const VkDependencyInfo dep = {
+         .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+         .memoryBarrierCount = 1,
+         .pMemoryBarriers = &b,
+      };
+
+      state->g9p_merge.barrier_held = false;
+      state->g9p_merge.src_stages = state->g9p_merge.dst_stages = 0;
+      state->g9p_merge.src_access = state->g9p_merge.dst_access = 0;
+      PVR_PER_ARCH(CmdPipelineBarrier2)(pvr_cmd_buffer_to_handle(cmd_buffer), &dep);
+   }
+}
+
+static void g9p_merge_attachment(const VkRenderingAttachmentInfo *a, const struct vk_image **image,
+                                 uint32_t *level, uint32_t *layer)
+{
+   VK_FROM_HANDLE(pvr_image_view, iv, a ? a->imageView : VK_NULL_HANDLE);
+
+   *image = iv ? iv->vk.image : NULL;
+   *level = iv ? iv->vk.base_mip_level : 0;
+   *layer = iv ? iv->vk.base_array_layer : 0;
+}
+
+/* Remember the render just begun, as the one a later render may continue */
+static void g9p_merge_record(struct pvr_cmd_buffer *cmd_buffer, const VkRenderingInfo *info)
+{
+   struct pvr_cmd_buffer_state *state = &cmd_buffer->state;
+
+   state->g9p_merge.color_count = MIN2(info->colorAttachmentCount, 8);
+   state->g9p_merge.has_resolve = info->colorAttachmentCount > 8;
+   for (uint32_t i = 0; i < state->g9p_merge.color_count; i++) {
+      g9p_merge_attachment(&info->pColorAttachments[i], &state->g9p_merge.color[i].image,
+                           &state->g9p_merge.color[i].level, &state->g9p_merge.color[i].layer);
+      state->g9p_merge.has_resolve |= info->pColorAttachments[i].resolveMode != VK_RESOLVE_MODE_NONE;
+   }
+   g9p_merge_attachment(info->pDepthAttachment, &state->g9p_merge.depth.image,
+                        &state->g9p_merge.depth.level, &state->g9p_merge.depth.layer);
+   if (info->pDepthAttachment)
+      state->g9p_merge.has_resolve |= info->pDepthAttachment->resolveMode != VK_RESOLVE_MODE_NONE;
+   if (info->pStencilAttachment && info->pStencilAttachment->imageView &&
+       (!info->pDepthAttachment || info->pStencilAttachment->imageView != info->pDepthAttachment->imageView))
+      state->g9p_merge.has_resolve = true;	/* separate stencil: not merged */
+   state->g9p_merge.area = info->renderArea;
+   state->g9p_merge.layers = info->layerCount;
+   state->g9p_merge.view_mask = info->viewMask;
+   state->g9p_merge.has_resolve |= info->viewMask != 0;	/* not kept open either */
+}
+
+/*
+ * A render that only loads attachments of the one kept open, over the same
+ * area, continues it: its tiles stay in tile memory instead of being stored
+ * and loaded again (Zink ends a render and begins one on the same images
+ * when the framebuffer changes, as a WebGL backbuffer's 4x MSAA passes do).
+ */
+static bool g9p_merge_compatible(const struct pvr_cmd_buffer *cmd_buffer, const VkRenderingInfo *info)
+{
+   const struct pvr_cmd_buffer_state *state = &cmd_buffer->state;
+   const struct vk_image *image;
+   uint32_t level, layer;
+
+   /* multiview: each view's copy of the render's control stream is made per render */
+   if (info->flags || state->g9p_merge.has_resolve || info->viewMask ||
+       memcmp(&info->renderArea, &state->g9p_merge.area, sizeof(info->renderArea)) ||
+       info->layerCount != state->g9p_merge.layers || info->viewMask != state->g9p_merge.view_mask ||
+       info->colorAttachmentCount > state->g9p_merge.color_count)
+      return false;
+   for (uint32_t i = 0; i < info->colorAttachmentCount; i++) {
+      const VkRenderingAttachmentInfo *a = &info->pColorAttachments[i];
+
+      g9p_merge_attachment(a, &image, &level, &layer);
+      if (!image)
+         continue;
+      if (image != state->g9p_merge.color[i].image || level != state->g9p_merge.color[i].level ||
+          layer != state->g9p_merge.color[i].layer || a->loadOp != VK_ATTACHMENT_LOAD_OP_LOAD ||
+          a->resolveMode != VK_RESOLVE_MODE_NONE)
+         return false;
+   }
+   if (info->pDepthAttachment && info->pDepthAttachment->imageView) {
+      g9p_merge_attachment(info->pDepthAttachment, &image, &level, &layer);
+      if (image != state->g9p_merge.depth.image || level != state->g9p_merge.depth.level ||
+          layer != state->g9p_merge.depth.layer ||
+          info->pDepthAttachment->loadOp != VK_ATTACHMENT_LOAD_OP_LOAD ||
+          info->pDepthAttachment->resolveMode != VK_RESOLVE_MODE_NONE)
+         return false;
+   }
+   if (info->pStencilAttachment && info->pStencilAttachment->imageView &&
+       (!info->pDepthAttachment || info->pStencilAttachment->imageView != info->pDepthAttachment->imageView))
+      return false;
+   /*
+    * With a held barrier, a draw of the new render that samples an attachment of the
+    * open one splits it again (pvr_arch_g9p_merge_check_draw()). Attachments in a
+    * feedback loop are read as attachments while drawn: not merged.
+    */
+   if (state->g9p_merge.barrier_held) {
+      for (uint32_t i = 0; i < info->colorAttachmentCount; i++)
+         if (info->pColorAttachments[i].imageView &&
+             info->pColorAttachments[i].imageLayout == VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT)
+            return false;
+      if (info->pDepthAttachment && info->pDepthAttachment->imageView &&
+          info->pDepthAttachment->imageLayout == VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT)
+         return false;
+   }
+   return true;
+}
+
+/* An image descriptor's address (g9p_pack_image_view(): bits 1-32 in d[2], 33 up in d[3]) */
+static uint64_t g9p_descriptor_address(const uint32_t *d)
+{
+   return (uint64_t)(d[3] & 0xff) << 33 | (uint64_t)(d[2] & ~0x1fu) << 1;
+}
+
+static bool g9p_merge_reads_open_attachment(const struct pvr_cmd_buffer *cmd_buffer,
+                                            const struct pvr_descriptor_state *desc,
+                                            unsigned set_index, unsigned binding, unsigned index)
+{
+   const struct pvr_cmd_buffer_state *state = &cmd_buffer->state;
+   const struct pvr_descriptor_set *set = desc->sets[set_index];
+   const struct vk_image *images[9];
+   unsigned n = 0;
+   uint64_t addr;
+
+   if (!set)
+      return false;
+   if (!set->mapping)
+      return true;	/* cannot tell: split */
+   {
+      const struct pvr_descriptor_set_layout_binding *b = &set->layout->bindings[binding];
+
+      addr = g9p_descriptor_address(
+         (const uint32_t *)((const uint8_t *)set->mapping + b->offset + index * b->stride));
+   }
+   for (uint32_t i = 0; i < state->g9p_merge.color_count; i++)
+      if (state->g9p_merge.color[i].image)
+         images[n++] = state->g9p_merge.color[i].image;
+   if (state->g9p_merge.depth.image)
+      images[n++] = state->g9p_merge.depth.image;
+   for (unsigned i = 0; i < n; i++) {
+      const struct pvr_image *im = container_of(images[i], struct pvr_image, vk);
+
+      if (addr >= im->dev_addr.addr && addr < im->dev_addr.addr + im->total_size)
+         return true;
+   }
+   return false;
+}
+
+/*
+ * Before a draw of a render that continued another past a held barrier: a
+ * draw that samples one of the open render's attachments needs what it
+ * stored. The render ends there (everything drawn so far stored), the
+ * barrier is replayed, and the continuation begins again, loading.
+ * Combined image samplers are checked; storage images are not used by
+ * G9P draws yet.
+ */
+void PVR_PER_ARCH(g9p_merge_check_draw)(struct pvr_cmd_buffer *cmd_buffer,
+                                        const struct pvr_g9p_graphics_state *g)
+{
+   struct pvr_cmd_buffer_state *state = &cmd_buffer->state;
+   const struct pvr_descriptor_state *desc = &state->gfx_desc_state;
+   bool conflict = false;
+
+   if (!state->g9p_merge.continued)
+      return;
+   for (unsigned t = 0; t < g->num_textures && !conflict; t++)
+      conflict = g9p_merge_reads_open_attachment(cmd_buffer, desc, g->textures[t].set,
+                                                 g->textures[t].binding, g->textures[t].index);
+   for (unsigned t = 0; t < g->vs_num_textures && !conflict; t++)
+      conflict = g9p_merge_reads_open_attachment(cmd_buffer, desc, g->vs_textures[t].set,
+                                                 g->vs_textures[t].binding, g->vs_textures[t].index);
+   if (!conflict)
+      return;
+
+   if (getenv("G9P_RPLOG"))
+      fprintf(stderr, "g9p: rp merge split: a draw samples an open attachment\n");
+   {
+      const VkDependencyInfo dep = {
+         .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+         .memoryBarrierCount = 1,
+         .pMemoryBarriers = &state->g9p_merge.next_barrier,
+      };
+      VkRenderingInfo next = state->g9p_merge.next;
+
+      for (uint32_t i = 0; i < next.colorAttachmentCount; i++)
+         state->g9p_merge.next_color[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+      if (next.pDepthAttachment)
+         state->g9p_merge.next_depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+      if (next.pStencilAttachment)
+         state->g9p_merge.next_stencil.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+      state->current_sub_cmd->is_suspend = false;
+      pvr_end_rendering_now(cmd_buffer);
+      PVR_PER_ARCH(CmdPipelineBarrier2)(pvr_cmd_buffer_to_handle(cmd_buffer), &dep);
+      PVR_PER_ARCH(CmdBeginRendering)(pvr_cmd_buffer_to_handle(cmd_buffer), &next);
+   }
+}
+
 void PVR_PER_ARCH(CmdEndRendering)(VkCommandBuffer commandBuffer)
 {
    VK_FROM_HANDLE(pvr_cmd_buffer, cmd_buffer, commandBuffer);
    struct pvr_cmd_buffer_state *state = &cmd_buffer->state;
-   VkResult result;
 
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
 
    if (state->current_sub_cmd && state->current_sub_cmd->is_suspend) {
       return;
    }
+   /* keep it open: the next render may continue it */
+   if (pvr_g9p_merge_enabled(cmd_buffer) && state->current_sub_cmd &&
+       state->current_sub_cmd->type == PVR_SUB_CMD_TYPE_GRAPHICS &&
+       state->current_sub_cmd->is_dynamic_render && !state->g9p_merge.has_resolve) {
+      state->current_sub_cmd->is_suspend = true;
+      state->g9p_merge.pending = true;
+      return;
+   }
+   pvr_end_rendering_now(cmd_buffer);
+}
 
+static void pvr_end_rendering_now(struct pvr_cmd_buffer *cmd_buffer)
+{
+   struct pvr_cmd_buffer_state *state = &cmd_buffer->state;
+   VkResult result;
+
+   state->g9p_merge.continued = false;
    result = pvr_arch_cmd_buffer_end_sub_cmd(cmd_buffer);
    if (result != VK_SUCCESS) {
       vk_command_buffer_set_error(&cmd_buffer->vk, result);
@@ -10040,6 +10359,7 @@ void PVR_PER_ARCH(CmdExecuteCommands)(VkCommandBuffer commandBuffer,
                                       const VkCommandBuffer *pCommandBuffers)
 {
    VK_FROM_HANDLE(pvr_cmd_buffer, cmd_buffer, commandBuffer);
+   pvr_arch_g9p_merge_flush(cmd_buffer);
    struct pvr_cmd_buffer_state *state = &cmd_buffer->state;
    struct pvr_cmd_buffer *last_cmd_buffer;
    VkResult result;
@@ -10436,6 +10756,40 @@ void PVR_PER_ARCH(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
                                        const VkDependencyInfo *pDependencyInfo)
 {
    VK_FROM_HANDLE(pvr_cmd_buffer, cmd_buffer, commandBuffer);
+   /*
+    * A render kept open for merging: a global barrier from
+    * attachment writes to fragment-stage reads or attachment accesses is
+    * held back. A render that continues it may not read the open render's
+    * attachments in a shader (g9p_merge_compatible()); otherwise the render
+    * ends and the barrier is replayed (pvr_arch_g9p_merge_flush()).
+    */
+   if (cmd_buffer->state.g9p_merge.pending && !pDependencyInfo->bufferMemoryBarrierCount &&
+       !pDependencyInfo->imageMemoryBarrierCount) {
+      const VkPipelineStageFlags2 attachment_stages =
+         VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+         VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+      bool held = true;
+
+      for (uint32_t i = 0; i < pDependencyInfo->memoryBarrierCount; i++) {
+         const VkMemoryBarrier2 *b = &pDependencyInfo->pMemoryBarriers[i];
+
+         held &= !(b->srcStageMask & ~attachment_stages) &&
+                 !(b->dstStageMask & ~(attachment_stages | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT));
+      }
+      if (held) {
+         for (uint32_t i = 0; i < pDependencyInfo->memoryBarrierCount; i++) {
+            const VkMemoryBarrier2 *b = &pDependencyInfo->pMemoryBarriers[i];
+
+            cmd_buffer->state.g9p_merge.src_stages |= b->srcStageMask;
+            cmd_buffer->state.g9p_merge.src_access |= b->srcAccessMask;
+            cmd_buffer->state.g9p_merge.dst_stages |= b->dstStageMask;
+            cmd_buffer->state.g9p_merge.dst_access |= b->dstAccessMask;
+         }
+         cmd_buffer->state.g9p_merge.barrier_held = true;
+         return;
+      }
+   }
+   pvr_arch_g9p_merge_flush(cmd_buffer);
    struct pvr_cmd_buffer_state *const state = &cmd_buffer->state;
    const struct pvr_render_pass *const render_pass =
       state->render_pass_info.pass;
@@ -10697,6 +11051,7 @@ void PVR_PER_ARCH(CmdWriteTimestamp2)(VkCommandBuffer commandBuffer,
 VkResult PVR_PER_ARCH(EndCommandBuffer)(VkCommandBuffer commandBuffer)
 {
    VK_FROM_HANDLE(pvr_cmd_buffer, cmd_buffer, commandBuffer);
+   pvr_arch_g9p_merge_flush(cmd_buffer);
    struct pvr_cmd_buffer_state *state = &cmd_buffer->state;
    VkResult result;
 

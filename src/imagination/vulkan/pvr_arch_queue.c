@@ -426,9 +426,9 @@ pvr_process_graphics_cmd_for_view(struct pvr_device *device,
       const VkRect2D *ra = &job->g9p_draws.render_area;
       const uint32_t *t = job->g9p_draws.tiles;
 
-      fprintf(stderr, "g9p: trace %u: %ux%u %s, %u draws, at %.1f ms, area %d,%d %ux%u, "
+      fprintf(stderr, "g9p: trace %u: %ux%u x%u %s, %u draws, at %.1f ms, area %d,%d %ux%u, "
               "tiles %u,%u-%u,%u, load op %d, pipelines", ++n,
-              job->g9p.width, job->g9p.height, job->g9p.load ? "loaded" : "cleared",
+              job->g9p.width, job->g9p.height, job->g9p.samples, job->g9p.load ? "loaded" : "cleared",
               job->g9p_draws.num_draws, os_time_get_nano() / 1e6, ra->offset.x, ra->offset.y,
               ra->extent.width, ra->extent.height, t[0], t[1], t[2], t[3], job->g9p.load_op);
       for (unsigned i = 0; i < MIN2(job->g9p_draws.num_draws, 12); i++)

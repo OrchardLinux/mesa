@@ -501,6 +501,32 @@ struct pvr_cmd_buffer_state {
 
    struct pvr_sub_cmd *current_sub_cmd;
 
+   /*
+    * G9P: a dynamic render ended but kept open (pvr_g9p_merge_*()): the next
+    * one may continue it if it only loads the same attachments
+    */
+   struct {
+      bool pending;
+      bool has_resolve;
+      uint32_t color_count;
+      struct { const struct vk_image *image; uint32_t level, layer; } color[8], depth;
+      VkRect2D area;
+      uint32_t layers, view_mask;
+      /* a global barrier held back while the render is open, replayed if it ends */
+      bool barrier_held;
+      VkPipelineStageFlags2 src_stages, dst_stages;
+      VkAccessFlags2 src_access, dst_access;
+      /*
+       * Continued past a held barrier: the continuation's rendering and the
+       * barrier, to split there if a draw samples an open attachment
+       * (pvr_arch_g9p_merge_check_draw())
+       */
+      bool continued;
+      VkRenderingInfo next;
+      VkRenderingAttachmentInfo next_color[8], next_depth, next_stencil;
+      VkMemoryBarrier2 next_barrier;
+   } g9p_merge;
+
    struct pvr_ppp_state ppp_state;
 
    struct ROGUE_TA_STATE_HEADER emit_header;
@@ -753,6 +779,15 @@ VkResult
    PVR_PER_ARCH(cmd_buffer_end_sub_cmd)(struct pvr_cmd_buffer *cmd_buffer);
 
 #   define pvr_arch_cmd_buffer_end_sub_cmd PVR_PER_ARCH(cmd_buffer_end_sub_cmd)
+
+void PVR_PER_ARCH(g9p_merge_flush)(struct pvr_cmd_buffer *cmd_buffer);
+struct pvr_g9p_graphics_state;
+void PVR_PER_ARCH(g9p_merge_check_draw)(struct pvr_cmd_buffer *cmd_buffer,
+                                        const struct pvr_g9p_graphics_state *state);
+
+#   define pvr_arch_g9p_merge_check_draw PVR_PER_ARCH(g9p_merge_check_draw)
+
+#   define pvr_arch_g9p_merge_flush PVR_PER_ARCH(g9p_merge_flush)
 
 void PVR_PER_ARCH(compute_generate_fence)(
    struct pvr_cmd_buffer *cmd_buffer,

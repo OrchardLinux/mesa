@@ -21,6 +21,7 @@ void PVR_PER_ARCH(CmdResetQueryPool)(VkCommandBuffer commandBuffer,
                                      uint32_t queryCount)
 {
    VK_FROM_HANDLE(pvr_cmd_buffer, cmd_buffer, commandBuffer);
+   pvr_arch_g9p_merge_flush(cmd_buffer);
    struct pvr_query_info query_info;
    VkResult result;
 
@@ -93,6 +94,7 @@ void PVR_PER_ARCH(CmdCopyQueryPoolResults)(VkCommandBuffer commandBuffer,
                                            VkQueryResultFlags flags)
 {
    VK_FROM_HANDLE(pvr_cmd_buffer, cmd_buffer, commandBuffer);
+   pvr_arch_g9p_merge_flush(cmd_buffer);
    struct pvr_query_info query_info;
    VkResult result;
 
@@ -250,6 +252,7 @@ void PVR_PER_ARCH(CmdBeginQueryIndexedEXT)(VkCommandBuffer commandBuffer,
                                            uint32_t index)
 {
    VK_FROM_HANDLE(pvr_cmd_buffer, cmd_buffer, commandBuffer);
+   pvr_arch_g9p_merge_flush(cmd_buffer);
    VK_FROM_HANDLE(pvr_query_pool, pool, queryPool);
 
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
@@ -281,6 +284,7 @@ void PVR_PER_ARCH(CmdEndQueryIndexedEXT)(VkCommandBuffer commandBuffer,
                                          uint32_t index)
 {
    VK_FROM_HANDLE(pvr_cmd_buffer, cmd_buffer, commandBuffer);
+   pvr_arch_g9p_merge_flush(cmd_buffer);
    VK_FROM_HANDLE(pvr_query_pool, pool, queryPool);
 
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
