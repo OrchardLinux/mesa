@@ -5645,7 +5645,7 @@ static bool needs_flatten(nir_shader *nir)
    return !exec_list_is_singular(&impl->body) || !exec_list_is_empty(&impl->locals);
 }
 
-/* Apply Apple's scalar operation budget before NIR's unroll passes. */
+/* Apply Apple's floating-point scalar ALU budget before NIR's unroll passes. */
 static void g5p_loop_budget_list(struct exec_list *list)
 {
    foreach_list_typed(nir_cf_node, node, node, list) {
@@ -5661,11 +5661,9 @@ static void g5p_loop_budget_list(struct exec_list *list)
                nir_foreach_instr(instr, block) {
                   if (instr->type == nir_instr_type_alu) {
                      nir_alu_instr *alu = nir_instr_as_alu(instr);
-                     if (!nir_op_is_vec_or_mov(alu->op))
+                     if (!nir_op_is_vec_or_mov(alu->op) &&
+                         nir_alu_type_get_base_type(nir_op_infos[alu->op].output_type) == nir_type_float)
                         ops += alu->def.num_components;
-                  } else if (instr->type == nir_instr_type_intrinsic ||
-                             instr->type == nir_instr_type_tex) {
-                     ops++;
                   }
                }
             }
