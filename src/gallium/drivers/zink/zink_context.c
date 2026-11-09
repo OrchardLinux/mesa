@@ -3886,9 +3886,10 @@ zink_batch_rp(struct zink_context *ctx)
    }
    unsigned clear_buffers = begin_rendering(ctx, true);
    assert(!ctx->rp_changed);
-   if (ctx->unordered_blitting)
+   if (ctx->unordered_blitting) {
       ctx->bs->has_reordered_work = true;
-   else
+      ctx->bs->reordered_stages |= VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;
+   } else
       ctx->bs->has_work = true;
 
    /* update the render-passes HUD query */
@@ -5433,6 +5434,7 @@ zink_copy_buffer(struct zink_context *ctx, struct zink_resource *dst, struct zin
    VkCommandBuffer cmdbuf = unsync ? ctx->bs->unsynchronized_cmdbuf : 
                                      can_unorder ? ctx->bs->reordered_cmdbuf : zink_get_cmdbuf(ctx, src, dst);
    ctx->bs->has_reordered_work |= can_unorder;
+   if (can_unorder) ctx->bs->reordered_stages |= VK_PIPELINE_STAGE_TRANSFER_BIT;
    ctx->bs->has_unsync |= unsync;
    zink_batch_reference_resource_rw(ctx, src, false);
    zink_batch_reference_resource_rw(ctx, dst, true);

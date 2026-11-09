@@ -385,6 +385,33 @@ static void g5p_ws_vma_unmap(struct pvr_winsys_vma *vma)
 
 /* ---- buffers ---- */
 
+static bool g5p_ws_wait_3d(void)
+{
+   static int enabled = -1;
+   if (enabled < 0) {
+      const char *v = getenv("PVR_G5P_WAIT_3D");
+      enabled = v ? strcmp(v, "0") != 0 : 1;
+   }
+   return enabled;
+}
+
+static bool g5p_ws_deplog(void)
+{
+   static int enabled = -1;
+   if (enabled < 0) {
+      const char *v = getenv("PVR_G5P_DEPLOG");
+      enabled = v ? strcmp(v, "0") != 0 : 0;
+   }
+   return enabled;
+}
+
+static int g5p_ws_dep_pending(struct g5p_ws *ws, struct vk_sync *sync)
+{
+   if (!sync) return -1;
+   uint32_t h = vk_sync_as_drm_syncobj(sync)->syncobj;
+   return drmSyncobjWait(ws->base.render_fd, &h, 1, 0, 0, NULL) == -ETIME;
+}
+
 static bool g5p_ws_waitlog(void)
 {
    static int enabled = -1;
@@ -1323,10 +1350,14 @@ static VkResult g5p_ws_render_submit(const struct pvr_winsys_render_ctx *ctx,
     * signalled and the geometry stage's gets the same fence afterwards (a G5P job is one TA + 3D pass) */
    struct drm_g5p_sync syncs[DRM_G5P_RENDER_MAX_SYNCS];
    unsigned n = 0;
-   struct vk_sync *waits[] = {info->geometry.wait, info->fragment.wait};
-   for (unsigned i = 0; i < ARRAY_SIZE(waits); i++)
-      if (waits[i])
-         syncs[n++] = (struct drm_g5p_sync){.handle = vk_sync_as_drm_syncobj(waits[i])->syncobj};
+   /* F5b: the fragment stage's wait gates only the 3D: the kernel drops this context's own
+    * earlier jobs from it (3D runs in queue order); PVR_G5P_WAIT_3D=0 sends it as a plain input */
+   const bool wait_3d = (ws->drm.info.capabilities & DRM_G5P_CAP_SYNC_WAIT_3D) && g5p_ws_wait_3d();
+   if (info->geometry.wait)
+      syncs[n++] = (struct drm_g5p_sync){.handle = vk_sync_as_drm_syncobj(info->geometry.wait)->syncobj};
+   if (info->fragment.wait && info->fragment.wait != info->geometry.wait)
+      syncs[n++] = (struct drm_g5p_sync){.handle = vk_sync_as_drm_syncobj(info->fragment.wait)->syncobj,
+                                         .flags = wait_3d ? DRM_G5P_SYNC_WAIT_3D : 0};
    struct vk_sync *signal = frag ? frag : geom;
    if (signal)
       syncs[n++] = (struct drm_g5p_sync){.handle = vk_sync_as_drm_syncobj(signal)->syncobj,
@@ -1421,6 +1452,10 @@ static VkResult g5p_ws_render_submit(const struct pvr_winsys_render_ctx *ctx,
       accepted = true;
       operation = "SYNCOBJ_TRANSFER last";
       if (drmSyncobjTransfer(ws->base.render_fd, c->last, 0, sig, 0, 0)) r = -errno;
+      if (g5p_ws_deplog())
+         fprintf(stderr, "G5P dep: job=%" PRIu64 " geom=%d frag=%d wait3d=%u\n",
+                 job_id, g5p_ws_dep_pending(ws, info->geometry.wait),
+                 g5p_ws_dep_pending(ws, info->fragment.wait), wait_3d);
    }
    if (!r && frag && geom) {
       operation = "SYNCOBJ_TRANSFER geometry";

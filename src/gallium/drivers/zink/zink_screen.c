@@ -3159,6 +3159,10 @@ init_driver_workarounds(struct zink_screen *screen)
    default:
       break;
    }
+   /* the kernel fences shared buffers itself (apple_g5p winsys): no wait-only
+    * submit and no CPU wait under queue_lock before present */
+   if (debug_get_bool_option("ZINK_KERNEL_IMPLICIT_SYNC", false))
+      screen->driver_workarounds.implicit_sync = false;
    /* TODO: maybe compile multiple variants for different set counts for compact mode? */
    if (screen->info.props.limits.maxBoundDescriptorSets < ZINK_DESCRIPTOR_ALL_TYPES ||
        zink_debug & (ZINK_DEBUG_COMPACT | ZINK_DEBUG_NOSHOBJ))
@@ -3736,6 +3740,7 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
    }
    zink_resource_struct_pools_init(screen);
 
+   screen->precise_sync = debug_get_bool_option("ZINK_PRECISE_SYNC", true);
    screen->driver_name_is_inferred = config && config->driver_name_is_inferred;
    screen->drm_fd = -1;
    simple_mtx_init(&screen->ralloc_lock, mtx_plain);

@@ -169,6 +169,7 @@ reset_batch_state_internal(struct zink_screen *screen, struct zink_batch_state *
 
    bs->has_work = false;
    bs->has_reordered_work = false;
+   bs->reordered_stages = 0;
    bs->has_unsync = false;
 }
 
@@ -823,8 +824,10 @@ submit_queue(void *data, void *gdata, int thread_index)
       /* big sync hammer: everything here must complete before the main cmdbuf */
       mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
       mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+      /* Only this batch's hoisted work runs here; cross-batch hazards have resource barriers. */
+      VkPipelineStageFlags src = screen->precise_sync && bs->reordered_stages ? bs->reordered_stages : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
       VKSCR(CmdPipelineBarrier)(bs->reordered_cmdbuf,
-                                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                 src,
                                  VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                  0, 1, &mb, 0, NULL, 0, NULL);
       VRAM_ALLOC_LOOP(result,
@@ -928,7 +931,7 @@ submit_queue(void *data, void *gdata, int thread_index)
        * otherwise as a read fence, which only later writers wait for.
        */
       if (res->obj->exportable_dmabuf) {
-         bool write = entry->data != NULL;
+         bool write = (uintptr_t)entry->data & 1;
          for (; res; res = zink_resource(res->base.b.next))
             zink_screen_import_dmabuf_semaphore(screen, res, sem[i++], write);
       }
@@ -1021,15 +1024,25 @@ zink_end_batch(struct zink_context *ctx)
     * for the write fences if the batch just read the image, but for all of
     * them if the batch wrote it.
     */
+   util_dynarray_clear(&bs->fd_wait_semaphore_stages);
    hash_table_foreach(&bs->exports, entry) {
       struct zink_resource *res = (void*)entry->key;
       if (!res->obj->exportable_dmabuf)
          continue;
-      bool write = entry->data != NULL;
+      bool write = (uintptr_t)entry->data & 1;
       for (struct zink_resource *r = res; r; r = zink_resource(r->base.b.next)) {
          VkSemaphore sem = zink_screen_export_dmabuf_semaphore(screen, r, write);
-         if (sem)
+         if (sem) {
             util_dynarray_append(&bs->fd_wait_semaphores, sem);
+            VkPipelineStageFlags st = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+            if (screen->precise_sync) {
+               st = (VkPipelineStageFlags)((uintptr_t)entry->data >> 1) | r->obj->access_stage |
+                    r->obj->unordered_access_stage;
+               if (!st || (st & (VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT | VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT)))
+                  st = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+            }
+            util_dynarray_append(&bs->fd_wait_semaphore_stages, st);
+         }
       }
    }
 
@@ -1044,6 +1057,9 @@ zink_end_batch(struct zink_context *ctx)
             imb.srcStageMask = VK_PIPELINE_STAGE_2_VIDEO_DECODE_BIT_KHR;
             imb.srcAccessMask = VK_ACCESS_2_VIDEO_DECODE_WRITE_BIT_KHR;
          }
+         /* A release to FOREIGN has no consumer here; the foreign user waits on
+          * the dma-buf fence and our next use re-acquires. */
+         if (screen->precise_sync) { imb.dstStageMask = VK_PIPELINE_STAGE_2_NONE; imb.dstAccessMask = 0; }
          VkDependencyInfo dep = {
             VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
             NULL,
@@ -1064,7 +1080,7 @@ zink_end_batch(struct zink_context *ctx)
          VKCTX(CmdPipelineBarrier)(
             bs->cmdbuf,
             res->obj->access_stage,
-            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            screen->precise_sync ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
             0,
             0, NULL,
             0, NULL,

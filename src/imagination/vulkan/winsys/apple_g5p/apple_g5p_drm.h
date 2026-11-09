@@ -500,4 +500,11 @@ struct drm_g5p_destroy_render_target {
 #define DRM_IOCTL_G5P_SUBMIT_RENDER_TYPED \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_G5P_SUBMIT_RENDER_TYPED, struct drm_g5p_submit_render_typed)
 
+/* An input that gates only the job's 3D (fragment) stage. The kernel drops the parts of it that
+ * are this render context's own earlier jobs (same-context 3D runs in queue order); every other
+ * fence still gates the whole job. Not with DRM_G5P_SYNC_SIGNAL. Needs DRM_G5P_CAP_SYNC_WAIT_3D. */
+#define DRM_G5P_SYNC_WAIT_3D (1U << 1)
+/* DRM_G5P_CAP_SYNC_WAIT_3D - drm_g5p_sync.flags accepts DRM_G5P_SYNC_WAIT_3D */
+#define DRM_G5P_CAP_SYNC_WAIT_3D (1ULL << 34)
+
 #endif

@@ -88,6 +88,32 @@ static bool pvr_g5p_serial_submits(void)
    return enabled;
 }
 
+static bool pvr_g5p_deplog(void)
+{
+   static int enabled = -1;
+   if (enabled < 0) {
+      const char *v = getenv("PVR_G5P_DEPLOG");
+      enabled = v ? strcmp(v, "0") != 0 : 0;
+   }
+   return enabled;
+}
+
+static bool pvr_g5p_waitonly_local(void)
+{
+   static int enabled = -1;
+   if (enabled < 0) {
+      const char *v = getenv("PVR_G5P_WAITONLY_LOCAL");
+      enabled = v ? strcmp(v, "0") != 0 : 1;
+   }
+   return enabled;
+}
+
+static uint32_t g5p_dep_submit;
+static int g5p_dep_pending(struct pvr_device *d, struct vk_sync *s)
+{
+   return vk_sync_wait(&d->vk, s, 0, VK_SYNC_WAIT_COMPLETE, 0) == VK_TIMEOUT;
+}
+
 static bool pvr_g5p_waitlog(void)
 {
    static int enabled = -1;
@@ -1102,6 +1128,12 @@ pvr_process_event_cmd_barrier(struct pvr_device *device,
    if (src_wait_count == 0)
       return VK_SUCCESS;
 
+   if (pvr_g5p_deplog() && (dst_mask & PVR_PIPELINE_STAGE_GEOM_BIT)) {
+      unsigned pending = 0;
+      for (unsigned k = 0; k < src_wait_count; k++) pending += g5p_dep_pending(device, wait_syncs[k].sync);
+      fprintf(stderr, "G5P dep: submit=%u barrier src=%#x dst=%#x pending=%u\n", g5p_dep_submit, src_mask, dst_mask, pending);
+   }
+
    u_foreach_bit (stage, dst_mask) {
       uint32_t wait_count = src_wait_count;
       struct vk_sync_signal signal;
@@ -1277,6 +1309,11 @@ pvr_process_event_cmd_wait(struct pvr_device *device,
       if (!wait_count)
          continue;
 
+      if (pvr_g5p_deplog() && stage == PVR_JOB_TYPE_GEOM) {
+         unsigned pending = 0;
+         for (unsigned k = 0; k < wait_count; k++) pending += g5p_dep_pending(device, waits[k].sync);
+         fprintf(stderr, "G5P dep: submit=%u event pending=%u\n", g5p_dep_submit, pending);
+      }
       if (queue->next_job_wait_sync[stage]) {
          waits[wait_count++] = (struct vk_sync_wait){
             .sync = queue->next_job_wait_sync[stage],
@@ -1583,9 +1620,11 @@ static VkResult pvr_clear_last_submits_syncs(struct pvr_queue *queue)
 
 static VkResult pvr_process_queue_signals(struct pvr_queue *queue,
                                           struct vk_sync_signal *signals,
-                                          uint32_t signal_count)
+                                          uint32_t signal_count,
+                                          const struct vk_sync_wait *extra, uint32_t extra_count)
 {
-   struct vk_sync_wait signal_waits[PVR_JOB_TYPE_MAX * 2];
+   STACK_ARRAY(struct vk_sync_wait, signal_waits, PVR_JOB_TYPE_MAX * 2 + extra_count);
+   if (!signal_waits) return vk_error(queue, VK_ERROR_OUT_OF_HOST_MEMORY);
    struct pvr_device *device = queue->device;
    VkResult result;
 
@@ -1622,20 +1661,26 @@ static VkResult pvr_process_queue_signals(struct pvr_queue *queue,
          };
       }
 
+      for (uint32_t k = 0; k < extra_count; k++)
+         signal_waits[wait_count++] = (struct vk_sync_wait){
+            .sync = extra[k].sync, .stage_mask = ~(VkPipelineStageFlags2)0, .wait_value = extra[k].wait_value };
       result = device->ws->ops->null_job_submit(device->ws,
                                                 signal_waits,
                                                 wait_count,
                                                 signal);
-      if (result != VK_SUCCESS)
+      if (result != VK_SUCCESS) {
+         STACK_ARRAY_FINISH(signal_waits);
          return result;
+      }
    }
 
+   STACK_ARRAY_FINISH(signal_waits);
    return VK_SUCCESS;
 }
 
 static VkResult pvr_process_queue_waits(struct pvr_queue *queue,
                                         struct vk_sync_wait *waits,
-                                        uint32_t wait_count)
+                                        uint32_t wait_count, uint32_t command_buffer_count)
 {
    struct pvr_device *device = queue->device;
    VkResult result;
@@ -1656,6 +1701,10 @@ static VkResult pvr_process_queue_waits(struct pvr_queue *queue,
             continue;
          }
 
+         if (pvr_g5p_deplog() && i == PVR_JOB_TYPE_GEOM)
+            fprintf(stderr, "G5P dep: submit=%u qwait dst=%#x pending=%u cbs=%u waits=%u\n",
+                    g5p_dep_submit, pvr_stage_mask_dst(waits[wait_idx].stage_mask),
+                    g5p_dep_pending(device, waits[wait_idx].sync), command_buffer_count, wait_count);
          stage_waits[stage_wait_count++] = (struct vk_sync_wait){
             .sync = waits[wait_idx].sync,
             .stage_mask = ~(VkPipelineStageFlags2)0,
@@ -1742,6 +1791,10 @@ static VkResult pvr_driver_queue_submit_jobs(struct vk_queue *queue,
    VkResult result;
 
    const int64_t g9p_tc = os_time_get_nano();
+   if (pvr_g5p_deplog()) g5p_dep_submit++;
+   /* a semaphore wait's second synchronization scope is its own batch; a batch
+    * without command buffers orders only its signals */
+   const bool waitonly_local = PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p) && !submit->command_buffer_count && submit->wait_count && pvr_g5p_waitonly_local();
    result = pvr_clear_last_submits_syncs(driver_queue);
    if (getenv("G9P_WAITLOG"))
       fprintf(stderr, "g9p: wait last submit %" PRId64 " us\n", (os_time_get_nano() - g9p_tc) / 1000);
@@ -1751,9 +1804,10 @@ static VkResult pvr_driver_queue_submit_jobs(struct vk_queue *queue,
    const int64_t g9p_tw = os_time_get_nano();
 
    if (submit->wait_count) {
+   if (submit->wait_count && !waitonly_local) {
       result = pvr_process_queue_waits(driver_queue,
                                        submit->waits,
-                                       submit->wait_count);
+                                       submit->wait_count, submit->command_buffer_count);
       if (result != VK_SUCCESS)
          return result;
    }
@@ -1777,7 +1831,9 @@ static VkResult pvr_driver_queue_submit_jobs(struct vk_queue *queue,
 
    result = pvr_process_queue_signals(driver_queue,
                                       submit->signals,
-                                      submit->signal_count);
+                                      submit->signal_count,
+                                      waitonly_local ? submit->waits : NULL,
+                                      waitonly_local ? submit->wait_count : 0);
    if (result != VK_SUCCESS)
       return result;
 

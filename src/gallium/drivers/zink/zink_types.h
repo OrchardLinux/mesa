@@ -691,6 +691,7 @@ struct zink_batch_state {
    /* these flags correspond to the matching cmdbufs */
    bool has_work;
    bool has_reordered_work;
+   VkPipelineStageFlags reordered_stages;
    bool has_unsync;
 };
 
@@ -1498,6 +1499,7 @@ struct zink_video_format_prop {
 #define ZINK_OBJ_CACHE_BUCKET_BITS 10
 
 struct zink_screen {
+   bool precise_sync;
    struct pipe_screen base;
 
    const char *vendor_name;
