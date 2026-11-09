@@ -1614,6 +1614,9 @@ void pvr_rogue_CmdUpdateBuffer(VkCommandBuffer commandBuffer,
 
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
 
+   PVR_G5P_HOOK(update_buffer, cmd_buffer, dstBuffer, dstOffset, dataSize, pData)
+
+
    result =
       pvr_arch_cmd_buffer_upload_general(cmd_buffer, pData, dataSize, &pvr_bo);
    if (result != VK_SUCCESS)
@@ -1637,6 +1640,9 @@ void pvr_rogue_CmdCopyBuffer2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(pvr_cmd_buffer, cmd_buffer, commandBuffer);
 
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
+
+   PVR_G5P_HOOK(copy_buffer, cmd_buffer, pCopyBufferInfo)
+
 
    PVR_TRACE_BEGIN_TRANSFER(cmd_buffer, PVR_TRANSFER_OP_COPY_BUFFER);
 
@@ -1668,6 +1674,9 @@ void pvr_rogue_CmdFillBuffer(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(pvr_buffer, dst, dstBuffer);
 
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
+
+   PVR_G5P_HOOK(fill_buffer, cmd_buffer, dstBuffer, dstOffset, fillSize, data)
+
 
    PVR_TRACE_BEGIN_TRANSFER(cmd_buffer, PVR_TRANSFER_OP_COPY_BUFFER);
 

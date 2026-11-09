@@ -161,6 +161,7 @@ if with_imagination_g5p
     'pvr_arch_g5p_perf.c',
     'pvr_arch_g5p_vdm.c',
     'pvr_arch_g5p_meta.c',
+    'pvr_arch_g5p_copy.c',
   )
   pvr_files += files(
     'pvr_g5p_formats.c',

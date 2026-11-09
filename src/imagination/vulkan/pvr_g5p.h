@@ -391,6 +391,11 @@ VkResult PVR_PER_ARCH(g5p_cmd_draw_indexed)(struct pvr_cmd_buffer *cmd_buffer, u
 VkResult PVR_PER_ARCH(g5p_device_init)(struct pvr_device *device);
 VkResult PVR_PER_ARCH(g5p_meta_init)(struct pvr_device *device);
 void PVR_PER_ARCH(g5p_meta_finish)(struct pvr_device *device);
+bool PVR_PER_ARCH(g5p_meta_copy_buffer)(struct pvr_cmd_buffer *, const VkCopyBufferInfo2 *);
+bool PVR_PER_ARCH(g5p_meta_fill_buffer)(struct pvr_cmd_buffer *, VkBuffer, VkDeviceSize, VkDeviceSize, uint32_t);
+bool PVR_PER_ARCH(g5p_meta_update_buffer)(struct pvr_cmd_buffer *, VkBuffer, VkDeviceSize, VkDeviceSize, const void *);
+void PVR_PER_ARCH(g5p_transfer_summary)(bool gpu, uint64_t wait_ns, uint64_t cpu_ns,
+                                      unsigned commands, unsigned kept, unsigned skipped);
 bool PVR_PER_ARCH(g5p_meta_blit)(struct pvr_cmd_buffer *cmd_buffer, const VkBlitImageInfo2 *info);
 void PVR_PER_ARCH(g5p_device_finish)(struct pvr_device *device);
 VkResult PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer,
@@ -402,6 +407,10 @@ uint32_t PVR_PER_ARCH(g5p_frag_stream)(const struct pvr_device *device,
                                        uint32_t size);
 
 #   define pvr_arch_g5p_device_init PVR_PER_ARCH(g5p_device_init)
+#   define pvr_arch_g5p_meta_copy_buffer PVR_PER_ARCH(g5p_meta_copy_buffer)
+#   define pvr_arch_g5p_meta_fill_buffer PVR_PER_ARCH(g5p_meta_fill_buffer)
+#   define pvr_arch_g5p_meta_update_buffer PVR_PER_ARCH(g5p_meta_update_buffer)
+#   define pvr_arch_g5p_transfer_summary PVR_PER_ARCH(g5p_transfer_summary)
 #   define pvr_arch_g5p_meta_blit PVR_PER_ARCH(g5p_meta_blit)
 #   define pvr_arch_g5p_device_finish PVR_PER_ARCH(g5p_device_finish)
 #   define pvr_arch_g5p_job_init PVR_PER_ARCH(g5p_job_init)

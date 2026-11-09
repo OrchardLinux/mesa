@@ -16,7 +16,10 @@
 static inline bool pvr_g5p_tbo_probe(void)
 {
    const char *s = getenv("PVR_G5P_TEXEL_BUFFER");
-   return s && !strcmp(s, "probe");
+   const char *copy = getenv("PVR_G5P_GPU_COPY");
+   /* Stage 1 meta copies use the same buffer-fetch lowering and descriptors. */
+   return (s && !strcmp(s, "probe")) ||
+          (copy && (!strcmp(copy, "1") || !strcmp(copy, "true") || !strcmp(copy, "yes")));
 }
 
 #endif

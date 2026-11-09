@@ -336,6 +336,17 @@
        ((result) = pvr_g5p_image_format_check((info), (tiling))) != VK_SUCCESS) \
       goto err_unsupported_format;
 
+
+#define PVR_G5P_HOOK_copy_buffer(cmd, info) \
+   if (PVR_HAS_FEATURE(&(cmd)->device->pdevice->dev_info, apple_g5p) && \
+       pvr_arch_g5p_meta_copy_buffer(cmd, info)) return;
+#define PVR_G5P_HOOK_fill_buffer(cmd, dst, off, size, data) \
+   if (PVR_HAS_FEATURE(&(cmd)->device->pdevice->dev_info, apple_g5p) && \
+       pvr_arch_g5p_meta_fill_buffer(cmd, dst, off, size, data)) return;
+#define PVR_G5P_HOOK_update_buffer(cmd, dst, off, size, data) \
+   if (PVR_HAS_FEATURE(&(cmd)->device->pdevice->dev_info, apple_g5p) && \
+       pvr_arch_g5p_meta_update_buffer(cmd, dst, off, size, data)) return;
+
 #endif /* PVR_G5P_HOOKS_H */
 
 /* The per-arch functions of the hooks, guarded on their own (as
