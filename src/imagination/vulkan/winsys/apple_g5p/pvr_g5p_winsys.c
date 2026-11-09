@@ -1430,7 +1430,7 @@ static VkResult g5p_ws_render_submit(const struct pvr_winsys_render_ctx *ctx,
    if (busy_retries)
       mesa_logw("apple_g5p render: backpressure context=%u retries=%u accepted=%u job=%" PRIu64 " result=%d",
                 c->context, busy_retries, accepted, job_id, r);
-   if (ws->perf.log >= 2)
+   if (ws->perf.log >= 3)
       fprintf(stderr, "G5P perf submit pid=%ld context=%u job=%" PRIu64 " start_ns=%" PRIu64
               " elapsed_us=%" PRIu64 " width=%u height=%u flags=%#x vdm=%u retries=%u result=%d\n",
               (long)getpid(), c->context, job_id, t0, (g5p_ws_perf_now() - t0) / 1000,

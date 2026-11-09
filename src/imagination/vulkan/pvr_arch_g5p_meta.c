@@ -31,6 +31,9 @@
 #include "pvr_g5p.h"
 #include "pvr_image.h"
 
+
+DEBUG_GET_ONCE_NUM_OPTION(g5p_perf_log, "PVR_G5P_PERF_LOG", 0)
+
 static VkResult
 g5p_meta_bind_map_buffer(struct vk_command_buffer *vk_cmd, struct vk_meta_device *meta, VkBuffer _buffer,
                          void **map_out)
@@ -233,7 +236,7 @@ PVR_PER_ARCH(g5p_meta_blit)(struct pvr_cmd_buffer *cmd_buffer, const VkBlitImage
       for (uint32_t i = 0; i < ARRAY_SIZE(cmd_buffer->state.barriers_needed); i++)
          cmd_buffer->state.barriers_needed[i] |= PVR_PIPELINE_STAGE_TRANSFER_BIT;
    }
-   if (getenv("PVR_G5P_PERF_LOG") && strtoul(getenv("PVR_G5P_PERF_LOG"), NULL, 0) >= 2) {
+   if (debug_get_option_g5p_perf_log() >= 3) {
       VK_FROM_HANDLE(pvr_image, src, info->srcImage);
       VK_FROM_HANDLE(pvr_image, dst, info->dstImage);
       fprintf(stderr, "G5P perf gpu-blit src=%s %ux%u dst=%s %ux%u regions=%u filter=%d rendered=%d\n",

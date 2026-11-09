@@ -184,7 +184,7 @@ g5p_ws_perf_account(struct g5p_ws_perf *p, const struct drm_g5p_render_resource 
          own_w += i >= chunks;
       }
    }
-   if (p->log >= 2)
+   if (p->log >= 3)
       fprintf(stderr,
               "G5P perf job res=%u chunks=%u own=%u own_written=%u omitted=%u writes_known=%d reads_known=%d vdm=%u pre=%" PRIu64 " post=%" PRIu64
               " arena_lo=+%#" PRIx64 " submit_us=%" PRIu64

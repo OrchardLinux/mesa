@@ -17,8 +17,10 @@
  */
 
 #include <assert.h>
+#include <pthread.h>
 #include <inttypes.h>
 #include <stdlib.h>
+#include "util/u_debug.h"
 #include <string.h>
 
 #include "vk_format.h"
@@ -39,6 +41,9 @@
 #include "pvr_image.h"
 #include "pvr_job_transfer.h"
 #include "winsys/apple_g5p/pvr_g5p_winsys.h"
+
+DEBUG_GET_ONCE_NUM_OPTION(g5p_perf_log, "PVR_G5P_PERF_LOG", 0)
+
 
 struct g5p_surface {
    uint8_t *base;
@@ -754,15 +759,16 @@ g5p_run(struct pvr_device *device, const struct pvr_transfer_cmd *cmd, bool log)
 
 VkResult
 PVR_PER_ARCH(g5p_transfer_submit)(struct pvr_device *device, struct pvr_sub_cmd_transfer *sub_cmd,
-                                  struct vk_sync *wait_sync, struct vk_sync *signal_sync)
+                                  const struct vk_sync_wait *waits, uint32_t wait_count, struct vk_sync *signal_sync)
 {
    VkResult result;
-   const char *perf = getenv("PVR_G5P_PERF_LOG");
-   const bool log = perf && strtoul(perf, NULL, 0) >= 2;
+   const int level = debug_get_option_g5p_perf_log();
+   const bool log = level >= 2;
    const uint64_t start = log ? os_time_get_nano() : 0;
 
-   if (wait_sync) {
-      result = vk_sync_wait(&device->vk, wait_sync, 0, VK_SYNC_WAIT_COMPLETE, UINT64_MAX);
+   if (wait_count) {
+      result = vk_sync_wait_many(&device->vk, wait_count, waits,
+                                 VK_SYNC_WAIT_COMPLETE, UINT64_MAX);
       if (result != VK_SUCCESS)
          return result;
    }
@@ -770,11 +776,33 @@ PVR_PER_ARCH(g5p_transfer_submit)(struct pvr_device *device, struct pvr_sub_cmd_
    unsigned commands = 0;
    list_for_each_entry (struct pvr_transfer_cmd, cmd, sub_cmd->transfer_cmds, link) {
       commands++;
-      if (!g5p_run(device, cmd, log))
+      if (!g5p_run(device, cmd, level >= 3))
          return vk_errorf(device, VK_ERROR_DEVICE_LOST,
                           "G5P transfer surface exceeds its stable BO mapping");
    }
-   if (log)
+   if (log) {
+      static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+      static struct {
+         uint64_t count, wait_ns, cpu_ns, commands, waits_kept, waits_skipped;
+      } totals;
+      const uint64_t end = os_time_get_nano();
+      pthread_mutex_lock(&lock);
+      totals.count++;
+      totals.wait_ns += ready - start;
+      totals.cpu_ns += end - ready;
+      totals.commands += commands;
+      totals.waits_kept += wait_count;
+      totals.waits_skipped += sub_cmd->g5p_waits_skipped;
+      if (totals.count == 120) {
+         fprintf(stderr, "G5P perf transfer-summary n=%" PRIu64 " wait_us=%" PRIu64
+                 " cpu_us=%" PRIu64 " cmds=%" PRIu64 " waits_kept=%" PRIu64
+                 " waits_skipped=%" PRIu64 "\n", totals.count, totals.wait_ns / 1000,
+                 totals.cpu_ns / 1000, totals.commands, totals.waits_kept, totals.waits_skipped);
+         memset(&totals, 0, sizeof(totals));
+      }
+      pthread_mutex_unlock(&lock);
+   }
+   if (level >= 3)
       fprintf(stderr, "G5P perf transfer pid=%ld start_ns=%" PRIu64 " wait_us=%" PRIu64
               " cpu_us=%" PRIu64 " commands=%u\n", (long)getpid(), start,
               (ready - start) / 1000, (os_time_get_nano() - ready) / 1000, commands);

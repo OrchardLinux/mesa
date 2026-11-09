@@ -281,6 +281,9 @@ struct pvr_sub_cmd_compute {
 };
 
 struct pvr_sub_cmd_transfer {
+#ifdef PVR_APPLE_G5P
+   uint32_t g5p_waits_skipped;
+#endif
    bool serialize_with_frag;
 
    /* Pointer to the actual transfer command list, allowing primary and

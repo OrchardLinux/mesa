@@ -40,7 +40,7 @@
  * own BO (the reads rule off, the other two on).
  * PVR_G5P_PERF_LOG=1: a summary line every 120 jobs (bytes the jobs named
  * for maintenance, before and after the job, and the submit ioctl's time);
- * =2: one line per job. Both count the jobs whose pass has no draw (a stream of
+ * =3: one line per job. Both count the jobs whose pass has no draw (a stream of
  * under G5P_PERF_DRAWLESS_VDM bytes: the terminate and its PPP block).
  *
  * The rule is the A9 ICD's (Mesa g5p-perf60-hypr 139fe06c167: cache

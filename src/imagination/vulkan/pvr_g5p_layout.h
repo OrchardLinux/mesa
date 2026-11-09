@@ -15,6 +15,7 @@
 struct pvr_device;
 struct pvr_sub_cmd_transfer;
 struct vk_sync;
+struct vk_sync_wait;
 
 #ifdef PVR_PER_ARCH
 
@@ -22,7 +23,7 @@ struct vk_sync;
  * unless one of them needs what only this file's copies do (a blit from a
  * block-compressed image, decoded per 4x4 block) */
 VkResult PVR_PER_ARCH(g5p_transfer_submit)(struct pvr_device *device, struct pvr_sub_cmd_transfer *sub_cmd,
-                                           struct vk_sync *wait_sync, struct vk_sync *signal_sync);
+                                           const struct vk_sync_wait *waits, uint32_t wait_count, struct vk_sync *signal_sync);
 #   define pvr_arch_g5p_transfer_submit PVR_PER_ARCH(g5p_transfer_submit)
 
 #endif /* PVR_PER_ARCH */

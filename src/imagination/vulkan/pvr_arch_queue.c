@@ -31,6 +31,9 @@
 
 #include "util/os_time.h"
 #include "pvr_g9p.h"
+#ifdef PVR_APPLE_G5P
+#include "winsys/apple_g5p/pvr_g5p_winsys.h"
+#endif
 #include "pvr_queue.h"
 #include "pvr_rt_dataset.h"
 
@@ -241,6 +244,18 @@ err_queues_finish:
 
 static void pvr_queue_finish(struct pvr_queue *queue)
 {
+#ifdef PVR_APPLE_G5P
+   for (uint32_t i = 0; i < ARRAY_SIZE(queue->g5p_inflight); i++) {
+      if (queue->g5p_inflight[i].done)
+         vk_sync_destroy(&queue->device->vk, queue->g5p_inflight[i].done);
+   }
+   if (queue->g5p_inflight_overflow)
+      vk_sync_destroy(&queue->device->vk, queue->g5p_inflight_overflow);
+   for (uint32_t i = 0; i < PVR_JOB_TYPE_MAX; i++) {
+      if (queue->g5p_sem_wait[i])
+         vk_sync_destroy(&queue->device->vk, queue->g5p_sem_wait[i]);
+   }
+#endif
    for (uint32_t i = 0; i < ARRAY_SIZE(queue->next_job_wait_sync); i++) {
       if (queue->next_job_wait_sync[i])
          vk_sync_destroy(&queue->device->vk, queue->next_job_wait_sync[i]);
@@ -284,6 +299,12 @@ static void pvr_update_job_syncs(struct pvr_device *device,
                       queue->last_job_signal_sync[submitted_job_type]);
    }
 
+#ifdef PVR_APPLE_G5P
+   if (queue->g5p_sem_wait[submitted_job_type]) {
+      vk_sync_destroy(&device->vk, queue->g5p_sem_wait[submitted_job_type]);
+      queue->g5p_sem_wait[submitted_job_type] = NULL;
+   }
+#endif
    queue->last_job_signal_sync[submitted_job_type] = new_signal_sync;
 }
 
@@ -312,6 +333,131 @@ g5p_merge_syncs(struct pvr_device *device, struct vk_sync *a, struct vk_sync *b,
    }
    return result;
 }
+
+/* Retain completions independently of last_job_signal_sync ownership. */
+static VkResult
+g5p_track_job(struct pvr_queue *queue, struct vk_sync *done,
+              const struct pvr_g5p_job *job)
+{
+   struct pvr_device *device = queue->device;
+   struct pvr_g5p_inflight next = {0};
+   VkResult result = g5p_merge_syncs(device, done, NULL, &next.done);
+   if (result != VK_SUCCESS)
+      return result;
+   if (job) {
+      next.known = !job->reads.unknown &&
+                   (job->perf.flags & G5P_PERF_WRITES_KNOWN) &&
+                   job->reads.count <= G5P_PERF_MAX_READS &&
+                   job->perf.writes <= G5P_PERF_MAX_WRITES;
+      if (next.known) {
+         next.reads = job->reads.count;
+         memcpy(next.r_base, job->reads.va, next.reads * sizeof(uint64_t));
+         memcpy(next.r_size, job->reads.size, next.reads * sizeof(uint64_t));
+         next.writes = job->perf.writes;
+         for (uint32_t i = 0; i < next.writes; i++)
+            next.known &= pvr_g5p_winsys_bo_range(device->ws, job->perf.write_va[i],
+                                                 &next.w_base[i], &next.w_size[i]);
+      }
+   }
+   struct pvr_g5p_inflight *slot =
+      &queue->g5p_inflight[queue->g5p_inflight_head % ARRAY_SIZE(queue->g5p_inflight)];
+   if (slot->done && vk_sync_wait(&device->vk, slot->done, 0,
+                                  VK_SYNC_WAIT_COMPLETE, 0) != VK_SUCCESS) {
+      struct vk_sync *overflow;
+      result = g5p_merge_syncs(device, queue->g5p_inflight_overflow, slot->done, &overflow);
+      if (result != VK_SUCCESS) {
+         vk_sync_destroy(&device->vk, next.done);
+         return result;
+      }
+      if (queue->g5p_inflight_overflow)
+         vk_sync_destroy(&device->vk, queue->g5p_inflight_overflow);
+      queue->g5p_inflight_overflow = overflow;
+   }
+   if (slot->done)
+      vk_sync_destroy(&device->vk, slot->done);
+   *slot = next;
+   queue->g5p_inflight_head++;
+   return VK_SUCCESS;
+}
+
+static bool
+g5p_ranges_overlap(uint64_t a, uint64_t as, uint64_t b, uint64_t bs)
+{
+   return a <= b ? b - a < as : a - b < bs;
+}
+
+static VkResult
+g5p_transfer_submit(struct pvr_device *device, struct pvr_queue *queue,
+                     struct pvr_sub_cmd_transfer *sub_cmd, struct vk_sync **signal)
+{
+   bool known = true;
+   bool hazards[16] = {0};
+   struct vk_sync_wait waits[18]; /* ring, overflow, semaphore waits */
+   uint32_t count = 0, candidates = 0;
+   VkResult result;
+   list_for_each_entry (struct pvr_transfer_cmd, cmd, sub_cmd->transfer_cmds, link) {
+      /* Resolve each touched surface to a whole BO; no fixed-size transfer set. */
+      for (uint32_t src = 0; src <= cmd->source_count; src++) {
+         uint64_t base, size;
+         const uint64_t addr = src ? cmd->sources[src - 1].surface.dev_addr.addr : cmd->dst.dev_addr.addr;
+         if (!pvr_g5p_winsys_bo_range(device->ws, addr, &base, &size)) {
+            known = false;
+            continue;
+         }
+         for (uint32_t i = 0; i < ARRAY_SIZE(queue->g5p_inflight); i++) {
+            const struct pvr_g5p_inflight *slot = &queue->g5p_inflight[i];
+            for (uint32_t w = 0; w < slot->writes; w++)
+               hazards[i] |= g5p_ranges_overlap(base, size, slot->w_base[w], slot->w_size[w]);
+            if (!src)
+               for (uint32_t r = 0; r < slot->reads; r++)
+                  hazards[i] |= g5p_ranges_overlap(base, size, slot->r_base[r], slot->r_size[r]);
+         }
+      }
+   }
+   if (!known) {
+      if (queue->next_job_wait_sync[PVR_JOB_TYPE_TRANSFER])
+         waits[count++] = (struct vk_sync_wait){
+            .sync = queue->next_job_wait_sync[PVR_JOB_TYPE_TRANSFER],
+            .stage_mask = ~(VkPipelineStageFlags2)0 };
+   } else {
+      for (uint32_t i = 0; i < ARRAY_SIZE(queue->g5p_inflight); i++) {
+         const struct pvr_g5p_inflight *slot = &queue->g5p_inflight[i];
+         if (!slot->done)
+            continue;
+         candidates++;
+         if (!slot->known || hazards[i])
+            waits[count++] = (struct vk_sync_wait){
+               .sync = slot->done, .stage_mask = ~(VkPipelineStageFlags2)0 };
+      }
+   }
+   sub_cmd->g5p_waits_skipped = known ? candidates - count : 0;
+   /* Overflow covers jobs evicted even before a barrier was recorded. */
+   if (known && queue->g5p_inflight_overflow)
+      waits[count++] = (struct vk_sync_wait){
+         .sync = queue->g5p_inflight_overflow, .stage_mask = ~(VkPipelineStageFlags2)0 };
+   if (known && queue->g5p_sem_wait[PVR_JOB_TYPE_TRANSFER])
+      waits[count++] = (struct vk_sync_wait){
+         .sync = queue->g5p_sem_wait[PVR_JOB_TYPE_TRANSFER], .stage_mask = ~(VkPipelineStageFlags2)0 };
+   result = pvr_arch_g5p_transfer_submit(device, sub_cmd, waits, count, *signal);
+   if (result != VK_SUCCESS)
+      return result;
+   if (known && queue->g5p_inflight_overflow) {
+      vk_sync_destroy(&device->vk, queue->g5p_inflight_overflow);
+      queue->g5p_inflight_overflow = NULL;
+   }
+   /* Preserve execution-dependency chains without delaying the CPU copy. */
+   if (known && queue->next_job_wait_sync[PVR_JOB_TYPE_TRANSFER]) {
+      struct vk_sync *merged;
+      result = g5p_merge_syncs(device, *signal,
+                              queue->next_job_wait_sync[PVR_JOB_TYPE_TRANSFER], &merged);
+      if (result != VK_SUCCESS)
+         return result;
+      vk_sync_destroy(&device->vk, *signal);
+      *signal = merged;
+   }
+   return VK_SUCCESS;
+}
+
 #endif
 
 static VkResult
@@ -604,6 +750,14 @@ pvr_process_graphics_cmd_for_view(struct pvr_device *device,
       }
    }
 
+#ifdef PVR_APPLE_G5P
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p)) {
+      result = g5p_track_job(queue, job->run_frag ? frag_signal_sync : geom_signal_sync,
+                             job->run_frag ? &job->g5p : NULL);
+      if (result != VK_SUCCESS)
+         goto err_destroy_frag_sync;
+   }
+#endif
    pvr_update_job_syncs(device, queue, geom_signal_sync, PVR_JOB_TYPE_GEOM);
 
    if (job->run_frag)
@@ -735,6 +889,15 @@ static VkResult pvr_process_compute_cmd(struct pvr_device *device,
    else if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p) && getenv("G9P_SYNC"))
       fprintf(stderr, "g9p: compute job done\n");
 
+#ifdef PVR_APPLE_G5P
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p)) {
+      result = g5p_track_job(queue, sync, NULL);
+      if (result != VK_SUCCESS) {
+         vk_sync_destroy(&device->vk, sync);
+         return result;
+      }
+   }
+#endif
    pvr_update_job_syncs(device, queue, sync, PVR_JOB_TYPE_COMPUTE);
 
    return result;
@@ -761,11 +924,7 @@ static VkResult pvr_process_transfer_cmds(struct pvr_device *device,
     * only the A9's copies know (pvr_g5p_layout.h)
     */
    if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p))
-      result = pvr_arch_g5p_transfer_submit(
-         device,
-         sub_cmd,
-         queue->next_job_wait_sync[PVR_JOB_TYPE_TRANSFER],
-         sync);
+      result = g5p_transfer_submit(device, queue, sub_cmd, &sync);
    else
 #endif
    /* G9P: no GPU transfer path yet; done by the CPU */
@@ -899,6 +1058,15 @@ static VkResult pvr_process_query_cmd(struct pvr_device *device,
       return result;
    }
 
+#ifdef PVR_APPLE_G5P
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p)) {
+      result = g5p_track_job(queue, sync, NULL);
+      if (result != VK_SUCCESS) {
+         vk_sync_destroy(&device->vk, sync);
+         return result;
+      }
+   }
+#endif
    pvr_update_job_syncs(device, queue, sync, PVR_JOB_TYPE_QUERY);
 
    return result;
@@ -1397,6 +1565,12 @@ static VkResult pvr_clear_last_submits_syncs(struct pvr_queue *queue)
          vk_sync_destroy(&queue->device->vk, queue->next_job_wait_sync[i]);
          queue->next_job_wait_sync[i] = NULL;
       }
+#ifdef PVR_APPLE_G5P
+      if (queue->g5p_sem_wait[i]) {
+         vk_sync_destroy(&queue->device->vk, queue->g5p_sem_wait[i]);
+         queue->g5p_sem_wait[i] = NULL;
+      }
+#endif
 
       if (queue->last_job_signal_sync[i]) {
          vk_sync_destroy(&queue->device->vk, queue->last_job_signal_sync[i]);
@@ -1492,6 +1666,29 @@ static VkResult pvr_process_queue_waits(struct pvr_queue *queue,
       if (!stage_wait_count)
          continue;
 
+#ifdef PVR_APPLE_G5P
+      if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p)) {
+         struct vk_sync *sem_wait;
+         uint32_t sem_count = stage_wait_count;
+         if (queue->g5p_sem_wait[i])
+            stage_waits[sem_count++] = (struct vk_sync_wait){
+               .sync = queue->g5p_sem_wait[i], .stage_mask = ~(VkPipelineStageFlags2)0 };
+         result = vk_sync_create(&device->vk, &device->pdevice->ws->syncobj_type,
+                                 0U, 0UL, &sem_wait);
+         if (result != VK_SUCCESS)
+            goto err_free_waits;
+         struct vk_sync_signal sem_signal = {
+            .sync = sem_wait, .stage_mask = ~(VkPipelineStageFlags2)0 };
+         result = device->ws->ops->null_job_submit(device->ws, stage_waits, sem_count, &sem_signal);
+         if (result != VK_SUCCESS) {
+            vk_sync_destroy(&device->vk, sem_wait);
+            goto err_free_waits;
+         }
+         if (queue->g5p_sem_wait[i])
+            vk_sync_destroy(&device->vk, queue->g5p_sem_wait[i]);
+         queue->g5p_sem_wait[i] = sem_wait;
+      }
+#endif
       if (queue->next_job_wait_sync[i]) {
          prev_wait = queue->next_job_wait_sync[i];
          stage_waits[stage_wait_count++] = (struct vk_sync_wait){
