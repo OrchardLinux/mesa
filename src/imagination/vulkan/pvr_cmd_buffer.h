@@ -17,6 +17,7 @@
 #include "vk_command_buffer.h"
 
 #include "pvr_common.h"
+#include "util/ralloc.h"
 #include "pvr_framebuffer.h"
 #include "pvr_job_render.h"
 #include "pvr_hw_pass.h"
@@ -682,6 +683,18 @@ struct pvr_cmd_buffer {
 
    /* List of pvr_bo structs associated with this cmd buffer. */
    struct list_head bo_list;
+#ifdef PVR_APPLE_G5P
+   /* G5P: per-draw uploads (pvr_arch_cmd_buffer_upload_general(), data-only
+    * pvr_arch_cmd_buffer_upload_pds()) are carved from blocks this command
+    * buffer owns: one pvr_bo_suballoc() per block, not per upload.
+    * [0] general heap, [1] PDS heap. A block is on bo_list; the views
+    * handed out live in g5p_views and are never freed one by one. */
+   struct {
+      struct pvr_suballoc_bo *block;
+      uint32_t used;
+   } g5p_upload[2];
+   struct linear_ctx *g5p_views;
+#endif
 
    struct list_head sub_cmds;
 

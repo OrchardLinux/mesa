@@ -28,6 +28,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <vulkan/vulkan.h>
 #include "pvr_g5p_ds_hooks.h"
@@ -88,6 +89,73 @@
 #include "vk_synchronization.h"
 #include "pvr_g9p.h"
 #include "vk_util.h"
+
+#ifdef PVR_APPLE_G5P
+#define G5P_UPLOAD_BLOCK_SIZE (64u * 1024u)
+#define G5P_UPLOAD_MAX (4u * 1024u) /* larger uploads keep the device suballocator */
+
+static bool g5p_upload_arena_on(const struct pvr_device *device)
+{
+   static int on = -1;
+   if (on < 0) {
+      const char *v = getenv("PVR_G5P_UPLOAD_ARENA");
+      on = !(v && !strcmp(v, "0"));
+   }
+   return on && PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p);
+}
+
+/* A view into this command buffer's block for heap idx (0 general, 1 PDS).
+ * Returns VK_NOT_READY when the request doesn't fit the scheme (too large or
+ * over-aligned): the caller then takes the old path. */
+static VkResult g5p_upload_alloc(struct pvr_cmd_buffer *cmd_buffer, unsigned idx, uint32_t size, uint32_t align,
+                                 struct pvr_suballoc_bo **out)
+{
+   struct pvr_device *device = cmd_buffer->device;
+   const uint32_t line = pvr_get_slc_cache_line_size(&device->pdevice->dev_info);
+   uint32_t aligned_size, offset;
+
+   if (!util_is_power_of_two_nonzero(align) || align > line)
+      return VK_NOT_READY;
+   /* same contract as pvr_bo_suballoc(): every upload starts and ends on an SLC line */
+   align = MAX2(align, line);
+   aligned_size = ALIGN_POT(size, align);
+   if (aligned_size > G5P_UPLOAD_MAX)
+      return VK_NOT_READY;
+
+   offset = cmd_buffer->g5p_upload[idx].block ? ALIGN_POT(cmd_buffer->g5p_upload[idx].used, align) : 0;
+   if (!cmd_buffer->g5p_upload[idx].block ||
+       offset + aligned_size > cmd_buffer->g5p_upload[idx].block->size) {
+      struct pvr_suballocator *allocator = idx ? &device->suballoc_pds : &device->suballoc_general;
+      struct pvr_suballoc_bo *block;
+      VkResult result = pvr_bo_suballoc(allocator, G5P_UPLOAD_BLOCK_SIZE, line, false, &block);
+      if (result != VK_SUCCESS)
+         return result;
+      list_add(&block->link, &cmd_buffer->bo_list);
+      cmd_buffer->g5p_upload[idx].block = block;
+      cmd_buffer->g5p_upload[idx].used = 0;
+      offset = 0;
+   }
+   if (!cmd_buffer->g5p_views) {
+      cmd_buffer->g5p_views = linear_context(NULL);
+      if (!cmd_buffer->g5p_views)
+         return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+   }
+   struct pvr_suballoc_bo *view = linear_zalloc_child(cmd_buffer->g5p_views, sizeof(*view));
+   if (!view)
+      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   const struct pvr_suballoc_bo *block = cmd_buffer->g5p_upload[idx].block;
+   list_inithead(&view->link);
+   view->allocator = NULL; /* a view: never on bo_list, never passed to pvr_bo_suballoc_free() */
+   view->bo = block->bo;
+   view->dev_addr = PVR_DEV_ADDR_OFFSET(block->dev_addr, offset);
+   view->offset = block->offset + offset;
+   view->size = aligned_size;
+   cmd_buffer->g5p_upload[idx].used = offset + aligned_size;
+   *out = view;
+   return VK_SUCCESS;
+}
+#endif
 
 /* Structure used to pass data into pvr_compute_generate_control_stream()
  * function.
@@ -217,6 +285,14 @@ static void pvr_cmd_buffer_free_resources(struct pvr_cmd_buffer *cmd_buffer)
    util_dynarray_fini(&cmd_buffer->state.query_indices);
 
    pvr_cmd_buffer_free_sub_cmds(cmd_buffer);
+
+#ifdef PVR_APPLE_G5P
+   memset(cmd_buffer->g5p_upload, 0, sizeof(cmd_buffer->g5p_upload));
+   if (cmd_buffer->g5p_views) {
+      linear_free_context(cmd_buffer->g5p_views);
+      cmd_buffer->g5p_views = NULL;
+   }
+#endif
 
    list_for_each_entry_safe (struct pvr_suballoc_bo,
                              suballoc_bo,
@@ -480,6 +556,21 @@ pvr_arch_cmd_buffer_upload_general(struct pvr_cmd_buffer *const cmd_buffer,
    struct pvr_suballoc_bo *suballoc_bo;
    VkResult result;
 
+#ifdef PVR_APPLE_G5P
+   if (g5p_upload_arena_on(device)) {
+      struct pvr_suballoc_bo *view;
+      VkResult r = g5p_upload_alloc(cmd_buffer, 0, size, cache_line_size, &view);
+      if (r == VK_SUCCESS) {
+         if (data)
+            memcpy(pvr_bo_suballoc_get_map_addr(view), data, size);
+         *pvr_bo_out = view;
+         return VK_SUCCESS;
+      }
+      if (r != VK_NOT_READY)
+         return pvr_cmd_buffer_set_error_unwarned(cmd_buffer, r);
+   }
+#endif
+
    result = pvr_gpu_upload(device,
                            device->heaps.general_heap,
                            data,
@@ -536,6 +627,29 @@ pvr_arch_cmd_buffer_upload_pds(struct pvr_cmd_buffer *const cmd_buffer,
 {
    struct pvr_device *const device = cmd_buffer->device;
    VkResult result;
+
+#ifdef PVR_APPLE_G5P
+   if (g5p_upload_arena_on(device) && !code && data && data_size_dwords) {
+      const uint32_t data_size = PVR_DW_TO_BYTES(data_size_dwords);
+      const uint32_t aligned = ALIGN_POT(data_size, data_alignment);
+      const uint32_t align = MAX2((uint32_t)min_alignment, data_alignment);
+      struct pvr_suballoc_bo *view;
+      VkResult r = g5p_upload_alloc(cmd_buffer, 1, aligned, align, &view);
+      if (r == VK_SUCCESS) {
+         uint8_t *map = pvr_bo_suballoc_get_map_addr(view);
+         memcpy(map, data, data_size);
+         memset(map + data_size, 0, view->size - data_size);
+         pds_upload_out->pvr_bo = view;
+         pds_upload_out->data_offset = view->dev_addr.addr - device->heaps.pds_heap->base_addr.addr;
+         pds_upload_out->data_size = aligned / 4;
+         pds_upload_out->code_offset = 0;
+         pds_upload_out->code_size = 0;
+         return VK_SUCCESS;
+      }
+      if (r != VK_NOT_READY)
+         return pvr_cmd_buffer_set_error_unwarned(cmd_buffer, r);
+   }
+#endif
 
    result = pvr_gpu_upload_pds(device,
                                data,

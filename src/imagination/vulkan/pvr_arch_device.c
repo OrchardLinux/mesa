@@ -849,11 +849,23 @@ VkResult PVR_PER_ARCH(create_device)(struct pvr_physical_device *pdevice,
    pvr_bo_suballocator_init(&device->suballoc_general,
                             device->heaps.general_heap,
                             device,
+#ifdef PVR_APPLE_G5P
+                            PVR_HAS_FEATURE(&pdevice->dev_info, apple_g5p)
+                               ? 512 * 1024
+                               : PVR_SUBALLOCATOR_GENERAL_SIZE);
+#else
                             PVR_SUBALLOCATOR_GENERAL_SIZE);
+#endif
    pvr_bo_suballocator_init(&device->suballoc_pds,
                             device->heaps.pds_heap,
                             device,
+#ifdef PVR_APPLE_G5P
+                            PVR_HAS_FEATURE(&pdevice->dev_info, apple_g5p)
+                               ? 512 * 1024
+                               : PVR_SUBALLOCATOR_PDS_SIZE);
+#else
                             PVR_SUBALLOCATOR_PDS_SIZE);
+#endif
    pvr_bo_suballocator_init(&device->suballoc_transfer,
                             device->heaps.transfer_frag_heap,
                             device,
