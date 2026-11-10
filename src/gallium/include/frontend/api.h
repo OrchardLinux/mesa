@@ -205,6 +205,7 @@ struct st_config_options
    bool force_gl_depth_component_type_int;
    bool transcode_etc;
    bool transcode_astc;
+   int transcode_s3tc;
    bool allow_compressed_fallback;
    char *force_explicit_uniform_loc_zero;
    char *force_gl_vendor;
