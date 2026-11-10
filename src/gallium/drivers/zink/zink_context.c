@@ -4354,13 +4354,13 @@ flush_batch(struct zink_context *ctx, bool sync)
    if (sync)
       sync_flush(ctx, ctx->bs);
 
-   if (ctx->bs->is_device_lost) {
-      check_device_lost(ctx);
-   } else {
-      zink_start_batch(ctx);
-      if (!ctx->bs->is_video)
-         reset_graphics_states(ctx);
-   }
+   check_device_lost(ctx);
+   /* The flushed state was submitted (also on a lost screen) and may still be in flight, so a lost
+    * context records into a new state too: keeping it appended the same state to batch_states again
+    * at the next flush and submitted it while its previous submission could be pending. */
+   zink_start_batch(ctx);
+   if (!ctx->bs->is_video)
+      reset_graphics_states(ctx);
    util_queue_fence_signal(&ctx->flush_fence);
 }
 
