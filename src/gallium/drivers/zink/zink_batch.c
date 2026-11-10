@@ -815,8 +815,10 @@ submit_queue(void *data, void *gdata, int thread_index)
     * forever. So the batch is still submitted, without its command buffers: its waits are consumed and every
     * signal happens; the batch is device-lost, which the context reports (a guilty reset). */
    VkResult result;
-   bool recorded = true;
-   if (bs->has_work) {
+   /* on a lost screen no batch is executed: each is submitted for its waits and signals only */
+   const bool screen_lost = screen->device_lost;
+   bool recorded = !screen_lost;
+   if (recorded && bs->has_work) {
       VRAM_ALLOC_LOOP(result,
          VKSCR(EndCommandBuffer)(bs->cmdbuf),
          if (result != VK_SUCCESS) {
@@ -856,9 +858,12 @@ submit_queue(void *data, void *gdata, int thread_index)
       );
    }
    if (!recorded) {
-      mesa_loge("ZINK: batch %" PRIu64 " dropped: its semaphores are signalled without its command buffers; "
-                "the context is lost", batch_id);
-      bs->is_device_lost = true;
+      /* the batch that lost the screen reports it (post_submit); later ones only keep their promises */
+      if (!screen_lost) {
+         mesa_loge("ZINK: batch %" PRIu64 " dropped: its semaphores are signalled without its command buffers; "
+                   "the context is lost", batch_id);
+         bs->is_device_lost = true;
+      }
       si[ZINK_SUBMIT_CMDBUF].commandBufferCount = 0;
    }
 
@@ -1023,10 +1028,12 @@ zink_end_batch(struct zink_context *ctx)
       ctx->swapchain = NULL;
    }
 
-   if (screen->device_lost)
-      return;
-
-   if (ctx->tc) {
+   /* A lost screen still submits the batch, without its command buffers (submit_queue): the present
+    * semaphore made above, the batch's timeline value and its other signals are promised to waiters.
+    * Returning here left them with no signal operation: the swapchain present then waited on a
+    * semaphore nothing would signal, the WSI dropped that present, the compositor kept its last
+    * buffer and the next acquire waited forever for a release point (glmark2 terrain on G5P). */
+   if (ctx->tc && !screen->device_lost) {
       set_foreach(&bs->active_queries, entry)
          zink_query_sync(ctx, (void*)entry->key);
    }
