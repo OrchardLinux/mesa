@@ -1637,7 +1637,8 @@ static VkResult pvr_process_queue_signals(struct pvr_queue *queue,
       for (uint32_t i = 0; i < PVR_JOB_TYPE_MAX; i++) {
          /* Include waits left by job types that ran no job, even when the
           * signal stage mask does not include that type. */
-         if (queue->next_job_wait_sync[i]) {
+         if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p) &&
+             queue->next_job_wait_sync[i]) {
             signal_waits[wait_count++] = (struct vk_sync_wait){
                .sync = queue->next_job_wait_sync[i],
                .stage_mask = ~(VkPipelineStageFlags2)0,
