@@ -2845,7 +2845,14 @@ fallback_copy_texsubimage(struct gl_context *ctx,
    unsigned dst_width = width;
    unsigned dst_height = height;
    unsigned dst_depth = 1;
-   struct pipe_transfer *transfer;
+   struct pipe_transfer *transfer = NULL;
+   /* A compressed format the driver doesn't have: the image's own copy of the
+    * compressed data is what gets written, and unmapping that decompresses
+    * or transcodes it into the resource (whose format is another one).
+    */
+   const bool compressed_fallback =
+      st_compressed_format_fallback(st, stImage->TexFormat);
+   GLint fallback_stride = 0;
 
    if (ST_DEBUG & DEBUG_FALLBACK)
       debug_printf("%s: fallback processing\n", __func__);
@@ -2873,10 +2880,17 @@ fallback_copy_texsubimage(struct gl_context *ctx,
    else
       transfer_usage = PIPE_MAP_WRITE;
 
-   texDest = st_texture_image_map(st, stImage, transfer_usage,
-                                  destX, destY, slice,
-                                  dst_width, dst_height, dst_depth,
-                                  &transfer);
+   if (compressed_fallback) {
+      st_MapTextureImage(ctx, stImage, slice, destX, destY,
+                         dst_width, dst_height,
+                         GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_RANGE_BIT,
+                         &texDest, &fallback_stride);
+   } else {
+      texDest = st_texture_image_map(st, stImage, transfer_usage,
+                                     destX, destY, slice,
+                                     dst_width, dst_height, dst_depth,
+                                     &transfer);
+   }
    if (!texDest) {
       _mesa_error(ctx, GL_OUT_OF_MEMORY, "glCopyTexSubImage()");
       goto err;
@@ -2938,7 +2952,10 @@ fallback_copy_texsubimage(struct gl_context *ctx,
             unpack.Invert = GL_TRUE;
          }
 
-         if (stImage->pt->target == PIPE_TEXTURE_1D_ARRAY) {
+         if (compressed_fallback) {
+            dstRowStride = fallback_stride;
+         }
+         else if (stImage->pt->target == PIPE_TEXTURE_1D_ARRAY) {
             dstRowStride = transfer->layer_stride;
          }
          else {
@@ -2975,7 +2992,10 @@ fallback_copy_texsubimage(struct gl_context *ctx,
       free(tempSrc);
    }
 
-   st_texture_image_unmap(st, stImage, slice);
+   if (compressed_fallback)
+      st_UnmapTextureImage(ctx, stImage, slice);
+   else
+      st_texture_image_unmap(st, stImage, slice);
 err:
    pipe->texture_unmap(pipe, src_trans);
 }
