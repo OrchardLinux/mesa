@@ -19,6 +19,7 @@
 
 #include "pvr_common.h"
 #include "pvr_csb.h"
+#include "pvr_device_info.h"
 #include "pvr_g9p_xfb_core.h"
 #include "pvr_pds.h"
 #include "util/shader_stats.h"
@@ -308,7 +309,8 @@ to_pvr_graphics_pipeline(struct pvr_pipeline *pipeline)
 }
 
 static enum pvr_pipeline_stage_bits
-pvr_stage_mask(VkPipelineStageFlags2 stage_mask)
+pvr_stage_mask(const struct pvr_device_info *dev_info,
+               VkPipelineStageFlags2 stage_mask)
 {
    enum pvr_pipeline_stage_bits stages = 0;
 
@@ -351,14 +353,20 @@ pvr_stage_mask(VkPipelineStageFlags2 stage_mask)
        * pvr_arch_g9p_transfer.c): a transfer barrier orders those too. Without it a CPU
        * readback after a GPU upload read the image before it was written. Only with those
        * paths on (opt-in): otherwise every CPU copy waited for every graphics job.
+       *
+       * G5P keeps transfers their own stage: its vk_meta renders join the
+       * transfer syncs themselves (g5p_transfer in pvr_process_graphics_cmd_for_view()),
+       * and widening every transfer stage made each upload barrier wait for
+       * the previous render's geometry and fragments.
        */
    {
       static int gpu_transfers = -1;
 
       if (gpu_transfers < 0)
          gpu_transfers = !getenv("G9P_NO_GPU_BLIT") || getenv("G9P_GPU_UPLOAD");
-      stages |= PVR_PIPELINE_STAGE_TRANSFER_BIT |
-                (gpu_transfers ? PVR_PIPELINE_STAGE_GEOM_BIT | PVR_PIPELINE_STAGE_FRAG_BIT : 0);
+      stages |= PVR_PIPELINE_STAGE_TRANSFER_BIT;
+      if (gpu_transfers && !PVR_HAS_FEATURE(dev_info, apple_g5p))
+         stages |= PVR_PIPELINE_STAGE_GEOM_BIT | PVR_PIPELINE_STAGE_FRAG_BIT;
    }
 
    if (stage_mask & (VK_PIPELINE_STAGE_2_TRANSFORM_FEEDBACK_BIT_EXT))
@@ -368,17 +376,19 @@ pvr_stage_mask(VkPipelineStageFlags2 stage_mask)
 }
 
 static inline enum pvr_pipeline_stage_bits
-pvr_stage_mask_src(VkPipelineStageFlags2 stage_mask)
+pvr_stage_mask_src(const struct pvr_device_info *dev_info,
+                   VkPipelineStageFlags2 stage_mask)
 {
    /* If the source is bottom of pipe, all stages will need to be waited for. */
    if (stage_mask & VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT)
       return PVR_PIPELINE_STAGE_ALL_BITS;
 
-   return pvr_stage_mask(stage_mask);
+   return pvr_stage_mask(dev_info, stage_mask);
 }
 
 static inline enum pvr_pipeline_stage_bits
-pvr_stage_mask_dst(VkPipelineStageFlags2 stage_mask)
+pvr_stage_mask_dst(const struct pvr_device_info *dev_info,
+                   VkPipelineStageFlags2 stage_mask)
 {
    /* If the destination is top of pipe, all stages should be blocked by prior
     * commands.
@@ -386,7 +396,7 @@ pvr_stage_mask_dst(VkPipelineStageFlags2 stage_mask)
    if (stage_mask & VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT)
       return PVR_PIPELINE_STAGE_ALL_BITS;
 
-   return pvr_stage_mask(stage_mask);
+   return pvr_stage_mask(dev_info, stage_mask);
 }
 
 #endif /* PVR_PIPELINE_H */

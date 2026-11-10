@@ -10998,8 +10998,8 @@ void PVR_PER_ARCH(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
          pDependencyInfo->pImageMemoryBarriers[i].dstStageMask;
    }
 
-   src_stage_mask = pvr_stage_mask_src(vk_src_stage_mask);
-   dst_stage_mask = pvr_stage_mask_dst(vk_dst_stage_mask);
+   src_stage_mask = pvr_stage_mask_src(&cmd_buffer->device->pdevice->dev_info, vk_src_stage_mask);
+   dst_stage_mask = pvr_stage_mask_dst(&cmd_buffer->device->pdevice->dev_info, vk_dst_stage_mask);
 
    for (uint32_t stage = 0U; stage != PVR_NUM_SYNC_PIPELINE_STAGES; stage++) {
       if (!(dst_stage_mask & BITFIELD_BIT(stage)))
@@ -11119,7 +11119,7 @@ void PVR_PER_ARCH(CmdResetEvent2)(VkCommandBuffer commandBuffer,
       .type = PVR_EVENT_TYPE_RESET,
       .set_reset = {
          .event = event,
-         .wait_for_stage_mask = pvr_stage_mask_src(stageMask),
+         .wait_for_stage_mask = pvr_stage_mask_src(&cmd_buffer->device->pdevice->dev_info, stageMask),
       },
    };
 
@@ -11148,7 +11148,7 @@ void PVR_PER_ARCH(CmdSetEvent2)(VkCommandBuffer commandBuffer,
       .type = PVR_EVENT_TYPE_SET,
       .set_reset = {
          .event = event,
-         .wait_for_stage_mask = pvr_stage_mask_dst(stage_mask),
+         .wait_for_stage_mask = pvr_stage_mask_dst(&cmd_buffer->device->pdevice->dev_info, stage_mask),
       },
    };
 
@@ -11200,7 +11200,7 @@ void PVR_PER_ARCH(CmdWaitEvents2)(VkCommandBuffer commandBuffer,
       for (uint32_t j = 0; j < info->imageMemoryBarrierCount; j++)
          mask |= info->pImageMemoryBarriers[j].dstStageMask;
 
-      stage_masks[i] = pvr_stage_mask_dst(mask);
+      stage_masks[i] = pvr_stage_mask_dst(&cmd_buffer->device->pdevice->dev_info, mask);
    }
 
    cmd_buffer->state.current_sub_cmd->event = (struct pvr_sub_cmd_event){

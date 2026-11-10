@@ -1662,7 +1662,7 @@ static VkResult pvr_process_queue_signals_g5p(struct pvr_queue *queue,
    for (uint32_t signal_idx = 0; signal_idx < signal_count; signal_idx++) {
       struct vk_sync_signal *signal = &signals[signal_idx];
       const enum pvr_pipeline_stage_bits signal_stage_src =
-         pvr_stage_mask_src(signal->stage_mask);
+         pvr_stage_mask_src(&device->pdevice->dev_info, signal->stage_mask);
       uint32_t wait_count = 0;
 
       for (uint32_t i = 0; i < PVR_JOB_TYPE_MAX; i++) {
@@ -1723,7 +1723,7 @@ static VkResult pvr_process_queue_signals(struct pvr_queue *queue,
    for (uint32_t signal_idx = 0; signal_idx < signal_count; signal_idx++) {
       struct vk_sync_signal *signal = &signals[signal_idx];
       const enum pvr_pipeline_stage_bits signal_stage_src =
-         pvr_stage_mask_src(signal->stage_mask);
+         pvr_stage_mask_src(&device->pdevice->dev_info, signal->stage_mask);
       uint32_t wait_count = 0;
 
       for (uint32_t i = 0; i < PVR_JOB_TYPE_MAX; i++) {
@@ -1783,14 +1783,14 @@ static VkResult pvr_process_queue_waits(struct pvr_queue *queue,
       struct vk_sync *prev_wait = NULL;
 
       for (uint32_t wait_idx = 0; wait_idx < wait_count; wait_idx++) {
-         if (!(pvr_stage_mask_dst(waits[wait_idx].stage_mask) &
+         if (!(pvr_stage_mask_dst(&device->pdevice->dev_info, waits[wait_idx].stage_mask) &
                BITFIELD_BIT(i))) {
             continue;
          }
 
          if (pvr_g5p_deplog() && i == PVR_JOB_TYPE_GEOM)
             fprintf(stderr, "G5P dep: submit=%u qwait dst=%#x pending=%u cbs=%u waits=%u\n",
-                    g5p_dep_submit, pvr_stage_mask_dst(waits[wait_idx].stage_mask),
+                    g5p_dep_submit, pvr_stage_mask_dst(&device->pdevice->dev_info, waits[wait_idx].stage_mask),
                     g5p_dep_pending(device, waits[wait_idx].sync), command_buffer_count, wait_count);
          stage_waits[stage_wait_count++] = (struct vk_sync_wait){
             .sync = waits[wait_idx].sync,
