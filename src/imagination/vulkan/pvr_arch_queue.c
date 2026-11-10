@@ -1803,7 +1803,6 @@ static VkResult pvr_driver_queue_submit_jobs(struct vk_queue *queue,
 
    const int64_t g9p_tw = os_time_get_nano();
 
-   if (submit->wait_count) {
    if (submit->wait_count && !waitonly_local) {
       result = pvr_process_queue_waits(driver_queue,
                                        submit->waits,
