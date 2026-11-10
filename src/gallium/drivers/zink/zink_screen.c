@@ -732,6 +732,7 @@ zink_init_screen_caps(struct zink_screen *screen)
    struct pipe_caps *caps = (struct pipe_caps *)&screen->base.caps;
 
    u_init_pipe_screen_caps(&screen->base, screen->is_cpu ? 0 : 1);
+   caps->r11g11b10f_requires_color_buffer_float = screen->is_g5p;
 
    /* Vulkan spec says the builtins count, so make GL count them towards
     * link-failing.
