@@ -248,6 +248,11 @@ struct pvr_device {
 
    /* Data Source for GPU tracing */
    struct pvr_ds_device ds;
+
+#ifdef PVR_APPLE_G5P
+   /* Apple A9 (G5P, has_apple_g5p): pvr_g5p.h */
+   struct pvr_g5p_device *g5p;
+#endif
 };
 
 struct pvr_device_memory {
