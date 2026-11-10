@@ -1038,8 +1038,21 @@ zink_draw_atoms(struct zink_context *ctx,
                                            ctx->element_state->hw_state.num_attribs, ctx->element_state->hw_state.dynattribs);
             break;
          case ZINK_ATOM_DESCRIPTORS:
-            if (zink_program_has_descriptors(&ctx->curr_program->base))
-               zink_descriptors_update(ctx, ZINK_PIPELINE_GFX);
+            if (zink_program_has_descriptors(&ctx->curr_program->base) &&
+                unlikely(!zink_descriptors_update(ctx, ZINK_PIPELINE_GFX))) {
+               /* out of descriptor memory: drop this draw. The atoms already emitted for it are
+                * clean, so the next draw takes the full path and emits every atom again.
+                */
+               zink_mark_atom_dirty(ctx, ZINK_ATOM_DESCRIPTORS);
+               if (VBS == ZINK_VBS_UNOWNED)
+                  zink_mark_atom_dirty(ctx, ZINK_ATOM_VERTEX_BUFFERS);
+               ctx->pipeline_changed[ZINK_PIPELINE_GFX] = true;
+               zink_select_draw_vbo(ctx);
+               /* a gfx pipeline may be bound now, which a mesh draw must replace (as after any draw) */
+               ctx->pipeline_changed[ZINK_PIPELINE_MESH] = true;
+               zink_select_draw_mesh_tasks(ctx);
+               return;
+            }
             break;
          case ZINK_ATOM_BINDLESS:
             if (ctx->di.any_bindless_dirty &&
@@ -1389,8 +1402,17 @@ zink_draw_mesh_tasks(struct pipe_context *pctx, const struct pipe_grid_info *inf
    emit_dynamic_state<ZINK_DYNAMIC_STATE3, BATCH_CHANGED>(ctx, pipeline_changed, ctx->vp_state.mesh_num_viewports, ctx->mesh_program->base.uses_shobj,
                                                           BITFIELD_BIT(ZINK_ATOM_LINE_WIDTH));
 
-   if (zink_program_has_descriptors(&ctx->mesh_program->base) && (BATCH_CHANGED || ctx->dd.push_state_changed[ZINK_PIPELINE_MESH] || ctx->dd.state_changed[ZINK_PIPELINE_MESH] || pipeline_changed))
-      zink_descriptors_update(ctx, ZINK_PIPELINE_MESH);
+   if (zink_program_has_descriptors(&ctx->mesh_program->base) && (BATCH_CHANGED || ctx->dd.push_state_changed[ZINK_PIPELINE_MESH] || ctx->dd.state_changed[ZINK_PIPELINE_MESH] || pipeline_changed) &&
+       unlikely(!zink_descriptors_update(ctx, ZINK_PIPELINE_MESH))) {
+      /* out of descriptor memory: drop this draw; the next one takes the full path, and so does
+       * the next gfx draw, as after any mesh draw
+       */
+      ctx->pipeline_changed[ZINK_PIPELINE_MESH] = true;
+      zink_select_draw_mesh_tasks(ctx);
+      ctx->pipeline_changed[ZINK_PIPELINE_GFX] = true;
+      zink_select_draw_vbo(ctx);
+      return;
+   }
 
    if (ctx->di.any_bindless_dirty &&
        /* some apps (d3dretrace) call MakeTextureHandleResidentARB randomly */
@@ -1669,8 +1691,10 @@ zink_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
       zink_select_launch_grid(ctx);
    }
 
-   if (zink_program_has_descriptors(&ctx->curr_compute->base) && (BATCH_CHANGED || ctx->dd.push_state_changed[1] || ctx->dd.state_changed[1] || pipeline_changed))
-      zink_descriptors_update(ctx, ZINK_PIPELINE_COMPUTE);
+   if (zink_program_has_descriptors(&ctx->curr_compute->base) && (BATCH_CHANGED || ctx->dd.push_state_changed[1] || ctx->dd.state_changed[1] || pipeline_changed) &&
+       unlikely(!zink_descriptors_update(ctx, ZINK_PIPELINE_COMPUTE)))
+      /* out of descriptor memory: drop this dispatch; its sets stay pending for the next one */
+      return;
    if (ctx->di.any_bindless_dirty && ctx->curr_compute->base.dd.bindless)
       zink_descriptors_update_bindless(ctx);
 
