@@ -545,6 +545,8 @@ struct pvr_cmd_buffer_state {
    uint32_t barriers_needed[PVR_NUM_SYNC_PIPELINE_STAGES];
 
    struct pvr_descriptor_state gfx_desc_state;
+   /* The push set of a meta operation, kept for the next one (g9p_meta_begin()) */
+   struct pvr_push_descriptor_set *g9p_meta_push_set;
    struct pvr_descriptor_state compute_desc_state;
 
    struct pvr_push_constants push_consts[PVR_STAGE_ALLOCATION_COUNT];

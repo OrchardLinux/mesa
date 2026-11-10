@@ -1599,9 +1599,12 @@ static uint64_t
 descriptor_buffer_addr(const struct pvr_descriptor_set *ds, unsigned slot_binding)
 {
    const unsigned element = slot_binding >> G9P_BINDING_ELEMENT_SHIFT;
-   const struct pvr_descriptor_set_layout_binding *b =
-      &ds->layout->bindings[slot_binding & BITFIELD_MASK(G9P_BINDING_ELEMENT_SHIFT)];
+   const unsigned index = slot_binding & BITFIELD_MASK(G9P_BINDING_ELEMENT_SHIFT);
+   const struct pvr_descriptor_set_layout_binding *b = &ds->layout->bindings[index];
 
+   /* A set of another layout than the pipeline's: no buffer, not what lies past its bindings */
+   if (index >= ds->layout->binding_count)
+      return 0;
    if (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC ||
        b->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) {
       const struct pvr_buffer_descriptor *d = &ds->dynamic_buffers[b->dynamic_buffer_idx + element];

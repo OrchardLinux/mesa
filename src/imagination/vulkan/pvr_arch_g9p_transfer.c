@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "vk_command_pool.h"
 #include "vk_format.h"
 #include "vk_enum_to_str.h"
 #include "vk_sync.h"
@@ -802,6 +803,17 @@ g9p_meta_begin(struct pvr_cmd_buffer *cmd_buffer, struct g9p_meta_save *save)
    save->pipeline = state->gfx_pipeline;
    save->vertex_binding0 = state->vertex_bindings[0];
    save->desc = state->gfx_desc_state;
+   /*
+    * A meta operation pushes its own descriptors (vk_meta's blit: a sampler and
+    * the source's images). The command buffer has one push set per bind point,
+    * and saving the state above saves only its pointer: pushing into it would
+    * replace the application's layout and descriptors, which g9p_meta_end()
+    * cannot put back. The application's next draw then read a uniform buffer
+    * binding the blit's layout does not have (Firefox on YouTube: a wild
+    * address, or a crash). So the meta operation pushes into a set of its own.
+    */
+   state->gfx_desc_state.push_set = state->g9p_meta_push_set;
+   state->g9p_meta_push_set = NULL;
    save->push[0] = state->push_consts[PVR_STAGE_ALLOCATION_VERTEX_GEOMETRY];
    save->push[1] = state->push_consts[PVR_STAGE_ALLOCATION_FRAGMENT];
 }
@@ -815,6 +827,11 @@ g9p_meta_end(struct pvr_cmd_buffer *cmd_buffer, const struct g9p_meta_save *save
    BITSET_SET_RANGE(cmd_buffer->vk.dynamic_graphics_state.dirty, 0, MESA_VK_DYNAMIC_GRAPHICS_STATE_ENUM_MAX - 1);
    state->gfx_pipeline = save->pipeline;
    state->vertex_bindings[0] = save->vertex_binding0;
+   /* Keep the meta operation's push set for the next one; a nested one made its own */
+   if (!state->g9p_meta_push_set)
+      state->g9p_meta_push_set = state->gfx_desc_state.push_set;
+   else
+      vk_free(&cmd_buffer->vk.pool->alloc, state->gfx_desc_state.push_set);
    state->gfx_desc_state = save->desc;
    state->gfx_desc_state.dirty_sets = ~0u;
    state->gfx_desc_state.push_set_dirty = state->gfx_desc_state.push_set != NULL;

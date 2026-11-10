@@ -210,6 +210,7 @@ static void pvr_cmd_buffer_free_resources(struct pvr_cmd_buffer *cmd_buffer)
            cmd_buffer->state.gfx_desc_state.push_set);
    vk_free(&cmd_buffer->vk.pool->alloc,
            cmd_buffer->state.compute_desc_state.push_set);
+   vk_free(&cmd_buffer->vk.pool->alloc, cmd_buffer->state.g9p_meta_push_set);
    pvr_cmd_buffer_attachments_free(cmd_buffer);
    pvr_cmd_buffer_clear_values_free(cmd_buffer);
 
