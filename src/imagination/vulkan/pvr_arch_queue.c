@@ -1648,7 +1648,8 @@ static VkResult pvr_clear_last_submits_syncs(struct pvr_queue *queue)
    return VK_SUCCESS;
 }
 
-static VkResult pvr_process_queue_signals(struct pvr_queue *queue,
+#ifdef PVR_APPLE_G5P
+static VkResult pvr_process_queue_signals_g5p(struct pvr_queue *queue,
                                           struct vk_sync_signal *signals,
                                           uint32_t signal_count,
                                           const struct vk_sync_wait *extra, uint32_t extra_count)
@@ -1707,6 +1708,61 @@ static VkResult pvr_process_queue_signals(struct pvr_queue *queue,
 
    STACK_ARRAY_FINISH(signal_waits);
    return VK_SUCCESS;
+}
+
+#endif
+
+static VkResult pvr_process_queue_signals(struct pvr_queue *queue,
+                                          struct vk_sync_signal *signals,
+                                          uint32_t signal_count)
+{
+   struct vk_sync_wait signal_waits[PVR_JOB_TYPE_MAX];
+   struct pvr_device *device = queue->device;
+   VkResult result;
+
+   for (uint32_t signal_idx = 0; signal_idx < signal_count; signal_idx++) {
+      struct vk_sync_signal *signal = &signals[signal_idx];
+      const enum pvr_pipeline_stage_bits signal_stage_src =
+         pvr_stage_mask_src(signal->stage_mask);
+      uint32_t wait_count = 0;
+
+      for (uint32_t i = 0; i < PVR_JOB_TYPE_MAX; i++) {
+         /* Exception for query jobs since that's something internal,
+          * so the user provided syncs won't ever have it as a source stage.
+          */
+         if (!(signal_stage_src & BITFIELD_BIT(i)) && i != PVR_JOB_TYPE_QUERY)
+            continue;
+
+         if (!queue->last_job_signal_sync[i])
+            continue;
+
+         signal_waits[wait_count++] = (struct vk_sync_wait){
+            .sync = queue->last_job_signal_sync[i],
+            .stage_mask = ~(VkPipelineStageFlags2)0,
+            .wait_value = 0,
+         };
+      }
+
+      result = device->ws->ops->null_job_submit(device->ws,
+                                                signal_waits,
+                                                wait_count,
+                                                signal);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+
+   return VK_SUCCESS;
+}
+
+static VkResult pvr_process_queue_signals_for_device(struct pvr_queue *queue,
+   struct vk_sync_signal *signals, uint32_t signal_count,
+   const struct vk_sync_wait *extra, uint32_t extra_count)
+{
+#ifdef PVR_APPLE_G5P
+   if (PVR_HAS_FEATURE(&queue->device->pdevice->dev_info, apple_g5p))
+      return pvr_process_queue_signals_g5p(queue, signals, signal_count, extra, extra_count);
+#endif
+   return pvr_process_queue_signals(queue, signals, signal_count);
 }
 
 static VkResult pvr_process_queue_waits(struct pvr_queue *queue,
@@ -1859,7 +1915,7 @@ static VkResult pvr_driver_queue_submit_jobs(struct vk_queue *queue,
 
    assert(suspended_data.rts == NULL && "suspended graphics job never resumed");
 
-   result = pvr_process_queue_signals(driver_queue,
+   result = pvr_process_queue_signals_for_device(driver_queue,
                                       submit->signals,
                                       submit->signal_count,
                                       waitonly_local ? submit->waits : NULL,
