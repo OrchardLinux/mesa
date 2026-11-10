@@ -3542,9 +3542,10 @@ emit_if(struct g9p_ctx *ctx, nir_if *nif)
       if (nir_block_first_instr(block) == nir_block_last_instr(block)) {
          if (!emit_break(ctx, when_passed))
             return false;
-         ctx->ip++;
+         G9P_A9_EMPTY_BREAK_BEFORE(ctx, side);
          if (!emit_cf_list(ctx, other))
             return false;
+         G9P_A9_EMPTY_BREAK_AFTER(ctx, side);
          release_condition(ctx, nif);
          return true;
       }
