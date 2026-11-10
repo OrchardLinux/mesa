@@ -2688,13 +2688,26 @@ zink_screen_timeline_wait(struct zink_screen *screen, uint64_t batch_id, uint64_
    if (zink_screen_check_last_finished(screen, batch_id))
       return true;
 
+   if (screen->device_lost) {
+      /* A lost screen never blocks a waiter. Its batches are still submitted, without their command
+       * buffers, and signal their timeline values, so read the timeline: batch states, their descriptor
+       * pools and buffer slabs are only recycled once last_finished passes their batch id. Without this
+       * every flush of a lost context made a new batch state and nothing was ever freed (glmark2 terrain
+       * on G5P filled 564 MiB in 3 s, then vkCreateDescriptorPool failed). Only values the timeline
+       * really reached are recorded: batches from before the loss may still be executing. The result
+       * is not passed to zink_screen_handle_vkresult, which would log (or abort) on every call.
+       */
+      uint64_t value = 0;
+      if (VKSCR(GetSemaphoreCounterValue)(screen->dev, screen->sem, &value) == VK_SUCCESS && value)
+         zink_screen_update_last_finished(screen, value);
+      return true;
+   }
+
    wi.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
    wi.semaphoreCount = 1;
    wi.pSemaphores = &screen->sem;
    wi.pValues = &batch_id;
    bool success = false;
-   if (screen->device_lost)
-      return true;
    VkResult ret = VKSCR(WaitSemaphores)(screen->dev, &wi, timeout);
    success = zink_screen_handle_vkresult(screen, ret);
 
