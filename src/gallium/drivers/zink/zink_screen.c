@@ -3778,14 +3778,6 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
       SCREEN_INIT_FAIL("resolve Vulkan loader entrypoints");
    }
 
-   if (config) {
-      driParseConfigFiles(config->options, config->options_info,
-                          &(driConfigFileParseParams) { .driverName = "zink" });
-      screen->driconf.dual_color_blend_by_location = driQueryOptionb(config->options, "dual_color_blend_by_location");
-      //screen->driconf.inline_uniforms = driQueryOptionb(config->options, "radeonsi_inline_uniforms");
-      screen->driconf.emulate_point_smooth = driQueryOptionb(config->options, "zink_emulate_point_smooth");
-      screen->driconf.zink_shader_object_enable = driQueryOptionb(config->options, "zink_shader_object_enable");
-   }
 
    simple_mtx_lock(&instance_lock);
    if (++instance_refcount == 1) {
@@ -3855,6 +3847,16 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
    screen->is_g5p = screen->info.driver_props.driverID == VK_DRIVER_ID_IMAGINATION_OPEN_SOURCE_MESA &&
                     !strcmp(screen->info.driver_props.driverName, "Mesa PowerVR G5P");
    screen->precise_sync = debug_get_bool_option("ZINK_PRECISE_SYNC", screen->is_g5p);
+
+   if (config) {
+      driParseConfigFiles(config->options, config->options_info,
+                          &(driConfigFileParseParams) { .driverName = "zink",
+                             .deviceName = screen->is_g5p ? "g5p" : NULL });
+      screen->driconf.dual_color_blend_by_location = driQueryOptionb(config->options, "dual_color_blend_by_location");
+      //screen->driconf.inline_uniforms = driQueryOptionb(config->options, "radeonsi_inline_uniforms");
+      screen->driconf.emulate_point_smooth = driQueryOptionb(config->options, "zink_emulate_point_smooth");
+      screen->driconf.zink_shader_object_enable = driQueryOptionb(config->options, "zink_shader_object_enable");
+   }
 
    if (!screen->info.rb2_feats.nullDescriptor) {
       mesa_loge("Zink requires the nullDescriptor feature of KHR/EXT robustness2.");
@@ -4044,9 +4046,9 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
     * ZINK_STAGING_FLUSH_MIB, default 1/32 of the device-local memory within [16, 256]MiB; 0 disables it.
     */
    /* ZINK_TRIM_MS: how often the end of a frame gives idle allocator memory back (zink_bo_trim()); 0 = never */
-   screen->trim_interval = debug_get_num_option("ZINK_TRIM_MS", 1000) * 1000;
+   screen->trim_interval = debug_get_num_option("ZINK_TRIM_MS", screen->is_g5p ? 1000 : 0) * 1000;
    screen->clamp_staging_mem = (uint64_t)debug_get_num_option("ZINK_STAGING_FLUSH_MIB",
-                                  CLAMP(screen->total_video_mem / 32, 16ull << 20, 256ull << 20) >> 20) << 20;
+                                  (screen->is_g5p ? CLAMP(screen->total_video_mem / 32, 16ull << 20, 256ull << 20) >> 20 : 0)) << 20;
    if (!os_get_total_physical_memory(&screen->total_mem)) {
       if (!screen->driver_name_is_inferred)
          mesa_loge("ZINK: failed to get total physical memory");
