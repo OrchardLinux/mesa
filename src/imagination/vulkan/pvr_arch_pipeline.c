@@ -1311,7 +1311,7 @@ pvr_graphics_pipeline_destroy(struct pvr_device *const device,
       ARRAY_SIZE(gfx_pipeline->shader_state.vertex.pds_attrib_programs);
    struct pvr_fragment_shader_state *fragment_state =
       &gfx_pipeline->shader_state.fragment;
-
+   PVR_G5P_HOOK(pipeline_destroy, device, allocator, gfx_pipeline)
    if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p)) {
       pvr_arch_g9p_graphics_pipeline_destroy(gfx_pipeline);
       pvr_pipeline_finish(device, &gfx_pipeline->base);
@@ -3121,7 +3121,7 @@ pvr_graphics_pipeline_compile(struct pvr_device *const device,
    struct pvr_fragment_shader_state *fragment_state =
       &gfx_pipeline->shader_state.fragment;
    struct usc_mrt_setup mrt_setup = { 0 };
-
+   PVR_G5P_HOOK(pipeline_compile, device, pCreateInfo, gfx_pipeline, state)
    if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p))
       return pvr_arch_g9p_graphics_pipeline_compile(device, pCreateInfo, gfx_pipeline,
                                                     state);
