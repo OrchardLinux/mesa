@@ -108,6 +108,16 @@ static bool pvr_g5p_barrier_skip_done(void)
    }
    return on;
 }
+
+static bool pvr_g5p_signal_share(void)
+{
+   static int on = -1;
+   if (on < 0) {
+      const char *v = getenv("PVR_G5P_SIGNAL_SHARE");
+      on = !(v && !strcmp(v, "0"));
+   }
+   return on;
+}
 #endif
 
 static bool pvr_g5p_waitonly_local(void)
@@ -1657,6 +1667,8 @@ static VkResult pvr_process_queue_signals_g5p(struct pvr_queue *queue,
    STACK_ARRAY(struct vk_sync_wait, signal_waits, PVR_JOB_TYPE_MAX * 2 + extra_count);
    if (!signal_waits) return vk_error(queue, VK_ERROR_OUT_OF_HOST_MEMORY);
    struct pvr_device *device = queue->device;
+   const struct vk_sync_signal *built = NULL;
+   enum pvr_pipeline_stage_bits built_src = 0;
    VkResult result;
 
    for (uint32_t signal_idx = 0; signal_idx < signal_count; signal_idx++) {
@@ -1664,6 +1676,25 @@ static VkResult pvr_process_queue_signals_g5p(struct pvr_queue *queue,
       const enum pvr_pipeline_stage_bits signal_stage_src =
          pvr_stage_mask_src(&device->pdevice->dev_info, signal->stage_mask);
       uint32_t wait_count = 0;
+
+      /* A signal with the stage mask of one already built waits for the same
+       * fences: take them from that signal's payload, one syncobj transfer
+       * instead of another merge (Zink signals its batch timeline and the
+       * present semaphore together). PVR_G5P_SIGNAL_SHARE=0 builds each. */
+      if (built && built_src == signal_stage_src && pvr_g5p_signal_share()) {
+         struct vk_sync_wait same = {
+            .sync = built->sync,
+            .stage_mask = ~(VkPipelineStageFlags2)0,
+            .wait_value = built->signal_value,
+         };
+
+         result = device->ws->ops->null_job_submit(device->ws, &same, 1, signal);
+         if (result != VK_SUCCESS) {
+            STACK_ARRAY_FINISH(signal_waits);
+            return result;
+         }
+         continue;
+      }
 
       for (uint32_t i = 0; i < PVR_JOB_TYPE_MAX; i++) {
          /* Include waits left by job types that ran no job, even when the
@@ -1686,6 +1717,11 @@ static VkResult pvr_process_queue_signals_g5p(struct pvr_queue *queue,
          if (!queue->last_job_signal_sync[i])
             continue;
 
+         /* a job a barrier already saw retired (pvr_process_event_cmd_barrier())
+          * orders nothing; known without asking the kernel again */
+         if (queue->g5p_src_done[i] && pvr_g5p_signal_share())
+            continue;
+
          signal_waits[wait_count++] = (struct vk_sync_wait){
             .sync = queue->last_job_signal_sync[i],
             .stage_mask = ~(VkPipelineStageFlags2)0,
@@ -1703,6 +1739,10 @@ static VkResult pvr_process_queue_signals_g5p(struct pvr_queue *queue,
       if (result != VK_SUCCESS) {
          STACK_ARRAY_FINISH(signal_waits);
          return result;
+      }
+      if (!built) {
+         built = signal;
+         built_src = signal_stage_src;
       }
    }
 
