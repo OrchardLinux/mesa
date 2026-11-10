@@ -1040,6 +1040,9 @@ static bool pvr_physical_device_get_properties(
       .maxDescriptorSetUpdateAfterBindTotalBuffersDynamic = PVR_MAX_DYNAMIC_BUFFERS,
    };
 
+   if (PVR_HAS_FEATURE(dev_info, apple_g5p))
+      snprintf(properties->driverName, sizeof(properties->driverName), "Mesa PowerVR G5P");
+
    if (strlen(pdevice->instance->drirc.debug.force_vk_devicename) > 0) {
       snprintf(properties->deviceName,
                sizeof(properties->deviceName),

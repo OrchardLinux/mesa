@@ -3743,7 +3743,6 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
    }
    zink_resource_struct_pools_init(screen);
 
-   screen->precise_sync = debug_get_bool_option("ZINK_PRECISE_SYNC", true);
    screen->driver_name_is_inferred = config && config->driver_name_is_inferred;
    screen->drm_fd = -1;
    simple_mtx_init(&screen->ralloc_lock, mtx_plain);
@@ -3852,6 +3851,10 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
          debug_printf("ZINK: failed to detect features\n");
       SCREEN_INIT_FAIL("query Vulkan physical device info");
    }
+
+   screen->is_g5p = screen->info.driver_props.driverID == VK_DRIVER_ID_IMAGINATION_OPEN_SOURCE_MESA &&
+                    !strcmp(screen->info.driver_props.driverName, "Mesa PowerVR G5P");
+   screen->precise_sync = debug_get_bool_option("ZINK_PRECISE_SYNC", screen->is_g5p);
 
    if (!screen->info.rb2_feats.nullDescriptor) {
       mesa_loge("Zink requires the nullDescriptor feature of KHR/EXT robustness2.");

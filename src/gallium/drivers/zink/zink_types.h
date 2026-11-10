@@ -1502,6 +1502,7 @@ struct zink_screen {
    /* Must stay first: zink_screen() casts a pipe_screen pointer directly. */
    struct pipe_screen base;
    bool precise_sync;
+   bool is_g5p;
 
    const char *vendor_name;
    const char *device_name;
