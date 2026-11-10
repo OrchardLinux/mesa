@@ -2914,6 +2914,7 @@ emit_tex(struct g9p_ctx *ctx, nir_tex_instr *tex)
 static bool
 emit_intrinsic(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
 {
+   G9P_A9_INTRINSICS
    switch (intr->intrinsic) {
    case nir_intrinsic_load_local_invocation_index:
       /* r0 at entry; reserved from the start when used */
@@ -3332,7 +3333,6 @@ emit_intrinsic(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
       release(ctx, &intr->instr);
       return true;
    }
-   G9P_A9_INTRINSICS
    default:
       fprintf(stderr, "g9p: intrinsic %s not supported yet\n",
               nir_intrinsic_infos[intr->intrinsic].name);

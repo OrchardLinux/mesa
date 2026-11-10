@@ -208,11 +208,13 @@ static bool a9_image(struct g9p_ctx *ctx, nir_intrinsic_instr *in)
    return true;
 }
 #define G9P_A9_INTRINSICS \
+   if (ctx->out->a9) { switch (intr->intrinsic) { \
    case nir_intrinsic_image_deref_store: case nir_intrinsic_image_deref_load: return a9_image(ctx, intr); \
    case nir_intrinsic_ssbo_atomic_swap: return a9_ssbo_cas(ctx, intr); \
    case nir_intrinsic_ssbo_atomic: return a9_ssbo_atomic(ctx, intr); \
    case nir_intrinsic_load_shared: case nir_intrinsic_store_shared: return a9_shared(ctx, intr); \
-   case nir_intrinsic_barrier: return a9_barrier(ctx, intr);
+   case nir_intrinsic_barrier: return a9_barrier(ctx, intr); \
+   default: break; } }
 #else
 #define G9P_A9_INTRINSICS
 #endif
