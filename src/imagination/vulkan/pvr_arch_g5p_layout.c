@@ -325,9 +325,12 @@ g5p_normalize_axis(int32_t *offset, uint32_t *extent, bool *flip)
    return *offset >= 0;
 }
 
-/* Texel (x, y) of the source as floats: a decoded block texel or an unpacked element */
+/* Texel (x, y) of the source as floats: a decoded block texel or an unpacked
+ * element. `unpack` is the source format's, resolved once by the caller:
+ * util_format_unpack_rgba() looks it up (a call_once) on every call. */
 static bool
-g5p_texel(struct g5p_surface *s, unsigned x, unsigned y, float out[4], const uint8_t **last, float block[16][4])
+g5p_texel(struct g5p_surface *s, const struct util_format_unpack_description *unpack, unsigned x, unsigned y,
+          float out[4], const uint8_t **last, float block[16][4])
 {
    if (s->blocks)
       return g5p_block_texel(s, x, y, out, last, block);
@@ -336,7 +339,7 @@ g5p_texel(struct g5p_surface *s, unsigned x, unsigned y, float out[4], const uin
 
    if (!from)
       return false;
-   util_format_unpack_rgba(s->format, out, from, 1);
+   unpack->unpack_rgba(out, from, 1);
    return true;
 }
 
@@ -346,7 +349,8 @@ g5p_texel(struct g5p_surface *s, unsigned x, unsigned y, float out[4], const uin
  * source level (not of the region). A 2:1 reduction is the 2x2 box average, which is what
  * glGenerateMipmap through Zink's blit expects. */
 static bool
-g5p_linear_sample(struct g5p_surface *src, const struct pvr_rect_mapping *m, unsigned x, unsigned y, float out[4],
+g5p_linear_sample(struct g5p_surface *src, const struct util_format_unpack_description *unpack,
+                  const struct pvr_rect_mapping *m, unsigned x, unsigned y, float out[4],
                   const uint8_t **last, float block[16][4])
 {
    const double sw = m->src_rect.extent.width, sh = m->src_rect.extent.height;
@@ -375,7 +379,7 @@ g5p_linear_sample(struct g5p_surface *src, const struct pvr_rect_mapping *m, uns
    for (unsigned t = 0; t < 4; t++) {
       float v[4];
 
-      if (!g5p_texel(src, us[t & 1], vs[t >> 1], v, last, block))
+      if (!g5p_texel(src, unpack, us[t & 1], vs[t >> 1], v, last, block))
          return false;
       for (unsigned c = 0; c < 4; c++)
          out[c] += w[t] * v[c];
@@ -590,15 +594,26 @@ g5p_copy(const struct pvr_rect_mapping *mapping, struct g5p_surface *src, struct
 
    /* A scaled linear blit filters. Integer and depth/stencil formats have no linear filter in
     * Vulkan, and an unscaled blit samples exactly at texel centres: both stay element copies. */
-   if (linear && !integer && !util_format_is_depth_or_stencil(src->format) && (sw != dw || sh != dh)) {
+   /* Resolve the per-texel unpack/pack entry points once: util's
+    * util_format_unpack_rgba()/util_format_pack_rgba() look the format up (a
+    * pthread_once) on every call, which was half of glmark2 terrain's CPU
+    * time in this loop. The same functions are called, so the results are
+    * bit for bit those of before. Vulkan blits never mix integer and float
+    * formats, so a non-integer source has a float destination. */
+   const struct util_format_unpack_description *unpack = util_format_unpack_description(src->format);
+   const struct util_format_pack_description *pack = util_format_pack_description(dst->format);
+   const bool pack_float = pack && pack->pack_rgba_float && !util_format_is_pure_integer(dst->format);
+
+   if (linear && !integer && !util_format_is_depth_or_stencil(src->format) && (sw != dw || sh != dh) &&
+       pack_float && (src->blocks || (unpack && unpack->unpack_rgba))) {
       for (unsigned y = 0; y < dh; y++) {
          for (unsigned x = 0; x < dw; x++) {
             uint8_t *to = g5p_element(dst, m->dst_rect.offset.x + x, m->dst_rect.offset.y + y);
             float v[4];
 
-            if (!to || !g5p_linear_sample(src, m, x, y, v, &last, block))
+            if (!to || !g5p_linear_sample(src, unpack, m, x, y, v, &last, block))
                return false;
-            util_format_pack_rgba(dst->format, to, v, 1);
+            pack->pack_rgba_float(to, 0, v, 0, 1, 1);
          }
       }
       return true;
@@ -638,7 +653,10 @@ g5p_copy(const struct pvr_rect_mapping *mapping, struct g5p_surface *src, struct
             if (!g5p_block_texel(src, m->src_rect.offset.x + sx,
                                  m->src_rect.offset.y + sy, v, &last, block))
                return false;
-            util_format_pack_rgba(dst->format, to, v, 1);
+            if (pack_float)
+               pack->pack_rgba_float(to, 0, v, 0, 1, 1);
+            else
+               util_format_pack_rgba(dst->format, to, v, 1);
             continue;
          }
 

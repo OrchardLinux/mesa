@@ -23,6 +23,7 @@
 #include "vk_util.h"
 #include "vk_enum_to_str.h"
 #include "util/u_debug.h"
+#include "util/u_math.h"
 
 #include "pvr_buffer.h"
 #include "pvr_cmd_buffer.h"
@@ -97,14 +98,54 @@ g5p_meta_format(VkFormat f)
 }
 
 static bool
+g5p_meta_mip_blit_enabled(void)
+{
+   static int enabled = -1;
+
+   if (enabled < 0)
+      enabled = debug_get_bool_option("PVR_G5P_GPU_MIPBLIT", true);
+   return enabled;
+}
+
+static bool
 g5p_meta_image(const struct pvr_image *image, VkImageUsageFlags needed)
 {
    /* twiddled or linear (Firefox's WebGL buffer and compositor texture are
-    * linear, shareable images): both are sampled and rendered by G5P */
+    * linear, shareable images): both are sampled and rendered by G5P. A
+    * twiddled mip chain too (glGenerateMipmap through Zink's per-level
+    * vkCmdBlitImage): G5P samples a one-level view of it and stores one
+    * level per render (twiddled PBE, pvr_arch_g5p.c); linear images have no
+    * mip views (pvr_arch_g5p_tex.c). PVR_G5P_GPU_MIPBLIT=0 keeps mip chains
+    * on the CPU. */
+   const bool mips = image->vk.mip_levels > 1;
    return image->vk.image_type == VK_IMAGE_TYPE_2D && image->vk.samples == VK_SAMPLE_COUNT_1_BIT &&
-          image->vk.mip_levels == 1 && image->vk.array_layers == 1 &&
-          (image->memlayout == PVR_MEMLAYOUT_TWIDDLED || image->memlayout == PVR_MEMLAYOUT_LINEAR) &&
+          image->vk.array_layers == 1 &&
+          (mips ? image->memlayout == PVR_MEMLAYOUT_TWIDDLED && g5p_meta_mip_blit_enabled() :
+                  image->memlayout == PVR_MEMLAYOUT_TWIDDLED || image->memlayout == PVR_MEMLAYOUT_LINEAR) &&
           (image->vk.usage & needed) && g5p_meta_format(image->vk.format);
+}
+
+/* The smallest destination level drawn: the PBE captures are 64x64 and up,
+ * and below one 32-pixel tile a level is cheaper on the CPU than a render
+ * job. */
+#define G5P_META_MIN_MIP_SIDE 32
+
+/* Whether the render of destination level `level` passes g5p_job_init()'s
+ * colour target guard (64-byte base, same address expression) and is big
+ * enough to be worth a render. Single-level images keep their old rule. */
+static bool
+g5p_meta_dst_level(const struct pvr_image *dst, const VkImageSubresourceLayers *sub)
+{
+   if (dst->vk.mip_levels == 1)
+      return true;
+
+   const struct pvr_image_plane *plane = pvr_single_plane_const(dst);
+   const struct pvr_mip_level *level = &plane->mip_levels[sub->mipLevel];
+   const uint64_t addr = dst->dev_addr.addr + plane->offset + level->offset +
+                         sub->baseArrayLayer * plane->layer_size;
+
+   return !(addr % 64) && u_minify(dst->vk.extent.width, sub->mipLevel) >= G5P_META_MIN_MIP_SIDE &&
+          u_minify(dst->vk.extent.height, sub->mipLevel) >= G5P_META_MIN_MIP_SIDE;
 }
 
 static bool
@@ -138,7 +179,7 @@ g5p_meta_blit_eligible(const struct pvr_cmd_buffer *cmd_buffer, const VkBlitImag
           vk_image_subresource_layer_count(&src->vk, &r->srcSubresource) != 1 ||
           vk_image_subresource_layer_count(&dst->vk, &r->dstSubresource) != 1 ||
           r->srcOffsets[0].z != 0 || r->srcOffsets[1].z != 1 || r->dstOffsets[0].z != 0 ||
-          r->dstOffsets[1].z != 1)
+          r->dstOffsets[1].z != 1 || !g5p_meta_dst_level(dst, &r->dstSubresource))
          return false;
    }
    return true;
