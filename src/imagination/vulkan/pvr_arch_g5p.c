@@ -748,14 +748,23 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
       const bool ms_store = g->samples == 4 && !hw_render->eot_surfaces[t].need_resolve;
 
       const bool twiddled=image->memlayout!=PVR_MEMLAYOUT_LINEAR && !ms_store;
+      /* A twiddled 2D target (a mip level, an array layer or a cube face, one
+       * layer per render): q0 bit 3 and no row pitch, as the native A9
+       * captures store (g5p_pbe.h). Device-proven as the L11 probe (36 CTS
+       * cases fixed, none lost); now the default. PVR_G5P_TWIDDLED_PBE=off
+       * restores the refusal. Layered renders and 3D depth planes stay
+       * refused: no capture qualifies them. */
       if(twiddled) {
-         const char *probe=getenv("PVR_G5P_TWIDDLED_PBE");
-         if(!probe || strcmp(probe,"probe"))
-            return G5P_REFUSE(cmd_buffer,"a non-linear colour target (twiddled PBE is step 7)");
-         if(image->memlayout!=PVR_MEMLAYOUT_TWIDDLED || image->vk.image_type!=VK_IMAGE_TYPE_2D ||
-            iview->vk.layer_count!=1 || (iview->vk.view_type!=VK_IMAGE_VIEW_TYPE_2D &&
-                                       iview->vk.view_type!=VK_IMAGE_VIEW_TYPE_2D_ARRAY))
-            return G5P_REFUSE(cmd_buffer,"twiddled PBE needs a single 2D layer (3D brick slices are not qualified)");
+         const char *mode=getenv("PVR_G5P_TWIDDLED_PBE");
+         if(mode && !strcmp(mode,"off"))
+            return G5P_REFUSE(cmd_buffer,"a non-linear colour target (PVR_G5P_TWIDDLED_PBE=off)");
+         if(image->memlayout!=PVR_MEMLAYOUT_TWIDDLED || image->vk.image_type!=VK_IMAGE_TYPE_2D)
+            return G5P_REFUSE(cmd_buffer,"a twiddled colour target in a 3D image (depth-plane PBE store is not "
+                              "qualified)");
+         if(iview->vk.layer_count!=1 || (iview->vk.view_type!=VK_IMAGE_VIEW_TYPE_2D &&
+                                         iview->vk.view_type!=VK_IMAGE_VIEW_TYPE_2D_ARRAY))
+            return G5P_REFUSE(cmd_buffer,"a layered twiddled colour target (%u layers; one layer per render is "
+                              "qualified)",iview->vk.layer_count);
       }
       if (!g5p_pbe_key(iview->vk.format, &key, &srgb))
          return G5P_REFUSE(cmd_buffer, "colour target format %s", vk_Format_to_str(iview->vk.format));
