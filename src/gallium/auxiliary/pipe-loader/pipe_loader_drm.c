@@ -155,6 +155,19 @@ pipe_loader_drm_probe_fd_nodup(struct pipe_loader_device **dev, int fd, bool zin
       FREE(ddev->base.driver_name);
       ddev->base.driver_name = strdup("zink");
    }
+#ifdef PIPE_LOADER_APPLE_G5P
+   /* Neither has apple_g5p (Apple A9, a render-only kernel driver). Left to
+    * the kmsro fallback below, its render node would become the renderonly
+    * "display": every scanout allocation a DRM_IOCTL_MODE_CREATE_DUMB on a
+    * render node (refused), and every imported dma-buf a second import there,
+    * released with DRM_IOCTL_MODE_DESTROY_DUMB (refused too, so each handle
+    * stays until the file is closed). Zink renders it, as for powervr.
+    */
+   if (strcmp(ddev->base.driver_name, "apple_g5p") == 0) {
+      FREE(ddev->base.driver_name);
+      ddev->base.driver_name = strdup("zink");
+   }
+#endif
 
    if (strcmp(ddev->base.driver_name, "virtio_gpu") == 0) {
       struct virgl_renderer_capset_drm caps;

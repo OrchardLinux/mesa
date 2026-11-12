@@ -140,7 +140,7 @@ struct g9p_ctx {
    struct g9p_vs_store vs_stores[4 * 64];
    unsigned num_vs_high;
    unsigned num_vs_stores;
-   unsigned num_keys;
+   unsigned num_keys; G9P_A9_CTX_FIELDS
    struct g9p_code *c;
    struct g9p_shader *out;
    mesa_shader_stage stage;
@@ -1102,7 +1102,7 @@ emit_vec(struct g9p_ctx *ctx, nir_alu_instr *alu)
    release(ctx, &alu->instr);
    return true;
 }
-
+#include "g9p_a9_alu.h"
 static bool
 emit_alu(struct g9p_ctx *ctx, nir_alu_instr *alu)
 {
@@ -1120,7 +1120,7 @@ emit_alu(struct g9p_ctx *ctx, nir_alu_instr *alu)
    }
    for (unsigned i = 0; i < num_inputs; i++)
       s[i] = nir_get_scalar(alu->src[i].src.ssa, alu->src[i].swizzle[0]);
-
+   G9P_A9_ALU_LITERAL_FMA();
    /* compared where it is used (emit_branch_cmp()) */
    if (branch_compare(&alu->def))
       return true;
@@ -1181,7 +1181,7 @@ emit_alu(struct g9p_ctx *ctx, nir_alu_instr *alu)
          if (r[0] < 0)
             return false;
          release(ctx, &alu->instr);
-         dst = alloc_reg(ctx);
+         dst = G9P_A9_ALU_SINGLE_DEST();
          if (dst < 0)
             return false;
          g9p_add_imm(ctx->c, dst, r[0], imm);
@@ -1191,7 +1191,7 @@ emit_alu(struct g9p_ctx *ctx, nir_alu_instr *alu)
    }
    if (alu->op == nir_op_mov && is_const(s[0], &imm)) {
       release(ctx, &alu->instr);
-      dst = alloc_reg(ctx);
+      dst = G9P_A9_ALU_SINGLE_DEST();
       if (dst < 0)
          return false;
       g9p_mov_imm(ctx->c, dst, imm);
@@ -2910,10 +2910,11 @@ emit_tex(struct g9p_ctx *ctx, nir_tex_instr *tex)
    }
    return true;
 }
-
+#include "g9p_a9_intrinsics.h"
 static bool
 emit_intrinsic(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
 {
+   G9P_A9_INTRINSICS
    switch (intr->intrinsic) {
    case nir_intrinsic_load_local_invocation_index:
       /* r0 at entry; reserved from the start when used */
@@ -3332,7 +3333,6 @@ emit_intrinsic(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
       release(ctx, &intr->instr);
       return true;
    }
-
    default:
       fprintf(stderr, "g9p: intrinsic %s not supported yet\n",
               nir_intrinsic_infos[intr->intrinsic].name);
@@ -3433,7 +3433,7 @@ emit_branch_cmp(struct g9p_ctx *ctx, nir_if *nif, bool *sense)
    case nir_op_ieq32:  cond = G9P_EQ;  *sense = true;  break;
    default:            cond = G9P_EQ;  *sense = false; break; /* ine32 */
    }
-   a = src_reg(ctx, nir_get_scalar(cmp->src[0].src.ssa, cmp->src[0].swizzle[0]));
+   a = src_reg(ctx, nir_get_scalar(cmp->src[0].src.ssa, cmp->src[0].swizzle[0])); G9P_A9_BRANCH_IMMEDIATE();
    b = src_reg(ctx, nir_get_scalar(cmp->src[1].src.ssa, cmp->src[1].swizzle[0]));
    if (a < 0 || b < 0)
       return false;
@@ -3542,9 +3542,10 @@ emit_if(struct g9p_ctx *ctx, nir_if *nif)
       if (nir_block_first_instr(block) == nir_block_last_instr(block)) {
          if (!emit_break(ctx, when_passed))
             return false;
-         ctx->ip++;
+         G9P_A9_EMPTY_BREAK_BEFORE(ctx, side);
          if (!emit_cf_list(ctx, other))
             return false;
+         G9P_A9_EMPTY_BREAK_AFTER(ctx, side);
          release_condition(ctx, nif);
          return true;
       }
@@ -3719,7 +3720,7 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
       }
    }
 
-   ctx->ip = 0;
+   ctx->ip = 0; G9P_A9_GENERATE_INIT;
    ctx->num_frag_samples = 0;
    if (!emit_cf_list(ctx, &impl->body))
       return false;
@@ -3735,6 +3736,7 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
     */
    stack = ctx->stage == MESA_SHADER_COMPUTE || ctx->c->uses_stack;
    body_n = ctx->c->n;
+   G9P_A9_SET_BODYLESS(ctx, body_n);
    body = malloc(body_n * sizeof(uint16_t) + 1);
    if (!body)
       return false;
@@ -3899,7 +3901,7 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
       break;
    }
    default:
-      g9p_end(ctx->c);
+      G9P_A9_END_PAD(ctx); g9p_end(ctx->c);
       break;
    }
    return true;
@@ -5106,7 +5108,7 @@ g9p_compile_compute(nir_shader *nir, struct g9p_shader *out, void *mem_ctx)
    NIR_PASS(_, nir, nir_lower_compute_system_values, &csv);
    return compile_back(nir, out, MESA_SHADER_COMPUTE, NULL, 0, false, false, mem_ctx);
 }
-
+#include "g9p_a9_compute.h"
 /*
  * The fragment position as a varying: window coordinates from gl_Position
  * and the viewport (G9P_VIEWPORT buffer), written to varying @slot

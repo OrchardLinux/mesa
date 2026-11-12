@@ -64,7 +64,7 @@ static VkResult pvr_ctx_reset_cmd_init(struct pvr_device *device,
                                        struct pvr_reset_cmd *const reset_cmd)
 {
    const struct pvr_device_info *dev_info = &device->pdevice->dev_info;
-
+   PVR_G5P_HOOK(ctx_reset_cmd_init)
    /* The reset framework depends on compute support in the hw. */
    assert(PVR_HAS_FEATURE(dev_info, compute));
 
@@ -1117,7 +1117,7 @@ VkResult pvr_arch_compute_ctx_create(struct pvr_device *const device,
    struct pvr_winsys_compute_ctx_create_info create_info;
    struct pvr_compute_ctx *ctx;
    VkResult result;
-
+   PVR_G5P_HOOK(compute_ctx_create)
    ctx = vk_alloc(&device->vk.alloc,
                   sizeof(*ctx),
                   8,
@@ -1125,8 +1125,8 @@ VkResult pvr_arch_compute_ctx_create(struct pvr_device *const device,
    if (!ctx)
       return vk_error(device->instance, VK_ERROR_OUT_OF_HOST_MEMORY);
 
-   ctx->device = device;
 
+   ctx->device = device;
    result = pvr_bo_alloc(
       device,
       device->heaps.general_heap,
@@ -1199,7 +1199,7 @@ err_free_ctx:
 void pvr_arch_compute_ctx_destroy(struct pvr_compute_ctx *const ctx)
 {
    struct pvr_device *device = ctx->device;
-
+   PVR_G5P_HOOK(compute_ctx_destroy)
    device->ws->ops->compute_ctx_destroy(ctx->ws_ctx);
 
    pvr_ctx_reset_cmd_fini(device, &ctx->reset_cmd);

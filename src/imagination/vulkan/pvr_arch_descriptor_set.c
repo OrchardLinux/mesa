@@ -18,7 +18,7 @@
 #include "pvr_image.h"
 #include "pvr_physical_device.h"
 #include "pvr_sampler.h"
-
+#include "pvr_g5p_compute_state.h"
 static void
 write_buffer(const struct pvr_descriptor_set *set,
              const VkDescriptorBufferInfo *buffer_info,
@@ -149,7 +149,7 @@ write_image_sampler(const struct pvr_descriptor_set *set,
          }
       }
    }
-
+   PVR_G5P_HOOK(image_sampler, set, image_info, &image_sampler_desc)
    memcpy(desc_mapping, &image_sampler_desc, sizeof(image_sampler_desc));
 }
 
@@ -215,7 +215,7 @@ write_storage_image(const struct pvr_descriptor_set *set,
       image_view->image_state[is_cube ? PVR_TEXTURE_STATE_STORAGE
                                       : PVR_TEXTURE_STATE_SAMPLE];
 
-   if (!PVR_HAS_FEATURE(dev_info, tpu_extended_integer_lookup)) {
+   if (!PVR_G5P_NATIVE_STORAGE(dev_info) && !PVR_HAS_FEATURE(dev_info, tpu_extended_integer_lookup)) {
       struct ROGUE_TEXSTATE_STRIDE_IMAGE_WORD1 word1;
       ROGUE_TEXSTATE_STRIDE_IMAGE_WORD1_unpack(&storage_image_desc.words[1],
                                                &word1);
@@ -250,7 +250,7 @@ write_buffer_view(const struct pvr_descriptor_set *set,
    if (is_texel_buffer && buffer_view->vk.buffer)
       container_of(buffer_view->vk.buffer, struct pvr_buffer, vk)->g9p_gpu_written = true;
 
-   if (is_texel_buffer &&
+   if (is_texel_buffer && !PVR_G5P_NATIVE_STORAGE(dev_info) &&
        !PVR_HAS_FEATURE(dev_info, tpu_extended_integer_lookup)) {
       struct ROGUE_TEXSTATE_STRIDE_IMAGE_WORD1 word1;
       ROGUE_TEXSTATE_STRIDE_IMAGE_WORD1_unpack(&buffer_view_state.words[1],

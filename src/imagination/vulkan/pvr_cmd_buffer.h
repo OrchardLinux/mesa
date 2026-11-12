@@ -17,6 +17,7 @@
 #include "vk_command_buffer.h"
 
 #include "pvr_common.h"
+#include "util/ralloc.h"
 #include "pvr_framebuffer.h"
 #include "pvr_job_render.h"
 #include "pvr_hw_pass.h"
@@ -66,6 +67,10 @@ struct pvr_transfer_cmd_surface {
    enum pvr_memlayout mem_layout;
 
    uint32_t sample_count;
+#ifdef PVR_APPLE_G5P
+   const struct pvr_image *g5p_image;
+   VkImageAspectFlags g5p_aspect;
+#endif
 };
 
 struct pvr_rect_mapping {
@@ -148,6 +153,10 @@ struct pvr_dynamic_render_info {
 };
 
 struct pvr_sub_cmd_gfx {
+#if defined(PVR_APPLE_G5P)
+   /* a vk_meta blit's render pass: transfer work for barriers (pvr_arch_g5p_meta.c) */
+   bool g5p_transfer;
+#endif
    struct pvr_dynamic_render_info *dr_info;
    struct pvr_renderpass_hwsetup_render *hw_render;
    uint32_t attachment_count;
@@ -265,9 +274,17 @@ struct pvr_sub_cmd_compute {
     * queue order (no compute shaders for them here)
     */
    struct pvr_query_info *g9p_query;
+#ifdef PVR_APPLE_G5P
+   /* A kernel record was emitted since the last end of pass: the next one
+    * starts with iOS's barrier task (pvr_arch_g5p_compute.c). */
+   bool g5p_kernel_since_end;
+#endif
 };
 
 struct pvr_sub_cmd_transfer {
+#ifdef PVR_APPLE_G5P
+   uint32_t g5p_waits_skipped;
+#endif
    bool serialize_with_frag;
 
    /* Pointer to the actual transfer command list, allowing primary and
@@ -606,6 +623,12 @@ struct pvr_cmd_buffer_state {
 
    uint32_t pds_fragment_descriptor_data_offset;
    uint32_t pds_compute_descriptor_data_offset;
+#if defined(PVR_APPLE_G5P)
+
+   /* G5P transform feedback (pvr_arch_g5p_xfb.c): bindings and events, NULL
+    * until the command buffer uses any */
+   struct pvr_g5p_xfb_cmd *g5p_xfb;
+#endif
 };
 
 /* Do not change this. This is the format used for the depth_bias_array
@@ -660,6 +683,18 @@ struct pvr_cmd_buffer {
 
    /* List of pvr_bo structs associated with this cmd buffer. */
    struct list_head bo_list;
+#ifdef PVR_APPLE_G5P
+   /* G5P: per-draw uploads (pvr_arch_cmd_buffer_upload_general(), data-only
+    * pvr_arch_cmd_buffer_upload_pds()) are carved from blocks this command
+    * buffer owns: one pvr_bo_suballoc() per block, not per upload.
+    * [0] general heap, [1] PDS heap. A block is on bo_list; the views
+    * handed out live in g5p_views and are never freed one by one. */
+   struct {
+      struct pvr_suballoc_bo *block;
+      uint32_t used;
+   } g5p_upload[2];
+   struct linear_ctx *g5p_views;
+#endif
 
    struct list_head sub_cmds;
 

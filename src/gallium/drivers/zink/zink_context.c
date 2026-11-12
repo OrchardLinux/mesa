@@ -3886,9 +3886,10 @@ zink_batch_rp(struct zink_context *ctx)
    }
    unsigned clear_buffers = begin_rendering(ctx, true);
    assert(!ctx->rp_changed);
-   if (ctx->unordered_blitting)
+   if (ctx->unordered_blitting) {
       ctx->bs->has_reordered_work = true;
-   else
+      ctx->bs->reordered_stages |= VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;
+   } else
       ctx->bs->has_work = true;
 
    /* update the render-passes HUD query */
@@ -4353,13 +4354,13 @@ flush_batch(struct zink_context *ctx, bool sync)
    if (sync)
       sync_flush(ctx, ctx->bs);
 
-   if (ctx->bs->is_device_lost) {
-      check_device_lost(ctx);
-   } else {
-      zink_start_batch(ctx);
-      if (!ctx->bs->is_video)
-         reset_graphics_states(ctx);
-   }
+   check_device_lost(ctx);
+   /* The flushed state was submitted (also on a lost screen) and may still be in flight, so a lost
+    * context records into a new state too: keeping it appended the same state to batch_states again
+    * at the next flush and submitted it while its previous submission could be pending. */
+   zink_start_batch(ctx);
+   if (!ctx->bs->is_video)
+      reset_graphics_states(ctx);
    util_queue_fence_signal(&ctx->flush_fence);
 }
 
@@ -4827,6 +4828,15 @@ zink_flush(struct pipe_context *pctx,
    if (flags & PIPE_FLUSH_END_OF_FRAME) {
       p_atomic_set(&ctx->hud.frame_submits, ctx->hud.frame_submits_current);
       ctx->hud.frame_submits_current = 0;
+   }
+
+   /* any flush will do: an application that only uploads and flushes has no frames */
+   if (screen->trim_interval) {
+      int64_t now = os_time_get();
+      if (now - p_atomic_read_relaxed(&screen->last_trim) >= screen->trim_interval) {
+         p_atomic_set(&screen->last_trim, now);
+         zink_bo_trim(screen);
+      }
    }
 
    if (pfence) {
@@ -5433,6 +5443,7 @@ zink_copy_buffer(struct zink_context *ctx, struct zink_resource *dst, struct zin
    VkCommandBuffer cmdbuf = unsync ? ctx->bs->unsynchronized_cmdbuf : 
                                      can_unorder ? ctx->bs->reordered_cmdbuf : zink_get_cmdbuf(ctx, src, dst);
    ctx->bs->has_reordered_work |= can_unorder;
+   if (can_unorder) ctx->bs->reordered_stages |= VK_PIPELINE_STAGE_TRANSFER_BIT;
    ctx->bs->has_unsync |= unsync;
    zink_batch_reference_resource_rw(ctx, src, false);
    zink_batch_reference_resource_rw(ctx, dst, true);

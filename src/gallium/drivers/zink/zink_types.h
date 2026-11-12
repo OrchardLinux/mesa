@@ -686,11 +686,14 @@ struct zink_batch_state {
    struct zink_batch_descriptor_data dd;
 
    VkDeviceSize resource_size;
+   /* bytes of transfer staging buffers whose upload this batch records: dead once recorded, but allocated until the batch completes */
+   VkDeviceSize staging_size;
 
    bool is_device_lost;
    /* these flags correspond to the matching cmdbufs */
    bool has_work;
    bool has_reordered_work;
+   VkPipelineStageFlags reordered_stages;
    bool has_unsync;
 };
 
@@ -1498,7 +1501,10 @@ struct zink_video_format_prop {
 #define ZINK_OBJ_CACHE_BUCKET_BITS 10
 
 struct zink_screen {
+   /* Must stay first: zink_screen() casts a pipe_screen pointer directly. */
    struct pipe_screen base;
+   bool precise_sync;
+   bool is_g5p;
 
    const char *vendor_name;
    const char *device_name;
@@ -1613,6 +1619,9 @@ struct zink_screen {
 
    uint64_t total_video_mem;
    uint64_t clamp_video_mem;
+   uint64_t clamp_staging_mem; // a batch holding this much dead upload staging is flushed; 0 = never
+   int64_t trim_interval; // usecs between zink_bo_trim() calls at the end of a frame; 0 = never
+   int64_t last_trim;
    uint64_t total_mem;
    uint64_t mapped_vram;
 

@@ -207,16 +207,22 @@ pvr_subpass_load_op_init(struct pvr_device *device,
    load_op->subpass = subpass;
    load_op->clears_loads_state.mrt_setup = &hw_subpass->setup;
 
-   result = pvr_arch_load_op_shader_generate(device, allocator, load_op);
-   if (result != VK_SUCCESS) {
-      vk_free2(&device->vk.alloc, allocator, load_op);
-      return result;
-   }
-
    load_op->view_count = 0;
    u_foreach_bit (view_idx, hw_render->view_mask) {
       load_op->view_indices[load_op->view_count] = view_idx;
       load_op->view_count++;
+   }
+
+   /* G5P supplies its own LOAD background programs. */
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p)) {
+      hw_render->subpasses[hw_subpass_idx].load_op = load_op;
+      return VK_SUCCESS;
+   }
+
+   result = pvr_arch_load_op_shader_generate(device, allocator, load_op);
+   if (result != VK_SUCCESS) {
+      vk_free2(&device->vk.alloc, allocator, load_op);
+      return result;
    }
 
    hw_render->subpasses[hw_subpass_idx].load_op = load_op;
@@ -326,6 +332,10 @@ static VkResult pvr_render_load_op_init(
    load_op->clears_loads_state.mrt_setup = &hw_render->init_setup;
    load_op->view_indices[0] = view_index;
    load_op->view_count = 1;
+
+   /* G5P supplies its own LOAD background programs. */
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p))
+      return VK_SUCCESS;
 
    return pvr_arch_load_op_shader_generate(device, allocator, load_op);
 }
@@ -856,7 +866,7 @@ PVR_PER_ARCH(CreateRenderPass2)(VkDevice _device,
          PVR_HAS_FEATURE(dev_info, gs_rta_support) &&
          pvr_arch_format_is_pbe_downscalable(&device->pdevice->dev_info,
                                              attachment->vk_format);
-
+      PVR_G5P_HOOK(pbe_resolve, dev_info, attachment)
       if (attachment->sample_count > pass->max_sample_count)
          pass->max_sample_count = attachment->sample_count;
    }

@@ -18,6 +18,9 @@
 #include "vk_queue.h"
 
 #include "pvr_common.h"
+#ifdef PVR_APPLE_G5P
+#include "winsys/apple_g5p/g5p_ws_perf.h"
+#endif
 
 struct vk_sync;
 
@@ -38,6 +41,20 @@ struct pvr_queue {
 
    struct vk_sync *last_job_signal_sync[PVR_JOB_TYPE_MAX];
    struct vk_sync *next_job_wait_sync[PVR_JOB_TYPE_MAX];
+#ifdef PVR_APPLE_G5P
+   /* last_job_signal_sync[i] is known complete (zero-timeout wait succeeded); cleared whenever it is replaced */
+   bool g5p_src_done[PVR_JOB_TYPE_MAX];
+   struct pvr_g5p_inflight {
+      struct vk_sync *done;
+      bool known;
+      uint8_t writes, reads;
+      uint64_t w_base[G5P_PERF_MAX_WRITES], w_size[G5P_PERF_MAX_WRITES];
+      uint64_t r_base[G5P_PERF_MAX_READS], r_size[G5P_PERF_MAX_READS];
+   } g5p_inflight[16];
+   uint32_t g5p_inflight_head;
+   struct vk_sync *g5p_inflight_overflow;
+   struct vk_sync *g5p_sem_wait[PVR_JOB_TYPE_MAX];
+#endif
 };
 
 VK_DEFINE_HANDLE_CASTS(pvr_queue, vk.base, VkQueue, VK_OBJECT_TYPE_QUEUE)

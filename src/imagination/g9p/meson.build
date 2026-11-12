@@ -24,7 +24,7 @@ g9p_replay = executable(
   files('g9p_replay.c'),
   include_directories : [inc_imagination, inc_powervr_g9p, inc_include, inc_src],
   c_args : [imagination_c_args],
-  link_with : libpowervr_g9p,
+  link_with : [libpowervr_g9p] + (with_imagination_g5p ? [libpowervr_g5p] : []),
   dependencies : [idep_mesautil, idep_nir],
   install : false,
 )

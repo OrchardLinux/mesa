@@ -362,6 +362,7 @@ VkResult pvr_GetQueryPoolResults(VkDevice _device,
    const uint32_t core_count = device->pdevice->dev_runtime_info.core_count;
    uint8_t *data = (uint8_t *)pData;
    VkResult result = VK_SUCCESS;
+   PVR_G5P_HOOK(xfb_query_results, device, pool, firstQuery, queryCount, pData, stride, flags)
 
    if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p) &&
        pool->query_type == VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT) {

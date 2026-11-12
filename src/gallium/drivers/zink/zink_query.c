@@ -163,6 +163,7 @@ reset_vk_query_pool(struct zink_context *ctx, struct zink_vk_query *vkq)
    if (vkq->needs_reset) {
       VKCTX(CmdResetQueryPool)(ctx->bs->reordered_cmdbuf, vkq->pool->query_pool, vkq->query_id, 1);
       ctx->bs->has_reordered_work = true;
+      ctx->bs->reordered_stages |= VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
    }
    vkq->needs_reset = false;
 }

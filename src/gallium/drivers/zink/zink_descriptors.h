@@ -180,7 +180,7 @@ zink_descriptor_program_init(struct zink_context *ctx, struct zink_program *pg);
 void
 zink_descriptor_program_deinit(struct zink_screen *screen, struct zink_program *pg);
 
-void
+bool
 zink_descriptors_update(struct zink_context *ctx, enum zink_pipeline_idx pidx);
 
 

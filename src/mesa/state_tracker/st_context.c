@@ -66,6 +66,7 @@
 #include "util/u_inlines.h"
 #include "util/u_upload_mgr.h"
 #include "util/u_vbuf.h"
+#include "util/log.h"
 #include "util/u_memory.h"
 #include "util/hash_table.h"
 #include "util/thread_sched.h"
@@ -473,6 +474,34 @@ st_have_perfquery(struct st_context *ctx)
           pipe->get_intel_perf_query_data;
 }
 
+/* Whether the driver samples every ETC2 format S3TC transcodes to, in every
+ * kind of texture S3TC is allowed in.
+ */
+static bool
+st_can_transcode_s3tc_to_etc2(struct pipe_screen *screen)
+{
+   static const enum pipe_format formats[] = {
+      PIPE_FORMAT_ETC2_RGB8,   PIPE_FORMAT_ETC2_SRGB8, PIPE_FORMAT_ETC2_RGB8A1,
+      PIPE_FORMAT_ETC2_SRGB8A1, PIPE_FORMAT_ETC2_RGBA8, PIPE_FORMAT_ETC2_SRGBA8,
+   };
+   static const enum pipe_texture_target targets[] = {
+      PIPE_TEXTURE_2D, PIPE_TEXTURE_CUBE, PIPE_TEXTURE_2D_ARRAY, PIPE_TEXTURE_CUBE_ARRAY,
+   };
+
+   for (unsigned t = 0; t < ARRAY_SIZE(targets); t++) {
+      if (targets[t] == PIPE_TEXTURE_2D_ARRAY && !screen->caps.max_texture_array_layers)
+         continue;
+      if (targets[t] == PIPE_TEXTURE_CUBE_ARRAY && !screen->caps.cube_map_array)
+         continue;
+      for (unsigned f = 0; f < ARRAY_SIZE(formats); f++) {
+         if (!screen->is_format_supported(screen, formats[f], targets[t], 0, 0,
+                                          PIPE_BIND_SAMPLER_VIEW))
+            return false;
+      }
+   }
+   return true;
+}
+
 static struct st_context *
 st_create_context_priv(struct gl_context *ctx, struct pipe_context *pipe,
                        const struct st_config_options *options)
@@ -597,6 +626,21 @@ st_create_context_priv(struct gl_context *ctx, struct pipe_context *pipe,
    st->has_s3tc = screen->is_format_supported(screen, PIPE_FORMAT_DXT5_RGBA,
                                               PIPE_TEXTURE_2D, 0, 0,
                                               PIPE_BIND_SAMPLER_VIEW);
+   /* S3TC on a driver that samples ETC2 and not S3TC: transcode at upload,
+    * to the ETC2 format of the same size, instead of decompressing to RGBA8
+    * (four to eight times the memory). Option 2 does it on a driver that has
+    * S3TC too, to test the path.
+    */
+   st->transcode_s3tc = options->transcode_s3tc &&
+                        (!st->has_s3tc || options->transcode_s3tc > 1) &&
+                        st_can_transcode_s3tc_to_etc2(screen);
+   if (st->transcode_s3tc) {
+      st->has_s3tc = false;
+      mesa_logi_once("S3TC textures are transcoded to ETC2");
+   } else if (options->transcode_s3tc && !st->has_s3tc) {
+      mesa_logi_once("S3TC textures are decompressed to RGBA8: "
+                     "the driver lacks an ETC2 format to transcode to");
+   }
    st->has_rgtc = screen->is_format_supported(screen, PIPE_FORMAT_RGTC2_UNORM,
                                               PIPE_TEXTURE_2D, 0, 0,
                                               PIPE_BIND_SAMPLER_VIEW);

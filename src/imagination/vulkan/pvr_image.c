@@ -27,7 +27,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
-
+#include "pvr_g5p_ds_hooks.h"
 #include "drm-uapi/drm_fourcc.h"
 #include "pvr_buffer.h"
 #include "pvr_device.h"
@@ -388,7 +388,7 @@ void pvr_DestroyImage(VkDevice _device,
 
    if (!image)
       return;
-
+   PVR_G5P_HOOK(memory_released, device, true, image->vma, image->total_size)
    pvr_image_fini(device, image);
    vk_image_destroy(&device->vk, pAllocator, &image->vk);
 }
@@ -398,7 +398,7 @@ VkResult pvr_image_init(struct pvr_device *device,
                         struct pvr_image *image)
 {
    unsigned pbe_stride_align = get_pbe_stride_align(&device->pdevice->dev_info);
-
+   PVR_G5P_HOOK(stride_align, device, pCreateInfo, pbe_stride_align)
    image->plane_count = vk_format_get_plane_count(image->vk.format);
    image->alignment = device->pdevice->ws->page_size;
 
@@ -421,7 +421,12 @@ VkResult pvr_image_init(struct pvr_device *device,
       pbe_stride_align = MAX2(pbe_stride_align, 64 / vk_format_get_blocksize(image->vk.format));
    pvr_image_init_physical_extent(image, pCreateInfo, pbe_stride_align);
    pvr_image_setup_mip_levels(image);
-
+#ifdef PVR_APPLE_G5P
+   /* G5P: the A9's colour layouts (pvr_g5p_image.c) */
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p))
+      pvr_g5p_image_layout(image, pbe_stride_align);
+#endif
+   PVR_G5P_HOOK(ds_image, device, image)
    return VK_SUCCESS;
 }
 
@@ -475,7 +480,7 @@ VkResult pvr_BindImageMemory2(VkDevice _device,
       VK_FROM_HANDLE(pvr_image, image, pBindInfos[i].image);
       VkDeviceSize offset = pBindInfos[i].memoryOffset;
       VkResult result;
-
+      PVR_G5P_HOOK(memory_bound, device, true, image->vma, image->total_size)
 #if defined(PVR_USE_WSI_PLATFORM)
       const VkBindImageMemorySwapchainInfoKHR *swapchain_info =
          vk_find_struct_const(pBindInfos[i].pNext,
@@ -538,6 +543,7 @@ void pvr_get_image_subresource_layout(const struct pvr_image *image,
       layout->depthPitch = plane->layer_size;
    layout->arrayPitch = plane->layer_size;
    layout->size = mip_level->size;
+   PVR_G5P_HOOK(slice_pitch, image, layout)
 }
 
 void pvr_GetImageSubresourceLayout2(VkDevice device,
@@ -546,7 +552,7 @@ void pvr_GetImageSubresourceLayout2(VkDevice device,
                                     VkSubresourceLayout2 *pLayout)
 {
    VK_FROM_HANDLE(pvr_image, image, _image);
-
+   PVR_G5P_HOOK(shm_layout_public, image, pSubresource, pLayout)
    pvr_get_image_subresource_layout(image,
                                     &pSubresource->imageSubresource,
                                     &pLayout->subresourceLayout);

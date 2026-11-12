@@ -76,6 +76,7 @@ u_driconf_fill_st_options(struct st_config_options *options,
    query_bool_option(force_gl_depth_component_type_int);
    query_bool_option(transcode_etc);
    query_bool_option(transcode_astc);
+   query_int_option(transcode_s3tc);
    query_bool_option(allow_compressed_fallback);
    query_string_option(force_explicit_uniform_loc_zero);
    query_string_option(force_gl_vendor);

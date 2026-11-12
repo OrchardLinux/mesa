@@ -104,6 +104,22 @@ release_expired_buffers_locked(struct pb_cache *mgr, struct list_head *cache,
 }
 
 /**
+ * Release the buffers that have been in the cache for longer than its
+ * timeout. Adding a buffer does this too; this is for a cache that nothing
+ * is being added to.
+ */
+void
+pb_cache_release_expired_buffers(struct pb_cache *mgr)
+{
+   simple_mtx_lock(&mgr->mutex);
+   unsigned current_time_ms = time_get_ms(mgr);
+
+   for (unsigned i = 0; i < mgr->num_heaps; i++)
+      release_expired_buffers_locked(mgr, &mgr->buckets[i], current_time_ms);
+   simple_mtx_unlock(&mgr->mutex);
+}
+
+/**
  * Add a buffer to the cache. This is typically done when the buffer is
  * being released.
  */
