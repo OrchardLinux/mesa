@@ -2069,6 +2069,31 @@ PVR_PER_ARCH(QueueSubmit2)(VkQueue _queue,
    return result;
 }
 
+/*
+ * vk_common_GetSemaphoreCounterValue() answers VK_ERROR_DEVICE_LOST once the
+ * device is lost, but the counter still advances: jobs accepted before the
+ * loss signal their points as they retire (with an error), and refused
+ * submissions signal theirs (QueueSubmit2 above). A client that recycles
+ * per-submission memory by the counter (Zink's batch states and descriptor
+ * pools) could otherwise never free it again and grew until it ran out of
+ * memory. Report the value the timeline really reached; the loss is still
+ * reported by every submission and wait.
+ */
+VKAPI_ATTR VkResult VKAPI_CALL
+PVR_PER_ARCH(GetSemaphoreCounterValue)(VkDevice _device,
+                                       VkSemaphore _semaphore,
+                                       uint64_t *pValue)
+{
+   VK_FROM_HANDLE(vk_device, device, _device);
+   VK_FROM_HANDLE(vk_semaphore, semaphore, _semaphore);
+
+   if (!vk_device_is_lost_no_report(device))
+      return vk_common_GetSemaphoreCounterValue(_device, _semaphore, pValue);
+
+   return vk_sync_get_value(device, vk_semaphore_get_active_sync(semaphore),
+                            pValue);
+}
+
 VkResult PVR_PER_ARCH(QueueBindSparse)(VkQueue _queue,
                                        uint32_t bindInfoCount,
                                        const VkBindSparseInfo *pBindInfo,
