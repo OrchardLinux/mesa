@@ -65,6 +65,7 @@
 #include "util/macros.h"
 #include "util/u_atomic.h"
 #include "vk_alloc.h"
+#include "vk_common_entrypoints.h"
 #include "vk_fence.h"
 #include "vk_log.h"
 #include "vk_object.h"
@@ -1967,6 +1968,25 @@ static VkResult pvr_driver_queue_submit_jobs(struct vk_queue *queue,
 }
 
 /*
+ * Performs a signal operation of a submission that will not run, unless the
+ * payload already has a signal pending (a job the kernel accepted signals it,
+ * with an error if its context is lost).
+ */
+static void pvr_signal_unsubmitted(struct vk_device *device,
+                                   struct vk_sync *sync,
+                                   uint64_t value)
+{
+   if ((sync->type->features & VK_SYNC_FEATURE_WAIT_PENDING) &&
+       vk_sync_wait(device, sync, value, VK_SYNC_WAIT_PENDING, 0) ==
+          VK_SUCCESS)
+      return;
+
+   /* a failure is logged by vk_sync_signal(); nothing else can be done */
+   VkResult result = vk_sync_signal(device, sync, value);
+   (void)result;
+}
+
+/*
  * A queue whose GPU context was lost (the kernel ends a hung job's context
  * and refuses its jobs with EIO) stays lost, so that clients see
  * VK_ERROR_DEVICE_LOST from here on instead of retrying
@@ -1990,11 +2010,62 @@ static VkResult pvr_driver_queue_submit(struct vk_queue *queue,
       struct pvr_queue *driver_queue = container_of(queue, struct pvr_queue, vk);
 
       for (uint32_t i = 0; i < submit->signal_count; i++)
-         vk_sync_signal(&driver_queue->device->vk, submit->signals[i].sync,
-                        submit->signals[i].signal_value);
+         pvr_signal_unsubmitted(&driver_queue->device->vk,
+                                submit->signals[i].sync,
+                                submit->signals[i].signal_value);
    }
    if (result == VK_ERROR_DEVICE_LOST)
       return vk_queue_set_lost(queue, "GPU context lost");
+   return result;
+}
+
+/*
+ * vk_common_QueueSubmit2() returns VK_ERROR_DEVICE_LOST on a lost device
+ * before it builds a submission, and stops at the first submission that
+ * fails, so none of the signal operations of those submissions reach
+ * pvr_driver_queue_submit(). Their semaphores and the fence then never get a
+ * payload. A wait for a pending signal on one of them never returns:
+ * vkGetSemaphoreFdKHR(SYNC_FD) on a binary semaphore waits for its signal to
+ * be submitted with no timeout, as does a wait-for-submit timeline wait. Zink
+ * exports its batch's semaphores into dma-bufs right after each submit, so a
+ * lost context left its flush thread blocked in the kernel and the
+ * application unable to exit.
+ *
+ * The submission is still refused with VK_ERROR_DEVICE_LOST and runs no
+ * work, but every signal it promised and no job will perform is performed
+ * here, as pvr_driver_queue_submit() does for a submission that fails.
+ */
+VKAPI_ATTR VkResult VKAPI_CALL
+PVR_PER_ARCH(QueueSubmit2)(VkQueue _queue,
+                           uint32_t submitCount,
+                           const VkSubmitInfo2 *pSubmits,
+                           VkFence _fence)
+{
+   VK_FROM_HANDLE(vk_queue, queue, _queue);
+   VK_FROM_HANDLE(vk_fence, fence, _fence);
+   struct vk_device *device = queue->base.device;
+   VkResult result;
+
+   result = vk_common_QueueSubmit2(_queue, submitCount, pSubmits, _fence);
+   if (result == VK_SUCCESS || !vk_device_is_lost_no_report(device))
+      return result;
+
+   for (uint32_t i = 0; i < submitCount; i++) {
+      for (uint32_t j = 0; j < pSubmits[i].signalSemaphoreInfoCount; j++) {
+         const VkSemaphoreSubmitInfo *info =
+            &pSubmits[i].pSignalSemaphoreInfos[j];
+         VK_FROM_HANDLE(vk_semaphore, semaphore, info->semaphore);
+         const uint64_t value =
+            semaphore->type == VK_SEMAPHORE_TYPE_TIMELINE ? info->value : 0;
+
+         pvr_signal_unsubmitted(device,
+                                vk_semaphore_get_active_sync(semaphore),
+                                value);
+      }
+   }
+   if (fence)
+      pvr_signal_unsubmitted(device, vk_fence_get_active_sync(fence), 0);
+
    return result;
 }
 
