@@ -611,14 +611,6 @@ static void pvr_rt_dataset_ws_create_info_init(
 
    create_info->rgn_header_size =
       pvr_rt_get_isp_region_size(device, mtile_info);
-   /* Apple G5P: the kernel's A9 path takes this as the size in bytes of one RT
-    * data's region headers (it refuses a job on a dataset with less than its
-    * own count of them), not as the ISP region size in dwords that the UAPI
-    * describes and every other device passes. One layer: the stride is that
-    * size.
-    */
-   if (PVR_HAS_FEATURE(dev_info, apple_g5p))
-      create_info->rgn_header_size = rt_dataset->rgn_headers_stride;
 }
 
 VkResult pvr_arch_render_target_dataset_create(
