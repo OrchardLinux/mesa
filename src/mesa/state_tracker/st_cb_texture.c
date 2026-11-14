@@ -2956,8 +2956,10 @@ fallback_copy_texsubimage(struct gl_context *ctx,
    /* A compressed format the driver doesn't have: the image's own copy of the
     * compressed data is what gets written, and unmapping that decompresses
     * or transcodes it into the resource (whose format is another one).
+    * Only where S3TC is transcoded (transcode_s3tc); elsewhere as before.
     */
    const bool compressed_fallback =
+      st->transcode_s3tc &&
       st_compressed_format_fallback(st, stImage->TexFormat);
    GLint fallback_stride = 0;
 

@@ -815,8 +815,10 @@ submit_queue(void *data, void *gdata, int thread_index)
     * forever. So the batch is still submitted, without its command buffers: its waits are consumed and every
     * signal happens; the batch is device-lost, which the context reports (a guilty reset). */
    VkResult result;
-   /* on a lost screen no batch is executed: each is submitted for its waits and signals only */
-   const bool screen_lost = screen->device_lost;
+   /* on a lost screen no batch is executed: each is submitted for its waits and signals only.
+    * G5P only: every other driver keeps skipping the submit (keep_promises false). */
+   const bool keep_promises = screen->is_g5p;
+   const bool screen_lost = screen->device_lost && keep_promises;
    bool recorded = !screen_lost;
    if (recorded && bs->has_work) {
       VRAM_ALLOC_LOOP(result,
@@ -824,6 +826,10 @@ submit_queue(void *data, void *gdata, int thread_index)
          if (result != VK_SUCCESS) {
             mesa_loge("ZINK: vkEndCommandBuffer failed (%s)", vk_Result_to_str(result));
             recorded = false;
+            if (!keep_promises) {
+               bs->is_device_lost = true;
+               goto end;
+            }
          }
       );
    }
@@ -845,6 +851,10 @@ submit_queue(void *data, void *gdata, int thread_index)
          if (result != VK_SUCCESS) {
             mesa_loge("ZINK: vkEndCommandBuffer failed (%s)", vk_Result_to_str(result));
             recorded = false;
+            if (!keep_promises) {
+               bs->is_device_lost = true;
+               goto end;
+            }
          }
       );
    }
@@ -854,6 +864,10 @@ submit_queue(void *data, void *gdata, int thread_index)
          if (result != VK_SUCCESS) {
             mesa_loge("ZINK: vkEndCommandBuffer failed (%s)", vk_Result_to_str(result));
             recorded = false;
+            if (!keep_promises) {
+               bs->is_device_lost = true;
+               goto end;
+            }
          }
       );
    }
@@ -963,6 +977,7 @@ submit_queue(void *data, void *gdata, int thread_index)
 
    /* submit_count is incremented together with fence.submitted below */
    count_submit = true;
+end:
    /* wake unflushed-usage waiters */
    mtx_lock(&bs->usage.mtx);
    u_cnd_monotonic_broadcast(&bs->usage.flush);
@@ -1028,11 +1043,14 @@ zink_end_batch(struct zink_context *ctx)
       ctx->swapchain = NULL;
    }
 
-   /* A lost screen still submits the batch, without its command buffers (submit_queue): the present
+   /* G5P: a lost screen still submits the batch, without its command buffers (submit_queue): the present
     * semaphore made above, the batch's timeline value and its other signals are promised to waiters.
     * Returning here left them with no signal operation: the swapchain present then waited on a
     * semaphore nothing would signal, the WSI dropped that present, the compositor kept its last
     * buffer and the next acquire waited forever for a release point (glmark2 terrain on G5P). */
+   if (screen->device_lost && !screen->is_g5p)
+      return;
+
    if (ctx->tc && !screen->device_lost) {
       set_foreach(&bs->active_queries, entry)
          zink_query_sync(ctx, (void*)entry->key);
