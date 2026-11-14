@@ -1,7 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 #ifndef G9P_A9_ALU_H
 #define G9P_A9_ALU_H
-#ifdef PVR_APPLE_G5P
 #   include "../g5p/g5p_usc.h"
 /* Coalesce only an immediate, sole store_reg use. No intervening instruction
  * may observe the old register value; no indirect or vector register writes. */
@@ -36,9 +35,7 @@ a9_alu_store_destination(struct g9p_ctx *ctx, nir_def *def)
 static int
 a9_alu_single_destination(struct g9p_ctx *ctx, nir_alu_instr *alu)
 {
-   const char *enabled = getenv("PVR_G5P_FMA_LITERALS");
-   int dst = ctx->out->a9 && (!enabled || strcmp(enabled, "0"))
-                ? a9_alu_store_destination(ctx, &alu->def) : -1;
+   int dst = ctx->out->a9 ? a9_alu_store_destination(ctx, &alu->def) : -1;
    return dst >= 0 ? dst : alloc_reg(ctx);
 }
 
@@ -48,8 +45,7 @@ a9_alu_fma_literals(struct g9p_ctx *ctx, nir_alu_instr *alu, nir_scalar s[3], bo
    uint32_t multiplier, addend;
    *handled = false;
    if (!ctx->out->a9 || alu->op != nir_op_ffma ||
-       !is_const(s[2], &addend) || (addend & 0x200) ||
-       (getenv("PVR_G5P_FMA_LITERALS") && !strcmp(getenv("PVR_G5P_FMA_LITERALS"), "0")))
+       !is_const(s[2], &addend) || (addend & 0x200))
       return true;
    unsigned literal = is_const(s[0], &multiplier) ? 0 : 1;
    if (!is_const(s[literal], &multiplier) || nir_scalar_is_const(s[1 - literal]))
@@ -76,9 +72,7 @@ a9_alu_fma_literals(struct g9p_ctx *ctx, nir_alu_instr *alu, nir_scalar s[3], bo
 }
 #   define G9P_A9_BRANCH_IMMEDIATE() do {                                \
       uint32_t value;                                                    \
-      const char *enabled = getenv("PVR_G5P_FMA_LITERALS");                \
       if (ctx->out->a9 && !is_float && a >= 0 &&                          \
-          (!enabled || strcmp(enabled, "0")) &&                         \
           is_const(nir_get_scalar(cmp->src[1].src.ssa,                    \
                                   cmp->src[1].swizzle[0]), &value) &&    \
           value < 1024) {                                               \
@@ -96,9 +90,4 @@ a9_alu_fma_literals(struct g9p_ctx *ctx, nir_alu_instr *alu, nir_scalar s[3], bo
       if (handled)                                           \
          return true;                                        \
    } while (0)
-#else
-#   define G9P_A9_BRANCH_IMMEDIATE()
-#   define G9P_A9_ALU_SINGLE_DEST() alloc_reg(ctx)
-#   define G9P_A9_ALU_LITERAL_FMA()
-#endif
 #endif

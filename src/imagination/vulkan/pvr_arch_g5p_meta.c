@@ -2,7 +2,6 @@
 /*
  * Apple's A9 GPU (G5P): image blits as fragment work through the common
  * Vulkan runtime's vk_meta, in the shape of Asahi's hk_cmd_meta.c.
- * Built only with -Dimagination-g5p-experimental=true.
  *
  * G5P's transfer sub-commands run on the CPU (pvr_arch_g5p_layout.c). A blit
  * between colour images the A9 can sample and render is instead a render
@@ -11,8 +10,6 @@
  * graphics state is put back afterwards. The render sub-commands it creates
  * are marked as transfer work (pvr_sub_cmd_gfx::g5p_transfer), so barriers
  * naming the transfer stages order them (pvr_arch_queue.c).
- *
- * PVR_G5P_GPU_BLIT=0 keeps every blit on the CPU (for A/B comparison).
  */
 
 #include <stdlib.h>
@@ -34,7 +31,6 @@
 #include "pvr_g5p_meta.h"
 
 
-DEBUG_GET_ONCE_NUM_OPTION(g5p_perf_log, "PVR_G5P_PERF_LOG", 0)
 
 static VkResult
 g5p_meta_bind_map_buffer(struct vk_command_buffer *vk_cmd, struct vk_meta_device *meta, VkBuffer _buffer,
@@ -98,16 +94,6 @@ g5p_meta_format(VkFormat f)
 }
 
 static bool
-g5p_meta_mip_blit_enabled(void)
-{
-   static int enabled = -1;
-
-   if (enabled < 0)
-      enabled = debug_get_bool_option("PVR_G5P_GPU_MIPBLIT", true);
-   return enabled;
-}
-
-static bool
 g5p_meta_image(const struct pvr_image *image, VkImageUsageFlags needed)
 {
    /* twiddled or linear (Firefox's WebGL buffer and compositor texture are
@@ -115,12 +101,11 @@ g5p_meta_image(const struct pvr_image *image, VkImageUsageFlags needed)
     * twiddled mip chain too (glGenerateMipmap through Zink's per-level
     * vkCmdBlitImage): G5P samples a one-level view of it and stores one
     * level per render (twiddled PBE, pvr_arch_g5p.c); linear images have no
-    * mip views (pvr_arch_g5p_tex.c). PVR_G5P_GPU_MIPBLIT=0 keeps mip chains
-    * on the CPU. */
+    * mip views (pvr_arch_g5p_tex.c). */
    const bool mips = image->vk.mip_levels > 1;
    return image->vk.image_type == VK_IMAGE_TYPE_2D && image->vk.samples == VK_SAMPLE_COUNT_1_BIT &&
           image->vk.array_layers == 1 &&
-          (mips ? image->memlayout == PVR_MEMLAYOUT_TWIDDLED && g5p_meta_mip_blit_enabled() :
+          (mips ? image->memlayout == PVR_MEMLAYOUT_TWIDDLED :
                   image->memlayout == PVR_MEMLAYOUT_TWIDDLED || image->memlayout == PVR_MEMLAYOUT_LINEAR) &&
           (image->vk.usage & needed) && g5p_meta_format(image->vk.format);
 }
@@ -149,22 +134,12 @@ g5p_meta_dst_level(const struct pvr_image *dst, const VkImageSubresourceLayers *
 }
 
 static bool
-g5p_meta_gpu_blit_enabled(void)
-{
-   static int enabled = -1;
-
-   if (enabled < 0)
-      enabled = debug_get_bool_option("PVR_G5P_GPU_BLIT", true);
-   return enabled;
-}
-
-static bool
 g5p_meta_blit_eligible(const struct pvr_cmd_buffer *cmd_buffer, const VkBlitImageInfo2 *info)
 {
    VK_FROM_HANDLE(pvr_image, src, info->srcImage);
    VK_FROM_HANDLE(pvr_image, dst, info->dstImage);
 
-   if (!cmd_buffer->device->g5p || !cmd_buffer->device->g5p->meta_ready || !g5p_meta_gpu_blit_enabled())
+   if (!cmd_buffer->device->g5p || !cmd_buffer->device->g5p->meta_ready)
       return false;
    /* a meta draw inside an active occlusion query would be counted */
    if (cmd_buffer->state.vis_test_enabled || cmd_buffer->vk.level != VK_COMMAND_BUFFER_LEVEL_PRIMARY)
@@ -225,14 +200,6 @@ PVR_PER_ARCH(g5p_meta_blit)(struct pvr_cmd_buffer *cmd_buffer, const VkBlitImage
    if (rendered) {
       for (uint32_t i = 0; i < ARRAY_SIZE(cmd_buffer->state.barriers_needed); i++)
          cmd_buffer->state.barriers_needed[i] |= PVR_PIPELINE_STAGE_TRANSFER_BIT;
-   }
-   if (debug_get_option_g5p_perf_log() >= 3) {
-      VK_FROM_HANDLE(pvr_image, src, info->srcImage);
-      VK_FROM_HANDLE(pvr_image, dst, info->dstImage);
-      fprintf(stderr, "G5P perf gpu-blit src=%s %ux%u dst=%s %ux%u regions=%u filter=%d rendered=%d\n",
-              vk_Format_to_str(src->vk.format), src->vk.extent.width, src->vk.extent.height,
-              vk_Format_to_str(dst->vk.format), dst->vk.extent.width, dst->vk.extent.height,
-              info->regionCount, info->filter, rendered);
    }
    return true;
 }

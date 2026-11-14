@@ -3,7 +3,7 @@
  * Apple's A9 GPU (G5P): depth/stencil attachments. The ZLS words, the
  * depth/stencil planes and the draw's ISP words, as the A9 driver on iPadOS
  * builds them (our iOS captures of depth, stencil and depth-bias passes,
- * 2026-11-01). Built only with -Dimagination-g5p-experimental=true.
+ * 2026-11-01).
  *
  * The functions without PVR_PER_ARCH are plain arithmetic on the words
  * (csbgen field packing, no driver objects), so a host test can check them
@@ -67,7 +67,7 @@ struct pvr_g5p_ds_target {
    uint8_t stencil_clear;   /* ISP_BGOBJVALS.stencil */
 };
 
-/* The ZLS words of the TYPED_V3 pass's V2 extension (drm_g5p_render_pass_ext):
+/* The ZLS words of a render's fragment stream (pvr_arch_g5p.c):
  * zls[] = ZLSCTL, ZLOAD_BASE, ZSTORE_BASE, STENCIL_LOAD_BASE,
  * STENCIL_STORE_BASE, ZLS_PIXELS; address_mask bit i says zls[i] is an
  * address (inside the job's listed ranges); the background object's depth

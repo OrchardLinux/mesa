@@ -13,13 +13,10 @@
 #define PVR_G5P_TBO_LIMIT 65536u
 #define PVR_G5P_TBO_MAGIC 0x54424f31u /* software metadata, never a GPU field */
 #define PVR_G5P_TBO_NIR_FOLDED (1u << 31)
+/* Texel buffers have not run on the device: not advertised */
 static inline bool pvr_g5p_tbo_probe(void)
 {
-   const char *s = getenv("PVR_G5P_TEXEL_BUFFER");
-   const char *copy = getenv("PVR_G5P_GPU_COPY");
-   /* Stage 1 meta copies use the same buffer-fetch lowering and descriptors. */
-   return (s && !strcmp(s, "probe")) ||
-          (copy && (!strcmp(copy, "1") || !strcmp(copy, "true") || !strcmp(copy, "yes")));
+   return false;
 }
 
 #endif

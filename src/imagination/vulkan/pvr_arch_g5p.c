@@ -3,8 +3,8 @@
  * Apple's A9 GPU (G5P, has_apple_g5p): the device-level state of the G5P
  * paths (pvr_g5p.h), its device-level programs, and its render jobs: the
  * per-render data of the background clear and the end of tile
- * (g5p_job_init) and the TYPED_V3 pass the A9 kernel takes
- * (g5p_frag_stream). Compiled only with -Dimagination-g5p-experimental=true.
+ * (g5p_job_init) and the command streams the powervr kernel driver takes
+ * for the A9 (g5p_geom_stream, g5p_frag_stream, g5p_compute_stream).
  *
  * Route (b) (docs: hardware question 1, 2026-11-03): the A9 renders and
  * retires jobs whose context store/resume programs are a bare PDS HALT,
@@ -29,6 +29,7 @@
 #include "g5p_color_source.h"
 #include "g5p_pbe.h"
 #include "util/half_float.h"
+#include "util/log.h"
 #include "pco_g5p_general.h"
 #include "g5p_usc.h"
 #include "pdsc.h"
@@ -39,6 +40,7 @@
 #include "pvr_cmd_buffer.h"
 #include "pvr_csb.h"
 #include "pvr_device.h"
+#include "pvr_free_list.h"
 #include "pvr_g5p.h"
 #include "pvr_g5p_dgl.h"
 #include "pvr_g5p_ds.h"
@@ -47,14 +49,12 @@
 #include "pvr_g5p_tex_encode.h"
 #include "pvr_g5p_tex.h"
 #include "pvr_g5p_mrt.h"
-#include "pvr_g5p_perf.h"
 #include "pvr_g5p_vdm.h"
 #include "pvr_hw_pass.h"
 #include "pvr_image.h"
 #include "pvr_job_render.h"
 #include "pvr_query.h"
 #include "pvr_rogue_pds_encode.h"
-#include "winsys/apple_g5p/apple_g5p_drm.h"
 
 static const unsigned g5p_mrt_variant_targets[PVR_G5P_MRT_VARIANTS] = { 1, 2, 4 };
 
@@ -63,8 +63,8 @@ static const unsigned g5p_mrt_variant_targets[PVR_G5P_MRT_VARIANTS] = { 1, 2, 4 
 /* A kick: 16 bytes of data, the code at +0x20 (the program registers name the data) */
 #define G5P_KICK_CODE 0x20
 
-/* The template-derived register words of a TYPED_V3 pass (the kernel
- * contract's layout, a9_contracts.h; the context words are the layout G9P
+/* The template-derived register words of a render's work records (the
+ * context words are the layout G9P
  * uses on the A10). Named here, values as the A9 ICD's passes carry them on
  * the device. */
 #define G5P_CTX_STORE_TA_SIZES0 0x24001002u
@@ -85,8 +85,7 @@ static const uint32_t g5p_scratch_ptr_off[6] = { 0x20, 0x24, 0x28, 0x2c, 0x6240,
 /* The default scissor and depth-bias tables of a render without tables of its
  * own. Its draws index entry 0 only (scindex/dbindex 0, scissor and bias
  * disabled): a draw that clips or biases makes the render's own table
- * (upstream's per-render tables, pvr_arch_g5p_gfx.c). One page each, not
- * the 65536-entry V1 pools (512 + 768 KiB of every device's arena). */
+ * (upstream's per-render tables, pvr_arch_g5p_gfx.c). One page each. */
 #define G5P_SCISSOR_POOL_BYTES 0x4000u
 #define G5P_DBIAS_POOL_BYTES 0x3000u
 
@@ -292,13 +291,6 @@ g5p_upload_load(struct pvr_device *device, struct pvr_g5p_programs *p, unsigned 
    p->load_common_dwords = prog.common_dwords;
 
    result = pvr_gpu_upload_usc(device, prog.code, prog.size, 64, &p->load_usc);
-   if (result == VK_SUCCESS && getenv("PVR_G5P_WS_LOG")) {
-      fprintf(stderr, "g5p load program: %zu bytes, temps %u, common %u dwords, %u uploads:", prog.size,
-              prog.temps, prog.common_dwords, prog.num_uploads);
-      for (unsigned i = 0; i < prog.size; i++)
-         fprintf(stderr, "%s%02x", i % 4 ? "" : " ", prog.code[i]);
-      fprintf(stderr, "\n");
-   }
    free(prog.code);
    if (result != VK_SUCCESS)
       return result;
@@ -486,6 +478,9 @@ PVR_PER_ARCH(g5p_device_init)(struct pvr_device *device)
 
    VkResult result = g5p_upload_programs(device, &device->g5p->programs);
    if (result == VK_SUCCESS)
+      result = pvr_free_list_create(device, PVR_G5P_FREE_LIST_SIZE, PVR_G5P_FREE_LIST_SIZE, 0, 0,
+                                    device->global_free_list, &device->g5p->free_list);
+   if (result == VK_SUCCESS)
       result = PVR_PER_ARCH(g5p_meta_init)(device);
    if (result != VK_SUCCESS)
       PVR_PER_ARCH(g5p_device_finish)(device);
@@ -508,6 +503,8 @@ PVR_PER_ARCH(g5p_device_finish)(struct pvr_device *device)
       device->vk.dispatch_table.DestroyPipelineLayout(vk_dev, device->g5p->clear_layout, NULL);
    simple_mtx_destroy(&device->g5p->clear_lock);
 
+   if (device->g5p->free_list)
+      pvr_free_list_destroy(device->g5p->free_list);
    g5p_free_programs(device, &device->g5p->programs);
    util_dynarray_fini(&device->g9p_vmas.vmas);
    simple_mtx_destroy(&device->g9p_vmas.lock);
@@ -536,14 +533,14 @@ g5p_pbe_encode(uint64_t q[3], uint32_t key, bool srgb, uint64_t va, uint32_t wid
    g5p_pbe_2d(q,key,srgb,va,width,height,row_stride,false);
 }
 
-/* A refusal, by name, on stderr too (vk_errorf() is silent in release builds) */
+/* A refusal, by name, in the log too (vk_errorf() is silent in release builds) */
 #define G5P_REFUSE(cmd_buffer, ...)                                                                                \
-   (fprintf(stderr, "G5P refuses: " __VA_ARGS__), fprintf(stderr, "\n"),                                          \
+   (mesa_logw("G5P refuses: " __VA_ARGS__),                                                                        \
     vk_errorf((cmd_buffer), VK_ERROR_FEATURE_NOT_PRESENT, "G5P: " __VA_ARGS__))
 
 /*
- * The background of a loaded colour attachment (loadOp LOAD; plan step 7,
- * rung B): the load program (a texelFetch of the attachment at the
+ * The background of a loaded colour attachment (loadOp LOAD): the load
+ * program (a texelFetch of the attachment at the
  * fragment's pixel, compiled by the backend) with its uploads, the
  * attachment's own texture state and a nearest, clamped single-level
  * sampler, DMA'd into the common store. BGRND0 = {the program's kick, the
@@ -614,14 +611,6 @@ g5p_load_background(struct pvr_cmd_buffer *cmd_buffer, const uint64_t state[4], 
       b3.pds_uniformsize = DIV_ROUND_UP(4 * n, ROGUE_CR_PDS_BGRND3_SIZEINFO_PDS_UNIFORMSIZE_UNIT_SIZE);
       b3.usc_sharedsize = DIV_ROUND_UP(p->load_common_dwords, ROGUE_CR_PDS_BGRND3_SIZEINFO_USC_SHAREDSIZE_UNIT_SIZE);
    }
-   if (getenv("PVR_G5P_WS_LOG")) {
-      const uint32_t *w = (const uint32_t *)state, *sw = (const uint32_t *)sampler;
-      fprintf(stderr, "g5p load: state %08x %08x %08x %08x %08x %08x %08x %08x sampler %08x %08x data", w[0],
-              w[1], w[2], w[3], w[4], w[5], w[6], w[7], sw[0], sw[1]);
-      for (unsigned i = 0; i < 4 * n; i++)
-         fprintf(stderr, " %08x", data[i]);
-      fprintf(stderr, "\n");
-   }
    return VK_SUCCESS;
 }
 
@@ -645,8 +634,7 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
    const unsigned n = null_target ? 1 : hw_render->eot_surface_count;
    unsigned v;
 
-   /* everything but the reads the pass's draws collected (pvr_g5p_perf.h) */
-   memset(g, 0, offsetof(struct pvr_g5p_job, reads));
+   memset(g, 0, sizeof(*g));
    /* three targets: Apple's 4-target pass with a fourth that stores to the null target (admitted by
     * pvr_arch_g5p_mrt_pass_check(): one 8-bit RGBA format; the program writes it zeros, pvr_g5p_nir.c) */
    const unsigned nt = n == 3 ? 4 : n;
@@ -751,13 +739,9 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
       /* A twiddled 2D target (a mip level, an array layer or a cube face, one
        * layer per render): q0 bit 3 and no row pitch, as the native A9
        * captures store (g5p_pbe.h). Device-proven as the L11 probe (36 CTS
-       * cases fixed, none lost); now the default. PVR_G5P_TWIDDLED_PBE=off
-       * restores the refusal. Layered renders and 3D depth planes stay
+       * cases fixed, none lost). Layered renders and 3D depth planes stay
        * refused: no capture qualifies them. */
       if(twiddled) {
-         const char *mode=getenv("PVR_G5P_TWIDDLED_PBE");
-         if(mode && !strcmp(mode,"off"))
-            return G5P_REFUSE(cmd_buffer,"a non-linear colour target (PVR_G5P_TWIDDLED_PBE=off)");
          if(image->memlayout!=PVR_MEMLAYOUT_TWIDDLED || image->vk.image_type!=VK_IMAGE_TYPE_2D)
             return G5P_REFUSE(cmd_buffer,"a twiddled colour target in a 3D image (depth-plane PBE store is not "
                               "qualified)");
@@ -800,10 +784,6 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
             g->msaa_resolve = true;
          }
       }
-      if (raw && getenv("PVR_G5P_DGL_LOG"))
-         fprintf(stderr, "DGL-PBE target=%u/%u words=%u total=%u source_half=%u source=uint-raw key=%08x store_key=%08x "
-                 "state=%016" PRIx64 ",%016" PRIx64 ",%016" PRIx64 "\n",
-                 t, n, raw_words, raw_total, 2 * raw_words * t, key, store_key, pbe[t][0], pbe[t][1], pbe[t][2]);
       if (!t) {
          if(twiddled) {
             struct pvr_image_descriptor desc;
@@ -957,50 +937,94 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
    g->eot[0] = eot_data.data_offset;
    g->eot[1] = p->eot.code_offset;
    g->eot[2] = g5p_mrt_eot_info(nt);
-   /* what the render writes, for the winsys's resource list (pvr_g5p_perf.h) */
-   pvr_arch_g5p_perf_job(cmd_buffer, hw_render, &g->reads, &g->perf);
-   g->perf.width = g->width;
-   g->perf.height = g->height;
-   g->perf.surfaces = hw_render->eot_surface_count;
-   g->perf.color_load = partial || sub_cmd->barrier_load || load ? VK_ATTACHMENT_LOAD_OP_LOAD :
-      hw_render->color_init_count ? hw_render->color_init[0].op : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-   g->perf.color_store = !null_target;
-   g->perf.zload = job->ds.load.d;
-   g->perf.zstore = job->ds.store.d;
-   g->perf.sload = job->ds.load.s;
-   g->perf.sstore = job->ds.store.s;
-   if (!null_target) {
-      const struct pvr_image_view *iv = info->attachments[hw_render->eot_surfaces[0].attachment_idx];
-      const struct pvr_image *im = pvr_image_view_get_image(iv);
-      const struct pvr_image_plane *pl = pvr_single_plane_const(im);
-      g->perf.eot_va = im->dev_addr.addr + pl->offset +
-         pl->mip_levels[iv->vk.base_mip_level].offset + iv->vk.base_array_layer * pl->layer_size;
-   }
    g->enabled = true;
    return VK_SUCCESS;
 }
 
-/* The TYPED_V3 pass of a G5P render job, in the fragment fw_stream (the
- * apple_g5p winsys submits it as it is). Returns its size, or 0. */
+/* ---- command streams ----
+ *
+ * The A9 takes its jobs through the powervr kernel driver: each command
+ * stream is the Rogue command's stream followed by one extension, as for the
+ * A10 (pvr_arch_g9p_gfx.c), with the A9's own extension types. The kernel
+ * builds the firmware's work record from the few words of the Rogue command
+ * it reads, the HWRT dataset and the extension
+ * (struct pvr_apple_g5p_geom_regs, pvr_apple_g5p_frag_regs and
+ * pvr_apple_g5p_compute_regs of its pvr_apple.h). A stream's fields are
+ * naturally aligned from the start of the stream; an array is 8-byte aligned.
+ */
+
+/* The extension header: type << 29 | the one data block every A9 extension has */
+#define G5P_EXTHDR(type) ((uint32_t)(type) << 29 | 1u)
+#define G5P_EXTHDR_TYPE_GEOM 2u    /* PVR_STREAM_EXTHDR_TYPE_GEOM_G5P */
+#define G5P_EXTHDR_TYPE_FRAG 2u    /* PVR_STREAM_EXTHDR_TYPE_FRAG_G5P */
+#define G5P_EXTHDR_TYPE_COMPUTE 1u /* PVR_STREAM_EXTHDR_TYPE_COMPUTE_G5P */
+/* PVR_APPLE_G5P_FRAG_MSAA_RESOLVE */
+#define G5P_FRAG_MSAA_RESOLVE (1u << 0)
+
+struct g5p_stream {
+   uint8_t *buf;
+   uint32_t len, size;
+};
+
+static void
+g5p_put(struct g5p_stream *s, const void *p, uint32_t size, uint32_t align)
+{
+   s->len = ALIGN_POT(s->len, align);
+   assert(s->len + size <= s->size);
+   memcpy(s->buf + s->len, p, size);
+   s->len += size;
+}
+
+static void
+g5p_put32(struct g5p_stream *s, uint32_t v)
+{
+   g5p_put(s, &v, 4, 4);
+}
+
+static void
+g5p_put64(struct g5p_stream *s, uint64_t v)
+{
+   g5p_put(s, &v, 8, 8);
+}
+
+/* The Rogue command is complete: its length goes into the stream header,
+ * and the extension header follows */
+static void
+g5p_put_exthdr(struct g5p_stream *s, unsigned type)
+{
+   memcpy(s->buf, &s->len, sizeof(s->len));
+   g5p_put32(s, G5P_EXTHDR(type));
+}
+
+/* The geometry stream of a G5P render job. Of the Rogue command the kernel
+ * reads the control stream's address. Returns its size, or 0. */
 uint32_t
-PVR_PER_ARCH(g5p_frag_stream)(const struct pvr_device *device, const struct pvr_render_job *job,
+PVR_PER_ARCH(g5p_geom_stream)(const struct pvr_device *device, const struct pvr_render_job *job,
                               uint8_t *buf, uint32_t size)
 {
    const struct pvr_g5p_programs *p = &device->g5p->programs;
    const struct pvr_g5p_job *g = &job->g5p;
-   struct drm_g5p_render_pass_v3 pass;
+   struct g5p_stream s = { .buf = buf, .len = 8, .size = size };
 
-   if (size < sizeof(pass) || !g->enabled)
+   if (!g->enabled)
       return 0;
-   memset(&pass, 0, sizeof(pass));
-   struct drm_g5p_render_pass *b = &pass.base;
-   b->size = sizeof(pass);
-   b->vdm_va = g->vdm_va;
-   b->vdm_size = g->vdm_bytes;
-   b->scratch_va = p->scratch->dev_addr.addr;
-   b->scratch_size = G5P_SCRATCH_BYTES;
+   memset(buf, 0, 8);
+   g5p_put64(&s, g->vdm_va); /* VDM control stream base */
+   g5p_put64(&s, 0);         /* border colour table */
+   g5p_put32(&s, 0);         /* PPP_CTRL */
+   g5p_put32(&s, 0);         /* TE_PSG */
+   g5p_put32(&s, 0);
+   g5p_put32(&s, 0);
+   g5p_put_exthdr(&s, G5P_EXTHDR_TYPE_GEOM);
+
+   /* the TA scratch block and the pointers the records take into it */
+   const uint64_t scratch = p->scratch->dev_addr.addr;
+   g5p_put64(&s, scratch);
    for (unsigned i = 0; i < ARRAY_SIZE(g5p_scratch_ptr_off); i++)
-      b->scratch_ptr[i] = b->scratch_va + g5p_scratch_ptr_off[i];
+      g5p_put64(&s, scratch + g5p_scratch_ptr_off[i]);
+   /* the TA state program: its byte offset from the PDS heap's base */
+   g5p_put64(&s, p->ta_kick.data_offset);
+   g5p_put64(&s, pvr_g5p_msaa_pass(g->samples, g->msaa_resolve).positions);
 
    /* context store and resume: the HALT (route (b)) */
    const uint32_t halt = p->halt.code_offset, data = p->halt.data_offset;
@@ -1012,63 +1036,114 @@ PVR_PER_ARCH(g5p_frag_stream)(const struct pvr_device *device, const struct pvr_
       { G5P_CTX_RESUME_SIZES, data | 5, halt, 0 },
       { G5P_CTX_RESUME_SIZES, data | 1, halt, 0 },
    };
-   memcpy(b->context_pds, store, sizeof(store));
-   memcpy(b->resume_pds, resume, sizeof(resume));
    /* the TA context program: the HALT too, with the TA resume's data word */
-   b->ta_pds[0] = G5P_TA_CTX_SIZES;
-   b->ta_pds[1] = data | 5;
-   b->ta_pds[2] = halt;
+   const uint32_t ta[4] = { G5P_TA_CTX_SIZES, data | 5, halt, 0 };
+   g5p_put(&s, store, sizeof(store), 8);
+   g5p_put(&s, resume, sizeof(resume), 8);
+   g5p_put(&s, ta, sizeof(ta), 8);
+   return s.len;
+}
 
-   memcpy(b->background, g->background, sizeof(b->background));
-   memcpy(b->eot, g->eot, sizeof(b->eot));
-   memcpy(b->eot_resume, g->eot, sizeof(b->eot_resume));
-   b->restore[0] = G5P_RESTORE0;
-   b->restore[1] = g5p_mrt_restore1(g->targets);
-   /* 4x: the kernel's AA words take the sample count, positions and the PBE resolve (pvr_g5p_msaa.c); all
-    * zero at one sample, the one-sample pass as before */
-   STATIC_ASSERT(PVR_G5P_MSAA_FLAG_RESOLVE == DRM_G5P_RENDER_MSAA_RESOLVE);
-   const struct pvr_g5p_msaa_words ms = pvr_g5p_msaa_pass(g->samples, g->msaa_resolve);
-   b->samples = ms.samples;
-   b->msaa_flags = ms.flags;
-   b->sample_positions = ms.positions;
+/* The fragment stream of a G5P render job. Of the Rogue command the kernel
+ * reads the scissor, depth-bias and occlusion-query table addresses and the
+ * background object's depth and values. Returns its size, or 0. */
+uint32_t
+PVR_PER_ARCH(g5p_frag_stream)(const struct pvr_device *device, const struct pvr_render_job *job,
+                              uint8_t *buf, uint32_t size)
+{
+   const struct pvr_g5p_programs *p = &device->g5p->programs;
+   const struct pvr_g5p_job *g = &job->g5p;
+   const struct pvr_sub_cmd_gfx *sub_cmd = container_of(job, const struct pvr_sub_cmd_gfx, job);
+   struct g5p_stream s = { .buf = buf, .len = 8, .size = size };
 
-   /* the V2 extension: the device's tables, the background object, the output width */
-   struct drm_g5p_render_pass_ext *e = &pass.ext;
-   const struct pvr_sub_cmd_gfx *sub_cmd =
-      container_of(job, const struct pvr_sub_cmd_gfx, job);
-   e->scissor_va = p->scissor_pool->dev_addr.addr;
-   e->scissor_count = MIN2(G5P_SCISSOR_POOL_BYTES / 8, DRM_G5P_RENDER_MAX_TABLE_ENTRIES);
-   e->dbias_va = p->dbias_pool->dev_addr.addr;
-   e->dbias_count = MIN2(G5P_DBIAS_POOL_BYTES / 12, DRM_G5P_RENDER_MAX_TABLE_ENTRIES);
+   if (!g->enabled)
+      return 0;
+   memset(buf, 0, 8);
+
+   /* the draws' scissor and depth-bias entries: upstream's per-render tables
+    * when a draw clips or biases, else the device's (entry 0 only) */
+   uint64_t scissor = p->scissor_pool->dev_addr.addr, dbias = p->dbias_pool->dev_addr.addr;
+   if (g->scissor_count && job->scissor_table_addr.addr)
+      scissor = job->scissor_table_addr.addr;
+   if (g->dbias_count && job->depth_bias_table_addr.addr)
+      dbias = job->depth_bias_table_addr.addr;
    /* the depth/stencil attachment's ZLS words and background object
     * (pvr_arch_g5p_ds.c; without one, depth 1.0f and tag | mask) */
    struct pvr_g5p_zls_words zls;
    pvr_arch_g5p_ds_pass(job, &zls);
-   memcpy(e->zls, zls.zls, sizeof(e->zls));
-   e->zls_address_mask = zls.address_mask;
-   e->bgobj_depth = zls.bgobj_depth;
-   e->bgobj_vals = zls.bgobj_vals;
-   /* the draws' scissor entries, when a draw is clipped: upstream's per-render table */
-   if (g->scissor_count && job->scissor_table_addr.addr) {
-      e->scissor_va = job->scissor_table_addr.addr;
-      e->scissor_count = MIN2(g->scissor_count, DRM_G5P_RENDER_MAX_TABLE_ENTRIES);
-   }
-   /* the draws' depth-bias entries: upstream's per-render table */
-   if (g->dbias_count && job->depth_bias_table_addr.addr) {
-      e->dbias_va = job->depth_bias_table_addr.addr;
-      e->dbias_count = MIN2(g->dbias_count, DRM_G5P_RENDER_MAX_TABLE_ENTRIES);
-   }
-   e->pixel_output_width = g->raw_words ? g->raw_pixel_width : g5p_mrt_pixel_width(g->targets);
-   if (sub_cmd->query_pool) {
-      e->occlusion_query_va =
-         sub_cmd->query_pool->result_buffer->dev_addr.addr;
-      e->occlusion_query_size = sub_cmd->query_pool->result_buffer->size;
-   }
 
-   pass.ta_program_va = device->heaps.pds_heap->base_addr.addr + p->ta_kick.data_offset;
-   pass.ta_program_size = 0x40;
-   pass.vdm_end = g->vdm_bytes;
-   memcpy(buf, &pass, sizeof(pass));
-   /* then what the job writes (pvr_g5p_perf.h) */
-   return sizeof(pass) + pvr_g5p_perf_stream_tail(&g->perf, buf + sizeof(pass), size - sizeof(pass));
+   g5p_put64(&s, scissor);
+   g5p_put64(&s, dbias);
+   g5p_put64(&s, sub_cmd->query_pool ? sub_cmd->query_pool->result_buffer->dev_addr.addr : 0);
+   g5p_put64(&s, 0); /* ZLSCTL and the load/store bases: in the extension */
+   g5p_put64(&s, 0);
+   g5p_put64(&s, 0);
+   for (unsigned i = 0; i < 8 * 3; i++)
+      g5p_put64(&s, 0); /* PBE words: in the end-of-tile program's data */
+   g5p_put64(&s, 0);    /* border colour table */
+   for (unsigned i = 0; i < 6; i++)
+      g5p_put64(&s, 0); /* Rogue background words: in the extension */
+   for (unsigned i = 0; i < 8; i++)
+      g5p_put32(&s, 0); /* USC clear registers */
+   g5p_put32(&s, 0);    /* USC pixel output control */
+   g5p_put32(&s, zls.bgobj_depth); /* ISP_BGOBJDEPTH */
+   g5p_put32(&s, zls.bgobj_vals);  /* ISP_BGOBJVALS */
+   g5p_put32(&s, 0); /* ISP_AA, ISP_CTL: the kernel's, from the dataset's samples */
+   g5p_put32(&s, 0);
+   g5p_put32(&s, 0); /* EVENT_PIXEL_PDS_INFO: in the extension's end-of-tile words */
+   g5p_put32(&s, 0);
+   g5p_put32(&s, 0);
+   g5p_put32(&s, 0);
+   g5p_put32(&s, 0);
+   g5p_put_exthdr(&s, G5P_EXTHDR_TYPE_FRAG);
+
+   const struct pvr_g5p_msaa_words ms = pvr_g5p_msaa_pass(g->samples, g->msaa_resolve);
+   const uint32_t restore[4] = { G5P_RESTORE0, g5p_mrt_restore1(g->targets), 0, 0 };
+   STATIC_ASSERT(PVR_G5P_MSAA_FLAG_RESOLVE == G5P_FRAG_MSAA_RESOLVE);
+
+   g5p_put64(&s, 0); /* PDS_BGRND1_BASE: no background texture state */
+   g5p_put(&s, zls.zls, sizeof(zls.zls), 8);
+   g5p_put64(&s, ms.positions);
+   g5p_put(&s, g->background, sizeof(g->background), 8);
+   g5p_put(&s, g->eot, sizeof(g->eot), 8);
+   g5p_put(&s, g->eot, sizeof(g->eot), 8); /* the partial render's end of tile: the same */
+   g5p_put(&s, restore, sizeof(restore), 8);
+   g5p_put32(&s, g->raw_words ? g->raw_pixel_width : g5p_mrt_pixel_width(g->targets));
+   g5p_put32(&s, ms.flags);
+   return s.len;
+}
+
+/* The stream of a G5P compute job: the CDM control stream, the context state
+ * buffer's words and the HALT as its context programs (serial execution: no
+ * captured save/restore window). Of the Rogue command the kernel reads the
+ * control stream's address. Returns its size. */
+uint32_t
+PVR_PER_ARCH(g5p_compute_stream)(const struct pvr_device *device, uint64_t cdm_va, uint32_t cdm_end,
+                                 uint64_t state_va, uint8_t *buf, uint32_t size)
+{
+   const struct pvr_g5p_programs *p = &device->g5p->programs;
+   const uint64_t halt = (uint64_t)p->halt.data_offset << 32 | p->halt.code_offset;
+   const uint32_t config[2] = { 0x40200003, 0 };
+   uint64_t state[4];
+   struct g5p_stream s = { .buf = buf, .len = 8, .size = size };
+
+   memset(buf, 0, 8);
+   g5p_put64(&s, 0);        /* border colour table */
+   g5p_put64(&s, cdm_va);   /* CDM control stream base */
+   g5p_put64(&s, state_va); /* context state base */
+   g5p_put32(&s, 0);        /* CDM_CONTEXT_PDS1 */
+   g5p_put_exthdr(&s, G5P_EXTHDR_TYPE_COMPUTE);
+
+   for (unsigned i = 0; i < ARRAY_SIZE(state); i++)
+      state[i] = state_va + 4 * i;
+   g5p_put(&s, state, sizeof(state), 8);
+   g5p_put64(&s, state_va + 0x6020);     /* the context state's tail */
+   g5p_put64(&s, cdm_va + cdm_end - 4);  /* the stream's terminate word */
+   g5p_put64(&s, halt);                  /* context store */
+   g5p_put64(&s, halt);                  /* context resume */
+   g5p_put64(&s, halt);                  /* terminate */
+   g5p_put(&s, config, sizeof(config), 8);
+   g5p_put32(&s, 0);                     /* the store's control word */
+   g5p_put32(&s, 0);                     /* the resume's */
+   return s.len;
 }

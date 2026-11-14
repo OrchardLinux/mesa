@@ -59,9 +59,9 @@ pvr_g5p_msaa_pass(uint32_t samples, bool resolve)
 }
 
 VkSampleCountFlags
-pvr_g5p_msaa_sample_counts(bool kernel_msaa)
+pvr_g5p_msaa_sample_counts(void)
 {
-   return VK_SAMPLE_COUNT_1_BIT | (kernel_msaa ? VK_SAMPLE_COUNT_4_BIT : 0);
+   return VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT;
 }
 
 static uint32_t

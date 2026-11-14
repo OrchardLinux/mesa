@@ -611,6 +611,14 @@ static void pvr_rt_dataset_ws_create_info_init(
 
    create_info->rgn_header_size =
       pvr_rt_get_isp_region_size(device, mtile_info);
+   /* Apple G5P: the kernel's A9 path takes this as the size in bytes of one RT
+    * data's region headers (it refuses a job on a dataset with less than its
+    * own count of them), not as the ISP region size in dwords that the UAPI
+    * describes and every other device passes. One layer: the stride is that
+    * size.
+    */
+   if (PVR_HAS_FEATURE(dev_info, apple_g5p))
+      create_info->rgn_header_size = rt_dataset->rgn_headers_stride;
 }
 
 VkResult pvr_arch_render_target_dataset_create(
@@ -677,6 +685,12 @@ VkResult pvr_arch_render_target_dataset_create(
    if (PVR_HAS_FEATURE(dev_info, apple_g9p)) {
       rt_dataset->local_free_list = device->g9p.free_list;
       result = VK_SUCCESS;
+   } else if (PVR_HAS_FEATURE(dev_info, apple_g5p)) {
+      /* Apple G5P: the list holds no pages (the kernel owns the parameter
+       * manager's memory); the device's one list says how large the pool
+       * is (pvr_arch_g5p_device_init()). */
+      rt_dataset->local_free_list = device->g5p->free_list;
+      result = VK_SUCCESS;
    } else {
       result = pvr_free_list_create(device,
                                     runtime_info->min_free_list_size,
@@ -741,7 +755,8 @@ err_pvr_rt_vheap_rtc_data_fini:
    pvr_rt_vheap_rtc_data_fini(rt_dataset);
 
 err_pvr_free_list_destroy:
-   if (rt_dataset->local_free_list != device->g9p.free_list)
+   if (rt_dataset->local_free_list != device->g9p.free_list &&
+       !(device->g5p && rt_dataset->local_free_list == device->g5p->free_list))
       pvr_free_list_destroy(rt_dataset->local_free_list);
 
 err_vk_free_rt_dataset:
@@ -876,12 +891,10 @@ pvr_render_job_ws_geometry_state_init(struct pvr_render_ctx *ctx,
                                       struct vk_sync *wait,
                                       struct pvr_winsys_geometry_state *state)
 {
-#ifdef PVR_APPLE_G5P
    if (job->g5p.enabled) {
-      /* G5P: the pass is in the fragment stream; no geometry words */
-      state->fw_stream_len = 0;
+      state->fw_stream_len = pvr_arch_g5p_geom_stream(ctx->device, job, state->fw_stream,
+                                                      sizeof(state->fw_stream));
    } else
-#endif
    if (job->g9p.enabled) {
       state->fw_stream_len = pvr_arch_g9p_geom_stream(ctx->device, job, state->fw_stream,
                                                       sizeof(state->fw_stream));
@@ -1388,13 +1401,10 @@ pvr_render_job_ws_fragment_state_init(struct pvr_render_ctx *ctx,
                                       struct vk_sync *wait,
                                       struct pvr_winsys_fragment_state *state)
 {
-#ifdef PVR_APPLE_G5P
    if (job->g5p.enabled) {
-      /* G5P: the TYPED_V3 pass the apple_g5p winsys submits */
       state->fw_stream_len = pvr_arch_g5p_frag_stream(ctx->device, job, state->fw_stream,
                                                       sizeof(state->fw_stream));
    } else
-#endif
    if (job->g9p.enabled) {
       state->fw_stream_len = pvr_arch_g9p_frag_stream(ctx->device, job, state->fw_stream,
                                                       sizeof(state->fw_stream));
@@ -1502,13 +1512,11 @@ static void pvr_render_job_ws_submit_info_init(
     * there. For now we'll always setup the pr.
     */
    /* G9P: no partial renders (the kernel's Apple path has none yet) */
-#ifdef PVR_APPLE_G5P
    if (job->g5p.enabled) {
-      /* G5P: no partial renders yet */
+      /* G5P: no partial renders (the kernel's Apple path has none) */
       submit_info->fragment_pr.fw_stream_len = 0;
       submit_info->fragment_pr.wait = wait_frag;
    } else
-#endif
    if (job->g9p.enabled) {
       submit_info->fragment_pr.fw_stream_len = 0;
       submit_info->fragment_pr.wait = wait_frag;

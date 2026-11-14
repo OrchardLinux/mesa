@@ -1,7 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 /*
  * Apple's A9 GPU (G5P): the rules for several colour targets (pvr_g5p_mrt.h).
- * Compiled only with -Dimagination-g5p-experimental=true.
  *
  * Ported from our A9 driver (pipeline creation, the pass and the draw of a
  * 2- or 4-target render), which ran these shapes on the device: Apple's own
@@ -13,6 +12,7 @@
 #include <inttypes.h>
 #include <stdio.h>
 
+#include "util/log.h"
 #include "vk_enum_to_str.h"
 #include "vk_log.h"
 
@@ -27,7 +27,7 @@
 
 /* A refusal, by name, on stderr too (vk_errorf() is silent in release builds) */
 #define G5P_MRT_REFUSE(obj, ...)                                                                                   \
-   (fprintf(stderr, "G5P refuses: " __VA_ARGS__), fprintf(stderr, "\n"),                                          \
+   (mesa_logw("G5P refuses: " __VA_ARGS__),                                                              \
     vk_errorf((obj), VK_ERROR_FEATURE_NOT_PRESENT, "G5P: " __VA_ARGS__))
 
 /* Two 32-bit integer targets of one format (dEQP's ShaderExecutor: a mat2xN
@@ -47,7 +47,7 @@ g5p_mrt_raw32_pair(unsigned n, VkFormat f0, VkFormat ft)
 #define G5P_MRT_RAW32_WIDE "32-bit integer targets take four output words each and one emitpix carries at most eight " \
                            "(two targets)"
 
-#define G5P_MRT_RAW32_PROBE "two 32-bit integer targets render only behind PVR_G5P_FORMATS=probe (not yet run on " \
+#define G5P_MRT_RAW32_PROBE "two 32-bit integer targets are not rendered (not yet run on " \
                             "the device)"
 
 VkResult

@@ -1,7 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 /*
  * Apple's A9 GPU (G5P, has_apple_g5p): the G5P paths of the PowerVR driver.
- * Built only with -Dimagination-g5p-experimental=true (PVR_APPLE_G5P).
  *
  * G5P follows G9P's shape (pvr_g9p.h, the G9P driver): it keeps the pvr_*
  * object model (devices, command buffers, render passes, descriptors,
@@ -27,7 +26,6 @@
 #include "util/simple_mtx.h"
 #include "vk_meta.h"
 #include "pvr_g5p_xfb_core.h"
-#include "pvr_g5p_perf.h"
 
 struct pvr_cmd_buffer;
 struct pvr_device;
@@ -99,9 +97,20 @@ struct pvr_g5p_programs {
    struct pvr_pds_upload raw_clear_kick[4];
 };
 
+/*
+ * The parameter buffer of a render (bytes): what the device's free list asks
+ * the kernel for. On the A9 the list holds no pages; its size is the size of
+ * the parameter manager's pool, which the kernel raises to what the render
+ * target's tiles need and which does not grow during a render. 4 MiB (32
+ * blocks of 128 KiB) is the pool the device's renders ran with.
+ */
+#define PVR_G5P_FREE_LIST_SIZE (4U * 1024U * 1024U)
+
 /* G5P's per-device state (pvr_device::g5p), allocated by g5p_device_init() */
 struct pvr_g5p_device {
    struct pvr_g5p_programs programs;
+   /* every render target dataset's local free list (pvr_arch_job_render.c) */
+   struct pvr_free_list *free_list;
    /* vkCmdClearAttachments' clear quad (pvr_arch_g5p_gfx.c): its pipeline
     * layout (fragment push constants 0..15) and a pipeline per colour
     * format and colour write mask (0xf, or 0 for a depth/stencil-only
@@ -119,7 +128,7 @@ struct pvr_g5p_device {
    bool meta_ready;
 };
 
-/* What a G5P render job hands its fragment stream (pvr_render_job::g5p) */
+/* What a G5P render job hands its geometry and fragment streams (pvr_render_job::g5p) */
 struct pvr_g5p_job {
    uint64_t vdm_va;             /* the control stream, one block */
    uint32_t background[8];      /* PDS_BGRND0..3 (64-bit registers: 8-byte aligned) */
@@ -134,16 +143,6 @@ struct pvr_g5p_job {
    uint32_t samples;            /* 1 or 4 (hw_render->sample_count) */
    bool msaa_resolve;           /* 4x: the PBE resolves target 0 into a one-sample view */
    bool enabled;
-   struct g5p_perf_tail perf;   /* what the job writes, for the winsys (pvr_g5p_perf.h) */
-   /* last two: what the pass's draws read outside the arena (pvr_arch_g5p_perf_draw()); job init keeps it */
-   struct pvr_g5p_perf_reads reads;
-   /* pvr_arch_g5p_perf_draw()'s memo: what this job's draws already noted (zeroed with the sub-command) */
-   struct {
-      const struct pvr_descriptor_set *set[PVR_MAX_DESCRIPTOR_SETS];
-      const struct pvr_graphics_pipeline *pipeline;
-      uint64_t vb[PVR_MAX_VERTEX_INPUT_BINDINGS];
-      uint64_t ib;
-   } reads_memo;
 };
 
 /* ---- graphics (pvr_arch_g5p_gfx.c, pvr_g5p_nir.c) ---- */
@@ -196,13 +195,11 @@ struct pvr_g5p_upload {
  * programs are pdsc's, the USC programs the G5P backend's.
  */
 /* Line and point polygon modes (plan row R8, hardware-proven: polygon-mode-1
- * 13/13 on 2026-11-05) are on by default with fillModeNonSolid;
- * PVR_G5P_POLYGON_MODE=0 turns them off (A/B, the old named refusal). */
+ * 13/13 on 2026-11-05) are on, with fillModeNonSolid. */
 static inline bool
 pvr_g5p_polygon_mode_enabled(void)
 {
-   const char *e = getenv("PVR_G5P_POLYGON_MODE");
-   return !(e && !strcmp(e, "0"));
+   return true;
 }
 
 struct pvr_g5p_pipeline {
@@ -247,7 +244,7 @@ struct pvr_g5p_pipeline {
    /* a point pipeline: the vertex program writes the point size after the
     * position (pco_g5p_vs_link::point_size) */
    bool vs_point_size;
-   /* polygon mode of a triangle pipeline (on by default; PVR_G5P_POLYGON_MODE=0 off): the
+   /* polygon mode of a triangle pipeline: the
     * ISP object type, as AGXMetalA9 encodeISPPrimitiveType picks it from
     * its triangle fill mode (desktop-gl-polygon-mode.md) */
    VkPolygonMode polygon_mode;
@@ -400,30 +397,29 @@ VkResult PVR_PER_ARCH(g5p_cmd_draw_indexed)(struct pvr_cmd_buffer *cmd_buffer, u
 VkResult PVR_PER_ARCH(g5p_device_init)(struct pvr_device *device);
 VkResult PVR_PER_ARCH(g5p_meta_init)(struct pvr_device *device);
 void PVR_PER_ARCH(g5p_meta_finish)(struct pvr_device *device);
-bool PVR_PER_ARCH(g5p_meta_copy_buffer)(struct pvr_cmd_buffer *, const VkCopyBufferInfo2 *);
-bool PVR_PER_ARCH(g5p_meta_fill_buffer)(struct pvr_cmd_buffer *, VkBuffer, VkDeviceSize, VkDeviceSize, uint32_t);
-bool PVR_PER_ARCH(g5p_meta_update_buffer)(struct pvr_cmd_buffer *, VkBuffer, VkDeviceSize, VkDeviceSize, const void *);
-void PVR_PER_ARCH(g5p_transfer_summary)(bool gpu, uint64_t wait_ns, uint64_t cpu_ns,
-                                      unsigned commands, unsigned kept, unsigned skipped);
 bool PVR_PER_ARCH(g5p_meta_blit)(struct pvr_cmd_buffer *cmd_buffer, const VkBlitImageInfo2 *info);
 void PVR_PER_ARCH(g5p_device_finish)(struct pvr_device *device);
 VkResult PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer,
                                     struct pvr_sub_cmd_gfx *sub_cmd,
                                     const struct pvr_renderpass_hwsetup_render *hw_render,
                                     struct pvr_render_job *job);
+uint32_t PVR_PER_ARCH(g5p_geom_stream)(const struct pvr_device *device,
+                                       const struct pvr_render_job *job, uint8_t *buf,
+                                       uint32_t size);
 uint32_t PVR_PER_ARCH(g5p_frag_stream)(const struct pvr_device *device,
                                        const struct pvr_render_job *job, uint8_t *buf,
                                        uint32_t size);
+uint32_t PVR_PER_ARCH(g5p_compute_stream)(const struct pvr_device *device, uint64_t cdm_va,
+                                          uint32_t cdm_end, uint64_t state_va, uint8_t *buf,
+                                          uint32_t size);
 
 #   define pvr_arch_g5p_device_init PVR_PER_ARCH(g5p_device_init)
-#   define pvr_arch_g5p_meta_copy_buffer PVR_PER_ARCH(g5p_meta_copy_buffer)
-#   define pvr_arch_g5p_meta_fill_buffer PVR_PER_ARCH(g5p_meta_fill_buffer)
-#   define pvr_arch_g5p_meta_update_buffer PVR_PER_ARCH(g5p_meta_update_buffer)
-#   define pvr_arch_g5p_transfer_summary PVR_PER_ARCH(g5p_transfer_summary)
 #   define pvr_arch_g5p_meta_blit PVR_PER_ARCH(g5p_meta_blit)
 #   define pvr_arch_g5p_device_finish PVR_PER_ARCH(g5p_device_finish)
 #   define pvr_arch_g5p_job_init PVR_PER_ARCH(g5p_job_init)
+#   define pvr_arch_g5p_geom_stream PVR_PER_ARCH(g5p_geom_stream)
 #   define pvr_arch_g5p_frag_stream PVR_PER_ARCH(g5p_frag_stream)
+#   define pvr_arch_g5p_compute_stream PVR_PER_ARCH(g5p_compute_stream)
 
 #endif /* PVR_PER_ARCH */
 

@@ -1,7 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 /*
  * Apple's A9 GPU (G5P): several colour targets (MRT) on the G5P paths.
- * Built only with -Dimagination-g5p-experimental=true (PVR_APPLE_G5P).
  *
  * The render pass side of 1, 2 and 4 targets (clear and end-of-tile
  * programs per target count, the PBE block, the pixel output width) is in

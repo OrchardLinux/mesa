@@ -1,9 +1,8 @@
 /* SPDX-License-Identifier: MIT */
 /*
  * Apple's A9 GPU (G5P): what the driver asks of a colour format
- * (pvr_g5p_formats.c, over the table in pvr_g5p_format_table.h). Built only
- * with -Dimagination-g5p-experimental=true; reached from the shared files
- * through pvr_g5p_hooks.h.
+ * (pvr_g5p_formats.c, over the table in pvr_g5p_format_table.h). Reached
+ * from the shared files through pvr_g5p_hooks.h.
  *
  * Users:
  *  - pvr_formats.c (hooks): the format features and the image-format query
@@ -12,9 +11,8 @@
  *  - the render job (pvr_arch_g5p.c) and the pipeline check
  *    (pvr_arch_g5p_gfx.c): a colour target's PBE key and sRGB bit.
  *
- * PVR_G5P_FORMATS=probe (read once) also advertises the table's probe rows:
- * formats decoded but not yet run on the device, for the device rung that
- * runs them. Never set it for anything else.
+ * The table's probe rows, formats decoded but not yet run on the device, are
+ * not advertised (pvr_g5p_formats_probe()).
  */
 
 #ifndef PVR_G5P_FORMATS_H
@@ -24,7 +22,7 @@
 #include <stdint.h>
 #include <vulkan/vulkan_core.h>
 
-/* Whether PVR_G5P_FORMATS=probe is set */
+/* Whether the table's probe rows are advertised: never */
 bool pvr_g5p_formats_probe(void);
 
 /* The texture key (format code, channel selectors; PVR_G5P_TEX_KEY()'s form)

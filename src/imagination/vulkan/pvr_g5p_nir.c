@@ -6,7 +6,7 @@
  * then pco_g5p_compile_general_link(). The backend's recognised forms depend
  * on this pass sequence, so it is the ICD's, not vk_pipeline's. There is no
  * captured-shape matcher and no out-of-process fallback here: the general
- * backend only. Compiled only with -Dimagination-g5p-experimental=true.
+ * backend only.
  */
 
 #include <stdio.h>
@@ -179,8 +179,8 @@ vec4_dyn_ubo(nir_shader *nir)
 }
 
 /*
- * Fragment code (unless PVR_G5P_FS_DYN_UBO=0; the backend refuses any
- * fragment index this does not bound): each register-indexed UBO index is
+ * Fragment code (the backend refuses any fragment index this does not
+ * bound): each register-indexed UBO index is
  * clamped to the block, umin(i, N) with N the last element whose bytes lie
  * inside the UBO variable (robust-access semantics). A negative index taken
  * by a helper lane would otherwise read 4 GiB past the pointer.

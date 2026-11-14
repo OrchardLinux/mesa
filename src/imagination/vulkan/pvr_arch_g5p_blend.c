@@ -2,8 +2,7 @@
 /*
  * Apple's A9 GPU (G5P): blending (pvr_g5p_blend.h). The pipeline's blend
  * state becomes the G5P backend's fragment program key, and the program
- * decides its draws' ISP pass type. Compiled only with
- * -Dimagination-g5p-experimental=true.
+ * decides its draws' ISP pass type.
  */
 
 #include "vk_graphics_state.h"

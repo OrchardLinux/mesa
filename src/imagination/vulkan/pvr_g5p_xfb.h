@@ -1,7 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 /*
  * Apple's A9 GPU (G5P): transform feedback on the G5P paths.
- * Built only with -Dimagination-g5p-experimental=true (PVR_APPLE_G5P).
  *
  * The vertex program's capturing variant stores every record itself
  * (pvr_g5p_compile_vs_xfb()); the rest is CPU work when the job is

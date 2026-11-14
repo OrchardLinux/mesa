@@ -109,19 +109,10 @@ enum { BLEND_NONE, BLEND_PREMULT, BLEND_STRAIGHT_OVER, BLEND_REPLACE, BLEND_GENE
  * blend ladder (linux-a9 blend-ladder.c, release7 2026-11-02: 45 rungs,
  * every pixel within 1 LSB) and of the bench ladder's three blend rungs
  * take their original byte-identical shape. All other core equations use
- * the same tile protocol with canonical native-f16 ALU lowering.
- * PVR_G5P_BLEND_GENERAL=1: explicitly enable (the default);
- * PVR_G5P_BLEND_GENERAL=0: none. */
+ * the same tile protocol with canonical native-f16 ALU lowering. */
 bool pco_g5p_blend_general(void)
 {
-   const char *e = getenv("PVR_G5P_BLEND_GENERAL");
-   return !e || strcmp(e, "0");
-}
-
-static bool blend_general_off(void)
-{
-   const char *e = getenv("PVR_G5P_BLEND_GENERAL");
-   return e && !strcmp(e, "0");
+   return true;
 }
 
 /* VkBlendFactor/VkBlendOp: src_rgb, dst_rgb, op_rgb, src_a, dst_a, op_a. */
@@ -2906,16 +2897,10 @@ static void emit_bool_alu(struct gctx *c, nir_alu_instr *a)
  * an operand that is read again is never marked as a last read. */
 enum vkind { VK_SHARED, VK_REG };
 
-/* PVR_G5P_VS_INLINE_UNIFORMS: unset or not "0" = 256 (Apple's limit),
- * "0" = 32 (the previous limit). */
+/* Apple's limit */
 static unsigned vs_inline_limit(void)
 {
-   static int limit = -1;
-   if (limit < 0) {
-      const char *value = getenv("PVR_G5P_VS_INLINE_UNIFORMS");
-      limit = value && !strcmp(value, "0") ? 32 : 256;
-   }
-   return limit;
+   return 256;
 }
 
 /* Inline shared ALU sources are witnessed through dword 255 for fma.shared_a
@@ -3308,8 +3293,7 @@ static void emit_ffma(struct gctx *c, nir_alu_instr *a)
             x.neg = false;
          }
          uint16_t h;
-         if (!x.abs && !f16_exact(bits, &h) && is_const(c, r[2]) &&
-             (!getenv("PVR_G5P_FMA_LITERALS") || strcmp(getenv("PVR_G5P_FMA_LITERALS"), "0"))) {
+         if (!x.abs && !f16_exact(bits, &h) && is_const(c, r[2])) {
             uint32_t addend = V(c, r[2].def, r[2].comp)->imm;
             if (!(addend & 0x200)) {
                unsigned xr = reg_of(c, x, "full-f32 literal ffma");
@@ -4165,18 +4149,15 @@ static void read_varying(struct gctx *c, nir_intrinsic_instr *in, struct drc *d)
 
 /* pair = UBO pointer + (index << shift); load 4 or 16 bytes from it. */
 /* Fragment register-indexed UBO loads compile with their index clamped to
- * the block (g5p_nir.c clamp_dyn_ubo); PVR_G5P_FS_DYN_UBO=0 refuses them
- * (the stage-1 behaviour, for A/B). */
+ * the block (g5p_nir.c clamp_dyn_ubo). */
 bool pco_g5p_fs_dyn_ubo(void)
 {
-   const char *e = getenv("PVR_G5P_FS_DYN_UBO");
-   return !(e && !strcmp(e, "0"));
+   return true;
 }
 
 bool pco_g5p_fuse_ffma(void)
 {
-   const char *e = getenv("PVR_G5P_FUSE");
-   return !(e && !strcmp(e, "0"));
+   return true;
 }
 
 /* The index is clamp_dyn_ubo's umin(i, last), a constant bound inside the block. */
@@ -4213,7 +4194,7 @@ static void emit_dyn_ubo(struct gctx *c, nir_intrinsic_instr *in)
     * umin(i, last): any value, negative included, then stays inside the
     * block (robust access). An index the clamp could not bound is refused. */
    if (!c->vs && !pco_g5p_fs_dyn_ubo())
-      refuse(c, "register-indexed UBO load (PVR_G5P_FS_DYN_UBO=0)");
+      refuse(c, "register-indexed UBO load");
    if (!c->vs && !clamped_index(ix))
       refuse(c, "register-indexed UBO load with an index not clamped to its block (a negative index would "
                 "fault: add_shift does not sign-extend)");
@@ -5125,15 +5106,8 @@ static void setup_inputs(struct gctx *c)
    unsigned next = c->p->input_mask ? 4 * util_last_bit(c->p->input_mask) : 0;
    /* The last fetch need not fill its vec4 slot. Its trailing dwords are
     * outside every DMA destination, so DOUTW can place IDs there without
-    * requiring high source encodings or racing an attribute fetch. Keep
-    * the proven default placement until this alternative is device-tested. */
-   const char *tail = getenv("PVR_G5P_XFB_ID_TAIL");
-   if (next >= NUM_DWORDS && c->attrib_components && tail && !strcmp(tail, "1")) {
-      unsigned last = util_last_bit(c->p->input_mask) - 1;
-      unsigned fetched = c->attrib_components[last];
-      if (fetched > 0 && fetched < 4)
-         next = 4 * last + fetched;
-   }
+    * requiring high source encodings or racing an attribute fetch. That
+    * placement is not device-tested and not used: the proven one stays. */
    for (unsigned i = 0; i < 2; i++) {
       if (!ids[i])
          continue;
@@ -5526,13 +5500,11 @@ static void fs_output(struct gctx *c)
       /* A kill before a general epilogue runs PUNCH_THROUGH with a general
        * blend, base program or punch variant alike. r39-6.1 hard-hung the
        * iPad in Aquarium with that form under depth writes (not bisected
-       * yet), so it is off unless PVR_G5P_PUNCH_BLEND=1 (the driver's punch
-       * variant switch); off, such a program is refused at pipeline
+       * yet), so it is off: such a program is refused at pipeline
        * creation, the r39-6 rule. */
-      const char *pb = getenv("PVR_G5P_PUNCH_BLEND");
-      if ((c->ndiscards || c->discard_always) && !(pb && !strcmp(pb, "1")))
+      if (c->ndiscards || c->discard_always)
          refuse(c, "discard in a program with a general blend epilogue "
-                   "(general-blend punch-through off by default; PVR_G5P_PUNCH_BLEND=1 enables)");
+                   "(general-blend punch-through is off)");
       uint8_t buf[512];
       const char *err;
       struct g5p_blend_key bk = general_key(c->key);
@@ -6080,7 +6052,7 @@ static unsigned blend_mode(struct gctx *c, const struct pco_g5p_fs_key *k)
             return BLEND_STRAIGHT_OVER;
       }
    }
-   if (pco_g5p_blend_general() || (!blend_general_off() && blend_is_proven(k))) {
+   if (pco_g5p_blend_general() || blend_is_proven(k)) {
       uint8_t buf[512];
       const char *err;
       struct g5p_blend_key bk = general_key(k);
@@ -7176,14 +7148,6 @@ static bool codegen(struct gctx *c)
       out->evidence |= PCO_G5P_EV_VARYINGS;
    out->side_effects = impl_has_side_effects(c->impl);
    out->refusal[0] = 0;
-   if (getenv("PVR_G5P_PRESSURE_LOG")) {
-      uint32_t hash;
-      memcpy(&hash, c->nir->info.source_blake3, sizeof(hash));
-      fprintf(stderr, "G5P pressure: stage=%s remat=%u compact=%u eager=%u cf=%u homes=%u bank0=%u bank1=%u "
-                      "size=%u hi_inline=%u blake3=%08x\n",
-              c->vs ? "vs" : "fs", c->remat, c->compact_vs, c->eager_vout, c->cf, c->nhomes, c->max_bank0, c->max_dword,
-              c->size, c->hi_inline, hash);
-   }
    return true;
 }
 
@@ -7673,11 +7637,6 @@ static bool compile_general_link(nir_shader *nir, bool half_output, const uint8_
    c->nir = nir;
    c->p = out;
    c->vs = nir->info.stage == MESA_SHADER_VERTEX;
-   /* Offline test only: the bank-0 placement from the first attempt, so the
-    * mixed-bank forms of every emitter appear in ordinary programs
-    * (bank-check.py and tuple-check.py over the compiled corpus). */
-   if (c->vs && getenv("PVR_G5P_VS_BANK0_FIRST") && strcmp(getenv("PVR_G5P_VS_BANK0_FIRST"), "0"))
-      c->vs_bank0 = true;
    c->half_output = half_output;
    c->attrib_components = attrib_components;
    c->key = key ? key : &default_key;
@@ -7764,8 +7723,6 @@ static bool compile_general_link(nir_shader *nir, bool half_output, const uint8_
       if (c->vs)
          c->vs_bank0 = true;
    }
-   if (getenv("G5P_PRINT_NIR"))
-      nir_print_shader(nir, stderr);
    c->impl = nir_shader_get_entrypoint(nir);
    nir_index_ssa_defs(c->impl);
    nir_index_instrs(c->impl);
@@ -7782,16 +7739,6 @@ static bool compile_general_link(nir_shader *nir, bool half_output, const uint8_
    if (!c->lastput || !c->home)
       refuse(c, "out of memory");
    memset(c->home, -1, c->impl->ssa_alloc * 4);
-   /* Qualification only (numeric runner's forced-order arm): give every
-    * straight-line vertex program the last retry's select nesting and
-    * pressure order up front, so the oracles that already pass on G5P also
-    * exercise that transform. Never set in production. */
-   if (c->vs && !c->cf && getenv("PVR_G5P_VS_FORCE_PRESSURE_ORDER") &&
-       strcmp(getenv("PVR_G5P_VS_FORCE_PRESSURE_ORDER"), "0")) {
-      const bool nested = nest_bool_selects(c), ordered = schedule_min_pressure(c);
-      reindex_pressure_retry(c);
-      fprintf(stderr, "G5P pressure: VS forced nested selects=%d pressure order=%d\n", nested, ordered);
-   }
    schedule_texture_batches(c);
    ok = two_pass(c);
    if (!ok && !c->vs && strstr(out->refusal, "register pressure")) {
@@ -7886,8 +7833,6 @@ homes_retry:
       codegen_reset(c);
       c->vs_bank0 = c->remat = c->eager_vout = c->compact_vs = true;
       ok = two_pass(c);
-      if (ok && getenv("PVR_G5P_PRESSURE_LOG"))
-         fprintf(stderr, "G5P pressure: VS explicit-LOD live-range splits=%u\n", split + 1);
    }
    /* Last vertex retry, only for a program every step above refused:
     * select nesting, then a pressure-driven order of the same instructions. */
@@ -7900,8 +7845,6 @@ homes_retry:
          c->vs_bank0 = c->remat = c->eager_vout = true;
          c->compact_vs = !impl_has_side_effects(c->impl);
          ok = two_pass(c);
-         if (ok && getenv("PVR_G5P_PRESSURE_LOG"))
-            fprintf(stderr, "G5P pressure: VS nested selects=%d pressure order=%d\n", nested, ordered);
       }
    }
 done:

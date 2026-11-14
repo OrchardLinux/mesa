@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: MIT
- * General NIR -> G5P USC backend (round 18), on top of the captured-shape
- * matcher in pco_g5p.c. Encodings come from g5p_usc.c (ISA round 18 field
+ * General NIR -> G5P USC backend (round 18). Encodings come from g5p_usc.c (ISA round 18 field
  * encoders); register conventions per stage are the ones witnessed by the
  * host compiler (isa-g5p.md). Anything without such a witness is refused
  * with a reason naming the NIR operation.
@@ -99,11 +98,11 @@ struct pco_g5p_fs_key {
    /* Source group bits by Apple's rule (1 only on a register's last read;
     * repeated reads get group 0 and the measured hint bits). Off: the
     * round-16..18 convention, group 1 on every fragment read (default, so
-    * those scenes keep their bytes). PVR_G5P_GROUPS=last-read turns it on. */
+    * those scenes keep their bytes). The driver's pipelines turn it on. */
    bool last_read_groups;
    /* Fuse an fmul and the fadds it feeds into ffmas (G9P's fusion), with
-    * last_read_groups only. Default on for fragment pipeline keys;
-    * PVR_G5P_FUSE=0 disables it. Captured shapes are not affected. */
+    * last_read_groups only. On for fragment pipeline keys. Captured shapes
+    * are not affected. */
    bool fuse_ffma;
    /* Colour attachments written by the program: 0 = 1. 1, 2 and 4 are the
     * homogeneous 8-bit RGBA sets with an Apple witness (g5p_mrt_out.h). */
@@ -266,8 +265,8 @@ bool pco_g5p_compile_general_key(nir_shader *nir, bool half_output, const uint8_
 bool pco_g5p_compile_general_link(nir_shader *nir, bool half_output, const uint8_t *attrib_components,
                                   const struct pco_g5p_fs_key *key, const struct pco_g5p_vs_link *link,
                                   struct pco_g5p_program *out);
-/* PVR_G5P_FS_DYN_UBO=1: fragment register-indexed UBO loads are compiled
- * (index clamped to the block) instead of refused. */
+/* Fragment register-indexed UBO loads are compiled (index clamped to the
+ * block) instead of refused. */
 bool pco_g5p_fs_dyn_ubo(void);
 bool pco_g5p_fuse_ffma(void);
 bool pco_g5p_blend_general(void);

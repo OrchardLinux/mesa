@@ -540,7 +540,7 @@ unsigned g5p_usc_special(uint8_t *out, bool end)
 }
 
 /* End of a task that writes no output: 5e 01 00 a0. The TA's end-of-stream
- * program (GET_RENDER_INFO's TA program slot, W+0x88) is a branch to the next
+ * program (the geometry work record's TA program slot, W+0x88) is a branch to the next
  * 64-byte block, 0xc000 padding, and this word: Apple's A9 job layout has it
  * there, and the G9P driver builds the same program for the same register
  * on the A10 (pvr_arch_g9p_gfx.c, "Register 0x470's program"). */

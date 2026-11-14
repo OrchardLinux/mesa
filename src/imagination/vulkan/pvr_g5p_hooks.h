@@ -2,13 +2,9 @@
 /*
  * The Apple A9 (G5P) hooks in the shared PowerVR driver files.
  *
- * Where a shared file has code after the hook that records its own line
- * number (vk_error() and friends pass __LINE__), the hook is one line,
- * PVR_G5P_HOOK(name, ...), and it takes the place of a blank line of that
- * file. A build without -Dimagination-g5p-experimental so keeps every line
- * number, and every byte of libvulkan_powervr_mesa.so, of the file without
- * G5P: the hook expands to nothing there. With the option it expands to the
- * PVR_G5P_HOOK_<name> below.
+ * A hook is one line in a shared file, PVR_G5P_HOOK(name, ...), which
+ * expands to the PVR_G5P_HOOK_<name> below: code that runs only on a device
+ * with has_apple_g5p.
  *
  * Included by pvr_winsys.h, so every file that has a hook sees it.
  */
@@ -16,24 +12,17 @@
 #ifndef PVR_G5P_HOOKS_H
 #define PVR_G5P_HOOKS_H
 
-#if defined(PVR_APPLE_G5P)
-#   define PVR_G5P_HOOK(name, ...) PVR_G5P_HOOK_##name(__VA_ARGS__)
-#else
-#   define PVR_G5P_HOOK(name, ...)
-#endif
+#define PVR_G5P_HOOK(name, ...) PVR_G5P_HOOK_##name(__VA_ARGS__)
 
 /* Textures and samplers (pvr_g5p_tex.h), colour formats (pvr_g5p_formats.h). */
-#if defined(PVR_APPLE_G5P)
-#   include "pvr_g5p_formats.h"
-#   include "pvr_g5p_layout.h"
-#   include "pvr_g5p_tex.h"
-#   include "pvr_g5p_texel_buffer.h"
-#   include "pvr_g5p_xfb.h"
-#   include "pvr_g5p_memory.h"
-#   include "pvr_g5p_spm.h"
-#   include "pvr_g5p_shm.h"
-#   include "pvr_g5p_compute_hooks.h"
-#endif
+#include "pvr_g5p_formats.h"
+#include "pvr_g5p_layout.h"
+#include "pvr_g5p_tex.h"
+#include "pvr_g5p_texel_buffer.h"
+#include "pvr_g5p_xfb.h"
+#include "pvr_g5p_memory.h"
+#include "pvr_g5p_shm.h"
+#include "pvr_g5p_compute_hooks.h"
 
 /* Uniform buffer textures: independent R5 probe; no storage exposure. */
 #define PVR_G5P_HOOK_texel_state(device, info, state) \
@@ -178,49 +167,25 @@
  * copies the attachment through a tile-rounded buffer with transfer jobs
  * before and after the render. The A9's ZLS plane is already whole 32-pixel
  * tiles in a power-of-two square (pvr_g5p_ds_layout()) and ZLS_PIXELS covers
- * them (pvr_g5p_ds_zls()), so the render loads and stores it in place. The
- * copy-around also ran through the CPU transfer path, which has no mapping
- * of arena-backed images ("G5P transfer: no stable CPU mapping", then a lost
- * device): every depth attachment with a side under the tile failed.
+ * them (pvr_g5p_ds_zls()), so the render loads and stores it in place.
  */
 #define PVR_G5P_HOOK_ds_subtile_alignment(dev_info)                           \
    if (PVR_HAS_FEATURE(dev_info, apple_g5p))                                  \
       return false;
 
-/* pvr_device.c, pvr_MapMemory2(): the CPU transfer path G5P shares with G9P
- * (pvr_arch_g9p_cpu_addr()) maps a bound BO and leaves it mapped. That is the
- * driver's mapping, not the application's, so a vkMapMemory of that memory
- * maps it again (the same CPU address, or a placed one) instead of being
- * refused as "already mapped".
- */
-#define PVR_G5P_HOOK_map_again(device, mem, addr, offset, data)          \
-   if (PVR_HAS_FEATURE(&(device)->pdevice->dev_info, apple_g5p) &&        \
-       (mem)->bo->map) {                                                  \
-      VkResult r_ = (device)->ws->ops->buffer_map((mem)->bo, addr);       \
-      if (r_ == VK_SUCCESS)                                               \
-         *(data) = (uint8_t *)(mem)->bo->map + (offset);                  \
-      return r_;                                                          \
-   }
-
-/* pvr_arch_framebuffer.c: experimental omission of unreachable generic SPM
- * allocations only. Keep zeroed per-render states for unconditional cleanup.
- * The existing G9P and generic branches remain unchanged.
+/* pvr_arch_framebuffer.c: the kernel's A9 path has no partial renders, so
+ * the framebuffer's SPM scratch buffer and programs are never used: none
+ * are made, as on G9P. The zeroed per-render states stay for the cleanup.
  */
 #define PVR_G5P_HOOK_spm_scratch(device, rstate)                         \
-   if (PVR_HAS_FEATURE(&(device)->pdevice->dev_info, apple_g5p) &&        \
-       pvr_g5p_spm_skip()) { (rstate)->scratch_buffer = NULL; } else
+   if (PVR_HAS_FEATURE(&(device)->pdevice->dev_info, apple_g5p)) {        \
+      (rstate)->scratch_buffer = NULL;                                    \
+   } else
 #define PVR_G5P_HOOK_spm_render(device)                                 \
-   if (!PVR_HAS_FEATURE(&(device)->pdevice->dev_info, apple_g5p) ||       \
-       !pvr_g5p_spm_skip())
+   if (!PVR_HAS_FEATURE(&(device)->pdevice->dev_info, apple_g5p))
 
-/* Application memory only: internal programs and control streams keep GPU type. */
-#define PVR_G5P_HOOK_memory_bo_type(device, info, type)                     \
-   if (PVR_HAS_FEATURE(&(device)->pdevice->dev_info, apple_g5p) &&           \
-       (type) == PVR_WINSYS_BO_TYPE_GPU &&                                  \
-       pvr_g5p_memory_is_large((info)->allocationSize))                     \
-      (type) = pvr_g5p_memory_is_dedicated_image(info)                      \
-                  ? PVR_G5P_BO_TYPE_IMAGE_DATA : PVR_G5P_BO_TYPE_DATA;
-
+/* pvr_device.c, pvr_GetImageMemoryRequirements2(): a large image prefers
+ * an allocation of its own (pvr_g5p_memory.h) */
 #define PVR_G5P_HOOK_memory_dedicated(device, requirements)                 \
    if (PVR_HAS_FEATURE(&(device)->pdevice->dev_info, apple_g5p))             \
       pvr_g5p_memory_dedicated(requirements);
@@ -230,33 +195,12 @@
  * (two EOT surfaces, which G5P refuses: "the pipeline writes 1 colour
  * targets, the pass has 2"). The reason for that rule, layered render
  * target clears deferred until after the PBE wrote, cannot occur: G5P
- * renders one layer per job. Dynamic rendering (Zink) never had the rule.
- * PVR_G5P_MSAA_PBE_RESOLVE=0: the rule back, for an A/B. */
-#if defined(PVR_APPLE_G5P)
-#   include <stdlib.h>
-#   include <string.h>
-static inline bool
-pvr_g5p_legacy_pbe_resolve(void)
-{
-   const char *e = getenv("PVR_G5P_MSAA_PBE_RESOLVE");
-   return !e || strcmp(e, "0");
-}
-#endif
+ * renders one layer per job. Dynamic rendering (Zink) never had the rule. */
 #define PVR_G5P_HOOK_pbe_resolve(dev_info, attachment)                      \
-   if (PVR_HAS_FEATURE(dev_info, apple_g5p) && pvr_g5p_legacy_pbe_resolve())  \
+   if (PVR_HAS_FEATURE(dev_info, apple_g5p))                                \
       (attachment)->is_pbe_downscalable =                                   \
          pvr_arch_format_is_pbe_downscalable(dev_info,                      \
                                              (attachment)->vk_format);
-
-/* A VkBuffer (image 0) or VkImage (image 1) binds memory (counted before
- * the bind, which fails only when the heap's bookkeeping is full) or is
- * destroyed with memory bound: the winsys's PVR_G5P_ARENA_LOG statistics. */
-#define PVR_G5P_HOOK_memory_bound(device, image, vma, bytes)                \
-   if (PVR_HAS_FEATURE(&(device)->pdevice->dev_info, apple_g5p) && !(vma))   \
-      pvr_g5p_winsys_bound((device)->ws, image, (int64_t)(bytes));
-#define PVR_G5P_HOOK_memory_released(device, image, vma, bytes)             \
-   if (PVR_HAS_FEATURE(&(device)->pdevice->dev_info, apple_g5p) && (vma))    \
-      pvr_g5p_winsys_bound((device)->ws, image, -(int64_t)(bytes));
 
 /* pvr_arch_xfb.c, vkCmdBind/Begin/EndTransformFeedbackEXT(): G5P records
  * its own events (pvr_g5p_xfb.h); Rogue's stream-out programs and End's
@@ -369,23 +313,12 @@ pvr_g5p_legacy_pbe_resolve(void)
        ((result) = pvr_g5p_image_format_check((info), (tiling))) != VK_SUCCESS) \
       goto err_unsupported_format;
 
-
-#define PVR_G5P_HOOK_copy_buffer(cmd, info) \
-   if (PVR_HAS_FEATURE(&(cmd)->device->pdevice->dev_info, apple_g5p) && \
-       pvr_arch_g5p_meta_copy_buffer(cmd, info)) return;
-#define PVR_G5P_HOOK_fill_buffer(cmd, dst, off, size, data) \
-   if (PVR_HAS_FEATURE(&(cmd)->device->pdevice->dev_info, apple_g5p) && \
-       pvr_arch_g5p_meta_fill_buffer(cmd, dst, off, size, data)) return;
-#define PVR_G5P_HOOK_update_buffer(cmd, dst, off, size, data) \
-   if (PVR_HAS_FEATURE(&(cmd)->device->pdevice->dev_info, apple_g5p) && \
-       pvr_arch_g5p_meta_update_buffer(cmd, dst, off, size, data)) return;
-
 #endif /* PVR_G5P_HOOKS_H */
 
 /* The per-arch functions of the hooks, guarded on their own (as
  * pvr_g5p_ds.h): a file that includes this header before PVR_PER_ARCH is
  * defined still gets them from a later include. */
-#if defined(PVR_APPLE_G5P) && defined(PVR_PER_ARCH) && !defined(PVR_G5P_HOOKS_ARCH_H)
+#if defined(PVR_PER_ARCH) && !defined(PVR_G5P_HOOKS_ARCH_H)
 #define PVR_G5P_HOOKS_ARCH_H
 
 struct pvr_cmd_buffer;

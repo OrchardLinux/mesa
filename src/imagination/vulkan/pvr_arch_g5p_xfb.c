@@ -1,7 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 /*
  * Apple's A9 GPU (G5P): transform feedback (pvr_g5p_xfb.h).
- * Compiled only with -Dimagination-g5p-experimental=true.
  *
  * Ported from our A9 driver (g5p_xfb.c: its events, its execution-time
  * resolve and its after-job copy), whose capture ran exact on the device
@@ -15,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "util/log.h"
 #include "util/os_time.h"
 #include "util/u_dynarray.h"
 #include "vk_command_buffer.h"
@@ -33,7 +33,7 @@
 
 /* A refusal, by name, on stderr too (vk_errorf() is silent in release builds) */
 #define G5P_XFB_REFUSE(obj, ...)                                                                                   \
-   (fprintf(stderr, "G5P refuses: " __VA_ARGS__), fprintf(stderr, "\n"),                                          \
+   (mesa_logw("G5P refuses: " __VA_ARGS__),                                                              \
     vk_errorf((obj), VK_ERROR_FEATURE_NOT_PRESENT, "G5P: " __VA_ARGS__))
 
 /* A buffer range named by a command (a binding or a counter) */
@@ -288,8 +288,8 @@ PVR_PER_ARCH(g5p_xfb_query_copy)(struct pvr_cmd_buffer *cmd_buffer, const struct
    r->e.query.flags = flags;
 }
 
-/* A buffer's CPU view (all G5P memory is CPU-visible: the apple_g5p arena),
- * mapped the way G9P's CPU transfers map theirs */
+/* A buffer's CPU view (all G5P memory is CPU-visible), mapped the way G9P's
+ * CPU transfers map theirs */
 static bool
 g5p_xfb_mem(struct pvr_device *device, const struct g5p_xfb_range *range, struct g5p_xfb_mem *mem,
             struct g5p_xfb_ref *ref)
@@ -308,41 +308,6 @@ g5p_xfb_mem(struct pvr_device *device, const struct g5p_xfb_range *range, struct
    mem->size = range->buffer->vk.size;
    *ref = (struct g5p_xfb_ref){ mem, range->offset };
    return true;
-}
-
-/* PVR_G5P_XFB_LOG=1: each event as it runs, on stderr (the offline proof
- * reads it: tools/g5p-1b-mrtxfb/xfb) */
-static bool
-g5p_xfb_logging(void)
-{
-   static int on = -1;
-   if (on < 0)
-      on = getenv("PVR_G5P_XFB_LOG") && atoi(getenv("PVR_G5P_XFB_LOG"));
-   return on;
-}
-
-static void
-g5p_xfb_log(const struct g5p_xfb_exec *x, const struct g5p_xfb_rec *r, bool staged)
-{
-   static const char *const kind[] = { "begin", "end", "draw", "qbegin", "qend", "qreset", "qcopy" };
-   fprintf(stderr, "g5p xfb: %s", kind[r->e.kind]);
-   if (r->e.kind == G5P_XFB_DRAW) {
-      uint32_t w[G5P_XFB_BLOCK_DWORDS];
-      memcpy(w, r->e.draw.block, sizeof(w));
-      fprintf(stderr, " vertices %u instances %u first %u vpp %u %s num_vertices %u", r->e.draw.vertices,
-              r->e.draw.instances, r->e.draw.first, r->e.draw.vpp, staged ? "staged" : "direct",
-              w[G5P_XFB_BLOCK_NUM_VERTICES_DW]);
-      for (unsigned b = 0; b < G5P_XFB_BUFFERS; b++)
-         if (r->e.draw.layout.buffers & (1u << b))
-            fprintf(stderr, " addr%u %#" PRIx64 " stride%u %u", b,
-                    (uint64_t)w[G5P_XFB_BLOCK_ADDR_DW(b)] | (uint64_t)w[G5P_XFB_BLOCK_ADDR_DW(b) + 1] << 32, b,
-                    r->e.draw.layout.stride[b]);
-   }
-   for (unsigned b = 0; b < G5P_XFB_BUFFERS; b++)
-      if (x->buf[b].ref.mem)
-         fprintf(stderr, " buf%u va %#" PRIx64 " offset %" PRIu64 " size %" PRIu64 " written %" PRIu64, b,
-                 x->buf[b].ref.mem->va, x->buf[b].ref.offset, x->buf[b].size, x->buf[b].written);
-   fprintf(stderr, " staging %" PRIu64 " copies %u\n", x->staging_bytes, x->ncopies);
 }
 
 /* Run the events [st->next, end) in command order. A new submission starts
@@ -391,12 +356,9 @@ g5p_xfb_run(struct pvr_device *device, struct pvr_g5p_xfb_cmd *st, unsigned end)
       }
       if (!ok)
          return G5P_XFB_REFUSE(device, "a transform feedback buffer without a CPU mapping");
-      const unsigned staged = x->nstage;
       const char *why = g5p_xfb_execute(x, &r->e);
       if (why)
          return G5P_XFB_REFUSE(device, "transform feedback: %s", why);
-      if (g5p_xfb_logging())
-         g5p_xfb_log(x, r, x->nstage > staged);
    }
    return VK_SUCCESS;
 }
@@ -429,13 +391,6 @@ PVR_PER_ARCH(g5p_xfb_before_job)(struct pvr_device *device, struct pvr_cmd_buffe
          return result;
       st->staging_sub = sub_cmd;
       g5p_xfb_bind_staging(x, st->staging->vma->dev_addr.addr);
-      if (g5p_xfb_logging()) {
-         fprintf(stderr, "g5p xfb: staging va %#" PRIx64 " bytes %" PRIu64 "\n", st->staging->vma->dev_addr.addr,
-                 x->staging_bytes);
-         for (unsigned c = 0; c < x->ncopies; c++)
-            fprintf(stderr, "g5p xfb: copy %u buf%u records %" PRIu64 " per instance %u of %u src %" PRIu64 "\n", c,
-                    x->copies[c].b, x->copies[c].records, x->copies[c].complete, x->copies[c].hw, x->copies[c].src);
-      }
    }
    return VK_SUCCESS;
 }

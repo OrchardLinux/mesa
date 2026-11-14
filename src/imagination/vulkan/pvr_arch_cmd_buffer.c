@@ -90,18 +90,12 @@
 #include "pvr_g9p.h"
 #include "vk_util.h"
 
-#ifdef PVR_APPLE_G5P
 #define G5P_UPLOAD_BLOCK_SIZE (64u * 1024u)
 #define G5P_UPLOAD_MAX (4u * 1024u) /* larger uploads keep the device suballocator */
 
-static bool g5p_upload_arena_on(const struct pvr_device *device)
+static bool g5p_upload_blocks_on(const struct pvr_device *device)
 {
-   static int on = -1;
-   if (on < 0) {
-      const char *v = getenv("PVR_G5P_UPLOAD_ARENA");
-      on = !(v && !strcmp(v, "0"));
-   }
-   return on && PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p);
+   return PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p);
 }
 
 /* A view into this command buffer's block for heap idx (0 general, 1 PDS).
@@ -155,7 +149,6 @@ static VkResult g5p_upload_alloc(struct pvr_cmd_buffer *cmd_buffer, unsigned idx
    *out = view;
    return VK_SUCCESS;
 }
-#endif
 
 /* Structure used to pass data into pvr_compute_generate_control_stream()
  * function.
@@ -286,13 +279,11 @@ static void pvr_cmd_buffer_free_resources(struct pvr_cmd_buffer *cmd_buffer)
 
    pvr_cmd_buffer_free_sub_cmds(cmd_buffer);
 
-#ifdef PVR_APPLE_G5P
    memset(cmd_buffer->g5p_upload, 0, sizeof(cmd_buffer->g5p_upload));
    if (cmd_buffer->g5p_views) {
       linear_free_context(cmd_buffer->g5p_views);
       cmd_buffer->g5p_views = NULL;
    }
-#endif
 
    list_for_each_entry_safe (struct pvr_suballoc_bo,
                              suballoc_bo,
@@ -556,8 +547,7 @@ pvr_arch_cmd_buffer_upload_general(struct pvr_cmd_buffer *const cmd_buffer,
    struct pvr_suballoc_bo *suballoc_bo;
    VkResult result;
 
-#ifdef PVR_APPLE_G5P
-   if (g5p_upload_arena_on(device)) {
+   if (g5p_upload_blocks_on(device)) {
       struct pvr_suballoc_bo *view;
       VkResult r = g5p_upload_alloc(cmd_buffer, 0, size, cache_line_size, &view);
       if (r == VK_SUCCESS) {
@@ -569,7 +559,6 @@ pvr_arch_cmd_buffer_upload_general(struct pvr_cmd_buffer *const cmd_buffer,
       if (r != VK_NOT_READY)
          return pvr_cmd_buffer_set_error_unwarned(cmd_buffer, r);
    }
-#endif
 
    result = pvr_gpu_upload(device,
                            device->heaps.general_heap,
@@ -628,8 +617,7 @@ pvr_arch_cmd_buffer_upload_pds(struct pvr_cmd_buffer *const cmd_buffer,
    struct pvr_device *const device = cmd_buffer->device;
    VkResult result;
 
-#ifdef PVR_APPLE_G5P
-   if (g5p_upload_arena_on(device) && !code && data && data_size_dwords) {
+   if (g5p_upload_blocks_on(device) && !code && data && data_size_dwords) {
       const uint32_t data_size = PVR_DW_TO_BYTES(data_size_dwords);
       const uint32_t aligned = ALIGN_POT(data_size, data_alignment);
       const uint32_t align = MAX2((uint32_t)min_alignment, data_alignment);
@@ -649,7 +637,6 @@ pvr_arch_cmd_buffer_upload_pds(struct pvr_cmd_buffer *const cmd_buffer,
       if (r != VK_NOT_READY)
          return pvr_cmd_buffer_set_error_unwarned(cmd_buffer, r);
    }
-#endif
 
    result = pvr_gpu_upload_pds(device,
                                data,
@@ -1782,14 +1769,12 @@ static VkResult pvr_sub_cmd_gfx_job_init(const struct pvr_device_info *dev_info,
     */
    job->view_state.view_index = 0;
 
-#ifdef PVR_APPLE_G5P
    if (PVR_HAS_FEATURE(dev_info, apple_g5p)) {
       /* the background, end of tile and stream of a G5P render: pvr_arch_g5p_job_init() */
       result = pvr_arch_g5p_job_init(cmd_buffer, sub_cmd, hw_render, job);
       if (result != VK_SUCCESS)
          return result;
    } else
-#endif
    if (PVR_HAS_FEATURE(dev_info, apple_g9p)) {
       result = pvr_arch_g9p_job_init(cmd_buffer, hw_render, job);
       if (result != VK_SUCCESS)
@@ -1861,11 +1846,9 @@ static VkResult pvr_sub_cmd_gfx_job_init(const struct pvr_device_info *dev_info,
              sizeof(job->pbe_reg_words));
    }
 
-#ifdef PVR_APPLE_G5P
    if (PVR_HAS_FEATURE(dev_info, apple_g5p)) {
       /* the background object: pvr_arch_g5p_job_init() */
    } else
-#endif
    if (PVR_HAS_FEATURE(dev_info, apple_g9p)) {
       /* the background object: pvr_arch_g9p_job_init() */
    } else if (sub_cmd->barrier_load) {
@@ -3696,11 +3679,9 @@ pvr_perform_start_of_render_attachment_clear(struct pvr_cmd_buffer *cmd_buffer,
    VkFormat vk_format;
    uint32_t iview_idx;
 
-#ifdef PVR_APPLE_G5P
    /* G5P: clears are background objects too (pvr_arch_g5p_job_init()) */
    if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g5p))
       return;
-#endif
    /* G9P: clears are background objects (pvr_arch_g9p_job_init()) */
    if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g9p))
       return;
@@ -4399,11 +4380,9 @@ void PVR_PER_ARCH(CmdBeginRenderPass2)(
     */
    hw_subpass = pvr_arch_get_hw_subpass(pass, 0);
    /* G9P: clears are background objects (pvr_arch_g9p_job_init()) */
-#ifdef PVR_APPLE_G5P
    if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g5p)) {
       /* G5P: clears are background objects too (pvr_arch_g5p_job_init()) */
    } else
-#endif
    if (hw_subpass->load_op &&
        !PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g9p)) {
       result = pvr_cs_write_load_op(cmd_buffer,
@@ -9721,7 +9700,6 @@ void PVR_PER_ARCH(CmdDraw)(VkCommandBuffer commandBuffer,
 
    PVR_TRACE_BEGIN_DRAW(cmd_buffer, PVR_DRAW);
 
-#ifdef PVR_APPLE_G5P
    if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g5p)) {
       /* G5P: the draw's VDM/PPP words and programs (pvr_arch_g5p_gfx.c) */
       const struct pvr_g5p_draw g5p_draw = {
@@ -9740,7 +9718,6 @@ void PVR_PER_ARCH(CmdDraw)(VkCommandBuffer commandBuffer,
          vk_command_buffer_set_error(&cmd_buffer->vk, result);
       goto end_cmd_draw;
    }
-#endif
    if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g9p)) {
       if (!state->gfx_pipeline)
          return;
@@ -9813,7 +9790,6 @@ void PVR_PER_ARCH(CmdDrawIndexed)(VkCommandBuffer commandBuffer,
 
    PVR_TRACE_BEGIN_DRAW(cmd_buffer, PVR_DRAW_INDEXED);
 
-#ifdef PVR_APPLE_G5P
    if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g5p)) {
       /* G5P: the draw with an index list (pvr_arch_g5p_vertex.c) */
       result = pvr_flush_push_descriptors(cmd_buffer, &cmd_buffer->state.gfx_desc_state);
@@ -9824,7 +9800,6 @@ void PVR_PER_ARCH(CmdDrawIndexed)(VkCommandBuffer commandBuffer,
          vk_command_buffer_set_error(&cmd_buffer->vk, result);
       goto end_cmd_draw_indexed;
    }
-#endif
    if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g9p)) {
       if (!state->gfx_pipeline)
          return;
@@ -10723,11 +10698,9 @@ void PVR_PER_ARCH(CmdNextSubpass2)(VkCommandBuffer commandBuffer,
    hw_subpass = &next_hw_render->subpasses[next_map->subpass];
    hw_subpass_load_op = hw_subpass->load_op;
 
-#ifdef PVR_APPLE_G5P
    if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g5p)) {
       /* G5P: clears and loads are background objects (pvr_arch_g5p_job_init()) */
    } else
-#endif
    if (hw_subpass_load_op &&
        !PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g9p)) {
       result = pvr_cs_write_load_op(cmd_buffer,

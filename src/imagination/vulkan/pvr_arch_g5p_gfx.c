@@ -7,10 +7,9 @@
  * the A9 ICD's recorder derives it (g5p_record.c of the route-b tree:
  * place_pipeline(), g5p_job_draw()); its template, prologue, epilogue and
  * static arena are not used, so a draw is only what pvr_* records here plus
- * the render job of pvr_arch_g5p.c. Compiled only with
- * -Dimagination-g5p-experimental=true.
+ * the render job of pvr_arch_g5p.c.
  *
- * Rung A of step 7 (docs: orchard-mesa-pr-plan.md "Step 7 design"): one
+ * The first form this drew (docs: orchard-mesa-pr-plan.md, rung A): one
  * linear colour target, no depth/stencil, one vertex buffer, non-indexed
  * single-instance draws, scissors and partial render areas as the ICD clips
  * them (region clip, ISP scissor table); blending as
@@ -30,6 +29,7 @@
 #include "vk_log.h"
 #include "vk_shader_module.h"
 
+#include "util/log.h"
 #include "util/ralloc.h"
 #include "util/u_dynarray.h"
 #include "util/u_math.h"
@@ -47,6 +47,7 @@
 #include "pvr_device.h"
 #include "pvr_framebuffer.h"
 #include "pvr_g5p.h"
+#include "pvr_g5p_vdm.h"
 #include "pvr_g5p_blend.h"
 #include "pvr_g5p_formats.h"
 #include "pvr_g5p_mrt.h"
@@ -75,49 +76,10 @@
 /* Region clip granularity in pixels */
 #define G5P_TILE 32
 
-/* PVR_G5P_WS_LOG: the words of every pipeline and draw (step7-compare.py reads them) */
-static bool
-g5p_logging(void)
-{
-   static int on = -1;
-   if (on < 0)
-      on = getenv("PVR_G5P_WS_LOG") != NULL;
-   return on;
-}
-
-static void
-g5p_dump(const char *who, const char *what, uint64_t addr, const uint32_t *w, unsigned n)
-{
-   if (!g5p_logging())
-      return;
-   fprintf(stderr, "g5p %s: %-16s @%#" PRIx64 ":", who, what, addr);
-   for (unsigned i = 0; i < n; i++)
-      fprintf(stderr, " %08x", w[i]);
-   fprintf(stderr, "\n");
-}
-
 /* USC programs have byte sizes and need not end on a dword boundary. */
-static void
-g5p_dump_code(const char *what, uint64_t addr, const void *code, unsigned size)
-{
-   if (!g5p_logging())
-      return;
-
-   const uint8_t *bytes = code;
-   fprintf(stderr, "g5p pipeline: %-16s @%#" PRIx64 ":", what, addr);
-   for (unsigned offset = 0; offset < size;) {
-      const unsigned count = MIN2(size - offset, sizeof(uint32_t));
-      uint32_t word = 0;
-      memcpy(&word, bytes + offset, count);
-      fprintf(stderr, " %08x", word);
-      offset += count;
-   }
-   fprintf(stderr, "\n");
-}
-
 /* A refusal, by name, on stderr too (vk_errorf() is silent in release builds) */
 #define G5P_REFUSE(obj, ...)                                                                                       \
-   (fprintf(stderr, "G5P refuses: " __VA_ARGS__), fprintf(stderr, "\n"),                                          \
+   (mesa_logw("G5P refuses: " __VA_ARGS__),                                                                        \
     vk_errorf((obj), VK_ERROR_FEATURE_NOT_PRESENT, "G5P: " __VA_ARGS__))
 
 /* ---- PDS programs (pdsc, Apple's DOUT form: the A9 ICD's) ---- */
@@ -423,8 +385,7 @@ usc_off(const struct pvr_device *device, const struct pvr_suballoc_bo *bo)
 static bool
 g5p_native_bresenham_line(const struct vk_graphics_pipeline_state *s)
 {
-   const char *mode = getenv("PVR_G5P_BRESENHAM");
-   return (!mode || strcmp(mode, "0")) && s->rs && s->ia &&
+   return s->rs && s->ia &&
       (s->ia->primitive_topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST ||
        s->ia->primitive_topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP) &&
       s->rs->line.mode == VK_LINE_RASTERIZATION_MODE_BRESENHAM;
@@ -472,7 +433,7 @@ g5p_check_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo *c
    if (s->rs && (s->rs->depth_clamp_enable ||
                  (s->rs->polygon_mode != VK_POLYGON_MODE_FILL && !pvr_g5p_polygon_mode_enabled())))
       return G5P_REFUSE(device, "depth clamp or polygon mode %d", s->rs->polygon_mode);
-   /* line and point fill (default; PVR_G5P_POLYGON_MODE=0 off): the qualified scope only */
+   /* line and point fill: the qualified scope only */
    if (s->rs && s->rs->polygon_mode != VK_POLYGON_MODE_FILL) {
       if (s->rs->polygon_mode != VK_POLYGON_MODE_LINE && s->rs->polygon_mode != VK_POLYGON_MODE_POINT)
          return G5P_REFUSE(device, "polygon mode %d", s->rs->polygon_mode);
@@ -535,8 +496,7 @@ g5p_check_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo *c
     * general sample's result read back for its outputs (texture() of an
     * array or cube, textureLod: red right, green to alpha scaled by a
     * coordinate), blending's destination term (labwc113). The A9 ICD ran
-    * every device suite and the desktop with them (PVR_G5P_GROUPS=last-read,
-    * automatic since Mesa117).
+    * every device suite and the desktop with them.
     */
    key->last_read_groups = true;
    key->fuse_ffma = pco_g5p_fuse_ffma();
@@ -630,8 +590,8 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
    struct pvr_g5p_vertex_layout vertex;
    pvr_g5p_vertex_layout_init(&vertex, s->vi, BITSET_TEST(s->dynamic, MESA_VK_DYNAMIC_VI_BINDING_STRIDES));
 
-   const char *depth_probe = getenv("PVR_G5P_DEPTH_EXPORT");
-   key.depth_feedback = depth_probe && !strcmp(depth_probe, "probe");
+   /* depth export through fragment feedback has not passed on the device */
+   key.depth_feedback = false;
    /* the fragment program first: the vertex program is compiled against the
     * varyings it reads (Apple's VertexProgramKey; Rogue's pco_rev_link_nir) */
    if (!pvr_g5p_compile_stage(fs_info, true, g->samples, NULL, &key, NULL, fs))
@@ -908,15 +868,6 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
          return result;
    }
 
-   if (g5p_logging()) {
-      fprintf(stderr, "g5p pipeline: vs %u bytes temps %u (program %u, written %u) outputs %u unified %u ids %#x "
-              "fetches %u; fs %u bytes temps %u varyings %u w_set %u discard %u\n",
-              g->vs_usc_size, g->vs_temps, vs->temps, vs->written_temps, g->vs_outputs, g->vs_unified,
-              g->vs_id_mask, g->fetch_count, g->fs_usc_size, g->fs_temps, fs->num_varyings, fs->w_set,
-              g->fs_discard);
-      g5p_dump_code("vs usc", usc_off(device, g->vs_usc), vs->code, vs->size);
-      g5p_dump_code("fs usc", usc_off(device, g->fs_usc), fs->code, fs->size);
-   }
    return VK_SUCCESS;
 }
 
@@ -932,25 +883,12 @@ g5p_pipeline_build_punch(struct pvr_device *device,
 {
    if (g->fs_discard_tokens < 2 && !g->fs_discard_select)
       return VK_SUCCESS;
-   /* Punch-through variant knobs. PVR_G5P_PUNCH_BLEND: the general-blend
-    * punch variant (r39-6.1's form: PUNCH_THROUGH + general blend + depth
-    * write) is OFF unless set to 1 -- r39-6.1 hard-hung the iPad in
-    * Aquarium with it, cause not yet bisected; a device that might hang
-    * must not by default. PVR_G5P_PUNCH=0: no punch variant at all.
-    * Without the variant, g5p_pipeline_check_draw_variants() refuses the
-    * pipeline at creation when a depth/stencil state could need it, the
-    * non-fatal form r39-3 had. */
-   static int punch_all = -1, punch_blend = -1;
-   if (punch_all < 0) {
-      const char *a = getenv("PVR_G5P_PUNCH"), *b = getenv("PVR_G5P_PUNCH_BLEND");
-      punch_all = !(a && !strcmp(a, "0"));
-      punch_blend = b && !strcmp(b, "1");
-      fprintf(stderr, "G5P: punch-through variants: %s\n",
-              !punch_all ? "all disabled (PVR_G5P_PUNCH=0)"
-              : punch_blend ? "general blend ENABLED (PVR_G5P_PUNCH_BLEND=1)"
-                            : "general blend disabled (default; PVR_G5P_PUNCH_BLEND=1 enables)");
-   }
-   if (!punch_all || (!punch_blend && g->fs_blend_mode == 4 /* general */))
+   /* The general-blend punch variant (r39-6.1's form: PUNCH_THROUGH +
+    * general blend + depth write) is not built: r39-6.1 hard-hung the iPad
+    * in Aquarium with it, cause not yet bisected. Without the variant,
+    * g5p_pipeline_check_draw_variants() refuses the pipeline at creation
+    * when a depth/stencil state could need it, the non-fatal form r39-3 had. */
+   if (g->fs_blend_mode == 4 /* general */)
       return VK_SUCCESS;
    struct pvr_g5p_pipeline *p =
       vk_zalloc(&device->vk.alloc, sizeof(*p), 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
@@ -1341,7 +1279,6 @@ g5p_scissor_index(struct pvr_cmd_buffer *cmd_buffer, int32_t x0, int32_t y0, int
       w1.scw1_ymin = y0;
       w1.scw1_ymax = y1;
    }
-   g5p_dump("draw", "isp scissor", 0, (const uint32_t[2]){ s.w0, s.w1 }, 2);
    const unsigned n = util_dynarray_num_elements(&cmd_buffer->scissor_array, struct pvr_scissor_words);
    if (n && !memcmp(util_dynarray_top_ptr(&cmd_buffer->scissor_array, struct pvr_scissor_words), &s, sizeof(s))) {
       *index = n - 1;
@@ -1402,7 +1339,6 @@ emit_words(struct pvr_csb *csb, const char *what, const uint32_t *w, unsigned n)
    uint32_t *dst = pvr_arch_csb_alloc_dwords(csb, n);
    if (dst)
       memcpy(dst, w, 4 * n);
-   g5p_dump("draw", what, 0, w, n);
 }
 
 /* VDM PPP_STATE: a block of `words` at `addr` */
@@ -1418,7 +1354,6 @@ emit_ppp(struct pvr_csb *csb, const char *what, uint64_t addr, const uint32_t *b
       s1.addrlsb = PVR_DEV_ADDR(addr);
    }
    emit_words(csb, "ppp state", w, 2);
-   g5p_dump("draw", what, addr, block, words);
 }
 
 /*
@@ -1590,9 +1525,6 @@ fs_uploads(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_pipeline *g, 
    if (result != VK_SUCCESS)
       return result;
    *block_va = bo->dev_addr.addr;
-   for (unsigned i = 0; i < n; i++)
-      g5p_dump("draw", "fs upload words", bo->dev_addr.addr, words[i], g->fs_uploads[i].dwords);
-   g5p_dump("draw", "uniform data", up.data_offset, data, 4 * dmas);
    return VK_SUCCESS;
 }
 
@@ -1690,9 +1622,7 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
    struct pvr_csb *stream = &cs->current_sub_cmd->gfx.control_stream;
    const uint64_t occupied = (uint64_t)list_length(&stream->pvr_bo_list) *
                              PVR_CMD_BUFFER_CSB_BO_SIZE;
-   if (occupied + PVR_CMD_BUFFER_CSB_BO_SIZE > device->ws->max_vdm_bytes) {
-      if (getenv("PVR_G5P_WS_LOG"))
-         fprintf(stderr, "g5p vdm: continue with LOAD at limit %u\n", device->ws->max_vdm_bytes);
+   if (occupied + PVR_CMD_BUFFER_CSB_BO_SIZE > PVR_G5P_MAX_VDM_BYTES) {
       result = pvr_cmd_buffer_insert_mid_frag_barrier_event(cmd_buffer,
                                                            PVR_PIPELINE_STAGE_FRAG_BIT,
                                                            PVR_PIPELINE_STAGE_GEOM_BIT);
@@ -1723,8 +1653,6 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
       return result;
    if (g->fs_depth_feedback)
       cs->current_sub_cmd->gfx.has_depth_feedback = true;
-   /* what the draw can read outside the arena, for the job's resource list (pvr_g5p_perf.h) */
-   pvr_arch_g5p_perf_draw(cmd_buffer, draw->indexed);
 
    /* the clip: the render area within the attachment, cut to the scissor
     * and to the viewport. A clip smaller than the attachment is the A9 ICD's
@@ -2110,8 +2038,6 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
       if (vector > 64)
          w[3] |= BITFIELD_BIT(30);
       emit_words(csb, "vdm state vs", w, 4);
-      g5p_dump("draw", "fetch code", fetch_code->code_offset,
-               pvr_bo_suballoc_get_map_addr(fetch_code->pvr_bo), fetch_code->code_size);
 
       /* 2. the varying format */
       emit_ppp(csb, "ppp varying", g->static_vary->dev_addr.addr, g->static_vary_words, 4);
@@ -2129,30 +2055,13 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
          v2.vs_pds_data_base_addr = PVR_DEV_ADDR(fetch_data.data_offset);
       }
       emit_words(csb, "vdm state data", w, 2);
-      g5p_dump("draw", "fetch data", fetch_data.data_offset, fdata, fbytes / 4);
    }
 
    /* 4. the fragment pointers and sizes */
    emit_ppp(csb, "ppp fragment", g->static_frag->dev_addr.addr, g->static_frag_words, 6);
-   g5p_dump("draw", "fs launch data", g->fs_launch.data_offset, pvr_bo_suballoc_get_map_addr(g->fs_launch.pvr_bo), 4);
-   g5p_dump("draw", "fs launch code", g->fs_launch.code_offset,
-            (const uint32_t *)pvr_bo_suballoc_get_map_addr(g->fs_launch.pvr_bo) + 8, g->fs_launch.code_size);
    if (g->fs_num_uploads) {
       /* then, as in the ICD's draws, the per-draw loader data pointer */
       emit_ppp(csb, "ppp uniform data", uniform_va, uniform_block, 2);
-      g5p_dump("draw", "uniform code", g->fs_loader.code_offset,
-               (const uint32_t *)pvr_bo_suballoc_get_map_addr(g->fs_loader.pvr_bo), g->fs_loader.code_size);
-   } else {
-      g5p_dump("draw", "uniform code", dp->halt.code_offset,
-               (const uint32_t *)pvr_bo_suballoc_get_map_addr(dp->halt.pvr_bo) + 4, 1);
-   }
-   if (g->varying.pvr_bo) {
-      const uint32_t *m = pvr_bo_suballoc_get_map_addr(g->varying.pvr_bo);
-      g5p_dump("draw", "varying data", g->varying.data_offset, m, g->varying.data_size);
-      g5p_dump("draw", "varying code", g->varying.code_offset, m + g->varying.data_size, g->varying.code_size);
-   } else {
-      g5p_dump("draw", "varying code", dp->halt.code_offset,
-               (const uint32_t *)pvr_bo_suballoc_get_map_addr(dp->halt.pvr_bo) + 4, 1);
    }
 
    /* 5-10. the per-draw blocks */
@@ -2160,7 +2069,6 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
                                         "ppp dbsc", "ppp stream out" };
    for (unsigned i = 0; i < nb; i++)
       emit_ppp(csb, names[i], ppp_va + 4 * blocks[i][0], &ppp[blocks[i][0]], blocks[i][1]);
-   g5p_dump("draw", "stream out data", dp->halt.data_offset, pvr_bo_suballoc_get_map_addr(dp->halt.pvr_bo), 5);
 
    /* 11. the index list: [the index buffer], count, instances - 1, first vertex or vertex offset, split
     * (pvr_arch_g5p_vertex.c) */

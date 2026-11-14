@@ -246,14 +246,6 @@ VkResult pvr_AllocateMemory(VkDevice _device,
          break;
       }
    }
-#if defined(PVR_APPLE_G5P)
-   /* G5P: memory that may become a dma-buf (exportable, or a WSI image) is a
-    * kernel BO of its own; the winsys's arena slices cannot be exported. */
-   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p) &&
-       (vk_find_struct_const(pAllocateInfo->pNext, EXPORT_MEMORY_ALLOCATE_INFO) ||
-        vk_find_struct_const(pAllocateInfo->pNext, WSI_MEMORY_ALLOCATE_INFO_MESA)))
-      type = PVR_WINSYS_BO_TYPE_DISPLAY;
-#endif
 
    if (fd_info && fd_info->handleType) {
       assert(
@@ -304,7 +296,7 @@ VkResult pvr_AllocateMemory(VkDevice _device,
        * entire allocation can be mapped.
        */
       const uint64_t alignment = device->heaps.general_heap->page_size;
-      PVR_G5P_HOOK(memory_bo_type, device, pAllocateInfo, type)
+
       /* FIXME: Need to determine the flags based on
        * device->pdevice->memory.memoryTypes[pAllocateInfo->memoryTypeIndex].propertyFlags.
        *
@@ -457,16 +449,19 @@ VkResult pvr_MapMemory2(VkDevice _device,
 
    assert(size > 0);
    assert(offset + size <= mem->bo->size);
-   PVR_G5P_HOOK(map_again, device, mem, addr, offset, ppData)
+
    /* From the Vulkan 1.2.194 spec:
     *
     *    "memory must not be currently host mapped"
     */
    if (mem->bo->map != NULL) {
-      /* G9P's CPU transfers map memory the application never mapped; that
-       * mapping stays until the memory is freed, see pvr_UnmapMemory2().
+      /* G9P's and G5P's CPU transfers map memory the application never
+       * mapped; that mapping stays until the memory is freed, see
+       * pvr_UnmapMemory2().
        */
-      if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p) && !addr) {
+      if ((PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p) ||
+           PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p)) &&
+          !addr) {
          *ppData = (uint8_t *)mem->bo->map + offset;
          return VK_SUCCESS;
       }
@@ -496,8 +491,11 @@ VkResult pvr_UnmapMemory2(VkDevice _device,
    VK_FROM_HANDLE(pvr_device, device, _device);
    VK_FROM_HANDLE(pvr_device_memory, mem, pMemoryUnmapInfo->memory);
 
-   /* A CPU transfer on G9P's queue may be using the mapping */
-   if (mem && PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p) && !mem->map_placed)
+   /* A CPU transfer on G9P's or G5P's queue may be using the mapping */
+   if (mem &&
+       (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p) ||
+        PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p)) &&
+       !mem->map_placed)
       return VK_SUCCESS;
 
    if (mem && mem->bo->map) {
@@ -591,14 +589,12 @@ VkResult pvr_bind_memory(struct pvr_device *device,
       util_dynarray_append_typed(&device->g9p_vmas.vmas, struct pvr_winsys_vma *, vma);
       simple_mtx_unlock(&device->g9p_vmas.lock);
    }
-#ifdef PVR_APPLE_G5P
    /* G5P: its CPU transfers find memory by device address too */
    if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p)) {
       simple_mtx_lock(&device->g9p_vmas.lock);
       util_dynarray_append_typed(&device->g9p_vmas.vmas, struct pvr_winsys_vma *, vma);
       simple_mtx_unlock(&device->g9p_vmas.lock);
    }
-#endif
 
    return VK_SUCCESS;
 
@@ -616,13 +612,11 @@ void pvr_unbind_memory(struct pvr_device *device, struct pvr_winsys_vma *vma)
       util_dynarray_delete_unordered(&device->g9p_vmas.vmas, struct pvr_winsys_vma *, vma);
       simple_mtx_unlock(&device->g9p_vmas.lock);
    }
-#ifdef PVR_APPLE_G5P
    if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p)) {
       simple_mtx_lock(&device->g9p_vmas.lock);
       util_dynarray_delete_unordered(&device->g9p_vmas.vmas, struct pvr_winsys_vma *, vma);
       simple_mtx_unlock(&device->g9p_vmas.lock);
    }
-#endif
 
    device->ws->ops->vma_unmap(vma);
    device->ws->ops->heap_free(vma);
@@ -638,7 +632,7 @@ VkResult pvr_BindBufferMemory2(VkDevice _device,
    for (i = 0; i < bindInfoCount; i++) {
       VK_FROM_HANDLE(pvr_device_memory, mem, pBindInfos[i].memory);
       VK_FROM_HANDLE(pvr_buffer, buffer, pBindInfos[i].buffer);
-      PVR_G5P_HOOK(memory_bound, device, false, buffer->vma, buffer->vk.size)
+
       VkResult result = pvr_bind_memory(device,
                                         mem,
                                         pBindInfos[i].memoryOffset,
@@ -837,7 +831,7 @@ void pvr_DestroyBuffer(VkDevice _device,
 
    if (!buffer)
       return;
-   PVR_G5P_HOOK(memory_released, device, false, buffer->vma, buffer->vk.size)
+
    if (buffer->vma)
       pvr_unbind_memory(device, buffer->vma);
 

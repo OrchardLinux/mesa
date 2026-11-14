@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 /*
  * Apple's A9 GPU (G5P): image memory and the sample counts the device
- * reports. Built only with -Dimagination-g5p-experimental=true.
+ * reports.
  *
  * Colour images (lane b; the A9 ICD's image_layout()/twiddled_layout()):
  * Apple's image state takes a linear layout for plain 2D only, so the A9
@@ -47,7 +47,6 @@
 #include "pvr_g5p_tex.h"
 #include "pvr_image.h"
 #include "pvr_physical_device.h"
-#include "winsys/apple_g5p/pvr_g5p_winsys.h"
 
 void
 pvr_g5p_image_layout(struct pvr_image *image, unsigned stride_align)
@@ -180,15 +179,14 @@ pvr_g5p_ds_image_layout(struct pvr_image *image)
 }
 
 /*
- * The device's sample counts: 1, and 4 when the kernel takes 4-sample passes,
- * for every framebuffer kind; sampled and storage images keep one sample
+ * The device's sample counts: 1 and 4 for every framebuffer kind; sampled and storage images keep one sample
  * (sampling a 4-sample image is not built: no 2D-multisample texture state
  * was captured). Upstream's Rogue limits offer 4 everywhere.
  */
 void
 pvr_g5p_msaa_limits(struct pvr_physical_device *pdevice, struct vk_properties *p)
 {
-   const VkSampleCountFlags fb = pvr_g5p_msaa_sample_counts(pvr_g5p_winsys_msaa(pdevice->ws));
+   const VkSampleCountFlags fb = pvr_g5p_msaa_sample_counts();
 
    p->framebufferColorSampleCounts = fb;
    p->framebufferDepthSampleCounts = fb;
@@ -206,8 +204,7 @@ pvr_g5p_msaa_limits(struct pvr_physical_device *pdevice, struct vk_properties *p
  * An image format's sample counts: 4 as well only for what a 4x pass
  * renders (our ICD's rule): a 2D optimal colour attachment of 4-byte
  * samples, or one of the depth/stencil formats the ZLS keeps on chip, used
- * neither as a sampled, storage nor input attachment image, on a kernel with
- * 4-sample passes. Upstream's Rogue answer is every count up to 8.
+ * neither as a sampled, storage nor input attachment image. Upstream's Rogue answer is every count up to 8.
  */
 void
 pvr_g5p_msaa_image_samples(struct pvr_physical_device *pdevice, const VkPhysicalDeviceImageFormatInfo2 *info,
@@ -219,7 +216,7 @@ pvr_g5p_msaa_image_samples(struct pvr_physical_device *pdevice, const VkPhysical
    const bool format_ok = pvr_g5p_ds_format(info->format) ||
                           (vk_format_is_color(info->format) && !vk_format_is_compressed(info->format) &&
                            !vk_format_is_int(info->format) && vk_format_get_blocksize(info->format) == 4);
-   const bool four = pvr_g5p_winsys_msaa(pdevice->ws) && tiling == VK_IMAGE_TILING_OPTIMAL &&
+   const bool four = tiling == VK_IMAGE_TILING_OPTIMAL &&
                      info->type == VK_IMAGE_TYPE_2D && !(info->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) &&
                      (info->usage & attach) && !(info->usage & read) && format_ok;
 

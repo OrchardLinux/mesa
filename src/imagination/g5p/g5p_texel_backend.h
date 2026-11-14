@@ -8,7 +8,7 @@
 #include "g5p_texel_defs.h"
 static const char *g5p_tbo_shape_refusal(const nir_tex_instr *t)
 {
-   if (!pvr_g5p_tbo_probe()) return "texel-buffer path requires qualification (PVR_G5P_TEXEL_BUFFER=probe)";
+   if (!pvr_g5p_tbo_probe()) return "texel-buffer path requires qualification";
    nir_deref_instr *d = nir_get_tex_deref(t, nir_tex_src_texture_deref);
    if (!d || d->deref_type != nir_deref_type_var)
       return "texel-buffer descriptor arrays or bindless handles not qualified";

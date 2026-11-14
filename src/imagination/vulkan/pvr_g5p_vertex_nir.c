@@ -2,8 +2,7 @@
 /*
  * Vertex input of G5P (Apple A9) pipelines: the layout of the vertex
  * attributes in the unified store, and the vertex program's NIR rewritten to
- * read them there (pvr_g5p_vertex.h). Compiled only with
- * -Dimagination-g5p-experimental=true.
+ * read them there (pvr_g5p_vertex.h).
  *
  * The fetch is the A9 ICD's (g5p_pipeline.c vertex_input_ok() and
  * fetch_per_binding()): the vertex fetch PDS program DMAs raw dwords, one
@@ -82,24 +81,8 @@ pvr_g5p_vertex_format_info(VkFormat format, struct pvr_g5p_vertex_format *f)
    if (!d || d->layout != UTIL_FORMAT_LAYOUT_PLAIN || d->block.width != 1 || d->block.height != 1 ||
        d->nr_channels < 1 || d->nr_channels > 4)
       return false;
-   /* A 32-bit fetch followed by ordinary scalar NIR operations. Enable
-    * advertisement and lowering together while device qualification is
-    * pending; no hardware packed conversion opcode is assumed. */
-   const char *packed = getenv("PVR_G5P_PACKED_VERTEX");
-   if (packed && !strcmp(packed, "1") && d->nr_channels == 4 && d->block.bits == 32 &&
-       d->channel[0].size == 10 && d->channel[1].size == 10 &&
-       d->channel[2].size == 10 && d->channel[3].size == 2) {
-      f->components = 4;
-      f->bytes = 1; /* four logical components occupy one dword */
-      f->convert = -1;
-      f->packed_1010102 = true;
-      for (unsigned c = 0; c < 4; c++) {
-         if (d->swizzle[c] > PIPE_SWIZZLE_W)
-            return false;
-         f->swizzle[c] = d->swizzle[c];
-      }
-      return true;
-   }
+   /* Packed 10:10:10:2 formats (a 32-bit fetch followed by scalar NIR
+    * operations, f->packed_1010102) have not run on the device: not taken. */
    const struct util_format_channel_description *ch = &d->channel[0];
    const unsigned bits = ch->size;
    if ((bits != 8 && bits != 16 && bits != 32) || d->block.bits != bits * d->nr_channels)

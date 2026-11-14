@@ -8,9 +8,9 @@
  * CORE_REVISION (0x00090f00) and CORE_ID (0x011b0602) registers decode;
  * Apple's kext checks branch 9 and version 15 and copies N = 6.
  *
- * Built only with -Dimagination-g5p-experimental=true. Nothing in the
- * PowerVR driver selects this entry yet: the A9 runs our own ICD and kernel
- * interface (step 1a of the joint plan; see g5p/README.md).
+ * The powervr kernel driver reports this BVNC for the A9 (its Apple
+ * backend, S8003), which selects this entry and with it the G5P paths of the
+ * driver (has_apple_g5p; see g5p/README.md).
  *
  * Values marked "A9" are established on the hardware or from Apple's
  * drivers; the others are the A10 entry's placeholders (apple-a10.h, which

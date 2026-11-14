@@ -49,7 +49,6 @@ struct pvr_render_target;
 struct pvr_compute_query_shader {
    struct pvr_suballoc_bo *usc_bo;
 
-#if defined(PVR_APPLE_G5P)
    /* The A9 uses native, open NIR query kernels rather than Rogue's common
     * precompiled programs. The bindings name raw addresses supplied by the
     * query recorder; G9P_PUSH_CONSTANTS names its small parameter block. */
@@ -60,7 +59,6 @@ struct pvr_compute_query_shader {
       unsigned set;
       unsigned binding;
    } g5p_buffers[4];
-#endif
 
    struct pvr_pds_upload pds_prim_code;
    uint32_t primary_data_size_dw;
@@ -262,10 +260,8 @@ struct pvr_device {
    /* Data Source for GPU tracing */
    struct pvr_ds_device ds;
 
-#ifdef PVR_APPLE_G5P
    /* Apple A9 (G5P, has_apple_g5p): pvr_g5p.h */
    struct pvr_g5p_device *g5p;
-#endif
 };
 
 struct pvr_device_memory {

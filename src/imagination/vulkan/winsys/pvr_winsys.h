@@ -301,7 +301,8 @@ struct pvr_winsys_compute_submit_info {
    /* Firmware stream buffer. This is the maximum possible size taking into
     * consideration all HW features, quirks and enhancements.
     */
-   uint8_t fw_stream[100];
+   /* G5P's stream with its extension is 128 bytes (pvr_arch_g5p.c) */
+   uint8_t fw_stream[128];
    uint32_t fw_stream_len;
 
    struct pvr_winsys_compute_submit_flags {
@@ -338,7 +339,7 @@ struct pvr_winsys_render_submit_info {
       /* Firmware stream buffer. This is the maximum possible size taking into
        * consideration all HW features, quirks and enhancements.
        */
-      uint8_t fw_stream[672];
+      uint8_t fw_stream[640];
       uint32_t fw_stream_len;
 
       struct pvr_winsys_fragment_state_flags {
@@ -456,9 +457,6 @@ struct pvr_winsys_ops {
 struct pvr_winsys {
    uint64_t page_size;
    uint32_t log2_page_size;
-
-   /* G5P GET_RENDER_INFO admission bound; zero on other winsyses. */
-   uint32_t max_vdm_bytes;
 
    const struct vk_sync_type *sync_types[3];
    struct vk_sync_type syncobj_type;

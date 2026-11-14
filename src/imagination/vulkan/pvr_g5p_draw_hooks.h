@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 /*
  * The Apple A9 (G5P) draw hooks in pvr_arch_cmd_buffer.c, in the form of
- * pvr_g5p_hooks.h (one PVR_G5P_HOOK(name) line that expands to nothing
- * without -Dimagination-g5p-experimental).
+ * pvr_g5p_hooks.h (one PVR_G5P_HOOK(name) line).
  *
  * The indirect lane wrote these in pvr_g5p_publish_hooks.h, which the
  * desktop perf base (ram3, insertion-only hooks) no longer has; they are
@@ -15,7 +14,6 @@
 #ifndef PVR_G5P_DRAW_HOOKS_H
 #define PVR_G5P_DRAW_HOOKS_H
 
-#if defined(PVR_APPLE_G5P)
 #include "pvr_g5p.h"
 
 /* Route indirect commands through the G5P builder, never generic Rogue PDS. */
@@ -37,6 +35,5 @@
          vk_command_buffer_set_error(&cmd_buffer->vk, result); \
       goto end_cmd_draw_indirect; \
    }
-#endif
 
 #endif /* PVR_G5P_DRAW_HOOKS_H */

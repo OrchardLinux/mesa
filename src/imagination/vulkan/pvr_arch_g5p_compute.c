@@ -138,7 +138,6 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
    /* The compiler's unit-Z specialization is valid only for these actual
     * dispatch dimensions. Indirect dimensions cannot be checked here. */
    if (state->a9_unit_z && (indirect_va || group_count[2] != 1)) {
-      fprintf(stderr, "G5P refuses: compute workgroup Z specialization requires a direct dispatch with one Z group\n");
       return vk_errorf(cmd_buffer, VK_ERROR_FEATURE_NOT_PRESENT,
                        "compute workgroup Z specialization requires a direct dispatch with one Z group");
    }
@@ -149,39 +148,7 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
        * record. A standalone usc_common_shared PDS DMA task here (the
        * earlier form) left the CDM silent on A9 hardware: its shared common
        * store allocation has no following kernel to consume it. The ordered
-       * pass tail alone retires (direct case). PVR_G5P_EMPTY_INDIRECT_DMA=1
-       * restores that shared DMA task and =2 emits it with a private common
-       * store allocation; both are hardware discriminators only. */
-      const char *dma_env = getenv("PVR_G5P_EMPTY_INDIRECT_DMA");
-      const unsigned dma = dma_env ? (unsigned)atoi(dma_env) : 0;
-      if (indirect_va && (dma == 1 || dma == 2)) {
-         uint32_t data[4] = { indirect_va, indirect_va >> 32,
-                             BITFIELD_BIT(31) | BITFIELD_BIT(28) | 3, 0 };
-         uint32_t code[2] = {
-            g9p_pds_dout(G9P_DOUTD, 0, G9P_PDS_DATA, 2, G9P_PDS_END),
-            g9p_pds_halt(),
-         };
-         result = pvr_arch_cmd_buffer_upload_pds(
-            cmd_buffer, data, ARRAY_SIZE(data),
-            ROGUE_CDMCTRL_KERNEL1_DATA_ADDR_ALIGNMENT, code, ARRAY_SIZE(code),
-            ROGUE_CDMCTRL_KERNEL2_CODE_ADDR_ALIGNMENT,
-            ROGUE_CDMCTRL_KERNEL1_DATA_ADDR_ALIGNMENT, &bind);
-         if (result != VK_SUCCESS)
-            return result;
-         struct g5p_cdm_record rec = g5p_cdm_dma_task(
-            G9P_CDM_DATA_BLOCKS(1), bind.data_offset, bind.code_offset, 1);
-         if (dma == 2)
-            rec.w[1] &= ~2u; /* KERNEL1 usc_common_shared */
-         pvr_csb_set_relocation_mark(&sub_cmd->control_stream);
-         emit_record(&sub_cmd->control_stream, &rec);
-         pvr_csb_clear_relocation_mark(&sub_cmd->control_stream);
-      }
-      if (getenv("PVR_G5P_WS_LOG"))
-         fprintf(stderr, "G5P-COMPUTE bodyless dispatch omitted; completion tail retained%s\n",
-                 !indirect_va ? "" :
-                 dma == 1 ? "; indirect argument DMA retained (shared)" :
-                 dma == 2 ? "; indirect argument DMA retained (private)" :
-                            "; indirect argument read omitted");
+       * pass tail alone retires (direct case). */
       return VK_SUCCESS;
    }
 
@@ -374,8 +341,6 @@ upload_cdm_task(struct pvr_cmd_buffer *cmd, bool fenced, struct pvr_pds_upload *
       g9p_pds_dout(G9P_DOUTU, 0, G9P_PDS_DATA, 0, G9P_PDS_END),
       g9p_pds_halt(),
    };
-   if (getenv("PVR_G5P_WS_LOG"))
-      fprintf(stderr, "G5P-COMPUTE end_task control=%u usc=%#x bytes=%u branch_to=64 end=8000\n", fenced, data[0], at);
    return pvr_arch_cmd_buffer_upload_pds(cmd, data, 4, 16, code, 2, 32, 64, out);
 }
 
@@ -396,8 +361,7 @@ upload_cdm_task(struct pvr_cmd_buffer *cmd, bool fenced, struct pvr_pds_upload *
  * 16x4, 8x1 and 16x1 stores). With it every shape is exact, natively and
  * through Zink (r3c, r3d, r3e).
  * It follows every pass that emitted a kernel record; a pass whose
- * dispatches were all bodyless (omitted) keeps the plain tail.
- * PVR_G5P_CDM_END_BARRIER=0 leaves it out (A/B only). */
+ * dispatches were all bodyless (omitted) keeps the plain tail. */
 
 /* The fence operand the flush program loads into r0:r1 (common dwords 0
  * and 1): the two words iOS's driver DMAs for this task. In compiler-built
@@ -443,9 +407,6 @@ upload_end_barrier(struct pvr_cmd_buffer *cmd, struct pvr_pds_upload *out)
       g9p_pds_dout(G9P_DOUTU, 2, G9P_PDS_DATA, 0, G9P_PDS_END),
       g9p_pds_halt(),
    };
-   if (getenv("PVR_G5P_WS_LOG"))
-      fprintf(stderr, "G5P-COMPUTE end_barrier usc=%#x bytes=%u source=%#" PRIx64 " pds=%08x %08x %08x\n",
-              data[4], at, va, code[0], code[1], code[2]);
    return pvr_arch_cmd_buffer_upload_pds(cmd, data, 8, 16, code, 3, 32, 64, out);
 }
 
@@ -455,10 +416,9 @@ PVR_PER_ARCH(g5p_compute_end_pass)(struct pvr_cmd_buffer *cmd,
 {
    uint32_t data[4] = {0}, code[4];
    struct pvr_pds_upload fence, fenced, kick, barrier;
-   const char *barrier_env = getenv("PVR_G5P_CDM_END_BARRIER");
    /* after a dispatch only, as iOS: a pass whose dispatches were all
     * bodyless (omitted) keeps the plain tail */
-   const bool end_barrier = sub->g5p_kernel_since_end && (!barrier_env || strcmp(barrier_env, "0"));
+   const bool end_barrier = sub->g5p_kernel_since_end;
    sub->g5p_kernel_since_end = false;
    VkResult task_result = upload_cdm_task(cmd, false, &kick);
    if (task_result == VK_SUCCESS)
@@ -510,8 +470,12 @@ PVR_PER_ARCH(g5p_compute_end_pass)(struct pvr_cmd_buffer *cmd,
    return pvr_csb_get_status(&sub->control_stream);
 }
 
+/* A compute context: the context state buffer the job's stream names, and
+ * the kernel's context. The static context state is optional on the A9 and
+ * left empty: the context programs travel with each job (the HALT). */
 VkResult
-PVR_PER_ARCH(g5p_compute_ctx_create)(struct pvr_device *device, struct pvr_compute_ctx **out)
+PVR_PER_ARCH(g5p_compute_ctx_create)(struct pvr_device *device, enum pvr_winsys_ctx_priority priority,
+                                     struct pvr_compute_ctx **out)
 {
    struct pvr_compute_ctx *ctx = vk_zalloc(&device->vk.alloc, sizeof(*ctx), 8,
                                            VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
@@ -522,7 +486,7 @@ PVR_PER_ARCH(g5p_compute_ctx_create)(struct pvr_device *device, struct pvr_compu
       &ctx->ctx_switch.compute_state_bo);
    if (r != VK_SUCCESS) { vk_free(&device->vk.alloc, ctx); return r; }
    memset(ctx->ctx_switch.compute_state_bo->bo->map, 0, 0x8000);
-   struct pvr_winsys_compute_ctx_create_info info = {0};
+   struct pvr_winsys_compute_ctx_create_info info = { .priority = priority };
    r = device->ws->ops->compute_ctx_create(device->ws, &info, &device->pdevice->dev_info,
                                           &ctx->ws_ctx);
    if (r != VK_SUCCESS) {
@@ -548,24 +512,17 @@ PVR_PER_ARCH(g5p_compute_job_submit)(struct pvr_compute_ctx *ctx,
 {
    struct pvr_device *d = ctx->device;
    const struct pvr_csb *cs = &sub->control_stream;
-   /* cdm_end is relative to the first block and must name its terminate.
-    * Chained CDM streams need the UAPI's terminal address, not a guessed
-    * contiguous byte count. Refuse until that form has its own gate. */
+   /* The job names its stream's terminate word, which is taken from the
+    * first block here. A chained CDM stream is refused until that form has
+    * run on the device. */
    if (cs->pvr_bo != list_first_entry(&cs->pvr_bo_list, struct pvr_bo, link))
       return vk_errorf(d, VK_ERROR_FEATURE_NOT_PRESENT, "G5P: chained CDM stream not implemented yet");
-   struct pvr_g5p_compute_stream stream = {
-      .cdm_va = pvr_csb_get_start_address(cs).addr,
-      .cdm_size = cs->pvr_bo->bo->size,
-      .cdm_end = (char *)cs->next - (char *)cs->start,
-      .state_va = ctx->ctx_switch.compute_state_bo->vma->dev_addr.addr,
-      .tail_va = ctx->ctx_switch.compute_state_bo->vma->dev_addr.addr + 0x6020,
-      .halt_code = d->g5p->programs.halt.code_offset,
-      .halt_data = d->g5p->programs.halt.data_offset,
-   };
    struct pvr_winsys_compute_submit_info info = { .wait = wait,
-      .frame_num = d->global_queue_present_count, .job_num = d->global_cmd_buffer_submit_count,
-      .fw_stream_len = sizeof(stream) };
-   static_assert(sizeof(stream) <= sizeof(info.fw_stream), "G5P compute winsys stream fits");
-   memcpy(info.fw_stream, &stream, sizeof(stream));
+      .frame_num = d->global_queue_present_count, .job_num = d->global_cmd_buffer_submit_count };
+   info.fw_stream_len =
+      pvr_arch_g5p_compute_stream(d, pvr_csb_get_start_address(cs).addr,
+                                  (uint32_t)((const char *)cs->next - (const char *)cs->start),
+                                  ctx->ctx_switch.compute_state_bo->vma->dev_addr.addr,
+                                  info.fw_stream, sizeof(info.fw_stream));
    return d->ws->ops->compute_submit(ctx->ws_ctx, &info, &d->pdevice->dev_info, signal);
 }

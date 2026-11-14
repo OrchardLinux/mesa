@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 /*
  * Apple's A9 GPU (G5P): the CPU copies that know the A9's layouts
- * (pvr_arch_g5p_layout.c). Built only with -Dimagination-g5p-experimental=true;
+ * (pvr_arch_g5p_layout.c).
  * reached from the shared files through pvr_g5p_hooks.h.
  */
 
@@ -23,7 +23,8 @@ struct vk_sync_wait;
  * unless one of them needs what only this file's copies do (a blit from a
  * block-compressed image, decoded per 4x4 block) */
 VkResult PVR_PER_ARCH(g5p_transfer_submit)(struct pvr_device *device, struct pvr_sub_cmd_transfer *sub_cmd,
-                                           const struct vk_sync_wait *waits, uint32_t wait_count, struct vk_sync *signal_sync);
+                                           const struct vk_sync_wait *waits, uint32_t wait_count,
+                                           struct vk_sync *signal_sync);
 #   define pvr_arch_g5p_transfer_submit PVR_PER_ARCH(g5p_transfer_submit)
 
 #endif /* PVR_PER_ARCH */

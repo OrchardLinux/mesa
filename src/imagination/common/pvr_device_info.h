@@ -356,8 +356,8 @@ struct pvr_device_features {
 
    /*
     * Apple A9 GPU (G5P): Apple's A9 shader ISA and job layouts; only set by
-    * the A9 entry, which -Dimagination-g5p-experimental=true builds. Placed
-    * in the trailing padding so that it changes no other field's position.
+    * the A9 entry. Placed in the trailing padding so that it changes no
+    * other field's position.
     */
    bool has_apple_g5p : 1;
 };

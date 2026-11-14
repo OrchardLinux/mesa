@@ -1,7 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * Apple's A9 GPU (G5P): colour formats (pvr_g5p_formats.h). Built only with
- * -Dimagination-g5p-experimental=true.
+ * Apple's A9 GPU (G5P): colour formats (pvr_g5p_formats.h).
  *
  * Upstream's pvr_get_image_format_features2() answers from Rogue's table,
  * which offers far more than the A9 path can do: integer and narrow render
@@ -25,18 +24,11 @@
 #include "pvr_g5p_format_table.h"
 #include "pvr_g5p_formats.h"
 
+/* Formats that have not run on the device are not advertised */
 bool
 pvr_g5p_formats_probe(void)
 {
-   static int probe = -1;
-
-   if (probe < 0) {
-      const char *e = getenv("PVR_G5P_FORMATS");
-      probe = e && !strcmp(e, "probe");
-      if (probe)
-         mesa_logw("G5P: PVR_G5P_FORMATS=probe: formats not yet run on the device are advertised");
-   }
-   return probe;
+   return false;
 }
 
 bool

@@ -6,7 +6,7 @@
  * (a9/gpu-msaa) writes the render target's AA words from the pass's
  * samples, flags and positions; userspace writes the PBE words, the
  * end-of-tile program's emit, the fragment DOUTU sample rate and the draw's
- * user pass. Built only with -Dimagination-g5p-experimental=true.
+ * user pass.
  *
  * The functions without PVR_PER_ARCH are plain arithmetic (no driver
  * objects), checked by a host test against the captured words.
@@ -19,8 +19,9 @@
 #include <stdint.h>
 #include <vulkan/vulkan_core.h>
 
-/* The pass fields of kernel a9/gpu-msaa (drm_g5p_render_pass: samples @296,
- * msaa_flags @300, sample_positions @304); zero keeps the one-sample pass */
+/* What a render's streams say about its samples (pvr_arch_g5p.c): the
+ * sample positions and the resolve flag; the sample count itself is the
+ * HWRT dataset's. Zero keeps the one-sample pass. */
 #define PVR_G5P_MSAA_FLAG_RESOLVE (1u << 0)
 struct pvr_g5p_msaa_words {
    uint32_t samples;
@@ -37,9 +38,8 @@ uint64_t pvr_g5p_msaa_positions(uint32_t samples);
  * averages the samples into a one-sample target at the end of each tile */
 struct pvr_g5p_msaa_words pvr_g5p_msaa_pass(uint32_t samples, bool resolve);
 
-/* The framebuffer sample counts: 1, and 4 when the kernel takes 4-sample
- * render targets (DRM_G5P_CAP_RENDER_MSAA) */
-VkSampleCountFlags pvr_g5p_msaa_sample_counts(bool kernel_msaa);
+/* The framebuffer sample counts: 1 and 4 */
+VkSampleCountFlags pvr_g5p_msaa_sample_counts(void);
 
 /* A 4-sample colour image: one 16-byte element of four samples per pixel in
  * Morton order (y in bit 0) over power-of-two sides, sample s at s * cpp

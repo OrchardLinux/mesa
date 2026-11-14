@@ -1,7 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 /*
  * Apple's A9 GPU (G5P): the vertex program's common-store uploads.
- * Built only with -Dimagination-g5p-experimental=true (PVR_APPLE_G5P).
  *
  * A vertex program that reads push constants, a uniform buffer or a buffer
  * address takes them from its common store, which a PDS loader fills before

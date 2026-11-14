@@ -31,9 +31,7 @@
 #include "g9p_formats.h"
 #include "hwdef/rogue_hw_utils.h"
 #include "pvr_g5p_ds_hooks.h"
-#if defined(PVR_APPLE_G5P)
 #   include "pvr_g5p_vertex.h"
-#endif
 #include "pvr_common.h"
 #include "pvr_csb.h"
 #include "pvr_device.h"
@@ -438,7 +436,6 @@ pvr_get_format_swizzle_for_tpu(const struct util_format_description *desc)
    return desc->swizzle;
 }
 
-#if defined(PVR_APPLE_G5P)
 /* G5P fetches the vertex formats of pvr_g5p_vertex_format_info() (32-bit
  * float and integer, 8/16-bit normalized and scaled, 16-bit float) with
  * dword strides. Of those, it advertises the ones a whole number of dwords
@@ -450,7 +447,6 @@ pvr_g5p_vertex_buffer_format(VkFormat vk_format)
    return pvr_g5p_vertex_format_info(vk_format, &(struct pvr_g5p_vertex_format){ 0 }) &&
           vk_format_get_blocksize(vk_format) % 4 == 0;
 }
-#endif
 
 static VkFormatFeatureFlags2
 pvr_get_buffer_format_features2(struct pvr_physical_device *pdevice,
@@ -460,12 +456,10 @@ pvr_get_buffer_format_features2(struct pvr_physical_device *pdevice,
    VkFormatFeatureFlags2 flags = 0;
 
    const struct pvr_format *pvr_format = pvr_get_format(pdevice, vk_format);
-#if defined(PVR_APPLE_G5P)
    /* the scaled formats have no entry of their own */
    if (!pvr_format && PVR_HAS_FEATURE(&pdevice->dev_info, apple_g5p) &&
        pvr_g5p_vertex_buffer_format(vk_format))
       return VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT;
-#endif
    if (!pvr_format)
       return 0;
 
@@ -478,14 +472,12 @@ pvr_get_buffer_format_features2(struct pvr_physical_device *pdevice,
 
    if (pvr_format->bind & PVR_BIND_VERTEX_BUFFER)
       flags |= VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT;
-#if defined(PVR_APPLE_G5P)
    /* the vertex formats G5P fetches, and no other */
    if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g5p)) {
       flags &= ~VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT;
       if (pvr_g5p_vertex_buffer_format(vk_format))
          flags |= VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT;
    }
-#endif
 
    if (vk_format_is_scaled(vk_format))
       /*
@@ -552,14 +544,12 @@ pvr_get_buffer_format_features2(struct pvr_physical_device *pdevice,
       break;
    }
 
-#if defined(PVR_APPLE_G5P)
    /* no texel buffers on G5P: the backend refuses buffer textures
     * (tex_shape_refusal()), so neither uniform nor storage texel buffers
     * (nor the storage bits derived from them below) are claimed */
    if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g5p))
       flags &= ~(VK_FORMAT_FEATURE_2_UNIFORM_TEXEL_BUFFER_BIT | VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_BIT |
                  VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_ATOMIC_BIT);
-#endif
    PVR_G5P_HOOK(texel_features, pdevice, vk_format, flags)
    if (flags & VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_BIT) {
       flags |= VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |

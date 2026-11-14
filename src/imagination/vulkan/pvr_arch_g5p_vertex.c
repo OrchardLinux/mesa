@@ -5,12 +5,13 @@
  * draws. Every word is derived as the A9 ICD's
  * recorder derives it (g5p_record.c g5p_job_draw(), section 11, "Index
  * list"; device-proven there with 8/16/32-bit indices, vertex offsets and
- * instances). Compiled only with -Dimagination-g5p-experimental=true.
+ * instances).
  */
 
 #include <inttypes.h>
 #include <stdio.h>
 
+#include "util/log.h"
 #include "vk_command_buffer.h"
 #include "vk_graphics_state.h"
 #include "vk_log.h"
@@ -27,7 +28,7 @@
 
 /* A refusal, by name, on stderr too (vk_errorf() is silent in release builds) */
 #define G5P_REFUSE(obj, ...)                                                                                       \
-   (fprintf(stderr, "G5P refuses: " __VA_ARGS__), fprintf(stderr, "\n"),                                          \
+   (mesa_logw("G5P refuses: " __VA_ARGS__),                                                              \
     vk_errorf((obj), VK_ERROR_FEATURE_NOT_PRESENT, "G5P: " __VA_ARGS__))
 
 VkResult
@@ -203,13 +204,6 @@ PVR_PER_ARCH(g5p_vertex_indirect)(struct pvr_cmd_buffer *cmd_buffer, const struc
    pvr_csb_emit (csb, VDMCTRL_STREAM_LINK1, link) {
       link.link_addrlsb = PVR_DEV_ADDR(va);
    }
-   if (getenv("PVR_G5P_INDIRECT_LOG")) {
-      fprintf(stderr, "G5P-INDIRECT packet va=%#" PRIx64 " args=%#" PRIx64 " indexed=%u words=%u:",
-              va, draw->indirect_addr, draw->indexed, n);
-      for (unsigned i = 0; i < n; i++)
-         fprintf(stderr, " %08x", words[i]);
-      fprintf(stderr, "\n");
-   }
    return csb->status;
 }
 
@@ -217,11 +211,8 @@ VkResult
 PVR_PER_ARCH(g5p_cmd_draw_indirect)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_buffer *buffer,
                                     VkDeviceSize offset, uint32_t count, uint32_t stride, bool indexed)
 {
-   /* The base-zero A9 native packet is hardware-qualified. Keep a diagnostic
-    * opt-out without changing the unqualified firstInstance/XFB scope. */
-   const char *mode = getenv("PVR_G5P_INDIRECT");
-   if (mode && !strcmp(mode, "0"))
-      return G5P_REFUSE(cmd_buffer, "indirect graphics draw disabled by PVR_G5P_INDIRECT=0");
+   /* The base-zero A9 native packet is hardware-qualified; the
+    * firstInstance/XFB scope is not. */
    if (!count)
       return VK_SUCCESS;
    const unsigned size = indexed ? sizeof(VkDrawIndexedIndirectCommand) : sizeof(VkDrawIndirectCommand);

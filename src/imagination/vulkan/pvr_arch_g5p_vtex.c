@@ -11,6 +11,7 @@
 #include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
+#include "util/log.h"
 #include "vk_alloc.h"
 #include "vk_log.h"
 #include "util/ralloc.h"
@@ -32,7 +33,7 @@
 #include "pvr_g5p_texel_buffer.h"
 
 #define VTEX_REFUSE(obj, ...) \
-   (fprintf(stderr, "G5P refuses: vertex texture " __VA_ARGS__), fprintf(stderr, "\n"), \
+   (mesa_logw("G5P refuses: vertex texture " __VA_ARGS__), \
     vk_errorf((obj), VK_ERROR_FEATURE_NOT_PRESENT, "G5P vertex texture: " __VA_ARGS__))
 #include "pvr_g5p_vtex_plan.h"
 static_assert(VTEX_COMMON >= PCO_G5P_COMMON_DWORDS, "vertex common-store plan bound");
@@ -214,8 +215,5 @@ PVR_PER_ARCH(g5p_vtex_draw)(struct pvr_cmd_buffer *cmd, const struct pvr_g5p_sta
    }
    pvr_csb_pack(&out->pds_state[1], VDMCTRL_PDS_STATE1, s1) { s1.pds_data_addr = PVR_DEV_ADDR(pds.data_offset); }
    pvr_csb_pack(&out->pds_state[2], VDMCTRL_PDS_STATE2, s2) { s2.pds_code_addr = PVR_DEV_ADDR(up->loader.code_offset); }
-   if (getenv("PVR_G5P_WS_LOG"))
-      fprintf(stderr, "g5p vtex uploads: %u sources -> %u DMAs, common=%u, CPU staging=%u bytes\n",
-              p->count, p->dmas, up->common_dwords, 4*up->common_dwords);
    return VK_SUCCESS;
 }

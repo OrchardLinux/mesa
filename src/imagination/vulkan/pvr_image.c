@@ -388,7 +388,7 @@ void pvr_DestroyImage(VkDevice _device,
 
    if (!image)
       return;
-   PVR_G5P_HOOK(memory_released, device, true, image->vma, image->total_size)
+
    pvr_image_fini(device, image);
    vk_image_destroy(&device->vk, pAllocator, &image->vk);
 }
@@ -421,11 +421,9 @@ VkResult pvr_image_init(struct pvr_device *device,
       pbe_stride_align = MAX2(pbe_stride_align, 64 / vk_format_get_blocksize(image->vk.format));
    pvr_image_init_physical_extent(image, pCreateInfo, pbe_stride_align);
    pvr_image_setup_mip_levels(image);
-#ifdef PVR_APPLE_G5P
    /* G5P: the A9's colour layouts (pvr_g5p_image.c) */
    if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p))
       pvr_g5p_image_layout(image, pbe_stride_align);
-#endif
    PVR_G5P_HOOK(ds_image, device, image)
    return VK_SUCCESS;
 }
@@ -480,7 +478,7 @@ VkResult pvr_BindImageMemory2(VkDevice _device,
       VK_FROM_HANDLE(pvr_image, image, pBindInfos[i].image);
       VkDeviceSize offset = pBindInfos[i].memoryOffset;
       VkResult result;
-      PVR_G5P_HOOK(memory_bound, device, true, image->vma, image->total_size)
+
 #if defined(PVR_USE_WSI_PLATFORM)
       const VkBindImageMemorySwapchainInfoKHR *swapchain_info =
          vk_find_struct_const(pBindInfos[i].pNext,

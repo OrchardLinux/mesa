@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 /*
  * Apple's A9 GPU (G5P): vkGetQueryPoolResults() of a transform feedback
- * stream query pool (pvr_g5p_xfb.h). Compiled only with
- * -Dimagination-g5p-experimental=true.
+ * stream query pool (pvr_g5p_xfb.h).
  *
  * The counts are the CPU resolve's (pvr_arch_g5p_xfb.c), two uint64_t per
  * query in the pool's result buffer, the availability in its availability

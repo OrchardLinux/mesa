@@ -1,11 +1,10 @@
 /* SPDX-License-Identifier: MIT */
 /*
  * Apple's A9 GPU (G5P): the CPU copies that know the A9's layouts
- * (pvr_g5p_layout.h). Built only with -Dimagination-g5p-experimental=true.
+ * (pvr_g5p_layout.h).
  *
- * G5P runs its transfer sub-commands on the CPU through the winsys's permanent
- * BO mappings. Application mappings may be placed or unmapped while an
- * asynchronous queue submission is executing, so they are never used here.
+ * G5P runs its transfer sub-commands on the CPU through the mapping of the
+ * bound memory, as G9P does (pvr_arch_g9p_transfer.c).
  * A blit from a block-compressed image is not an element
  * copy: upstream hands it over in texels on a surface of 4x4 blocks
  * (pvr_setup_transfer_surface() converts to blocks only for raw copies), and
@@ -40,9 +39,6 @@
 #include "pvr_g9p.h"
 #include "pvr_image.h"
 #include "pvr_job_transfer.h"
-#include "winsys/apple_g5p/pvr_g5p_winsys.h"
-
-DEBUG_GET_ONCE_NUM_OPTION(g5p_perf_log, "PVR_G5P_PERF_LOG", 0)
 
 
 struct g5p_surface {
@@ -62,11 +58,20 @@ g5p_surface_init(struct pvr_device *device, const struct pvr_transfer_cmd_surfac
 {
    out->base = NULL;
    out->available = 0;
+   /* the bound memory at this address, mapped as G9P's copies map it
+    * (pvr_arch_g9p_cpu_addr()), and how much of it follows the address */
    simple_mtx_lock(&device->g9p_vmas.lock);
    util_dynarray_foreach (&device->g9p_vmas.vmas, struct pvr_winsys_vma *, v) {
-      if (pvr_g5p_winsys_vma_cpu_addr(*v, s->dev_addr.addr, 1,
-                                      &out->base, &out->available))
+      struct pvr_winsys_vma *vma = *v;
+      const uint64_t addr = s->dev_addr.addr;
+
+      if (addr < vma->dev_addr.addr || addr >= vma->dev_addr.addr + vma->size)
+         continue;
+      if (!vma->bo->map && device->ws->ops->buffer_map(vma->bo, NULL) != VK_SUCCESS)
          break;
+      out->base = (uint8_t *)vma->bo->map + vma->bo_offset + (addr - vma->dev_addr.addr);
+      out->available = vma->bo->size - vma->bo_offset - (addr - vma->dev_addr.addr);
+      break;
    }
    simple_mtx_unlock(&device->g9p_vmas.lock);
    out->format = vk_format_to_pipe_format(s->vk_format);
@@ -84,7 +89,7 @@ g5p_surface_init(struct pvr_device *device, const struct pvr_transfer_cmd_surfac
    out->aspects = s->g5p_aspect;
    out->image_offset = s->g5p_image ? s->dev_addr.addr - s->g5p_image->dev_addr.addr - pvr_single_plane_const(s->g5p_image)->offset : 0;
    if (!out->base)
-      mesa_loge("G5P transfer: no stable CPU mapping for %#" PRIx64, s->dev_addr.addr);
+      mesa_loge("G5P transfer: no CPU mapping for %#" PRIx64, s->dev_addr.addr);
    return out->base != NULL;
 }
 
@@ -722,16 +727,12 @@ g5p_copy_aspects(const struct pvr_rect_mapping *mapping, struct g5p_surface *src
 }
 
 static bool
-g5p_run(struct pvr_device *device, const struct pvr_transfer_cmd *cmd, bool log)
+g5p_run(struct pvr_device *device, const struct pvr_transfer_cmd *cmd)
 {
    struct g5p_surface dst;
 
    if (!g5p_surface_init(device, &cmd->dst, &dst))
       return false;
-   if (log && (cmd->flags & PVR_TRANSFER_CMD_FLAGS_FILL))
-      fprintf(stderr, "G5P perf transfer-cmd fill dst=%s %ux%u twiddled=%d scissor=%ux%u\n",
-              util_format_short_name(dst.format), dst.width, dst.height, dst.twiddled,
-              cmd->scissor.extent.width, cmd->scissor.extent.height);
    if (cmd->flags & PVR_TRANSFER_CMD_FLAGS_FILL) {
       if (dst.image && vk_format_is_depth_or_stencil(dst.image->vk.format)) {
          const struct pvr_g5p_ds_format *f = pvr_g5p_ds_format(dst.image->vk.format);
@@ -752,15 +753,6 @@ g5p_run(struct pvr_device *device, const struct pvr_transfer_cmd *cmd, bool log)
 
       if (!g5p_surface_init(device, &source->surface, &src))
          return false;
-      if (log) {
-         const VkRect2D *r = source->mapping_count ? &source->mappings[0].dst_rect : &cmd->scissor;
-         fprintf(stderr, "G5P perf transfer-cmd copy src=%s %ux%u twiddled=%d dst=%s %ux%u twiddled=%d "
-                 "mappings=%u first=%dx%d linear=%d\n",
-                 util_format_short_name(src.format), src.width, src.height, src.twiddled,
-                 util_format_short_name(dst.format), dst.width, dst.height, dst.twiddled,
-                 source->mapping_count, (int)r->extent.width, (int)r->extent.height,
-                 source->filter == PVR_FILTER_LINEAR);
-      }
       if (!source->mapping_count) {
          /* the whole destination scissor, 1:1 */
          const struct pvr_rect_mapping m = { .src_rect = cmd->scissor, .dst_rect = cmd->scissor };
@@ -775,66 +767,22 @@ g5p_run(struct pvr_device *device, const struct pvr_transfer_cmd *cmd, bool log)
    return true;
 }
 
-void
-PVR_PER_ARCH(g5p_transfer_summary)(bool gpu, uint64_t wait_ns, uint64_t cpu_ns,
-                                 unsigned commands, unsigned kept, unsigned skipped)
-{
-   if (debug_get_option_g5p_perf_log() < 2)
-      return;
-   static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
-   static struct {
-      uint64_t count, gpu_copies, cpu_fallbacks, wait_ns, cpu_ns, commands, waits_kept, waits_skipped;
-   } totals;
-   pthread_mutex_lock(&lock);
-   totals.count++;
-   totals.gpu_copies += gpu;
-   totals.cpu_fallbacks += !gpu;
-   totals.wait_ns += wait_ns;
-   totals.cpu_ns += cpu_ns;
-   totals.commands += commands;
-   totals.waits_kept += kept;
-   totals.waits_skipped += skipped;
-   if (totals.count == 120) {
-      fprintf(stderr, "G5P perf transfer-summary n=%" PRIu64 " wait_us=%" PRIu64
-              " cpu_us=%" PRIu64 " cmds=%" PRIu64 " waits_kept=%" PRIu64
-              " waits_skipped=%" PRIu64 " gpu_copies=%" PRIu64 " cpu_fallbacks=%" PRIu64 "\n", totals.count, totals.wait_ns / 1000,
-              totals.cpu_ns / 1000, totals.commands, totals.waits_kept, totals.waits_skipped,
-              totals.gpu_copies, totals.cpu_fallbacks);
-      memset(&totals, 0, sizeof(totals));
-   }
-   pthread_mutex_unlock(&lock);
-}
-
 VkResult
 PVR_PER_ARCH(g5p_transfer_submit)(struct pvr_device *device, struct pvr_sub_cmd_transfer *sub_cmd,
-                                  const struct vk_sync_wait *waits, uint32_t wait_count, struct vk_sync *signal_sync)
+                                  const struct vk_sync_wait *waits, uint32_t wait_count,
+                                  struct vk_sync *signal_sync)
 {
    VkResult result;
-   const int level = debug_get_option_g5p_perf_log();
-   const bool log = level >= 2;
-   const uint64_t start = log ? os_time_get_nano() : 0;
 
    if (wait_count) {
-      result = vk_sync_wait_many(&device->vk, wait_count, waits,
-                                 VK_SYNC_WAIT_COMPLETE, UINT64_MAX);
+      result = vk_sync_wait_many(&device->vk, wait_count, waits, VK_SYNC_WAIT_COMPLETE, UINT64_MAX);
       if (result != VK_SUCCESS)
          return result;
    }
-   const uint64_t ready = log ? os_time_get_nano() : 0;
-   unsigned commands = 0;
    list_for_each_entry (struct pvr_transfer_cmd, cmd, sub_cmd->transfer_cmds, link) {
-      commands++;
-      if (!g5p_run(device, cmd, level >= 3))
+      if (!g5p_run(device, cmd))
          return vk_errorf(device, VK_ERROR_DEVICE_LOST,
-                          "G5P transfer surface exceeds its stable BO mapping");
+                          "G5P transfer surface exceeds its memory's mapping");
    }
-   if (log) {
-      pvr_arch_g5p_transfer_summary(false, ready - start, os_time_get_nano() - ready,
-                                    commands, wait_count, sub_cmd->g5p_waits_skipped);
-   }
-   if (level >= 3)
-      fprintf(stderr, "G5P perf transfer pid=%ld start_ns=%" PRIu64 " wait_us=%" PRIu64
-              " cpu_us=%" PRIu64 " commands=%u\n", (long)getpid(), start,
-              (ready - start) / 1000, (os_time_get_nano() - ready) / 1000, commands);
    return vk_sync_signal(&device->vk, signal_sync, 0);
 }

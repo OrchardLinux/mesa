@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 /*
  * Apple's A9 GPU (G5P): a render's VDM control stream of more than one
- * pvr_csb block (pvr_g5p_vdm.h). Compiled only with
- * -Dimagination-g5p-experimental=true.
+ * pvr_csb block (pvr_g5p_vdm.h).
  *
  * pvr_csb records a graphics control stream in blocks of
  * PVR_CMD_BUFFER_CSB_BO_SIZE (4 KiB), each in its own allocation, and chains
@@ -10,11 +9,12 @@
  * the link is written where the block's last complete state update ended,
  * and that update moves to the next block). The A9's VDM follows such links
  * (Apple's own render streams carry STREAM_LINK `80000001 <addr>`, the same
- * encoding; docs/gpu/experiments/frida-agx-findings.md), but our kernel takes
- * a pass's stream as one range: [vdm_va, vdm_va + vdm_size) inside one
- * listed resource, at most GET_RENDER_INFO.max_vdm_bytes, with the stream's
- * STREAM_TERMINATE as its last dword at vdm_va + vdm_end - 4
- * (render-user-validate.h g5p_ru_pass3_check(), g5p_ru_pass3_content()).
+ * encoding; docs/gpu/experiments/frida-agx-findings.md), but every render
+ * that ran on the device had its stream as one range ending in
+ * STREAM_TERMINATE, which the apple-g5p kernel driver required. The powervr
+ * kernel driver takes only the stream's address, so the chained form could
+ * be submitted as it is; until that has run on the device the stream is
+ * still laid out as one range of at most PVR_G5P_MAX_VDM_BYTES.
  *
  * So a stream of several blocks is laid out again as one: each block's
  * commands up to its chaining link, then the last block's up to the
@@ -25,7 +25,7 @@
  * crossed a block boundary was moved whole by pvr_csb, and a STREAM_LINK
  * with return to a secondary stream returns to the dword after it, wherever
  * that is). Only the chaining links, which jump to the next block, are left
- * out. The draw path continues with LOAD before the negotiated limit.
+ * out. The draw path continues with LOAD before the limit.
  */
 
 #include <inttypes.h>
@@ -33,6 +33,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "util/log.h"
 #include "vk_log.h"
 
 #include "pvr_bo.h"
@@ -41,10 +42,9 @@
 #include "pvr_device.h"
 #include "winsys/pvr_winsys.h"
 #include "pvr_g5p_vdm.h"
-#include "winsys/apple_g5p/apple_g5p_drm.h"
 
 #define G5P_VDM_REFUSE(cmd_buffer, ...)                                                                            \
-   (fprintf(stderr, "G5P refuses: " __VA_ARGS__), fprintf(stderr, "\n"),                                          \
+   (mesa_logw("G5P refuses: " __VA_ARGS__),                                                              \
     vk_errorf((cmd_buffer), VK_ERROR_FEATURE_NOT_PRESENT, "G5P: " __VA_ARGS__))
 
 /* The bytes of a block before its chaining link to `next`, or -1 when the
@@ -95,9 +95,9 @@ PVR_PER_ARCH(g5p_vdm_stream)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr
                                i + 1);
       total += (uint64_t)len;
    }
-   const uint32_t limit = cmd_buffer->device->ws->max_vdm_bytes;
+   const uint32_t limit = PVR_G5P_MAX_VDM_BYTES;
    if (total > limit)
-      return G5P_VDM_REFUSE(cmd_buffer, "a control stream of %" PRIu64 " bytes in %u blocks (the kernel takes %u)",
+      return G5P_VDM_REFUSE(cmd_buffer, "a control stream of %" PRIu64 " bytes in %u blocks (at most %u)",
                             total, blocks, limit);
 
    const size_t size = total + ROGUE_VDMCTRL_GUARD_SIZE_DEFAULT;
@@ -118,9 +118,6 @@ PVR_PER_ARCH(g5p_vdm_stream)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr
    free(flat);
    if (result != VK_SUCCESS)
       return result;
-   if (getenv("PVR_G5P_WS_LOG"))
-      fprintf(stderr, "g5p vdm: %u blocks, %" PRIu64 " bytes laid out as one stream at %#" PRIx64 "\n", blocks,
-              total, bo->dev_addr.addr);
    *va = bo->dev_addr.addr;
    *bytes = (uint32_t)total;
    return VK_SUCCESS;

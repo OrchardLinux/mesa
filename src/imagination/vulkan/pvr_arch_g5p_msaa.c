@@ -2,12 +2,12 @@
 /*
  * Apple's A9 GPU (G5P): the shape of a 4x render, checked against the
  * render pass before any word is written (the words: pvr_g5p_msaa.c). What
- * the captures show is built; the rest is refused by name. Built only with
- * -Dimagination-g5p-experimental=true.
+ * the captures show is built; the rest is refused by name.
  */
 
 #include <stdio.h>
 
+#include "util/log.h"
 #include "vk_format.h"
 #include "vk_log.h"
 
@@ -17,7 +17,7 @@
 #include "pvr_image.h"
 
 #define G5P_MSAA_REFUSE(cmd_buffer, ...)                                                                           \
-   (fprintf(stderr, "G5P refuses: " __VA_ARGS__), fprintf(stderr, "\n"),                                          \
+   (mesa_logw("G5P refuses: " __VA_ARGS__),                                                              \
     vk_errorf((cmd_buffer), VK_ERROR_FEATURE_NOT_PRESENT, "G5P: " __VA_ARGS__))
 
 /*

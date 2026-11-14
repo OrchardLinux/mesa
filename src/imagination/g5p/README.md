@@ -3,34 +3,46 @@
 `src/imagination/g5p` compiles NIR to the shader ISA of the Apple A9's GPU
 (S8000/S8003, iPad 5): a PowerVR Rogue core (BVNC 9.15.6.2) run by Apple's
 own firmware, with Apple's own USC instruction set, the generation before the
-A10's G9P. It is built only with `-Dimagination-g5p-experimental=true` and is
-not conformant.
+A10's G9P. It is not conformant.
 
-This is step 1a of the plan to run both Apple generations on one Mesa driver
-built on the upstream PowerVR Vulkan driver, with a backend per generation:
-the G5P compiler sits beside `src/imagination/g9p`, and the A9 has a
-device-info entry (`common/device_info/apple-a9.h`) with the feature bit
-`apple_g5p`. Nothing of G9P is changed. Nothing in the PowerVR driver uses
-this backend yet; step 1b moves the A9 onto the `pvr_*` driver behind
-`PVR_HAS_FEATURE(dev_info, apple_g5p)`.
+Both Apple generations run on one Mesa driver, the upstream PowerVR Vulkan
+driver with a backend per generation: the G5P compiler sits beside
+`src/imagination/g9p`, and the A9 has a device-info entry
+(`common/device_info/apple-a9.h`) with the feature bit `apple_g5p`. The
+kernel side is the `powervr` driver's Apple backend for both: it reports the
+A9's BVNC, which selects the entry, and takes the A9's jobs as Rogue command
+streams with the A9's stream extensions (`vulkan/pvr_arch_g5p.c`,
+"command streams"). The A9's paths of the driver are the `pvr_arch_g5p_*.c`
+and `pvr_g5p_*` files in `vulkan/`, reached from the shared files through
+`PVR_HAS_FEATURE(dev_info, apple_g5p)` and the hooks of
+`vulkan/pvr_g5p_hooks.h`. Compute shaders are compiled by the G9P compiler in
+its A9 mode (`g9p/g9p_a9*.h`).
 
 None of this is proposed upstream. It was written by AI agents (every commit
 carries `Generated-by: LLM`).
+
+## Origin
+
+The A9 driver is Berkay Kösebay's: the shader backend, the state packing, the
+PDS programs and the device work behind them, brought up on an iPad 5 (J71t)
+against his own kernel driver and UAPI (`apple-g5p`), OrchardLinux/mesa
+PR #7. It was then moved onto the powervr kernel interface; what was not
+carried over is listed in that change's description.
 
 ## Files
 
 - `g5p_usc.[ch]`: the field encoders, one function per instruction form. Each
   form was measured from Apple's A9 compiler output (`applegpu_g5p`) and
   checked against an independent Python reference.
-- `pco_g5p_general.[ch]`: the general backend, NIR to G5P: instruction
-  selection, register allocation, the vertex and fragment register
-  conventions, varyings, textures, multiple render targets, transform
-  feedback stores, control flow and registers above r31.
+- `pco_g5p_general.[ch]`: the backend, NIR to G5P: instruction selection,
+  register allocation, the vertex and fragment register conventions,
+  varyings, textures, multiple render targets, transform feedback stores,
+  control flow and registers above r31.
 - `g5p_blend.c`, `g5p_recipes.c`: the blend epilogues (built from Apple's
   blend forms) and fixed lowerings.
 - `g5p_mrt_out.h`: the output-register plan for one to four colour targets.
-- `pco_g5p.[ch]`: the first, captured-shape compiler, which reads PCO IR
-  before Rogue scheduling. It is kept for the shapes it matches.
+- `tests/`: the encoders and lowerings against their references
+  (`meson test`, with `-Dbuild-tests=true`).
 
 ## Parts ported from G9P
 
@@ -41,22 +53,21 @@ two generations are identical for every form compared so far.
 | Part | G9P source commits | Where here |
 |---|---|---|
 | Discards in blending programs become a select | `7013b551398`, `7a64e1d1bf4` | `pco_g5p_general.c` |
-| Multiply-add fusion (default on, `PVR_G5P_FUSE=0` disables) | `28cdfceab8e` | `pco_g5p_general.c` |
+| Multiply-add fusion | `28cdfceab8e` | `pco_g5p_general.c` |
 | If/else and loops on the execution-mask stack; their encoders | `d91427625ff` | `pco_g5p_general.c`, `g5p_usc.c` |
 | Registers above r31 (homes) and their moves | `d1ab45daed3` | `pco_g5p_general.c`, `g5p_usc.c` |
 
 ## The notes these comments cite
 
-Comments cite our notes by path, like `docs/gpu/experiments/xfb.md` or
+Comments cite Berkay's notes by path, like `docs/gpu/experiments/xfb.md` or
 `isa-g5p.md`, and test tools by path, like `tools/gpu-userspace/g5p_usc.py`.
 The published ones are in [brkosebay/a9-gpu](https://github.com/brkosebay/a9-gpu)
 under the same paths. Some, like the full ISA notes, are not published yet.
 
 ## Status
 
-Proven on A9 hardware with our own ICD and kernel interface (not in this
-tree yet): the desktop (labwc, Hyprland) on the GPU, GPU clients through
-linux-dmabuf, up to four colour targets, depth/stencil, transform feedback
-with 4-byte stores, and OpenGL ES 3.0 through Zink. Control flow ran on the
-hardware in a short ladder; its desktop use, registers above r31 and FMA
-fusion are checked offline only. Not done: compute.
+Run on A9 hardware with the apple-g5p kernel driver: the desktop (labwc,
+Hyprland) on the GPU, GPU clients through linux-dmabuf, up to four colour
+targets, depth/stencil, transform feedback with 4-byte stores, and OpenGL
+ES 3.0 through Zink; PR #7 also carries 4x multisampling and compute. On the
+powervr kernel interface nothing has run on hardware yet.

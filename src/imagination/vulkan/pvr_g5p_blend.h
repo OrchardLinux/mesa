@@ -3,8 +3,7 @@
  * Apple's A9 GPU (G5P): blending. The A9 blends in the fragment program
  * (the G5P backend's epilogues, src/imagination/g5p/g5p_blend.c): the
  * pipeline's blend state becomes the backend's program key, and the
- * program's tile read sets the ISP pass type of its draws. Built only with
- * -Dimagination-g5p-experimental=true.
+ * program's tile read sets the ISP pass type of its draws.
  */
 
 #ifndef PVR_G5P_BLEND_H

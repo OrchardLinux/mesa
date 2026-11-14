@@ -1,5 +1,4 @@
 /* SPDX-License-Identifier: MIT */
-#ifdef PVR_APPLE_G5P
 #include "../g5p/g5p_barrier.h"
 #include "../g5p/g5p_atomic.h"
 #include "../g5p/g5p_image.h"
@@ -215,6 +214,3 @@ static bool a9_image(struct g9p_ctx *ctx, nir_intrinsic_instr *in)
    case nir_intrinsic_load_shared: case nir_intrinsic_store_shared: return a9_shared(ctx, intr); \
    case nir_intrinsic_barrier: return a9_barrier(ctx, intr); \
    default: break; } }
-#else
-#define G9P_A9_INTRINSICS
-#endif

@@ -3,8 +3,7 @@
  * Apple's A9 GPU (G5P): depth/stencil attachments in the driver's objects.
  * The words are pvr_g5p_ds.c's; this file reads them from the render pass,
  * pvr_render_job::ds (upstream pvr_sub_cmd_gfx_job_init()'s load/store
- * decisions) and the dynamic state. Built only with
- * -Dimagination-g5p-experimental=true.
+ * decisions) and the dynamic state.
  */
 
 #include <assert.h>
@@ -12,6 +11,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "util/log.h"
 #include "vk_format.h"
 #include "vk_graphics_state.h"
 #include "vk_log.h"
@@ -29,7 +29,7 @@
 
 /* A refusal, by name, on stderr too (vk_errorf() is silent in release builds) */
 #define G5P_DS_REFUSE(cmd_buffer, ...)                                                                             \
-   (fprintf(stderr, "G5P refuses: " __VA_ARGS__), fprintf(stderr, "\n"),                                          \
+   (mesa_logw("G5P refuses: " __VA_ARGS__),                                                              \
     vk_errorf((cmd_buffer), VK_ERROR_FEATURE_NOT_PRESENT, "G5P: " __VA_ARGS__))
 
 VkResult

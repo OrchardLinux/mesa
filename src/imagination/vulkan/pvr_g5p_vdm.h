@@ -1,9 +1,8 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * Apple's A9 GPU (G5P): a render's VDM control stream as the kernel takes
- * it, one contiguous range ending in STREAM_TERMINATE, also when pvr_csb
- * recorded it in several linked blocks (pvr_arch_g5p_vdm.c). Built only with
- * -Dimagination-g5p-experimental=true.
+ * Apple's A9 GPU (G5P): a render's VDM control stream as it has run on the
+ * device, one contiguous range ending in STREAM_TERMINATE, also when pvr_csb
+ * recorded it in several linked blocks (pvr_arch_g5p_vdm.c).
  */
 
 #ifndef PVR_G5P_VDM_H
@@ -14,6 +13,11 @@
 
 #include "pvr_macros.h"
 
+/* The longest stream laid out as one range (the limit the device ran with):
+ * a render whose stream would pass it continues in a second render that
+ * loads the first one's result (pvr_arch_g5p_gfx.c) */
+#define PVR_G5P_MAX_VDM_BYTES (1u << 20)
+
 #ifdef PVR_PER_ARCH
 
 struct pvr_cmd_buffer;
@@ -21,7 +25,7 @@ struct pvr_csb;
 
 /* The stream's address and length through its terminate: the first block
  * itself when there is one, else one upload of the blocks' commands without
- * their chaining links; a stream past the kernel's limit is refused */
+ * their chaining links; a stream past PVR_G5P_MAX_VDM_BYTES is refused */
 VkResult PVR_PER_ARCH(g5p_vdm_stream)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_csb *csb, uint64_t *va,
                                       uint32_t *bytes);
 

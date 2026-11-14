@@ -2,7 +2,6 @@
 /*
  * Apple's A9 GPU (G5P): the texture state of image views and the words of
  * samplers, written into upstream's pvr_* descriptors (pvr_g5p_tex.h).
- * Compiled only with -Dimagination-g5p-experimental=true.
  *
  * In the shape of G9P's image and sampler states (the G9P driver,
  * pvr_arch_g9p_gfx.c "Image and sampler states"): upstream's objects, the
@@ -147,15 +146,6 @@ PVR_PER_ARCH(g5p_pack_image_view)(const struct pvr_image_view *iview, struct pvr
    static_assert(sizeof(desc->words) + sizeof(desc->meta) == 32, "G5P image state is 32 bytes");
    memset(desc, 0, sizeof(*desc));
    if (why) {
-      if (getenv("PVR_G5P_WS_LOG")) {
-         const struct pvr_image *image = pvr_image_view_get_image(iview);
-         mesa_logw("G5P view state refused: format=%s image=%s type=%s aspects=%#x "
-                   "extent=%ux%u levels=%u layers=%u usage=%#" PRIx64 ": %s",
-                   vk_Format_to_str(iview->vk.format), vk_Format_to_str(image->vk.format),
-                   vk_ImageViewType_to_str(iview->vk.view_type), iview->vk.aspects,
-                   image->vk.extent.width, image->vk.extent.height,
-                   image->vk.mip_levels, image->vk.array_layers, (uint64_t)image->vk.usage, why);
-      }
       /* A view with both depth and stencil aspects is an attachment view, never sampled: a sampled descriptor
        * takes one of the two aspects (VUID-VkDescriptorImageInfo-imageView-01976), whose own view has its
        * state. No warning for it: Zink's depth/stencil surfaces are such views of sampled-usage images, and

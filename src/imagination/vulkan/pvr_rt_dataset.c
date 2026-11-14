@@ -8,6 +8,7 @@
 
 #include "pvr_device.h"
 #include "pvr_free_list.h"
+#include "pvr_g5p.h"
 
 static void pvr_rt_rgn_headers_data_fini(struct pvr_rt_dataset *rt_dataset)
 {
@@ -71,7 +72,8 @@ void pvr_render_target_dataset_destroy(struct pvr_rt_dataset *rt_dataset)
    pvr_rt_vheap_rtc_data_fini(rt_dataset);
 
    /* G9P: the device's list, shared by every dataset */
-   if (rt_dataset->local_free_list != device->g9p.free_list)
+   if (rt_dataset->local_free_list != device->g9p.free_list &&
+       !(device->g5p && rt_dataset->local_free_list == device->g5p->free_list))
       pvr_free_list_destroy(rt_dataset->local_free_list);
 
    vk_free(&device->vk.alloc, rt_dataset);

@@ -21,7 +21,7 @@ VkResult pvr_g5p_tbo_pack(struct pvr_device *device, const struct pvr_texture_st
    bool srgb;
    const char *why = NULL;
    unsigned cpp = vk_format_get_blocksize(info->format);
-   if (!pvr_g5p_tbo_probe()) why = "texel buffers require hardware qualification (PVR_G5P_TEXEL_BUFFER=probe)";
+   if (!pvr_g5p_tbo_probe()) why = "texel buffers require hardware qualification";
    else if (!pvr_g5p_tbo_format(info->format) || !pvr_g5p_format_tex(info->format, &key, &srgb)) why = "unqualified texel-buffer format";
    else if (info->addr.addr % PVR_G5P_TBO_ALIGN) why = "texel buffer base is not 64-byte aligned";
    else if (!info->buffer_elems || info->buffer_elems > PVR_G5P_TBO_LIMIT) why = "texel-buffer range outside 1..65536 elements";

@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 /*
  * Apple's A9 GPU (G5P): image-view texture state and sampler words for the
- * pvr_* descriptors. Built only with -Dimagination-g5p-experimental=true.
+ * pvr_* descriptors.
  *
  * The shape follows G9P's g9p_pack_image_view()/g9p_pack_sampler() (the
  * G9P driver, pvr_arch_g9p_gfx.c): upstream's image, view and sampler objects,

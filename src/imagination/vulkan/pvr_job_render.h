@@ -33,9 +33,7 @@
 #include "pvr_csb.h"
 #include "pvr_limits.h"
 #include "pvr_types.h"
-#ifdef PVR_APPLE_G5P
 #include "pvr_g5p.h"
-#endif
 
 struct pvr_device;
 struct pvr_device_info;
@@ -211,11 +209,9 @@ struct pvr_render_job {
 
       uint32_t view_index;
    } view_state;
-#ifdef PVR_APPLE_G5P
 
-   /* G5P (pvr_arch_g5p.c): the words of its TYPED_V3 pass */
+   /* G5P (pvr_arch_g5p.c): what its geometry and fragment streams carry */
    struct pvr_g5p_job g5p;
-#endif
 };
 
 #ifdef PVR_PER_ARCH

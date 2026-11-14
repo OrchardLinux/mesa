@@ -1,7 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * Apple's A9 GPU (G5P): the colour format table. Built only with
- * -Dimagination-g5p-experimental=true.
+ * Apple's A9 GPU (G5P): the colour format table.
  *
  * One row per Vulkan colour format the A9 samples or renders: the image-state
  * key (format code and channel selectors, the same key in the texture state
@@ -37,7 +36,7 @@
  *    packs R8, RG8, R16F, RG16F and RG11B10F from the two-word program too:
  *    exact on the device. Blending is the fragment program's, on the tile's
  *    f16 values before the PBE, for every rendered row;
- *  - probes (PVR_G5P_FORMATS=probe, for a device rung only): rows decoded or
+ *  - probes (for a device rung only): rows decoded or
  *    derived but not yet run, not advertised by default. None at present.
  */
 
@@ -65,7 +64,7 @@ enum pvr_g5p_fmt_flags {
    PVR_G5P_FMT_BLEND = 1u << 3,        /* blending into it (the fragment program's) */
    PVR_G5P_FMT_COMPRESSED = 1u << 4,   /* 4x4 blocks, twiddled only */
    PVR_G5P_FMT_INTEGER = 1u << 5,      /* integer texel: texelFetch/unfiltered */
-   /* not advertised unless PVR_G5P_FORMATS=probe (none at present) */
+   /* not advertised (none at present) */
    PVR_G5P_FMT_PROBE_SAMPLED = 1u << 8, /* the sampled bits are a probe */
    PVR_G5P_FMT_PROBE_RENDER = 1u << 9,  /* the render (and blend) bits are a probe */
    PVR_G5P_FMT_PROBE_BLEND = 1u << 10,  /* the blend bit alone is a probe */

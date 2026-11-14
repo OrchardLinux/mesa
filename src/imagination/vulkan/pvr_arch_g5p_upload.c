@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 /*
  * Apple's A9 GPU (G5P): the vertex program's common-store uploads
- * (pvr_g5p_upload.h). Compiled only with -Dimagination-g5p-experimental=true.
+ * (pvr_g5p_upload.h).
  *
  * Ported from our A9 driver's round-19 vertex loader (loader_program() and
  * loader_data() of its recorder, PDS_STATE_UPDATE before the vertex data),
@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "util/log.h"
 #include "vk_alloc.h"
 #include "vk_enum_to_str.h"
 #include "vk_log.h"
@@ -35,28 +36,8 @@
 
 /* A refusal, by name, on stderr too (vk_errorf() is silent in release builds) */
 #define G5P_UP_REFUSE(obj, ...)                                                                                    \
-   (fprintf(stderr, "G5P refuses: " __VA_ARGS__), fprintf(stderr, "\n"),                                          \
+   (mesa_logw("G5P refuses: " __VA_ARGS__),                                                              \
     vk_errorf((obj), VK_ERROR_FEATURE_NOT_PRESENT, "G5P: " __VA_ARGS__))
-
-static bool
-g5p_up_log(void)
-{
-   static int on = -1;
-   if (on < 0)
-      on = getenv("PVR_G5P_WS_LOG") != NULL;
-   return on;
-}
-
-static void
-g5p_up_dump(const char *what, uint64_t addr, const uint32_t *w, unsigned n)
-{
-   if (!g5p_up_log())
-      return;
-   fprintf(stderr, "g5p draw: %-16s @%#" PRIx64 ":", what, addr);
-   for (unsigned i = 0; i < n; i++)
-      fprintf(stderr, " %08x", w[i]);
-   fprintf(stderr, "\n");
-}
 
 /* The loader: DOUTD c(2i):c(2i+1) -> common store with the control word in
  * c(2n+2i), the last one ends, then HALT (the fragment loader's shape) */
@@ -254,7 +235,6 @@ PVR_PER_ARCH(g5p_vs_uploads_draw)(struct pvr_cmd_buffer *cmd_buffer, const struc
          if (result != VK_SUCCESS)
             return result;
          src[i] = bo->dev_addr.addr;
-         g5p_up_dump("vs upload push", src[i], (const uint32_t *)(push->data + u->offset), u->dwords);
          break;
       case PCO_G5P_UPLOAD_UBO:
          /* the buffer itself: the DOUTD reads it when the job runs */
@@ -312,7 +292,6 @@ PVR_PER_ARCH(g5p_vs_uploads_draw)(struct pvr_cmd_buffer *cmd_buffer, const struc
    result = pvr_arch_cmd_buffer_upload_pds(cmd_buffer, data, 4 * n, 16, NULL, 0, 0, 16, &pds);
    if (result != VK_SUCCESS)
       return result;
-   g5p_up_dump("vs upload data", pds.data_offset, data, 4 * n);
 
    /* PDS_STATE_UPDATE for the VDM: one 16-byte data unit per DOUTD; the
     * common store sized as AGXMetalA9's VertexProgramVariantPDSState does,
@@ -327,7 +306,5 @@ PVR_PER_ARCH(g5p_vs_uploads_draw)(struct pvr_cmd_buffer *cmd_buffer, const struc
    pvr_csb_pack (&out->pds_state[2], VDMCTRL_PDS_STATE2, s2) {
       s2.pds_code_addr = PVR_DEV_ADDR(up->loader.code_offset);
    }
-   g5p_up_dump("vs loader code", up->loader.code_offset,
-               (const uint32_t *)pvr_bo_suballoc_get_map_addr(up->loader.pvr_bo), up->loader.code_size);
    return VK_SUCCESS;
 }
