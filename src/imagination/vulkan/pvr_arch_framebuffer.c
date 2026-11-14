@@ -137,7 +137,7 @@ pvr_arch_render_state_setup(struct pvr_device *device,
       result = vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
       goto err_free_render_targets;
    }
-
+   PVR_G5P_HOOK(spm_scratch, device, rstate)
    /* G9P has no SPM (see below): nothing ever spills to the scratch buffer,
     * which is the size of the framebuffer (12 MB at 1536x2048).
     */
@@ -159,7 +159,7 @@ pvr_arch_render_state_setup(struct pvr_device *device,
                                       &rstate->ppp_state_size);
    if (result != VK_SUCCESS)
       goto err_release_scratch_buffer;
-
+   PVR_G5P_HOOK(spm_render, device)
    for (uint32_t i = 0; i < render_count; i++) {
       /*
        * G9P has no SPM: a scene that outgrows the parameter buffer is not

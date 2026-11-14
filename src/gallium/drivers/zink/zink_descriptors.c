@@ -861,6 +861,18 @@ multi_pool_destroy(struct zink_screen *screen, struct zink_descriptor_pool_multi
    FREE(mpool);
 }
 
+/* a failed descriptor allocation drops the draw or dispatch that needed it: say so once */
+static void
+report_descriptor_oom(void)
+{
+   /* a race only repeats the message */
+   static bool reported;
+   if (!reported) {
+      reported = true;
+      mesa_loge("ZINK: out of descriptor memory: the draws and dispatches that need new descriptor sets are dropped");
+   }
+}
+
 static VkDescriptorPool
 create_pool(struct zink_screen *screen, unsigned num_type_sizes, const VkDescriptorPoolSize *sizes, unsigned flags)
 {
@@ -966,8 +978,11 @@ check_pool_alloc(struct zink_context *ctx, struct zink_descriptor_pool_multi *mp
             }
          }
       }
-      if (!mpool->pool)
-         UNREACHABLE("out of descriptor memory!");
+      /* out of memory: the caller drops the draw (or dispatch) that needed the set */
+      if (!mpool->pool) {
+         report_descriptor_oom();
+         return NULL;
+      }
    }
    struct zink_descriptor_pool *pool = mpool->pool;
    /* allocate up to $current * 10, e.g., 10 -> 100;
@@ -996,6 +1011,8 @@ static struct zink_descriptor_pool *
 create_push_pool(struct zink_screen *screen, struct zink_batch_state *bs, bool is_compute, bool has_fbfetch)
 {
    struct zink_descriptor_pool *pool = CALLOC_STRUCT(zink_descriptor_pool);
+   if (!pool)
+      return NULL;
    VkDescriptorPoolSize sizes[2];
    sizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
    if (is_compute)
@@ -1006,6 +1023,10 @@ create_push_pool(struct zink_screen *screen, struct zink_batch_state *bs, bool i
       sizes[1].descriptorCount = MAX_LAZY_DESCRIPTORS;
    }
    pool->pool = create_pool(screen, !is_compute && has_fbfetch ? 2 : 1, sizes, 0);
+   if (!pool->pool) {
+      FREE(pool);
+      return NULL;
+   }
    return pool;
 }
 
@@ -1013,6 +1034,15 @@ static struct zink_descriptor_pool *
 check_push_pool_alloc(struct zink_context *ctx, struct zink_descriptor_pool_multi *mpool, struct zink_batch_state *bs, enum zink_pipeline_idx pidx)
 {
    struct zink_screen *screen = zink_screen(ctx->base.screen);
+   /* an earlier pool creation for this batch state ran out of memory: try again */
+   if (unlikely(!mpool->pool)) {
+      mpool->pool = create_push_pool(screen, bs, pidx == ZINK_PIPELINE_COMPUTE, ctx->dd.has_fbfetch);
+      if (!mpool->pool) {
+         report_descriptor_oom();
+         return NULL;
+      }
+      bs->dd.has_fbfetch = ctx->dd.has_fbfetch;
+   }
    struct zink_descriptor_pool *pool = mpool->pool;
    /* allocate up to $current * 10, e.g., 10 -> 100 or 100 -> 1000 */
    if (pool->set_idx == pool->sets_alloc || unlikely(ctx->dd.has_fbfetch != bs->dd.has_fbfetch)) {
@@ -1029,6 +1059,10 @@ check_push_pool_alloc(struct zink_context *ctx, struct zink_descriptor_pool_mult
          if (unlikely(ctx->dd.has_fbfetch != bs->dd.has_fbfetch))
             mpool->reinit_overflow = true;
          bs->dd.has_fbfetch = ctx->dd.has_fbfetch;
+         if (!bs->dd.push_pool[pidx].pool) {
+            report_descriptor_oom();
+            return NULL;
+         }
          return check_push_pool_alloc(ctx, &bs->dd.push_pool[pidx], bs, pidx);
       }
       if (!zink_descriptor_util_alloc_sets(screen, ctx->dd.push_dsl[pidx]->layout,
@@ -1263,8 +1297,8 @@ zink_descriptors_update_masked_buffer(struct zink_context *ctx, enum zink_pipeli
    }
 }
 
-/* updates the mask of changed_sets and binds the mask of bind_sets */
-static void
+/* updates the mask of changed_sets and binds the mask of bind_sets; false if out of descriptor memory */
+static bool
 zink_descriptors_update_masked(struct zink_context *ctx, enum zink_pipeline_idx pidx, uint8_t changed_sets, uint8_t bind_sets)
 {
    struct zink_screen *screen = zink_screen(ctx->base.screen);
@@ -1275,12 +1309,12 @@ zink_descriptors_update_masked(struct zink_context *ctx, enum zink_pipeline_idx 
 
    /* skip if no descriptors are updated */
    if (!pg->dd.binding_usage || (!changed_sets && !bind_sets))
-      return;
+      return true;
 
    /* populate usable sets for the changed_sets mask */
    if (!populate_sets(ctx, bs, pg, changed_sets, desc_sets, pidx)) {
       debug_printf("ZINK: couldn't get descriptor sets!\n");
-      return;
+      return false;
    }
    /* no flushing allowed: sets are allocated to the batch, so this breaks everything */
    assert(ctx->bs == bs);
@@ -1314,6 +1348,7 @@ zink_descriptors_update_masked(struct zink_context *ctx, enum zink_pipeline_idx 
                               pg->layout, type + 1, 1, &bs->dd.sets[pidx][type + 1],
                               0, NULL);
    }
+   return true;
 }
 
 static void
@@ -1336,8 +1371,11 @@ bind_bindless_db(struct zink_context *ctx, struct zink_program *pg, enum zink_pi
  * - update push set
  * - generate masks for updating other sets
  * - always called from driver thread
+ *
+ * returns false when a descriptor set could not be allocated: the caller must not record the
+ * draw or dispatch, and the changed state stays pending for the next one
  */
-void
+bool
 zink_descriptors_update(struct zink_context *ctx, enum zink_pipeline_idx pidx)
 {
    struct zink_batch_state *bs = ctx->bs;
@@ -1367,7 +1405,7 @@ zink_descriptors_update(struct zink_context *ctx, enum zink_pipeline_idx pidx)
             bind_bindless_db(ctx, pg, pidx);
          /* the set was bound with a separable layout, which no other program is compatible with */
          ctx->dd.bindless_bound[pidx] = false;
-         return;
+         return true;
       }
    }
 
@@ -1469,8 +1507,9 @@ zink_descriptors_update(struct zink_context *ctx, enum zink_pipeline_idx pidx)
             if (ctx->dd.push_state_changed[pidx]) {
                struct zink_descriptor_pool *pool = check_push_pool_alloc(ctx, &bs->dd.push_pool[is_compute], bs, is_compute);
                VkDescriptorSet push_set = get_descriptor_set(pool);
+               /* out of memory: push_state_changed stays set */
                if (!push_set)
-                  mesa_loge("ZINK: failed to get push descriptor set! prepare to crash!");
+                  return false;
                VKCTX(UpdateDescriptorSetWithTemplate)(screen->dev, push_set, pg->dd.templates[0], ctx);
                bs->dd.sets[pidx][0] = push_set;
             }
@@ -1483,10 +1522,12 @@ zink_descriptors_update(struct zink_context *ctx, enum zink_pipeline_idx pidx)
       }
    }
    ctx->dd.push_state_changed[pidx] = false;
-   if (zink_descriptor_mode == ZINK_DESCRIPTOR_MODE_DB)
+   if (zink_descriptor_mode == ZINK_DESCRIPTOR_MODE_DB) {
       zink_descriptors_update_masked_buffer(ctx, pidx, changed_sets, bind_sets);
-   else
-      zink_descriptors_update_masked(ctx, pidx, changed_sets, bind_sets);
+   } else if (!zink_descriptors_update_masked(ctx, pidx, changed_sets, bind_sets)) {
+      /* out of memory: the push set is current, the other sets stay pending */
+      return false;
+   }
    /* bindless descriptors are context-based and get updated elsewhere,
     * but the set is only valid for the bind point and layout it was bound with
     */
@@ -1506,6 +1547,7 @@ zink_descriptors_update(struct zink_context *ctx, enum zink_pipeline_idx pidx)
    ctx->dd.pg[pidx] = pg;
    bs->dd.compat_id[pidx] = pg->compat_id;
    ctx->dd.state_changed[pidx] = 0;
+   return true;
 }
 
 /* called from gallium descriptor change hooks, e.g., set_sampler_views */

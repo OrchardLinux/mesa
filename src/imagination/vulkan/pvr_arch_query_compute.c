@@ -353,7 +353,7 @@ VkResult
 pvr_arch_device_create_compute_query_programs(struct pvr_device *device)
 {
    VkResult result;
-
+   PVR_G5P_HOOK(query_programs_create, device)
    result = pvr_create_compute_query_precomp_program(
       device,
       CS_QUERY_AVAILABILITY_COMMON,
@@ -394,7 +394,7 @@ err_destroy_availability_query_program:
 
 void pvr_arch_device_destroy_compute_query_programs(struct pvr_device *device)
 {
-   pvr_destroy_compute_query_program(device, &device->availability_shader);
+   PVR_G5P_HOOK(query_programs_destroy, device) pvr_destroy_compute_query_program(device, &device->availability_shader);
    pvr_destroy_compute_query_program(device, &device->copy_results_shader);
    pvr_destroy_compute_query_program(device, &device->reset_queries_shader);
 }
@@ -410,7 +410,7 @@ VkResult pvr_arch_add_query_program(struct pvr_cmd_buffer *cmd_buffer,
    uint32_t *const_buffer;
    struct pvr_suballoc_bo *pvr_bo;
    VkResult result;
-
+   PVR_G5P_HOOK(query_program, cmd_buffer, query_info)
    result =
       pvr_arch_cmd_buffer_start_sub_cmd(cmd_buffer, PVR_SUB_CMD_TYPE_QUERY);
    if (result != VK_SUCCESS)

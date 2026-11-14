@@ -28,7 +28,7 @@
 
 #include "pco/pco.h"
 #include "pco_uscgen_programs.h"
-
+#include "pvr_g5p_ds_hooks.h"
 #include "pvr_device.h"
 #include "pvr_dump_info.h"
 #include "pvr_entrypoints.h"
@@ -1040,6 +1040,9 @@ static bool pvr_physical_device_get_properties(
       .maxDescriptorSetUpdateAfterBindTotalBuffersDynamic = PVR_MAX_DYNAMIC_BUFFERS,
    };
 
+   if (PVR_HAS_FEATURE(dev_info, apple_g5p))
+      snprintf(properties->driverName, sizeof(properties->driverName), "Mesa PowerVR G5P");
+
    if (strlen(pdevice->instance->drirc.debug.force_vk_devicename) > 0) {
       snprintf(properties->deviceName,
                sizeof(properties->deviceName),
@@ -1280,7 +1283,21 @@ VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
                          "Failed to collect physical device properties");
       goto err_pvr_winsys_destroy;
    }
-
+   PVR_G5P_HOOK(msaa_limits, pdevice, &supported_properties)
+   /* G5P: transform feedback is the vertex program's own stores and a CPU
+    * resolve (pvr_g5p_xfb.h): stream 0, no byte-count draws; its stream
+    * queries count on the CPU too. No dynamic colour-write enables: G5P compiles the write
+    * mask into the fragment program, and Zink makes them dynamic whenever
+    * they exist. */
+   if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g5p)) {
+      supported_features.geometryStreams = false;
+      supported_properties.transformFeedbackDraw = false;
+      supported_properties.transformFeedbackQueries = true;
+      supported_extensions.EXT_color_write_enable = false;
+      supported_features.dualSrcBlend = true;
+      supported_properties.maxFragmentDualSrcAttachments = 1;
+      supported_features.colorWriteEnable = false; PVR_G5P_HOOK(release9_features, supported_features)
+   }
    /*
     * G9P: host image copies through the driver's CPU copies (all its memory
     * is CPU-visible; pvr_arch_g9p_transfer.c)
@@ -1308,7 +1325,7 @@ VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
       memcpy(supported_properties.optimalTilingLayoutUUID, "G9P layout 1\0\0\0\0", VK_UUID_SIZE);
       supported_properties.identicalMemoryTypeRequirements = true;
    }
-
+   PVR_G5P_HOOK(texel_limits, pdevice, &supported_properties)
    vk_physical_device_dispatch_table_from_entrypoints(
       &dispatch_table,
       &pvr_physical_device_entrypoints,

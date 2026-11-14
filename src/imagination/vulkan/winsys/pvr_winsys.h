@@ -301,7 +301,8 @@ struct pvr_winsys_compute_submit_info {
    /* Firmware stream buffer. This is the maximum possible size taking into
     * consideration all HW features, quirks and enhancements.
     */
-   uint8_t fw_stream[100];
+   /* G5P's stream with its extension is 128 bytes (pvr_arch_g5p.c) */
+   uint8_t fw_stream[128];
    uint32_t fw_stream_len;
 
    struct pvr_winsys_compute_submit_flags {
@@ -479,5 +480,8 @@ VkResult pvr_winsys_create(const char *render_path,
                            bool keep_display_master,
                            const VkAllocationCallbacks *alloc,
                            struct pvr_winsys **ws_out);
+
+/* Apple A9 (G5P): its hooks in the shared files */
+#include "pvr_g5p_hooks.h"
 
 #endif /* PVR_WINSYS_H */

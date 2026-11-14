@@ -732,6 +732,7 @@ zink_init_screen_caps(struct zink_screen *screen)
    struct pipe_caps *caps = (struct pipe_caps *)&screen->base.caps;
 
    u_init_pipe_screen_caps(&screen->base, screen->is_cpu ? 0 : 1);
+   caps->r11g11b10f_requires_color_buffer_float = screen->is_g5p;
 
    /* Vulkan spec says the builtins count, so make GL count them towards
     * link-failing.
@@ -2687,6 +2688,21 @@ zink_screen_timeline_wait(struct zink_screen *screen, uint64_t batch_id, uint64_
    if (zink_screen_check_last_finished(screen, batch_id))
       return true;
 
+   if (screen->device_lost && screen->is_g5p) {
+      /* G5P: a lost screen never blocks a waiter. Its batches are still submitted, without their command
+       * buffers, and signal their timeline values, so read the timeline: batch states, their descriptor
+       * pools and buffer slabs are only recycled once last_finished passes their batch id. Without this
+       * every flush of a lost context made a new batch state and nothing was ever freed (glmark2 terrain
+       * on G5P filled 564 MiB in 3 s, then vkCreateDescriptorPool failed). Only values the timeline
+       * really reached are recorded: batches from before the loss may still be executing. The result
+       * is not passed to zink_screen_handle_vkresult, which would log (or abort) on every call.
+       */
+      uint64_t value = 0;
+      if (VKSCR(GetSemaphoreCounterValue)(screen->dev, screen->sem, &value) == VK_SUCCESS && value)
+         zink_screen_update_last_finished(screen, value);
+      return true;
+   }
+
    wi.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
    wi.semaphoreCount = 1;
    wi.pSemaphores = &screen->sem;
@@ -3771,15 +3787,6 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
       goto fail;
    }
 
-   if (config) {
-      driParseConfigFiles(config->options, config->options_info,
-                          &(driConfigFileParseParams) { .driverName = "zink" });
-      screen->driconf.dual_color_blend_by_location = driQueryOptionb(config->options, "dual_color_blend_by_location");
-      //screen->driconf.inline_uniforms = driQueryOptionb(config->options, "radeonsi_inline_uniforms");
-      screen->driconf.emulate_point_smooth = driQueryOptionb(config->options, "zink_emulate_point_smooth");
-      screen->driconf.zink_shader_object_enable = driQueryOptionb(config->options, "zink_shader_object_enable");
-   }
-
    simple_mtx_lock(&instance_lock);
    if (++instance_refcount == 1) {
       instance_info.loader_version = zink_get_loader_version(screen);
@@ -3843,6 +3850,22 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
       if (!screen->driver_name_is_inferred)
          debug_printf("ZINK: failed to detect features\n");
       goto fail;
+   }
+
+   /* Apple A9 (G5P, the PowerVR Vulkan driver): its memory, synchronization and lost-device handling */
+   screen->is_g5p = screen->info.driver_props.driverID == VK_DRIVER_ID_IMAGINATION_OPEN_SOURCE_MESA &&
+                    !strcmp(screen->info.driver_props.driverName, "Mesa PowerVR G5P");
+   screen->precise_sync = screen->is_g5p;
+
+   /* after the device is known: G5P has driconf defaults of its own (device "g5p") */
+   if (config) {
+      driParseConfigFiles(config->options, config->options_info,
+                          &(driConfigFileParseParams) { .driverName = "zink",
+                             .deviceName = screen->is_g5p ? "g5p" : NULL });
+      screen->driconf.dual_color_blend_by_location = driQueryOptionb(config->options, "dual_color_blend_by_location");
+      //screen->driconf.inline_uniforms = driQueryOptionb(config->options, "radeonsi_inline_uniforms");
+      screen->driconf.emulate_point_smooth = driQueryOptionb(config->options, "zink_emulate_point_smooth");
+      screen->driconf.zink_shader_object_enable = driQueryOptionb(config->options, "zink_shader_object_enable");
    }
 
    if (!screen->info.rb2_feats.nullDescriptor) {
@@ -4026,6 +4049,16 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
 
    screen->total_video_mem = get_video_mem(screen);
    screen->clamp_video_mem = screen->total_video_mem * 0.8;
+   /* G5P (1.5 GB of unified memory). A texture upload leaves its staging buffer referenced by the batch, and
+    * the suballocator cannot reuse it until that batch completes. The oom flush above only counts it against
+    * 80% of the device's memory, so a loading loop (uploads, no draws) kept every staging buffer it ever made.
+    * Dead staging gets its own, much smaller limit: 1/32 of the device-local memory within [16, 256] MiB.
+    * And once a second a flush gives idle allocator memory back (zink_bo_trim()).
+    */
+   if (screen->is_g5p) {
+      screen->trim_interval = 1000 * 1000;
+      screen->clamp_staging_mem = CLAMP(screen->total_video_mem / 32, 16ull << 20, 256ull << 20);
+   }
    if (!os_get_total_physical_memory(&screen->total_mem)) {
       if (!screen->driver_name_is_inferred)
          mesa_loge("ZINK: failed to get total physical memory");

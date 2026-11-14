@@ -35,6 +35,9 @@
 #include "pvr_rt_dataset.h"
 
 #include <assert.h>
+#include <inttypes.h>
+#include <stdlib.h>
+#include <string.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -59,6 +62,7 @@
 #include "util/macros.h"
 #include "util/u_atomic.h"
 #include "vk_alloc.h"
+#include "vk_common_entrypoints.h"
 #include "vk_fence.h"
 #include "vk_log.h"
 #include "vk_object.h"
@@ -121,7 +125,8 @@ static VkResult pvr_queue_init(struct pvr_device *device,
    }
 
    /* Apple's firmware has no transfer engine; the kernel refuses the context. */
-   if (!PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p)) {
+   if (!PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p) &&
+       !PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p)) {
       result = pvr_arch_transfer_ctx_create(
          device,
          pvr_winsys_from_vk_queue_priority(global_priority),
@@ -259,7 +264,33 @@ static void pvr_update_job_syncs(struct pvr_device *device,
                       queue->last_job_signal_sync[submitted_job_type]);
    }
 
+   queue->g5p_src_done[submitted_job_type] = false;
    queue->last_job_signal_sync[submitted_job_type] = new_signal_sync;
+}
+
+/* A sync that signals when both a and b (either may be NULL) have: a null
+ * job's syncobj transfer, no CPU wait */
+static VkResult
+g5p_merge_syncs(struct pvr_device *device, struct vk_sync *a, struct vk_sync *b, struct vk_sync **out)
+{
+   struct vk_sync_wait waits[2];
+   uint32_t n = 0;
+   VkResult result;
+
+   if (a)
+      waits[n++] = (struct vk_sync_wait){ .sync = a, .stage_mask = ~(VkPipelineStageFlags2)0 };
+   if (b)
+      waits[n++] = (struct vk_sync_wait){ .sync = b, .stage_mask = ~(VkPipelineStageFlags2)0 };
+   result = vk_sync_create(&device->vk, &device->pdevice->ws->syncobj_type, 0U, 0UL, out);
+   if (result != VK_SUCCESS)
+      return result;
+   const struct vk_sync_signal signal = { .sync = *out, .stage_mask = ~(VkPipelineStageFlags2)0 };
+   result = device->ws->ops->null_job_submit(device->ws, waits, n, (struct vk_sync_signal *)&signal);
+   if (result != VK_SUCCESS) {
+      vk_sync_destroy(&device->vk, *out);
+      *out = NULL;
+   }
+   return result;
 }
 
 static VkResult
@@ -367,13 +398,26 @@ pvr_process_graphics_cmd_for_view(struct pvr_device *device,
       }
    }
 
+   struct vk_sync *frag_wait = queue->next_job_wait_sync[PVR_JOB_TYPE_FRAG];
+   /* a vk_meta blit's render (pvr_arch_g5p_meta.c) is transfer work: its
+    * fragments also wait for what barriers made transfers wait for */
+   struct vk_sync *g5p_frag_wait = NULL;
+   if (sub_cmd->g5p_transfer && queue->next_job_wait_sync[PVR_JOB_TYPE_TRANSFER]) {
+      result = g5p_merge_syncs(device, frag_wait, queue->next_job_wait_sync[PVR_JOB_TYPE_TRANSFER],
+                               &g5p_frag_wait);
+      if (result != VK_SUCCESS)
+         goto err_destroy_frag_sync;
+      frag_wait = g5p_frag_wait;
+   }
    result =
       pvr_arch_render_job_submit(queue->gfx_ctx,
                                  &sub_cmd->job,
                                  queue->next_job_wait_sync[PVR_JOB_TYPE_GEOM],
-                                 queue->next_job_wait_sync[PVR_JOB_TYPE_FRAG],
+                                 frag_wait,
                                  geom_signal_sync,
                                  frag_signal_sync);
+   if (g5p_frag_wait)
+      vk_sync_destroy(&device->vk, g5p_frag_wait);
 
    if (original_ctrl_stream_addr.addr > 0)
       job->ctrl_stream_addr = original_ctrl_stream_addr;
@@ -540,6 +584,16 @@ pvr_process_graphics_cmd_for_view(struct pvr_device *device,
    if (job->run_frag)
       pvr_update_job_syncs(device, queue, frag_signal_sync, PVR_JOB_TYPE_FRAG);
 
+   /* ... and later transfer-stage barriers wait for its fragments */
+   if (sub_cmd->g5p_transfer && job->run_frag) {
+      struct vk_sync *transfer_done;
+      result = g5p_merge_syncs(device, queue->last_job_signal_sync[PVR_JOB_TYPE_TRANSFER], frag_signal_sync,
+                               &transfer_done);
+      if (result != VK_SUCCESS)
+         return result;
+      pvr_update_job_syncs(device, queue, transfer_done, PVR_JOB_TYPE_TRANSFER);
+   }
+
    /* FIXME: DoShadowLoadOrStore() */
 
    return VK_SUCCESS;
@@ -559,6 +613,7 @@ static VkResult pvr_process_graphics_cmd(struct pvr_device *device,
                                          struct pvr_sub_cmd_gfx *sub_cmd)
 {
    const pvr_dev_addr_t ds_addr = sub_cmd->job.ds.addr;
+   PVR_G5P_HOOK(xfb_before_job, device, cmd_buffer, sub_cmd)
 
    if (util_dynarray_num_elements(&sub_cmd->g9p_realigns, char)) {
       struct vk_sync *wait = queue->next_job_wait_sync[PVR_JOB_TYPE_GEOM];
@@ -615,6 +670,7 @@ static VkResult pvr_process_graphics_cmd(struct pvr_device *device,
       if (result != VK_SUCCESS)
          return result;
    }
+   PVR_G5P_HOOK(xfb_after_job, device, queue, cmd_buffer, sub_cmd)
 
    return PVR_PER_ARCH(g9p_xfb_after_job)(device, queue, cmd_buffer, sub_cmd);
 }
@@ -672,6 +728,32 @@ static VkResult pvr_process_transfer_cmds(struct pvr_device *device,
    if (result != VK_SUCCESS)
       return result;
 
+   /* G5P: the A9's firmware has no transfer engine either; the CPU does
+    * them, as on G9P, plus what only the A9's copies know (pvr_g5p_layout.h).
+    *
+    * The copy runs here, at submit, so it waits for every job submitted
+    * before it, not only for what barriers and semaphores name: G5P keeps
+    * the last submission's jobs in flight (pvr_clear_last_submits_syncs()),
+    * where G9P has waited for them before it gets here.
+    */
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p)) {
+      struct vk_sync_wait waits[PVR_JOB_TYPE_MAX + 1];
+      uint32_t wait_count = 0;
+
+      if (queue->next_job_wait_sync[PVR_JOB_TYPE_TRANSFER])
+         waits[wait_count++] = (struct vk_sync_wait){
+            .sync = queue->next_job_wait_sync[PVR_JOB_TYPE_TRANSFER],
+            .stage_mask = ~(VkPipelineStageFlags2)0,
+         };
+      for (uint32_t i = 0; i < PVR_JOB_TYPE_MAX; i++) {
+         if (queue->last_job_signal_sync[i] && !queue->g5p_src_done[i])
+            waits[wait_count++] = (struct vk_sync_wait){
+               .sync = queue->last_job_signal_sync[i],
+               .stage_mask = ~(VkPipelineStageFlags2)0,
+            };
+      }
+      result = pvr_arch_g5p_transfer_submit(device, sub_cmd, waits, wait_count, sync);
+   } else
    /* G9P: no GPU transfer path yet; done by the CPU */
    if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p))
       result = pvr_arch_g9p_transfer_submit(
@@ -825,18 +907,31 @@ pvr_process_event_cmd_barrier(struct pvr_device *device,
             ~(PVR_PIPELINE_STAGE_ALL_BITS | PVR_PIPELINE_STAGE_QUERY_BIT)));
 
    u_foreach_bit (stage, src_mask) {
-      if (queue->last_job_signal_sync[stage]) {
-         wait_syncs[src_wait_count++] = (struct vk_sync_wait){
-            .sync = queue->last_job_signal_sync[stage],
-            .stage_mask = ~(VkPipelineStageFlags2)0,
-            .wait_value = 0,
-         };
+      struct vk_sync *s = queue->last_job_signal_sync[stage];
+      if (!s)
+         continue;
+      /* G5P: a source whose work already completed orders nothing; skip it
+       * instead of building a syncobj per dst stage around a signalled fence.
+       * The cache is per stage and cleared when the sync is replaced. */
+      if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p)) {
+         if (queue->g5p_src_done[stage])
+            continue;
+         if (vk_sync_wait(&device->vk, s, 0, VK_SYNC_WAIT_COMPLETE, 0) == VK_SUCCESS) {
+            queue->g5p_src_done[stage] = true;
+            continue;
+         }
       }
+      wait_syncs[src_wait_count++] = (struct vk_sync_wait){
+         .sync = s,
+         .stage_mask = ~(VkPipelineStageFlags2)0,
+         .wait_value = 0,
+      };
    }
 
    /* No previous src jobs that need finishing so no need for a barrier. */
    if (src_wait_count == 0)
       return VK_SUCCESS;
+
 
    u_foreach_bit (stage, dst_mask) {
       uint32_t wait_count = src_wait_count;
@@ -1221,12 +1316,20 @@ static VkResult pvr_process_cmd_buffer(struct pvr_device *device,
 
       p_atomic_inc(&device->global_cmd_buffer_submit_count);
    }
+   PVR_G5P_HOOK(xfb_end_cmd_buffer, device, cmd_buffer)
 
    return PVR_PER_ARCH(g9p_xfb_end_cmd_buffer)(device, cmd_buffer);
 }
 
 static VkResult pvr_clear_last_submits_syncs(struct pvr_queue *queue)
 {
+   /* Keep the last submission's syncs instead of waiting for them on the CPU.
+    * The next jobs and barriers wait for them on the GPU: a barrier's first
+    * scope reaches into earlier submissions. pvr_update_job_syncs replaces each
+    * sync when its job type signals again; the kernel holds its own fence refs. */
+   if (PVR_HAS_FEATURE(&queue->device->pdevice->dev_info, apple_g5p))
+      return VK_SUCCESS;
+
    struct vk_sync_wait waits[PVR_JOB_TYPE_MAX * 2];
    uint32_t wait_count = 0;
    VkResult result;
@@ -1295,11 +1398,104 @@ static VkResult pvr_clear_last_submits_syncs(struct pvr_queue *queue)
       if (queue->last_job_signal_sync[i]) {
          vk_sync_destroy(&queue->device->vk, queue->last_job_signal_sync[i]);
          queue->last_job_signal_sync[i] = NULL;
+         queue->g5p_src_done[i] = false;
       }
    }
 
    return VK_SUCCESS;
 }
+
+static VkResult pvr_process_queue_signals_g5p(struct pvr_queue *queue,
+                                          struct vk_sync_signal *signals,
+                                          uint32_t signal_count,
+                                          const struct vk_sync_wait *extra, uint32_t extra_count)
+{
+   STACK_ARRAY(struct vk_sync_wait, signal_waits, PVR_JOB_TYPE_MAX * 2 + extra_count);
+   if (!signal_waits) return vk_error(queue, VK_ERROR_OUT_OF_HOST_MEMORY);
+   struct pvr_device *device = queue->device;
+   const struct vk_sync_signal *built = NULL;
+   enum pvr_pipeline_stage_bits built_src = 0;
+   VkResult result;
+
+   for (uint32_t signal_idx = 0; signal_idx < signal_count; signal_idx++) {
+      struct vk_sync_signal *signal = &signals[signal_idx];
+      const enum pvr_pipeline_stage_bits signal_stage_src =
+         pvr_stage_mask_src(&device->pdevice->dev_info, signal->stage_mask);
+      uint32_t wait_count = 0;
+
+      /* A signal with the stage mask of one already built waits for the same
+       * fences: take them from that signal's payload, one syncobj transfer
+       * instead of another merge (Zink signals its batch timeline and the
+       * present semaphore together). */
+      if (built && built_src == signal_stage_src) {
+         struct vk_sync_wait same = {
+            .sync = built->sync,
+            .stage_mask = ~(VkPipelineStageFlags2)0,
+            .wait_value = built->signal_value,
+         };
+
+         result = device->ws->ops->null_job_submit(device->ws, &same, 1, signal);
+         if (result != VK_SUCCESS) {
+            STACK_ARRAY_FINISH(signal_waits);
+            return result;
+         }
+         continue;
+      }
+
+      for (uint32_t i = 0; i < PVR_JOB_TYPE_MAX; i++) {
+         /* Include waits left by job types that ran no job, even when the
+          * signal stage mask does not include that type. */
+         if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p) &&
+             queue->next_job_wait_sync[i]) {
+            signal_waits[wait_count++] = (struct vk_sync_wait){
+               .sync = queue->next_job_wait_sync[i],
+               .stage_mask = ~(VkPipelineStageFlags2)0,
+               .wait_value = 0,
+            };
+         }
+
+         /* Exception for query jobs since that's something internal,
+          * so the user provided syncs won't ever have it as a source stage.
+          */
+         if (!(signal_stage_src & BITFIELD_BIT(i)) && i != PVR_JOB_TYPE_QUERY)
+            continue;
+
+         if (!queue->last_job_signal_sync[i])
+            continue;
+
+         /* a job a barrier already saw retired (pvr_process_event_cmd_barrier())
+          * orders nothing; known without asking the kernel again */
+         if (queue->g5p_src_done[i])
+            continue;
+
+         signal_waits[wait_count++] = (struct vk_sync_wait){
+            .sync = queue->last_job_signal_sync[i],
+            .stage_mask = ~(VkPipelineStageFlags2)0,
+            .wait_value = 0,
+         };
+      }
+
+      for (uint32_t k = 0; k < extra_count; k++)
+         signal_waits[wait_count++] = (struct vk_sync_wait){
+            .sync = extra[k].sync, .stage_mask = ~(VkPipelineStageFlags2)0, .wait_value = extra[k].wait_value };
+      result = device->ws->ops->null_job_submit(device->ws,
+                                                signal_waits,
+                                                wait_count,
+                                                signal);
+      if (result != VK_SUCCESS) {
+         STACK_ARRAY_FINISH(signal_waits);
+         return result;
+      }
+      if (!built) {
+         built = signal;
+         built_src = signal_stage_src;
+      }
+   }
+
+   STACK_ARRAY_FINISH(signal_waits);
+   return VK_SUCCESS;
+}
+
 
 static VkResult pvr_process_queue_signals(struct pvr_queue *queue,
                                           struct vk_sync_signal *signals,
@@ -1312,7 +1508,7 @@ static VkResult pvr_process_queue_signals(struct pvr_queue *queue,
    for (uint32_t signal_idx = 0; signal_idx < signal_count; signal_idx++) {
       struct vk_sync_signal *signal = &signals[signal_idx];
       const enum pvr_pipeline_stage_bits signal_stage_src =
-         pvr_stage_mask_src(signal->stage_mask);
+         pvr_stage_mask_src(&device->pdevice->dev_info, signal->stage_mask);
       uint32_t wait_count = 0;
 
       for (uint32_t i = 0; i < PVR_JOB_TYPE_MAX; i++) {
@@ -1343,6 +1539,15 @@ static VkResult pvr_process_queue_signals(struct pvr_queue *queue,
    return VK_SUCCESS;
 }
 
+static VkResult pvr_process_queue_signals_for_device(struct pvr_queue *queue,
+   struct vk_sync_signal *signals, uint32_t signal_count,
+   const struct vk_sync_wait *extra, uint32_t extra_count)
+{
+   if (PVR_HAS_FEATURE(&queue->device->pdevice->dev_info, apple_g5p))
+      return pvr_process_queue_signals_g5p(queue, signals, signal_count, extra, extra_count);
+   return pvr_process_queue_signals(queue, signals, signal_count);
+}
+
 static VkResult pvr_process_queue_waits(struct pvr_queue *queue,
                                         struct vk_sync_wait *waits,
                                         uint32_t wait_count)
@@ -1361,7 +1566,7 @@ static VkResult pvr_process_queue_waits(struct pvr_queue *queue,
       struct vk_sync *prev_wait = NULL;
 
       for (uint32_t wait_idx = 0; wait_idx < wait_count; wait_idx++) {
-         if (!(pvr_stage_mask_dst(waits[wait_idx].stage_mask) &
+         if (!(pvr_stage_mask_dst(&device->pdevice->dev_info, waits[wait_idx].stage_mask) &
                BITFIELD_BIT(i))) {
             continue;
          }
@@ -1429,6 +1634,9 @@ static VkResult pvr_driver_queue_submit_jobs(struct vk_queue *queue,
    VkResult result;
 
    const int64_t g9p_tc = os_time_get_nano();
+   /* a semaphore wait's second synchronization scope is its own batch; a batch
+    * without command buffers orders only its signals */
+   const bool waitonly_local = PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p) && !submit->command_buffer_count && submit->wait_count;
    result = pvr_clear_last_submits_syncs(driver_queue);
    if (getenv("G9P_WAITLOG"))
       fprintf(stderr, "g9p: wait last submit %" PRId64 " us\n", (os_time_get_nano() - g9p_tc) / 1000);
@@ -1437,7 +1645,7 @@ static VkResult pvr_driver_queue_submit_jobs(struct vk_queue *queue,
 
    const int64_t g9p_tw = os_time_get_nano();
 
-   if (submit->wait_count) {
+   if (submit->wait_count && !waitonly_local) {
       result = pvr_process_queue_waits(driver_queue,
                                        submit->waits,
                                        submit->wait_count);
@@ -1462,13 +1670,34 @@ static VkResult pvr_driver_queue_submit_jobs(struct vk_queue *queue,
 
    assert(suspended_data.rts == NULL && "suspended graphics job never resumed");
 
-   result = pvr_process_queue_signals(driver_queue,
+   result = pvr_process_queue_signals_for_device(driver_queue,
                                       submit->signals,
-                                      submit->signal_count);
+                                      submit->signal_count,
+                                      waitonly_local ? submit->waits : NULL,
+                                      waitonly_local ? submit->wait_count : 0);
    if (result != VK_SUCCESS)
       return result;
 
    return VK_SUCCESS;
+}
+
+/*
+ * Performs a signal operation of a submission that will not run, unless the
+ * payload already has a signal pending (a job the kernel accepted signals it,
+ * with an error if its context is lost).
+ */
+static void pvr_signal_unsubmitted(struct vk_device *device,
+                                   struct vk_sync *sync,
+                                   uint64_t value)
+{
+   if ((sync->type->features & VK_SYNC_FEATURE_WAIT_PENDING) &&
+       vk_sync_wait(device, sync, value, VK_SYNC_WAIT_PENDING, 0) ==
+          VK_SUCCESS)
+      return;
+
+   /* a failure is logged by vk_sync_signal(); nothing else can be done */
+   VkResult result = vk_sync_signal(device, sync, value);
+   (void)result;
 }
 
 /*
@@ -1494,13 +1723,99 @@ static VkResult pvr_driver_queue_submit(struct vk_queue *queue,
    if (result != VK_SUCCESS) {
       struct pvr_queue *driver_queue = container_of(queue, struct pvr_queue, vk);
 
-      for (uint32_t i = 0; i < submit->signal_count; i++)
-         vk_sync_signal(&driver_queue->device->vk, submit->signals[i].sync,
-                        submit->signals[i].signal_value);
+      for (uint32_t i = 0; i < submit->signal_count; i++) {
+         if (PVR_HAS_FEATURE(&driver_queue->device->pdevice->dev_info, apple_g5p))
+            pvr_signal_unsubmitted(&driver_queue->device->vk,
+                                   submit->signals[i].sync,
+                                   submit->signals[i].signal_value);
+         else
+            vk_sync_signal(&driver_queue->device->vk, submit->signals[i].sync,
+                           submit->signals[i].signal_value);
+      }
    }
    if (result == VK_ERROR_DEVICE_LOST)
       return vk_queue_set_lost(queue, "GPU context lost");
    return result;
+}
+
+/*
+ * vk_common_QueueSubmit2() returns VK_ERROR_DEVICE_LOST on a lost device
+ * before it builds a submission, and stops at the first submission that
+ * fails, so none of the signal operations of those submissions reach
+ * pvr_driver_queue_submit(). Their semaphores and the fence then never get a
+ * payload. A wait for a pending signal on one of them never returns:
+ * vkGetSemaphoreFdKHR(SYNC_FD) on a binary semaphore waits for its signal to
+ * be submitted with no timeout, as does a wait-for-submit timeline wait. Zink
+ * exports its batch's semaphores into dma-bufs right after each submit, so a
+ * lost context left its flush thread blocked in the kernel and the
+ * application unable to exit.
+ *
+ * The submission is still refused with VK_ERROR_DEVICE_LOST and runs no
+ * work, but every signal it promised and no job will perform is performed
+ * here, as pvr_driver_queue_submit() does for a submission that fails.
+ *
+ * On the Apple A9 (G5P) only, where this was found and tested; other devices
+ * keep the common behaviour.
+ */
+VKAPI_ATTR VkResult VKAPI_CALL
+PVR_PER_ARCH(QueueSubmit2)(VkQueue _queue,
+                           uint32_t submitCount,
+                           const VkSubmitInfo2 *pSubmits,
+                           VkFence _fence)
+{
+   VK_FROM_HANDLE(vk_queue, queue, _queue);
+   VK_FROM_HANDLE(vk_fence, fence, _fence);
+   struct vk_device *device = queue->base.device;
+   VkResult result;
+
+   result = vk_common_QueueSubmit2(_queue, submitCount, pSubmits, _fence);
+   if (result == VK_SUCCESS || !vk_device_is_lost_no_report(device) ||
+       !PVR_HAS_FEATURE(&container_of(device, struct pvr_device, vk)->pdevice->dev_info, apple_g5p))
+      return result;
+
+   for (uint32_t i = 0; i < submitCount; i++) {
+      for (uint32_t j = 0; j < pSubmits[i].signalSemaphoreInfoCount; j++) {
+         const VkSemaphoreSubmitInfo *info =
+            &pSubmits[i].pSignalSemaphoreInfos[j];
+         VK_FROM_HANDLE(vk_semaphore, semaphore, info->semaphore);
+         const uint64_t value =
+            semaphore->type == VK_SEMAPHORE_TYPE_TIMELINE ? info->value : 0;
+
+         pvr_signal_unsubmitted(device,
+                                vk_semaphore_get_active_sync(semaphore),
+                                value);
+      }
+   }
+   if (fence)
+      pvr_signal_unsubmitted(device, vk_fence_get_active_sync(fence), 0);
+
+   return result;
+}
+
+/*
+ * vk_common_GetSemaphoreCounterValue() answers VK_ERROR_DEVICE_LOST once the
+ * device is lost, but the counter still advances: jobs accepted before the
+ * loss signal their points as they retire (with an error), and refused
+ * submissions signal theirs (QueueSubmit2 above). A client that recycles
+ * per-submission memory by the counter (Zink's batch states and descriptor
+ * pools) could otherwise never free it again and grew until it ran out of
+ * memory. Report the value the timeline really reached; the loss is still
+ * reported by every submission and wait. On the Apple A9 (G5P) only.
+ */
+VKAPI_ATTR VkResult VKAPI_CALL
+PVR_PER_ARCH(GetSemaphoreCounterValue)(VkDevice _device,
+                                       VkSemaphore _semaphore,
+                                       uint64_t *pValue)
+{
+   VK_FROM_HANDLE(vk_device, device, _device);
+   VK_FROM_HANDLE(vk_semaphore, semaphore, _semaphore);
+
+   if (!vk_device_is_lost_no_report(device) ||
+       !PVR_HAS_FEATURE(&container_of(device, struct pvr_device, vk)->pdevice->dev_info, apple_g5p))
+      return vk_common_GetSemaphoreCounterValue(_device, _semaphore, pValue);
+
+   return vk_sync_get_value(device, vk_semaphore_get_active_sync(semaphore),
+                            pValue);
 }
 
 VkResult PVR_PER_ARCH(QueueBindSparse)(VkQueue _queue,

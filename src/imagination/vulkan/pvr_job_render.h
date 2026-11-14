@@ -33,6 +33,7 @@
 #include "pvr_csb.h"
 #include "pvr_limits.h"
 #include "pvr_types.h"
+#include "pvr_g5p.h"
 
 struct pvr_device;
 struct pvr_device_info;
@@ -208,6 +209,9 @@ struct pvr_render_job {
 
       uint32_t view_index;
    } view_state;
+
+   /* G5P (pvr_arch_g5p.c): what its geometry and fragment streams carry */
+   struct pvr_g5p_job g5p;
 };
 
 #ifdef PVR_PER_ARCH

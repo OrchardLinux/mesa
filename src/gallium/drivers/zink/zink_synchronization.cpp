@@ -162,6 +162,7 @@ zink_get_cmdbuf(struct zink_context *ctx, struct zink_resource *src, struct zink
 
    if (unordered_exec) {
       ctx->bs->has_reordered_work = true;
+      ctx->bs->reordered_stages |= VK_PIPELINE_STAGE_TRANSFER_BIT;
       return ctx->bs->reordered_cmdbuf;
    }
    ctx->bs->has_work = true;
@@ -398,6 +399,17 @@ struct update_unordered_access_and_get_cmdbuf<false> {
 static void
 apply_new_access(struct zink_context *ctx, struct zink_resource *res, VkAccessFlags flags, VkPipelineStageFlags pipeline, bool unordered, bool usage_matches, bool is_write)
 {
+   if (zink_screen(ctx->base.screen)->precise_sync && res->obj->exportable_dmabuf) {
+      /* F5b: the stages that touch an exported buffer in this batch, for its fd wait: the old
+       * ones (the src of this barrier) and the new one */
+      simple_mtx_lock(&ctx->bs->exportable_lock);
+      struct hash_entry *he = _mesa_hash_table_search(&ctx->bs->exports, res);
+      if (he)
+         he->data = (void *)((uintptr_t)he->data |
+                             ((uintptr_t)(res->obj->access_stage | res->obj->unordered_access_stage | pipeline) << 1));
+      simple_mtx_unlock(&ctx->bs->exportable_lock);
+   }
+
    if (unordered) {
       if (is_write) {
          res->obj->unordered_access = flags;

@@ -455,10 +455,13 @@ VkResult pvr_MapMemory2(VkDevice _device,
     *    "memory must not be currently host mapped"
     */
    if (mem->bo->map != NULL) {
-      /* G9P's CPU transfers map memory the application never mapped; that
-       * mapping stays until the memory is freed, see pvr_UnmapMemory2().
+      /* G9P's and G5P's CPU transfers map memory the application never
+       * mapped; that mapping stays until the memory is freed, see
+       * pvr_UnmapMemory2().
        */
-      if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p) && !addr) {
+      if ((PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p) ||
+           PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p)) &&
+          !addr) {
          *ppData = (uint8_t *)mem->bo->map + offset;
          return VK_SUCCESS;
       }
@@ -488,8 +491,11 @@ VkResult pvr_UnmapMemory2(VkDevice _device,
    VK_FROM_HANDLE(pvr_device, device, _device);
    VK_FROM_HANDLE(pvr_device_memory, mem, pMemoryUnmapInfo->memory);
 
-   /* A CPU transfer on G9P's queue may be using the mapping */
-   if (mem && PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p) && !mem->map_placed)
+   /* A CPU transfer on G9P's or G5P's queue may be using the mapping */
+   if (mem &&
+       (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p) ||
+        PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p)) &&
+       !mem->map_placed)
       return VK_SUCCESS;
 
    if (mem && mem->bo->map) {
@@ -583,6 +589,12 @@ VkResult pvr_bind_memory(struct pvr_device *device,
       util_dynarray_append_typed(&device->g9p_vmas.vmas, struct pvr_winsys_vma *, vma);
       simple_mtx_unlock(&device->g9p_vmas.lock);
    }
+   /* G5P: its CPU transfers find memory by device address too */
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p)) {
+      simple_mtx_lock(&device->g9p_vmas.lock);
+      util_dynarray_append_typed(&device->g9p_vmas.vmas, struct pvr_winsys_vma *, vma);
+      simple_mtx_unlock(&device->g9p_vmas.lock);
+   }
 
    return VK_SUCCESS;
 
@@ -596,6 +608,11 @@ err_out:
 void pvr_unbind_memory(struct pvr_device *device, struct pvr_winsys_vma *vma)
 {
    if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p)) {
+      simple_mtx_lock(&device->g9p_vmas.lock);
+      util_dynarray_delete_unordered(&device->g9p_vmas.vmas, struct pvr_winsys_vma *, vma);
+      simple_mtx_unlock(&device->g9p_vmas.lock);
+   }
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p)) {
       simple_mtx_lock(&device->g9p_vmas.lock);
       util_dynarray_delete_unordered(&device->g9p_vmas.vmas, struct pvr_winsys_vma *, vma);
       simple_mtx_unlock(&device->g9p_vmas.lock);
@@ -1170,4 +1187,5 @@ void pvr_GetImageMemoryRequirements2(VkDevice _device,
          break;
       }
    }
+   PVR_G5P_HOOK(memory_dedicated, device, pMemoryRequirements)
 }

@@ -18,6 +18,8 @@ if with_imagination_vk or with_tools.contains('imagination')
   subdir('pco')
   subdir('ds')
   subdir('pdsc')
+  # G5P first: the G9P compiler calls G5P's A9 encoders.
+  subdir('g5p')
   subdir('g9p')
 endif
 

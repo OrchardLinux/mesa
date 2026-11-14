@@ -38,6 +38,8 @@ struct pvr_queue {
 
    struct vk_sync *last_job_signal_sync[PVR_JOB_TYPE_MAX];
    struct vk_sync *next_job_wait_sync[PVR_JOB_TYPE_MAX];
+   /* G5P: last_job_signal_sync[i] is known complete (zero-timeout wait succeeded); cleared whenever it is replaced */
+   bool g5p_src_done[PVR_JOB_TYPE_MAX];
 };
 
 VK_DEFINE_HANDLE_CASTS(pvr_queue, vk.base, VkQueue, VK_OBJECT_TYPE_QUEUE)

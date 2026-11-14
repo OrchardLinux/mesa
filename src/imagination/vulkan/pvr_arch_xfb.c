@@ -776,7 +776,7 @@ void PVR_PER_ARCH(CmdBindTransformFeedbackBuffersEXT)(
    }
 
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
-
+   PVR_G5P_HOOK(xfb_bind, cmd_buffer, firstBinding, bindingCount, pBuffers, pOffsets, pSizes)
    for (uint32_t i = 0; i < ARRAY_SIZE(xfb_state->bindings); i++) {
       struct pvr_xfb_binding *binding = &xfb_state->bindings[i];
 
@@ -821,7 +821,7 @@ void PVR_PER_ARCH(CmdBeginTransformFeedbackEXT)(
    }
 
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
-
+   PVR_G5P_HOOK(xfb_begin, cmd_buffer, firstCounterBuffer, counterBufferCount, pCounterBuffers, pCounterBufferOffsets)
    xfb_state->counter_buffer_count = counterBufferCount;
 
    for (uint32_t i = 0; i < ARRAY_SIZE(xfb_state->bindings); i++) {
@@ -871,7 +871,7 @@ void PVR_PER_ARCH(CmdEndTransformFeedbackEXT)(
    }
 
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
-
+   PVR_G5P_HOOK(xfb_end, cmd_buffer, firstCounterBuffer, counterBufferCount, pCounterBuffers, pCounterBufferOffsets)
    xfb_state->counter_buffer_count = counterBufferCount;
 
    for (uint32_t i = 0; i < ARRAY_SIZE(xfb_state->bindings); i++) {

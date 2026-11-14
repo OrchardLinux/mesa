@@ -1437,6 +1437,17 @@ zink_bo_release_unused(struct zink_screen *screen)
    clean_up_buffer_managers(screen);
 }
 
+/* Give idle memory back. Freed slab entries are only reclaimed when an allocation of some size finds its slabs
+ * full, and cached buffers only expire when another buffer is cached: after a level is unloaded, hundreds of MiB
+ * of freed textures otherwise stay allocated for as long as nothing asks for more.
+ */
+void
+zink_bo_trim(struct zink_screen *screen)
+{
+   pb_slabs_reclaim(&screen->pb.bo_slabs);
+   pb_cache_release_expired_buffers(&screen->pb.bo_cache);
+}
+
 bool
 zink_bo_init(struct zink_screen *screen)
 {

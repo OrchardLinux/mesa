@@ -72,6 +72,7 @@ struct pb_buffer_lean *pb_cache_reclaim_buffer(struct pb_cache *mgr, pb_size siz
                                           unsigned alignment, unsigned usage,
                                           unsigned bucket_index);
 unsigned pb_cache_release_all_buffers(struct pb_cache *mgr);
+void pb_cache_release_expired_buffers(struct pb_cache *mgr);
 void pb_cache_init_entry(struct pb_cache *mgr, struct pb_cache_entry *entry,
                          struct pb_buffer_lean *buf, unsigned bucket_index);
 void pb_cache_init(struct pb_cache *mgr, unsigned num_heaps,

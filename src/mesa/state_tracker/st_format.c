@@ -129,6 +129,30 @@ st_mesa_format_to_pipe_format(const struct st_context *st,
    }
 
    if (_mesa_is_format_s3tc(mesaFormat) && !st->has_s3tc) {
+      /* Transcoded to the ETC2 format of the same bits per texel and the
+       * same alpha (st_UnmapTextureImage()).
+       */
+      if (st->transcode_s3tc) {
+         switch (mesaFormat) {
+         case MESA_FORMAT_RGB_DXT1:
+            return PIPE_FORMAT_ETC2_RGB8;
+         case MESA_FORMAT_SRGB_DXT1:
+            return PIPE_FORMAT_ETC2_SRGB8;
+         case MESA_FORMAT_RGBA_DXT1:
+            return PIPE_FORMAT_ETC2_RGB8A1;
+         case MESA_FORMAT_SRGBA_DXT1:
+            return PIPE_FORMAT_ETC2_SRGB8A1;
+         case MESA_FORMAT_RGBA_DXT3:
+         case MESA_FORMAT_RGBA_DXT5:
+            return PIPE_FORMAT_ETC2_RGBA8;
+         case MESA_FORMAT_SRGBA_DXT3:
+         case MESA_FORMAT_SRGBA_DXT5:
+            return PIPE_FORMAT_ETC2_SRGBA8;
+         default:
+            UNREACHABLE("Unknown S3TC format");
+         }
+      }
+
       return _mesa_is_format_srgb(mesaFormat) ? PIPE_FORMAT_R8G8B8A8_SRGB :
                                                 PIPE_FORMAT_R8G8B8A8_UNORM;
    }

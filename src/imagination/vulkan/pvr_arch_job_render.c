@@ -677,6 +677,12 @@ VkResult pvr_arch_render_target_dataset_create(
    if (PVR_HAS_FEATURE(dev_info, apple_g9p)) {
       rt_dataset->local_free_list = device->g9p.free_list;
       result = VK_SUCCESS;
+   } else if (PVR_HAS_FEATURE(dev_info, apple_g5p)) {
+      /* Apple G5P: the list holds no pages (the kernel owns the parameter
+       * manager's memory); the device's one list says how large the pool
+       * is (pvr_arch_g5p_device_init()). */
+      rt_dataset->local_free_list = device->g5p->free_list;
+      result = VK_SUCCESS;
    } else {
       result = pvr_free_list_create(device,
                                     runtime_info->min_free_list_size,
@@ -741,7 +747,8 @@ err_pvr_rt_vheap_rtc_data_fini:
    pvr_rt_vheap_rtc_data_fini(rt_dataset);
 
 err_pvr_free_list_destroy:
-   if (rt_dataset->local_free_list != device->g9p.free_list)
+   if (rt_dataset->local_free_list != device->g9p.free_list &&
+       !(device->g5p && rt_dataset->local_free_list == device->g5p->free_list))
       pvr_free_list_destroy(rt_dataset->local_free_list);
 
 err_vk_free_rt_dataset:
@@ -876,6 +883,10 @@ pvr_render_job_ws_geometry_state_init(struct pvr_render_ctx *ctx,
                                       struct vk_sync *wait,
                                       struct pvr_winsys_geometry_state *state)
 {
+   if (job->g5p.enabled) {
+      state->fw_stream_len = pvr_arch_g5p_geom_stream(ctx->device, job, state->fw_stream,
+                                                      sizeof(state->fw_stream));
+   } else
    if (job->g9p.enabled) {
       state->fw_stream_len = pvr_arch_g9p_geom_stream(ctx->device, job, state->fw_stream,
                                                       sizeof(state->fw_stream));
@@ -1382,6 +1393,10 @@ pvr_render_job_ws_fragment_state_init(struct pvr_render_ctx *ctx,
                                       struct vk_sync *wait,
                                       struct pvr_winsys_fragment_state *state)
 {
+   if (job->g5p.enabled) {
+      state->fw_stream_len = pvr_arch_g5p_frag_stream(ctx->device, job, state->fw_stream,
+                                                      sizeof(state->fw_stream));
+   } else
    if (job->g9p.enabled) {
       state->fw_stream_len = pvr_arch_g9p_frag_stream(ctx->device, job, state->fw_stream,
                                                       sizeof(state->fw_stream));
@@ -1489,6 +1504,11 @@ static void pvr_render_job_ws_submit_info_init(
     * there. For now we'll always setup the pr.
     */
    /* G9P: no partial renders (the kernel's Apple path has none yet) */
+   if (job->g5p.enabled) {
+      /* G5P: no partial renders (the kernel's Apple path has none) */
+      submit_info->fragment_pr.fw_stream_len = 0;
+      submit_info->fragment_pr.wait = wait_frag;
+   } else
    if (job->g9p.enabled) {
       submit_info->fragment_pr.fw_stream_len = 0;
       submit_info->fragment_pr.wait = wait_frag;
