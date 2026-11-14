@@ -73,6 +73,9 @@
 #include "vk_render_pass.h"
 #include "vk_util.h"
 #include "pvr_g9p.h"
+#if defined(PVR_APPLE_G5P)
+#   include "pvr_g5p.h"
+#endif
 #include "vulkan/runtime/vk_pipeline.h"
 #include "vulkan/vulkan_core.h"
 
@@ -1156,7 +1159,7 @@ pvr_compute_pipeline_init(struct pvr_device *device,
                      PVR_PIPELINE_TYPE_COMPUTE,
                      pCreateInfo->layout,
                      &compute_pipeline->base);
-
+   PVR_G5P_HOOK(compute_pipeline)
    if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p)) {
       result = pvr_arch_g9p_compute_pipeline_compile(device, pCreateInfo,
                                                      compute_pipeline);
@@ -1222,7 +1225,7 @@ static void pvr_compute_pipeline_destroy(
       vk_free2(&device->vk.alloc, allocator, compute_pipeline);
       return;
    }
-
+   PVR_G5P_HOOK(compute_pipeline_destroy)
    pvr_pds_compute_program_destroy(device,
                                    allocator,
                                    &compute_pipeline->pds_cs_program,
@@ -1312,6 +1315,15 @@ pvr_graphics_pipeline_destroy(struct pvr_device *const device,
    struct pvr_fragment_shader_state *fragment_state =
       &gfx_pipeline->shader_state.fragment;
 
+#ifdef PVR_APPLE_G5P
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p)) {
+      /* G5P: the programs of pvr_arch_g5p_graphics_pipeline_compile() */
+      pvr_arch_g5p_graphics_pipeline_destroy(device, gfx_pipeline);
+      pvr_pipeline_finish(device, &gfx_pipeline->base);
+      vk_free2(&device->vk.alloc, allocator, gfx_pipeline);
+      return;
+   }
+#endif
    if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p)) {
       pvr_arch_g9p_graphics_pipeline_destroy(gfx_pipeline);
       pvr_pipeline_finish(device, &gfx_pipeline->base);
@@ -3122,6 +3134,12 @@ pvr_graphics_pipeline_compile(struct pvr_device *const device,
       &gfx_pipeline->shader_state.fragment;
    struct usc_mrt_setup mrt_setup = { 0 };
 
+#ifdef PVR_APPLE_G5P
+   /* G5P: its own compile, the G5P backend from NIR (pvr_arch_g5p_gfx.c) */
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p))
+      return pvr_arch_g5p_graphics_pipeline_compile(device, pCreateInfo, gfx_pipeline,
+                                                    state);
+#endif
    if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p))
       return pvr_arch_g9p_graphics_pipeline_compile(device, pCreateInfo, gfx_pipeline,
                                                     state);

@@ -17,6 +17,7 @@
 
 #include "g9p_formats.h"
 
+#include "g9p_a9.h"
 /*
  * Common-store buffer slots per shader; a vertex binding takes two (its
  * address and stride), and Zink gives each attribute its own binding
@@ -158,7 +159,7 @@ struct g9p_target {
 
 struct g9p_shader {
    mesa_shader_stage stage;
-
+   G9P_A9_FIELDS
    /* USC code, a multiple of 64 bytes, ending with the end word */
    uint16_t *code;
    unsigned code_size;

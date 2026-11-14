@@ -519,6 +519,12 @@ VkResult pvr_arch_mrt_load_ops_setup(struct pvr_cmd_buffer *cmd_buffer,
    if (!pvr_rendering_info_needs_load(dr_info))
       return VK_SUCCESS;
 
+   /* G5P builds its LOAD background from its own programs (pvr_arch_g5p_job_init(),
+    * g5p_load_background()); Rogue's load-op program was compiled and uploaded per
+    * vkCmdBeginRendering and never read. */
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p))
+      return VK_SUCCESS;
+
    result =
       pvr_mrt_add_missing_output_register_write(dr_info->mrt_setup, alloc);
    if (result != VK_SUCCESS)

@@ -26,6 +26,7 @@ void PVR_PER_ARCH(CmdResetQueryPool)(VkCommandBuffer commandBuffer,
    VkResult result;
 
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
+   PVR_G5P_HOOK(xfb_query_reset, cmd_buffer, queryPool, firstQuery, queryCount)
 
    {
       VK_FROM_HANDLE(pvr_query_pool, pool, queryPool);
@@ -99,6 +100,7 @@ void PVR_PER_ARCH(CmdCopyQueryPoolResults)(VkCommandBuffer commandBuffer,
    VkResult result;
 
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
+   PVR_G5P_HOOK(xfb_query_copy, cmd_buffer, queryPool, firstQuery, queryCount, dstBuffer, dstOffset, stride, flags)
 
    {
       VK_FROM_HANDLE(pvr_query_pool, pool, queryPool);
@@ -256,6 +258,7 @@ void PVR_PER_ARCH(CmdBeginQueryIndexedEXT)(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(pvr_query_pool, pool, queryPool);
 
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
+   PVR_G5P_HOOK(xfb_query_begin, cmd_buffer, pool, query, index)
 
    if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g9p) &&
        pool->query_type == VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT) {
@@ -288,6 +291,7 @@ void PVR_PER_ARCH(CmdEndQueryIndexedEXT)(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(pvr_query_pool, pool, queryPool);
 
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
+   PVR_G5P_HOOK(xfb_query_end, cmd_buffer, pool, query)
 
    if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g9p) &&
        pool->query_type == VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT) {

@@ -77,12 +77,15 @@
 #include "util/u_upload_mgr.h"
 #include "util/u_tile.h"
 #include "util/format/u_format.h"
+#include "util/format/u_format_etc2_enc.h"
 #include "util/format/u_formats.h"
 #include "util/u_surface.h"
 #include "util/u_sampler.h"
 #include "util/u_math.h"
 #include "util/box.h"
 #include "util/u_memory.h"
+#include "util/u_cpu_detect.h"
+#include "util/u_thread.h"
 #include "cso_cache/cso_context.h"
 
 #define DBG if (0) printf
@@ -685,6 +688,100 @@ upload_astc_slice_with_flushed_void_extents(uint8_t *dst,
    }
 }
 
+/* Some rows of blocks of an S3TC -> ETC2 transcode */
+struct s3tc_transcode_job {
+   uint8_t *dst;
+   unsigned dst_stride;
+   enum pipe_format dst_format;
+   const uint8_t *src;
+   unsigned src_stride;
+   mesa_format src_format;
+   unsigned width, height;
+   bool ok;
+};
+
+/* A row of blocks at a time: decoded to RGBA8, encoded again */
+static int
+s3tc_transcode_rows(void *data)
+{
+   struct s3tc_transcode_job *job = data;
+   const uint8_t *src = job->src;
+   uint8_t *dst = job->dst;
+   uint8_t *rgba = malloc((size_t)job->width * 4 * 4);
+
+   job->ok = rgba != NULL;
+   if (!rgba)
+      return 0;
+
+   for (unsigned y = 0; y < job->height; y += 4) {
+      const unsigned rows = MIN2(4, job->height - y);
+
+      _mesa_unpack_s3tc(rgba, job->width * 4, src, job->src_stride,
+                        job->width, rows, job->src_format);
+      util_format_etc2_encode_rgba8(job->dst_format, dst, job->dst_stride,
+                                    rgba, job->width * 4, job->width, rows);
+      src += job->src_stride;
+      dst += job->dst_stride;
+   }
+
+   free(rgba);
+   return 0;
+}
+
+/**
+ * Transcode S3TC to the ETC2 format of the same block size. The encoder is
+ * what an upload costs, so an image of some size is split over the CPUs (up
+ * to four): the rows of blocks are independent.
+ */
+static bool
+transcode_s3tc_to_etc2(uint8_t *dst, unsigned dst_stride,
+                       enum pipe_format dst_format,
+                       const uint8_t *src, unsigned src_stride,
+                       mesa_format src_format,
+                       unsigned width, unsigned height)
+{
+   const unsigned block_rows = DIV_ROUND_UP(height, 4);
+   struct s3tc_transcode_job job[4];
+   thrd_t thread[4];
+   bool threaded[4] = { false };
+   unsigned jobs = 1;
+   bool ok = true;
+
+   if ((uint64_t)width * height >= 128 * 128)
+      jobs = CLAMP(util_get_cpu_caps()->nr_cpus, 1, MIN2(4, block_rows));
+
+   for (unsigned j = 0, row = 0; j < jobs; j++) {
+      const unsigned rows = (block_rows - row) / (jobs - j);
+
+      job[j] = (struct s3tc_transcode_job) {
+         .dst = dst + (size_t)row * dst_stride,
+         .dst_stride = dst_stride,
+         .dst_format = dst_format,
+         .src = src + (size_t)row * src_stride,
+         .src_stride = src_stride,
+         .src_format = src_format,
+         .width = width,
+         .height = MIN2(rows * 4, height - row * 4),
+      };
+      row += rows;
+   }
+
+   /* the last job is this thread's */
+   for (unsigned j = 0; j + 1 < jobs; j++)
+      threaded[j] = u_thread_create(&thread[j], s3tc_transcode_rows,
+                                    &job[j]) == thrd_success;
+   for (unsigned j = 0; j < jobs; j++) {
+      if (!threaded[j])
+         s3tc_transcode_rows(&job[j]);
+   }
+   for (unsigned j = 0; j < jobs; j++) {
+      if (threaded[j])
+         thrd_join(thread[j], NULL);
+      ok &= job[j].ok;
+   }
+   return ok;
+}
+
 void
 st_UnmapTextureImage(struct gl_context *ctx,
                      struct gl_texture_image *texImage,
@@ -765,6 +862,16 @@ st_UnmapTextureImage(struct gl_context *ctx,
                                                         transfer->box.width,
                                                         transfer->box.height,
                                                         texImage->pt->format);
+         } else if (_mesa_is_format_s3tc(texImage->TexFormat) &&
+                    util_format_etc2_can_encode(texImage->pt->format)) {
+            if (!transcode_s3tc_to_etc2(map, transfer->stride,
+                                        texImage->pt->format,
+                                        itransfer->temp_data,
+                                        itransfer->temp_stride,
+                                        texImage->TexFormat,
+                                        transfer->box.width,
+                                        transfer->box.height))
+               _mesa_error(ctx, GL_OUT_OF_MEMORY, "S3TC transcode");
          } else if (util_format_is_compressed(texImage->pt->format)) {
             /* Transcode into a different compressed format. */
             size_t size =
@@ -2845,7 +2952,14 @@ fallback_copy_texsubimage(struct gl_context *ctx,
    unsigned dst_width = width;
    unsigned dst_height = height;
    unsigned dst_depth = 1;
-   struct pipe_transfer *transfer;
+   struct pipe_transfer *transfer = NULL;
+   /* A compressed format the driver doesn't have: the image's own copy of the
+    * compressed data is what gets written, and unmapping that decompresses
+    * or transcodes it into the resource (whose format is another one).
+    */
+   const bool compressed_fallback =
+      st_compressed_format_fallback(st, stImage->TexFormat);
+   GLint fallback_stride = 0;
 
    if (ST_DEBUG & DEBUG_FALLBACK)
       debug_printf("%s: fallback processing\n", __func__);
@@ -2873,10 +2987,17 @@ fallback_copy_texsubimage(struct gl_context *ctx,
    else
       transfer_usage = PIPE_MAP_WRITE;
 
-   texDest = st_texture_image_map(st, stImage, transfer_usage,
-                                  destX, destY, slice,
-                                  dst_width, dst_height, dst_depth,
-                                  &transfer);
+   if (compressed_fallback) {
+      st_MapTextureImage(ctx, stImage, slice, destX, destY,
+                         dst_width, dst_height,
+                         GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_RANGE_BIT,
+                         &texDest, &fallback_stride);
+   } else {
+      texDest = st_texture_image_map(st, stImage, transfer_usage,
+                                     destX, destY, slice,
+                                     dst_width, dst_height, dst_depth,
+                                     &transfer);
+   }
    if (!texDest) {
       _mesa_error(ctx, GL_OUT_OF_MEMORY, "glCopyTexSubImage()");
       goto err;
@@ -2938,7 +3059,10 @@ fallback_copy_texsubimage(struct gl_context *ctx,
             unpack.Invert = GL_TRUE;
          }
 
-         if (stImage->pt->target == PIPE_TEXTURE_1D_ARRAY) {
+         if (compressed_fallback) {
+            dstRowStride = fallback_stride;
+         }
+         else if (stImage->pt->target == PIPE_TEXTURE_1D_ARRAY) {
             dstRowStride = transfer->layer_stride;
          }
          else {
@@ -2975,7 +3099,10 @@ fallback_copy_texsubimage(struct gl_context *ctx,
       free(tempSrc);
    }
 
-   st_texture_image_unmap(st, stImage, slice);
+   if (compressed_fallback)
+      st_UnmapTextureImage(ctx, stImage, slice);
+   else
+      st_texture_image_unmap(st, stImage, slice);
 err:
    pipe->texture_unmap(pipe, src_trans);
 }

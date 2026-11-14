@@ -36,6 +36,9 @@
 #include "pvr_entrypoints.h"
 #include "pvr_formats.h"
 #include "pvr_g9p.h"
+#if defined(PVR_APPLE_G5P)
+#include "pvr_g5p.h"
+#endif
 #include "pvr_hw_pass.h"
 #include "pvr_image.h"
 #include "pvr_job_transfer.h"
@@ -223,6 +226,7 @@ static void pvr_setup_transfer_surface(struct pvr_device *device,
    surface->vk_format = format;
    surface->mem_layout = image->memlayout;
    surface->sample_count = image->vk.samples;
+   PVR_G5P_HOOK(transfer_slice, image, surface, &info, fdepth, aspect_mask)
 
    /* G9P: a 3D image's slices are twiddled 2D layers, one depthPitch apart */
    if (image->memlayout == PVR_MEMLAYOUT_3DTWIDDLED &&
@@ -288,6 +292,12 @@ void pvr_rogue_CmdBlitImage2(VkCommandBuffer commandBuffer,
    if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p) &&
        pvr_arch_g9p_meta_blit(cmd_buffer, pBlitImageInfo))
       return;
+#if defined(PVR_APPLE_G5P)
+   /* G5P: a blit the A9 can sample and render is a render pass (pvr_arch_g5p_meta.c) */
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p) &&
+       pvr_arch_g5p_meta_blit(cmd_buffer, pBlitImageInfo))
+      return;
+#endif
 
    PVR_TRACE_BEGIN_TRANSFER(cmd_buffer, PVR_TRANSFER_OP_BLIT_IMAGE);
 
@@ -1604,6 +1614,9 @@ void pvr_rogue_CmdUpdateBuffer(VkCommandBuffer commandBuffer,
 
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
 
+   PVR_G5P_HOOK(update_buffer, cmd_buffer, dstBuffer, dstOffset, dataSize, pData)
+
+
    result =
       pvr_arch_cmd_buffer_upload_general(cmd_buffer, pData, dataSize, &pvr_bo);
    if (result != VK_SUCCESS)
@@ -1627,6 +1640,9 @@ void pvr_rogue_CmdCopyBuffer2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(pvr_cmd_buffer, cmd_buffer, commandBuffer);
 
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
+
+   PVR_G5P_HOOK(copy_buffer, cmd_buffer, pCopyBufferInfo)
+
 
    PVR_TRACE_BEGIN_TRANSFER(cmd_buffer, PVR_TRANSFER_OP_COPY_BUFFER);
 
@@ -1658,6 +1674,9 @@ void pvr_rogue_CmdFillBuffer(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(pvr_buffer, dst, dstBuffer);
 
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
+
+   PVR_G5P_HOOK(fill_buffer, cmd_buffer, dstBuffer, dstOffset, fillSize, data)
+
 
    PVR_TRACE_BEGIN_TRANSFER(cmd_buffer, PVR_TRANSFER_OP_COPY_BUFFER);
 
@@ -2590,7 +2609,7 @@ void pvr_rogue_CmdClearAttachments(VkCommandBuffer commandBuffer,
          pvr_cmd_buffer_set_error_unwarned(cmd_buffer, result);
       return;
    }
-
+   PVR_G5P_HOOK(clear_attachments, cmd_buffer, attachmentCount, pAttachments, rectCount, pRects)
    /* TODO: There are some optimizations that can be made here:
     *  - For a full screen clear, update the clear values for the corresponding
     *    attachment index.

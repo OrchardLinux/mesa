@@ -905,6 +905,8 @@ struct pipe_caps {
    bool primitive_restart_fixed_index;
    bool indep_blend_enable;
    bool indep_blend_func;
+   /* Require EXT_color_buffer_float or ES 3.2 for packed-float FBOs in ES. */
+   bool r11g11b10f_requires_color_buffer_float;
    bool fs_coord_origin_upper_left;
    bool fs_coord_origin_lower_left;
    bool fs_coord_pixel_center_half_integer;

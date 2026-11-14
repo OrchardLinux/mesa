@@ -33,6 +33,9 @@
 #include "pvr_rt_dataset.h"
 #include "pvr_tex_state.h"
 #include "pvr_g9p.h"
+#if defined(PVR_APPLE_G5P)
+#   include "pvr_g5p.h"
+#endif
 #include "pvr_utrace.h"
 #include "util/os_misc.h"
 
@@ -846,11 +849,23 @@ VkResult PVR_PER_ARCH(create_device)(struct pvr_physical_device *pdevice,
    pvr_bo_suballocator_init(&device->suballoc_general,
                             device->heaps.general_heap,
                             device,
+#ifdef PVR_APPLE_G5P
+                            PVR_HAS_FEATURE(&pdevice->dev_info, apple_g5p)
+                               ? 512 * 1024
+                               : PVR_SUBALLOCATOR_GENERAL_SIZE);
+#else
                             PVR_SUBALLOCATOR_GENERAL_SIZE);
+#endif
    pvr_bo_suballocator_init(&device->suballoc_pds,
                             device->heaps.pds_heap,
                             device,
+#ifdef PVR_APPLE_G5P
+                            PVR_HAS_FEATURE(&pdevice->dev_info, apple_g5p)
+                               ? 512 * 1024
+                               : PVR_SUBALLOCATOR_PDS_SIZE);
+#else
                             PVR_SUBALLOCATOR_PDS_SIZE);
+#endif
    pvr_bo_suballocator_init(&device->suballoc_transfer,
                             device->heaps.transfer_frag_heap,
                             device,
@@ -908,6 +923,13 @@ VkResult PVR_PER_ARCH(create_device)(struct pvr_physical_device *pdevice,
          goto err_pvr_free_compute_empty;
       }
    }
+#if defined(PVR_APPLE_G5P)
+   if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g5p)) {
+      result = pvr_arch_g5p_device_init(device);
+      if (result != VK_SUCCESS)
+         goto err_pvr_free_compute_empty;
+   }
+#endif
 
    result = pvr_device_init_view_index_init_programs(device);
    if (result != VK_SUCCESS)
@@ -1011,6 +1033,10 @@ err_pvr_finish_g9p:
       pvr_arch_g9p_gfx_device_finish(device);
       pvr_arch_g9p_device_finish(device);
    }
+#if defined(PVR_APPLE_G5P)
+   if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g5p))
+      pvr_arch_g5p_device_finish(device);
+#endif
 
 err_pvr_free_compute_empty:
    pvr_bo_suballoc_free(device->pds_compute_empty_program.pvr_bo);
@@ -1090,6 +1116,10 @@ void PVR_PER_ARCH(destroy_device)(struct pvr_device *device,
       pvr_arch_g9p_gfx_device_finish(device);
       pvr_arch_g9p_device_finish(device);
    }
+#if defined(PVR_APPLE_G5P)
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p))
+      pvr_arch_g5p_device_finish(device);
+#endif
    pvr_bo_suballoc_free(device->pds_compute_empty_program.pvr_bo);
 
    for (uint32_t u = 0; u < PVR_MAX_MULTIVIEW; ++u)

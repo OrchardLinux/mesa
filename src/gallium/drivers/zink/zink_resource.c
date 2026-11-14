@@ -3020,6 +3020,18 @@ zink_transfer_copy_bufimage(struct zink_context *ctx,
 
    int x = buf2img ? trans->offset : 0;
    assert(dst->obj->transfer_dst);
+   if (buf2img && !(trans->base.b.usage & PIPE_MAP_UNSYNCHRONIZED) && !ctx->in_rp) {
+      /* the staging buffer is garbage after this copy but stays allocated until the batch completes:
+       * flush (and wait, like the oom flush) before a loop of uploads holds too much of it;
+       * never inside a renderpass, where the frame's own flush comes soon enough
+       */
+      struct zink_screen *screen = zink_screen(ctx->base.screen);
+      ctx->bs->staging_size += src->obj->size;
+      if (screen->clamp_staging_mem && ctx->bs->staging_size >= screen->clamp_staging_mem) {
+         ctx->oom_flush = true;
+         ctx->oom_stall = true;
+      }
+   }
    zink_copy_image_buffer(ctx, dst, src, x, 0, 0, trans->base.b.level, &trans->base.b.box, trans->base.b.usage);
 }
 

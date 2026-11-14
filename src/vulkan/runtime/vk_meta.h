@@ -296,6 +296,11 @@ VkResult vk_meta_create_buffer_view(struct vk_command_buffer *cmd,
                                     const VkBufferViewCreateInfo *info,
                                     VkBufferView *buffer_view_out);
 
+VkResult vk_meta_create_image(struct vk_command_buffer *cmd,
+                              struct vk_meta_device *meta,
+                              const VkImageCreateInfo *info,
+                              VkImage *image_out);
+
 VkResult vk_meta_create_image_view(struct vk_command_buffer *cmd,
                                    struct vk_meta_device *meta,
                                    const VkImageViewCreateInfo *info,

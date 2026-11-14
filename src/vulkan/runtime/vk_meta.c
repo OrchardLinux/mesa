@@ -524,6 +524,21 @@ vk_meta_create_buffer(struct vk_command_buffer *cmd,
 }
 
 VkResult
+vk_meta_create_image(struct vk_command_buffer *cmd,
+                     struct vk_meta_device *meta,
+                     const VkImageCreateInfo *info, VkImage *image_out)
+{
+   struct vk_device *device = cmd->base.device;
+   VkResult result = device->dispatch_table.CreateImage(
+      vk_device_to_handle(device), info, NULL, image_out);
+   if (result != VK_SUCCESS)
+      return result;
+   vk_meta_object_list_add_handle(&cmd->meta_objects, VK_OBJECT_TYPE_IMAGE,
+                                  (uint64_t)*image_out);
+   return VK_SUCCESS;
+}
+
+VkResult
 vk_meta_create_image_view(struct vk_command_buffer *cmd,
                           struct vk_meta_device *meta,
                           const VkImageViewCreateInfo *info,

@@ -312,6 +312,10 @@
 #define DRI_CONF_TRANSCODE_ASTC(def) \
    DRI_CONF_OPT_B(transcode_astc, def, "Transcode ASTC formats to DXTC if unsupported")
 
+#define DRI_CONF_TRANSCODE_S3TC(def) \
+   DRI_CONF_OPT_I(transcode_s3tc, def, 0, 2, \
+                  "Transcode S3TC formats to ETC2 (0 = never, 1 = if S3TC is unsupported and ETC2 is supported, 2 = whenever ETC2 is supported, for testing)")
+
 #define DRI_CONF_ALLOW_COMPRESSED_FALLBACK(def) \
    DRI_CONF_OPT_B(allow_compressed_fallback, def, "Allow fallback to uncompressed formats for unsupported compressed formats")
 

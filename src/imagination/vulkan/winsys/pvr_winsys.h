@@ -338,7 +338,7 @@ struct pvr_winsys_render_submit_info {
       /* Firmware stream buffer. This is the maximum possible size taking into
        * consideration all HW features, quirks and enhancements.
        */
-      uint8_t fw_stream[640];
+      uint8_t fw_stream[672];
       uint32_t fw_stream_len;
 
       struct pvr_winsys_fragment_state_flags {
@@ -457,6 +457,9 @@ struct pvr_winsys {
    uint64_t page_size;
    uint32_t log2_page_size;
 
+   /* G5P GET_RENDER_INFO admission bound; zero on other winsyses. */
+   uint32_t max_vdm_bytes;
+
    const struct vk_sync_type *sync_types[3];
    struct vk_sync_type syncobj_type;
    struct vk_sync_timeline_type timeline_syncobj_type;
@@ -479,5 +482,8 @@ VkResult pvr_winsys_create(const char *render_path,
                            bool keep_display_master,
                            const VkAllocationCallbacks *alloc,
                            struct pvr_winsys **ws_out);
+
+/* Apple A9 (G5P): its hooks in the shared files */
+#include "pvr_g5p_hooks.h"
 
 #endif /* PVR_WINSYS_H */

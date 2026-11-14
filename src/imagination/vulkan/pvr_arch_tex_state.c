@@ -120,7 +120,7 @@ VkResult pvr_arch_pack_tex_state(struct pvr_device *device,
       vk_format_get_ycbcr_info(info->format);
    enum pvr_memlayout mem_layout;
    VkImageViewType iview_type;
-
+   PVR_G5P_HOOK(texel_state, device, info, state)
    if (info->type == VK_IMAGE_VIEW_TYPE_1D &&
        info->mem_layout == PVR_MEMLAYOUT_LINEAR) {
       /* Change the memory layout to twiddled as there isn't a TEXSTATE_TEXTYPE

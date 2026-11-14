@@ -33,6 +33,9 @@
 #if defined(PVR_SUPPORT_SERVICES_DRIVER)
 #   include "pvrsrvkm/pvr_srv_public.h"
 #endif
+#if defined(PVR_APPLE_G5P)
+#   include "apple_g5p/pvr_g5p_winsys.h"
+#endif
 
 void pvr_winsys_destroy(struct pvr_winsys *ws)
 {
@@ -100,6 +103,10 @@ VkResult pvr_winsys_create(const char *render_path,
 #if defined(PVR_SUPPORT_SERVICES_DRIVER)
    } else if (strcmp(version->name, PVR_SRV_DRIVER_NAME) == 0) {
       result = pvr_srv_winsys_create(render_fd, display_fd, alloc, ws_out);
+#endif
+#if defined(PVR_APPLE_G5P)
+   } else if (strcmp(version->name, PVR_G5P_DRIVER_NAME) == 0) {
+      result = pvr_g5p_winsys_create(render_fd, display_fd, alloc, ws_out);
 #endif
    } else {
       result = vk_errorf(

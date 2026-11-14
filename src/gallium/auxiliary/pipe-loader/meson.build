@@ -11,6 +11,10 @@ files_pipe_loader = files(
 
 libpipe_loader_defines = []
 libpipe_loader_links = []
+# Apple A9 (G5P, -Dimagination-g5p-experimental): its render node goes to Zink
+if get_option('imagination-g5p-experimental')
+  libpipe_loader_defines += '-DPIPE_LOADER_APPLE_G5P'
+endif
 
 if dep_libdrm.found()
   files_pipe_loader += files('pipe_loader_drm.c')

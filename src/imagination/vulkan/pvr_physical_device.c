@@ -28,7 +28,7 @@
 
 #include "pco/pco.h"
 #include "pco_uscgen_programs.h"
-
+#include "pvr_g5p_ds_hooks.h"
 #include "pvr_device.h"
 #include "pvr_dump_info.h"
 #include "pvr_entrypoints.h"
@@ -36,6 +36,9 @@
 #include "pvr_macros.h"
 #include "pvr_winsys.h"
 #include "pvr_wsi.h"
+#if defined(PVR_APPLE_G5P)
+#include "winsys/apple_g5p/pvr_g5p_winsys.h"
+#endif
 
 #define VK_VENDOR_ID_IMAGINATION 0x1010
 
@@ -655,8 +658,11 @@ static bool pvr_physical_device_get_properties(
       (usc_slots * max_instances_per_pds_task >= 512U) ? 512U : 384U;
 
    assert(pdevice->memory.memoryHeapCount == 1);
+   /* At least the spec's minimum (maxMemoryAllocationSize, 2^30): a G5P heap
+    * may be smaller (the memory its kernel VM can pin); an allocation larger
+    * than the heap still fails with VK_ERROR_OUT_OF_DEVICE_MEMORY. */
    const VkDeviceSize max_memory_alloc_size =
-      pdevice->memory.memoryHeaps[0].size;
+      MAX2(pdevice->memory.memoryHeaps[0].size, 1ull << 30);
 
    const uint32_t line_sub_pixel_precision_bits =
       PVR_HAS_FEATURE(dev_info, simple_internal_parameter_format) ? 4U : 8U;
@@ -1040,6 +1046,9 @@ static bool pvr_physical_device_get_properties(
       .maxDescriptorSetUpdateAfterBindTotalBuffersDynamic = PVR_MAX_DYNAMIC_BUFFERS,
    };
 
+   if (PVR_HAS_FEATURE(dev_info, apple_g5p))
+      snprintf(properties->driverName, sizeof(properties->driverName), "Mesa PowerVR G5P");
+
    if (strlen(pdevice->instance->drirc.debug.force_vk_devicename) > 0) {
       snprintf(properties->deviceName,
                sizeof(properties->deviceName),
@@ -1255,6 +1264,14 @@ VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
    /* Setup available memory heaps and types */
    pdevice->memory.memoryHeapCount = 1;
    pdevice->memory.memoryHeaps[0].size = pvr_compute_heap_size(instance);
+#if defined(PVR_APPLE_G5P)
+   /* G5P: unified memory, a share of RAM, but no more than the kernel VM can
+    * pin (pvr_g5p_winsys_heap_size()): a heap the kernel cannot back made
+    * clients plan for memory they could never get. */
+   if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g5p))
+      pdevice->memory.memoryHeaps[0].size = pvr_g5p_winsys_heap_size(
+         pdevice->ws, os_get_gpu_heap_size(instance->drirc.misc.heap_memory_percent, NULL));
+#endif
    pdevice->memory.memoryHeaps[0].flags = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
 
    pdevice->memory.memoryTypeCount = 1;
@@ -1280,7 +1297,23 @@ VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
                          "Failed to collect physical device properties");
       goto err_pvr_winsys_destroy;
    }
-
+   PVR_G5P_HOOK(msaa_limits, pdevice, &supported_properties)
+#if defined(PVR_APPLE_G5P)
+   /* G5P: transform feedback is the vertex program's own stores and a CPU
+    * resolve (pvr_g5p_xfb.h): stream 0, no byte-count draws; its stream
+    * queries count on the CPU too. No dynamic colour-write enables: G5P compiles the write
+    * mask into the fragment program, and Zink makes them dynamic whenever
+    * they exist. */
+   if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g5p)) {
+      supported_features.geometryStreams = false;
+      supported_properties.transformFeedbackDraw = false;
+      supported_properties.transformFeedbackQueries = true;
+      supported_extensions.EXT_color_write_enable = false;
+      supported_features.dualSrcBlend = true;
+      supported_properties.maxFragmentDualSrcAttachments = 1;
+      supported_features.colorWriteEnable = false; PVR_G5P_HOOK(release9_features, supported_features)
+   }
+#endif
    /*
     * G9P: host image copies through the driver's CPU copies (all its memory
     * is CPU-visible; pvr_arch_g9p_transfer.c)
@@ -1308,7 +1341,7 @@ VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
       memcpy(supported_properties.optimalTilingLayoutUUID, "G9P layout 1\0\0\0\0", VK_UUID_SIZE);
       supported_properties.identicalMemoryTypeRequirements = true;
    }
-
+   PVR_G5P_HOOK(texel_limits, pdevice, &supported_properties)
    vk_physical_device_dispatch_table_from_entrypoints(
       &dispatch_table,
       &pvr_physical_device_entrypoints,

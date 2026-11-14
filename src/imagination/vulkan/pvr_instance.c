@@ -114,6 +114,10 @@ pvr_drm_device_is_compatible(drmDevicePtr drm_dev)
 #if defined(PVR_SUPPORT_SERVICES_DRIVER)
    is_pvr |= !strcmp(version->name, PVR_SRV_DRIVER_NAME);
 #endif /* defined(PVR_SUPPORT_SERVICES_DRIVER) */
+#if defined(PVR_APPLE_G5P)
+   /* Apple A9 (G5P): our kernel's typed UAPI (winsys/apple_g5p) */
+   is_pvr |= !strcmp(version->name, "apple_g5p");
+#endif
 
    drmFreeVersion(version);
    close(fd);
