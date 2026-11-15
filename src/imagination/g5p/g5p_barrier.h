@@ -10,7 +10,7 @@ static inline void
 g5p_shared_barrier_fenced(struct g9p_code *c, unsigned r, unsigned T,
                    unsigned k, unsigned st, unsigned N, int fence_pair)
 {
-   assert(!c->fragment && k < 128 && N && N <= 31);
+   assert(!c->fragment && k < 128 && N && N <= 15);
    g9p_wait(c);
    G9P_EMIT(c, 0x1181, 0x0101 | T << 9, 0x0120, 0xa5bd, 0x0070);
    unsigned skip = g9p_jump(c, 0x0120, 0);

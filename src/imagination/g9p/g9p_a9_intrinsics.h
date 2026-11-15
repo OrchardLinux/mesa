@@ -108,9 +108,10 @@ static bool a9_barrier(struct g9p_ctx *ctx, nir_intrinsic_instr *in)
       g9p_mov_uniform(ctx->c,fence_pair+1,57,zero);
    }
    if (scope == SCOPE_WORKGROUP) {
-      unsigned N = ctx->a9_barriers_remaining--;
-      if (!N || N > 31)
-         return g9p_fail(ctx->out, "more than 31 workgroup barrier sites in a compute shader");
+      /* Apple's A9 b30/b32/b40/b70 (disassembled barrier kernels): both
+       * X2f and X0f count down and wrap in 1..15, not 1..31. */
+      unsigned rem = ctx->a9_barriers_remaining--;
+      unsigned N = ((rem - 1) % 15) + 1;
       if (n > 32) {
          int r = alloc_temp(ctx), t = alloc_temp(ctx);
          if (r < 0 || t < 0) return false;
