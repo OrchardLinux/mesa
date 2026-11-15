@@ -671,10 +671,12 @@ static bool pvr_physical_device_get_properties(
       .deviceType = VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU,
       /* deviceName and pipelineCacheUUID are filled below .*/
 
-      .maxImageDimension1D = 4096U,
-      .maxImageDimension2D = 4096U,
+      /* G5P: 8192, the Orchard kernel's render-target bound (G5P_RU_MAX_DIM) and inside the A9's
+       * 14-bit width/height fields of the texture and PBE states (pvr_g5p_tex_encode.h, g5p_pbe.h) */
+      .maxImageDimension1D = PVR_HAS_FEATURE(dev_info, apple_g5p) ? 8192U : 4096U,
+      .maxImageDimension2D = PVR_HAS_FEATURE(dev_info, apple_g5p) ? 8192U : 4096U,
       .maxImageDimension3D = pvr_get_texture_extent_max_z(dev_info),
-      .maxImageDimensionCube = 4096U,
+      .maxImageDimensionCube = PVR_HAS_FEATURE(dev_info, apple_g5p) ? 8192U : 4096U,
       .maxImageArrayLayers = rogue_get_render_size_max_z(dev_info),
       .maxTexelBufferElements = 64U * 1024U,
       .maxUniformBufferRange = PVR_HAS_FEATURE(dev_info, apple_g5p) ? 64U * 1024U : 16U * 1024U,
@@ -763,10 +765,11 @@ static bool pvr_physical_device_get_properties(
       .maxSamplerAnisotropy = 16.0f, /* Requires samplerAnisotropy */
       .maxViewports = 1U, /* Requires multiViewport */
 
-      .maxViewportDimensions[0] = 4096U,
-      .maxViewportDimensions[1] = 4096U,
-      .viewportBoundsRange[0] = -8192.0f,
-      .viewportBoundsRange[1] = 8191.0f,
+      .maxViewportDimensions[0] = PVR_HAS_FEATURE(dev_info, apple_g5p) ? 8192U : 4096U,
+      .maxViewportDimensions[1] = PVR_HAS_FEATURE(dev_info, apple_g5p) ? 8192U : 4096U,
+      /* at least [-2 * maxViewportDimensions, 2 * maxViewportDimensions - 1] */
+      .viewportBoundsRange[0] = PVR_HAS_FEATURE(dev_info, apple_g5p) ? -16384.0f : -8192.0f,
+      .viewportBoundsRange[1] = PVR_HAS_FEATURE(dev_info, apple_g5p) ? 16383.0f : 8191.0f,
 
       .viewportSubPixelBits = 0U,
       .minMemoryMapAlignment = pdevice->ws->page_size,
@@ -786,8 +789,8 @@ static bool pvr_physical_device_get_properties(
       .maxInterpolationOffset = 0.5f,
       .subPixelInterpolationOffsetBits = 4U,
 
-      .maxFramebufferWidth = 4096U,
-      .maxFramebufferHeight = 4096U,
+      .maxFramebufferWidth = PVR_HAS_FEATURE(dev_info, apple_g5p) ? 8192U : 4096U,
+      .maxFramebufferHeight = PVR_HAS_FEATURE(dev_info, apple_g5p) ? 8192U : 4096U,
       .maxFramebufferLayers = 256U,
 
       /* Note: update nir_shader_compiler_options.max_samples when changing this. */
