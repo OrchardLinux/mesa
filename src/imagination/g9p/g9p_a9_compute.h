@@ -165,22 +165,21 @@ bool g9p_a9_compile_compute(nir_shader *nir, struct g9p_shader *out, void *mem_c
    };
    memset(out, 0, sizeof(*out));
    out->a9 = true;
+   a9_last_refusal[0] = 0;
    lower_front(nir);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, a9_lower_subgroups_size1,
             nir_metadata_control_flow, NULL);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, a9_pack_image_store,
             nir_metadata_control_flow, NULL);
    NIR_PASS(_, nir, nir_lower_alu);
-   NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_mem_shared, glsl_get_natural_size_align_bytes);
-   NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_shared, nir_address_format_32bit_offset);
+   /* lower_front() already allocated and lowered shared variables. Doing
+    * it again double-counts the allocation after addresses became explicit. */
    const nir_lower_mem_access_bit_sizes_options shared_opts = {
       .modes = nir_var_mem_shared, .callback = a9_shared_size_align,
    };
    NIR_PASS(_, nir, nir_lower_mem_access_bit_sizes, &shared_opts);
    if (nir->info.shared_size > 16384) {
-      if (!out->a9_refusal[0])
-         snprintf(out->a9_refusal, sizeof(out->a9_refusal), "shared allocation exceeds 16384 bytes");
-      return false;
+      return g9p_fail(out, "shared memory %u bytes, above the A9's 16384", nir->info.shared_size);
    }
    out->a9_local_dwords = 4 + DIV_ROUND_UP(nir->info.shared_size, 4);
    NIR_PASS(_, nir, nir_shader_tex_pass, a9_lower_array_layer, nir_metadata_control_flow, NULL);
@@ -198,20 +197,20 @@ bool g9p_a9_compile_compute(nir_shader *nir, struct g9p_shader *out, void *mem_c
       if (!out->a9_refusal[0])
          snprintf(out->a9_refusal, sizeof(out->a9_refusal),
                "more than 13 buffers with shared texture levels (common 28-30)");
-      return false;
+      return backend_failure(out, &(struct g9p_ctx){0});
    }
    if (out->a9_num_uploads && out->num_buffers > 15) {
       if (!out->a9_refusal[0])
          snprintf(out->a9_refusal, sizeof(out->a9_refusal),
                "%u buffers with sampled textures (buffer words reach the texture words at common 32)",
                out->num_buffers);
-      return false;
+      return backend_failure(out, &(struct g9p_ctx){0});
    }
    if (sizes && out->num_textures) {
       if (!out->a9_refusal[0])
          snprintf(out->a9_refusal, sizeof(out->a9_refusal),
                "a texture size query together with a storage image (both at common 40-47)");
-      return false;
+      return backend_failure(out, &(struct g9p_ctx){0});
    }
    return true;
 }

@@ -19,6 +19,8 @@
 #include <limits.h>
 #include <stdio.h>
 #include "c11/threads.h"
+#include <stdarg.h>
+#include "util/log.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -45,6 +47,43 @@
 #include "util/log.h"
 
 DEBUG_GET_ONCE_BOOL_OPTION(g9p_pressure, "G9P_PRESSURE", false)
+
+/* Pipeline compilation may run on several threads. Keep the fallback for
+ * the current compile, never a different pipeline's last diagnostic. */
+static thread_local char a9_last_refusal[192];
+const char *g9p_a9_last_refusal(void)
+{
+   return a9_last_refusal[0] ? a9_last_refusal : "A9 backend failed without a diagnostic";
+}
+
+static bool
+g9p_fail(struct g9p_shader *out, const char *fmt, ...)
+{
+   char why[192];
+   va_list ap;
+   va_start(ap, fmt);
+   vsnprintf(why, sizeof(why), fmt, ap);
+   va_end(ap);
+   if (out->a9) {
+      if (!out->a9_refusal[0])
+         snprintf(out->a9_refusal, sizeof(out->a9_refusal), "%s", why);
+      snprintf(a9_last_refusal, sizeof(a9_last_refusal), "%s", out->a9_refusal);
+   }
+   if (out->a9) {
+      mesa_logw("G5P refuses: %s", why);
+   } else {
+      /* Preserve main's non-A9 diagnostics. */
+      if (!strcmp(why, "shader has no entry point"))
+         return false;
+      if (!strncmp(why, "too many loops", 14))
+         snprintf(why, sizeof(why), "too many loops");
+      char *suffix = strstr(why, " (no parking victim)");
+      if (!suffix) suffix = strstr(why, " (bank-0 homes exhausted)");
+      if (suffix) *suffix = 0;
+      fprintf(stderr, "g9p: %s\n", why);
+   }
+   return false;
+}
 
 /* r0-r29 for values, the mask stack after them (G9P_REGS: debug override) */
 static unsigned
@@ -317,6 +356,23 @@ struct g9p_ctx {
    unsigned *exit_jumps;
    unsigned num_exit_jumps, max_exit_jumps;
 };
+
+/* Every compile_back failure reaches this helper, including control flow
+ * failures outside emit_instr(). An instruction's precise reason wins. */
+static bool
+backend_failure(struct g9p_shader *out, const struct g9p_ctx *ctx)
+{
+   if (out->a9) {
+      if (out->a9_refusal[0]) {
+         char why[sizeof(out->a9_refusal)];
+         memcpy(why, out->a9_refusal, sizeof(why));
+         return g9p_fail(out, "%s", why);
+      }
+      return ctx->oom ? g9p_fail(out, "out of registers at instruction %u", ctx->oom_ip) :
+                        g9p_fail(out, "backend control flow or register allocation failed at instruction %u", ctx->ip);
+   }
+   return false;
+}
 
 static unsigned
 key(const nir_def *def, unsigned comp)
@@ -3764,6 +3820,10 @@ emit_cf_list(struct g9p_ctx *ctx, struct exec_list *list)
 static bool
 generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
 {
+   if (ctx->out->a9) {
+      ctx->out->a9_refusal[0] = a9_last_refusal[0] = 0;
+      ctx->out->a9_num_uploads = 0;
+   }
    uint16_t *body;
    unsigned body_n;
 
@@ -4922,7 +4982,7 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
 
    impl = nir_shader_get_entrypoint(nir);
    if (!impl)
-      return false;
+      return g9p_fail(out, "shader has no entry point");
    nir_index_ssa_defs(impl);
    ctx.tex_total = count_textures(impl);
    if (getenv("G9P_DEBUG"))
@@ -4963,8 +5023,8 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
    ctx.ip = 0;
    walk_liveness(&ctx, &impl->body, false);
    if (ctx.loop_index > (out->a9 ? G9P_MAX_LOOPS : 64)) {
-      fprintf(stderr, "g9p: too many loops\n");
-      return false;
+      g9p_fail(out, "too many loops (%u, maximum %u)", ctx.loop_index, out->a9 ? G9P_MAX_LOOPS : 64);
+      return backend_failure(out, &ctx);
    }
    ctx.ip = 0;
    ctx.loop_index = 0;
@@ -5047,14 +5107,13 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
       /* A9 compute parks values above its bank-1 limit in bank 0. */
       if (!ctx.oom || (stage == MESA_SHADER_COMPUTE && !(out->a9)) || num_homed >= 1024 ||
           g9p_no_homes)
-         return false;
+         return backend_failure(out, &ctx);
       stuck = ctx.oom_ip == last_oom_ip ? stuck + 1 : 0;
       last_oom_ip = ctx.oom_ip;
       /* each retry parks one more value; 40 live scalars need more than 16 (drawbench fs 2) */
       if (stuck >= 64) {
-         fprintf(stderr, "g9p: out of registers at instruction %u (parking does not help)\n",
-                 ctx.oom_ip);
-         return false;
+         g9p_fail(out, "out of registers at instruction %u (parking does not help)", ctx.oom_ip);
+         return backend_failure(out, &ctx);
       }
       for (unsigned d = 0; d < ctx.num_decls; d++) {
          const unsigned k = key(ctx.decls[d], 0);
@@ -5089,8 +5148,8 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
           ctx.reg[best - 1] >= 0)
          victim = best - 1;
       if (victim < 0) {
-         fprintf(stderr, "g9p: out of registers at instruction %u\n", ctx.oom_ip);
-         return false;
+         g9p_fail(out, "out of registers at instruction %u (no parking victim)", ctx.oom_ip);
+         return backend_failure(out, &ctx);
       }
       {
          const unsigned start = victim_decl ? ctx.reg_first[victim / 4] : ctx.def_ip[victim / 4];
@@ -5114,8 +5173,8 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
                home = 32 + h;
          }
          if (home < 0) {
-            fprintf(stderr, "g9p: out of registers above r31 at instruction %u\n", ctx.oom_ip);
-            return false;
+            g9p_fail(out, "out of registers above r31 at instruction %u (bank-0 homes exhausted)", ctx.oom_ip);
+            return backend_failure(out, &ctx);
          }
          homed[num_homed++] = (__typeof__(*homed)){ start, end, (int8_t)home };
          ctx.home[victim] = home;
@@ -5124,9 +5183,8 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
    }
    st = ctx.max_reg + 1;
    if (ctx.c->high_bank0 && ctx.value_cap && st + 1 > ctx.value_cap + 1) {
-      if (!out->a9_refusal[0])
-         snprintf(out->a9_refusal, sizeof(out->a9_refusal), "bank-1 cap exceeded");
-      return false;
+      g9p_fail(out, "bank-1 cap exceeded");
+      return backend_failure(out, &ctx);
    }
    /*
     * Vertex shaders: the mask stack below r16, selects use it too (dEQP vertex
@@ -5144,22 +5202,22 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
       for (unsigned k = 0; k < ctx.out->num_buffers; k++)
          changed |= ctx.out->buffers[k].dwords != ctx.prev_dwords[k];
       if (changed && !generate(&ctx, impl, 15))
-         return false;
+         return backend_failure(out, &ctx);
       st = MAX2(ctx.max_reg, 15);
    } else if (stage == MESA_SHADER_VERTEX && st > 15) {
       ctx.reserve_st_low = true;
       if (!generate(&ctx, impl, 15)) {
          /* without r15, address work can run out of low registers */
          if (!ctx.oom || ctx.reserve_low)
-            return false;
+            return backend_failure(out, &ctx);
          ctx.reserve_low = true;
          ctx.oom = false;
          if (!generate(&ctx, impl, 15))
-            return false;
+            return backend_failure(out, &ctx);
       }
       st = MAX2(ctx.max_reg, 15);
    } else if (!generate(&ctx, impl, st))
-      return false;
+      return backend_failure(out, &ctx);
 
    /*
     * Buffers over the uniform operands' 512 dwords: only the dwords it reads, in as few runs
@@ -5209,8 +5267,8 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
             runs++;
          }
          if (span > 512) {
-            fprintf(stderr, "g9p: fragment shader reads %u dwords of buffers in %u runs\n", span, runs);
-            return false;
+            g9p_fail(out, "fragment shader reads %u dwords of buffers in %u runs", span, runs);
+            return backend_failure(out, &ctx);
          }
 
          unsigned next = g9p_fs_buf_base(out->num_textures);
@@ -5239,7 +5297,7 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
             }
          }
          if (!generate(&ctx, impl, st))
-            return false;
+            return backend_failure(out, &ctx);
       }
    }
 
@@ -5255,8 +5313,8 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
    out->code = ctx.c->w;
    out->code_size = 2 * ctx.c->n;
    if (stage != MESA_SHADER_COMPUTE && st + 1 > 32) {
-      fprintf(stderr, "g9p: %u registers, a graphics task has 32\n", out->num_regs);
-      return false;
+      g9p_fail(out, "%u registers, a graphics task has 32", out->num_regs);
+      return backend_failure(out, &ctx);
    }
    if (getenv("G9P_DEBUG")) {
       fprintf(stderr, "g9p: %u registers, %u bytes of code\n", out->num_regs,

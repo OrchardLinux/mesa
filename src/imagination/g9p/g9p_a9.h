@@ -30,6 +30,7 @@ struct g9p_a9_upload {
    if ((ctx)->out->a9 && (ctx)->stage == MESA_SHADER_COMPUTE) \
       (ctx)->out->a9_bodyless = !(n); \
 } while (0)
+const char *g9p_a9_last_refusal(void);
 struct g9p_shader;
 bool g9p_a9_compile_compute(nir_shader *, struct g9p_shader *, void *);
 #endif

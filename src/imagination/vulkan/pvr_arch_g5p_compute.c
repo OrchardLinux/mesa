@@ -58,7 +58,7 @@ PVR_PER_ARCH(g5p_compute_pipeline_compile)(
       /* Shader capture and diagnostic stubs (pvr_g5p_shader_dump.h). */
       const bool stub = pvr_g5p_capture_stub();
       char reason[sizeof(shader.a9_refusal)];
-      snprintf(reason, sizeof(reason), "%s", shader.a9_refusal[0] ? shader.a9_refusal : "no reason recorded");
+      snprintf(reason, sizeof(reason), "%s", shader.a9_refusal[0] ? shader.a9_refusal : g9p_a9_last_refusal());
       pvr_g5p_shader_dump(&create_info->stage, create_info->layout, "comp", NULL, 0, stub ? "STUB" : "REFUSE",
                           reason);
       if (!stub) {

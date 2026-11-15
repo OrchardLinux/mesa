@@ -27,25 +27,7 @@ static const uint8_t a9_tex_size_dw[] = { 40, 44 };
 static void
 a9_tex_refuse(struct g9p_ctx *ctx, const char *why)
 {
-   if (!ctx->out->a9_refusal[0])
-      if (!ctx->out->a9_refusal[0])
-      if (!ctx->out->a9_refusal[0])
-      if (!ctx->out->a9_refusal[0])
-      if (!ctx->out->a9_refusal[0])
-      if (!ctx->out->a9_refusal[0])
-      if (!ctx->out->a9_refusal[0])
-      if (!ctx->out->a9_refusal[0])
-      if (!ctx->out->a9_refusal[0])
-      if (!ctx->out->a9_refusal[0])
-      if (!ctx->out->a9_refusal[0])
-      if (!ctx->out->a9_refusal[0])
-      if (!ctx->out->a9_refusal[0])
-      if (!ctx->out->a9_refusal[0])
-      if (!ctx->out->a9_refusal[0])
-      if (!ctx->out->a9_refusal[0])
-      if (!ctx->out->a9_refusal[0])
-      if (!ctx->out->a9_refusal[0])
-      snprintf(ctx->out->a9_refusal, sizeof(ctx->out->a9_refusal), "%s", why);
+   g9p_fail(ctx->out, "%s", why);
 }
 
 /* The common dword of an upload, added if new; -1 when its slots are full */
