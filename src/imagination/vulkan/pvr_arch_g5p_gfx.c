@@ -9,7 +9,7 @@
  * static arena are not used, so a draw is only what pvr_* records here plus
  * the render job of pvr_arch_g5p.c.
  *
- * The first form this drew (docs: orchard-mesa-pr-plan.md, rung A): one
+ * The first form this drew (the initial triangle path): one
  * linear colour target, no depth/stencil, one vertex buffer, non-indexed
  * single-instance draws, scissors and partial render areas as the ICD clips
  * them (region clip, ISP scissor table); blending as
@@ -78,10 +78,6 @@
 #define G5P_TILE 32
 
 /* USC programs have byte sizes and need not end on a dword boundary. */
-/* A refusal, by name, on stderr too (vk_errorf() is silent in release builds) */
-#define G5P_REFUSE(obj, ...)                                                                                       \
-   (mesa_logw("G5P refuses: " __VA_ARGS__),                                                                        \
-    vk_errorf((obj), VK_ERROR_FEATURE_NOT_PRESENT, "G5P: " __VA_ARGS__))
 
 /* ---- PDS programs (pdsc, Apple's DOUT form: the A9 ICD's) ---- */
 
@@ -392,8 +388,8 @@ g5p_native_bresenham_line(const struct vk_graphics_pipeline_state *s)
       s->rs->line.mode == VK_LINE_RASTERIZATION_MODE_BRESENHAM;
 }
 
-/* What rung A draws: refused by name otherwise (the ICD's validate_state()
- * with rung A's limits) */
+/* What initial triangle path draws: refused by name otherwise (the ICD's validate_state()
+ * with initial triangle path's limits) */
 static VkResult
 g5p_check_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo *create_info,
                 const struct vk_graphics_pipeline_state *s, struct pco_g5p_fs_key *key)
@@ -595,7 +591,7 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
    key.depth_feedback = false;
    /* the fragment program first: the vertex program is compiled against the
     * varyings it reads (Apple's VertexProgramKey; Rogue's pco_rev_link_nir) */
-   /* PVR_G5P_SHADER_DUMP / PVR_G5P_CAPTURE_STUB (pvr_g5p_shader_dump.h) */
+   /* PVR_DEBUG=shader_dump / PVR_DEBUG=capture_stub (pvr_g5p_shader_dump.h) */
    VkPipelineShaderStageCreateInfo stub_info, fs_stub_info;
    VkShaderModuleCreateInfo stub_module, fs_stub_module;
    const uint32_t dump_samples = g->samples;
@@ -957,12 +953,9 @@ g5p_pipeline_build_punch(struct pvr_device *device,
    return result;
 }
 
-/* Every refusal a draw could meet because of its programs is decided here,
- * at pipeline creation, never while recording: a refused draw fails the
- * whole command buffer (vkEndCommandBuffer), and Zink then drops the batch
- * (Aquarium on r39-6: no water/background, 3 fps). The draw selects the
- * punch variant from the dynamic depth/stencil state (g5p_draw()); this
- * takes every state the pipeline allows: a dynamic enable may be on, a
+/* Program variants are checked at creation under the selected refusal
+ * policy. The draw selects its punch variant from dynamic depth/stencil
+ * state (g5p_draw()); this takes every state the pipeline allows: a dynamic enable may be on, a
  * depth write needs the depth test, and a stencil test may write. */
 static VkResult
 g5p_pipeline_check_draw_variants(struct pvr_device *device,

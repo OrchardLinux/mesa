@@ -533,10 +533,6 @@ g5p_pbe_encode(uint64_t q[3], uint32_t key, bool srgb, uint64_t va, uint32_t wid
    g5p_pbe_2d(q,key,srgb,va,width,height,row_stride,false);
 }
 
-/* A refusal, by name, in the log too (vk_errorf() is silent in release builds) */
-#define G5P_REFUSE(cmd_buffer, ...)                                                                                \
-   (mesa_logw("G5P refuses: " __VA_ARGS__),                                                                        \
-    vk_errorf((cmd_buffer), VK_ERROR_FEATURE_NOT_PRESENT, "G5P: " __VA_ARGS__))
 
 /*
  * The background of a loaded colour attachment (loadOp LOAD): the load

@@ -25,10 +25,6 @@
 #include "pvr_hw_pass.h"
 #include "pvr_image.h"
 
-/* A refusal, by name, on stderr too (vk_errorf() is silent in release builds) */
-#define G5P_MRT_REFUSE(obj, ...)                                                                                   \
-   (mesa_logw("G5P refuses: " __VA_ARGS__),                                                              \
-    vk_errorf((obj), VK_ERROR_FEATURE_NOT_PRESENT, "G5P: " __VA_ARGS__))
 
 /* Two 32-bit integer targets of one format (dEQP's ShaderExecutor: a mat2xN
  * output's columns, modf's two results): the raw32 output's four words each,
@@ -61,19 +57,19 @@ PVR_PER_ARCH(g5p_mrt_pipeline_check)(struct pvr_device *device, unsigned n, cons
     * whose fourth target stores to the null target (pvr_arch_g5p.c, pvr_g5p_nir.c) */
    enum g5p_mrt_refusal r = g5p_mrt_out_plan_make(n == 3 ? 4 : n, &plan);
    if (r != G5P_MRT_OK)
-      return G5P_MRT_REFUSE(device, "%u colour attachments: %s", n, g5p_mrt_refusal_str(r));
+      return G5P_REFUSE(device, "%u colour attachments: %s", n, g5p_mrt_refusal_str(r));
    for (unsigned i = 0; i < n; i++) {
       const int pair = g5p_mrt_raw32_pair(n, formats[0], formats[i]);
       if (pair < 0)
-         return G5P_MRT_REFUSE(device, "colour attachment %u of %u is %s: %s", i, n, vk_Format_to_str(formats[i]),
+         return G5P_REFUSE(device, "colour attachment %u of %u is %s: %s", i, n, vk_Format_to_str(formats[i]),
                                G5P_MRT_RAW32_PROBE);
       if (pair)
          continue;
       if (n > 2 && pvr_g5p_raw32_kind(formats[i]))
-         return G5P_MRT_REFUSE(device, "%u colour attachments of %s: %s", n, vk_Format_to_str(formats[i]),
+         return G5P_REFUSE(device, "%u colour attachments of %s: %s", n, vk_Format_to_str(formats[i]),
                                G5P_MRT_RAW32_WIDE);
       if (!pvr_g5p_mrt_format_ok(formats[i]) || formats[i] != formats[0])
-         return G5P_MRT_REFUSE(device, "colour attachment %u of %u is %s, attachment 0 %s: %s", i, n,
+         return G5P_REFUSE(device, "colour attachment %u of %u is %s, attachment 0 %s: %s", i, n,
                                vk_Format_to_str(formats[i]), vk_Format_to_str(formats[0]),
                                g5p_mrt_refusal_str(G5P_MRT_MIXED_FORMATS));
    }
@@ -104,33 +100,33 @@ PVR_PER_ARCH(g5p_mrt_pass_check)(struct pvr_cmd_buffer *cmd_buffer,
       return VK_SUCCESS;
    /* three: Apple's 4-target pass with a padding fourth target (pvr_arch_g5p.c) */
    if (n > G5P_MRT_MAX_TARGETS)
-      return G5P_MRT_REFUSE(cmd_buffer, "%u colour targets: %s", n, g5p_mrt_refusal_str(G5P_MRT_TOO_MANY_TARGETS));
+      return G5P_REFUSE(cmd_buffer, "%u colour targets: %s", n, g5p_mrt_refusal_str(G5P_MRT_TOO_MANY_TARGETS));
 
    for (unsigned t = 0; t < n; t++) {
       const uint32_t idx = hw_render->eot_surfaces[t].attachment_idx;
       if (idx >= info->attachment_count || !info->attachments[idx])
-         return G5P_MRT_REFUSE(cmd_buffer, "colour target %u of %u has no image view", t, n);
+         return G5P_REFUSE(cmd_buffer, "colour target %u of %u has no image view", t, n);
       iview[t] = info->attachments[idx];
       const struct pvr_image *image = pvr_image_view_get_image(iview[t]);
 
       const int pair = g5p_mrt_raw32_pair(n, iview[0]->vk.format, iview[t]->vk.format);
       if (pair < 0)
-         return G5P_MRT_REFUSE(cmd_buffer, "colour target %u of %u is %s: %s", t, n,
+         return G5P_REFUSE(cmd_buffer, "colour target %u of %u is %s: %s", t, n,
                                vk_Format_to_str(iview[t]->vk.format), G5P_MRT_RAW32_PROBE);
       if (!pair && n > 2 && pvr_g5p_raw32_kind(iview[t]->vk.format))
-         return G5P_MRT_REFUSE(cmd_buffer, "%u colour targets of %s: %s", n, vk_Format_to_str(iview[t]->vk.format),
+         return G5P_REFUSE(cmd_buffer, "%u colour targets of %s: %s", n, vk_Format_to_str(iview[t]->vk.format),
                                G5P_MRT_RAW32_WIDE);
       if (!pair && (!pvr_g5p_mrt_format_ok(iview[t]->vk.format) || iview[t]->vk.format != iview[0]->vk.format))
-         return G5P_MRT_REFUSE(cmd_buffer, "colour target %u of %u is %s, target 0 %s: %s", t, n,
+         return G5P_REFUSE(cmd_buffer, "colour target %u of %u is %s, target 0 %s: %s", t, n,
                                vk_Format_to_str(iview[t]->vk.format), vk_Format_to_str(iview[0]->vk.format),
                                g5p_mrt_refusal_str(G5P_MRT_MIXED_FORMATS));
       if (iview[t]->vk.base_mip_level || iview[t]->vk.layer_count != 1 || image->vk.samples != VK_SAMPLE_COUNT_1_BIT)
-         return G5P_MRT_REFUSE(cmd_buffer, "colour target %u of %u: mip %u, %u layers, %u samples (one level, one layer, "
+         return G5P_REFUSE(cmd_buffer, "colour target %u of %u: mip %u, %u layers, %u samples (one level, one layer, "
                                "one sample)", t, n, iview[t]->vk.base_mip_level, iview[t]->vk.layer_count,
                                image->vk.samples);
       if (iview[t]->vk.extent.width != iview[0]->vk.extent.width ||
           iview[t]->vk.extent.height != iview[0]->vk.extent.height)
-         return G5P_MRT_REFUSE(cmd_buffer, "colour target %u is %ux%u, target 0 %ux%u (one size per pass)", t,
+         return G5P_REFUSE(cmd_buffer, "colour target %u is %ux%u, target 0 %ux%u (one size per pass)", t,
                                iview[t]->vk.extent.width, iview[t]->vk.extent.height, iview[0]->vk.extent.width,
                                iview[0]->vk.extent.height);
       va[t] = g5p_mrt_target_va(iview[t], &bytes[t]);
@@ -140,7 +136,7 @@ PVR_PER_ARCH(g5p_mrt_pass_check)(struct pvr_cmd_buffer *cmd_buffer,
     * an N-target LOAD background (none exists) */
    for (unsigned i = 0; i < hw_render->color_init_count; i++)
       if (hw_render->color_init[i].op == VK_ATTACHMENT_LOAD_OP_LOAD)
-         return G5P_MRT_REFUSE(cmd_buffer, "LOAD of a colour attachment with %u colour targets (no N-target LOAD "
+         return G5P_REFUSE(cmd_buffer, "LOAD of a colour attachment with %u colour targets (no N-target LOAD "
                                "background)", n);
 
    /* The clear and end-of-tile programs cover whole tiles of every target: a
@@ -148,7 +144,7 @@ PVR_PER_ARCH(g5p_mrt_pass_check)(struct pvr_cmd_buffer *cmd_buffer,
    const VkRect2D *area = &info->render_area;
    if (area->offset.x || area->offset.y || area->extent.width != iview[0]->vk.extent.width ||
        area->extent.height != iview[0]->vk.extent.height)
-      return G5P_MRT_REFUSE(cmd_buffer, "%u colour targets in a partial render area (%d,%d %ux%u of %ux%u)", n,
+      return G5P_REFUSE(cmd_buffer, "%u colour targets in a partial render area (%d,%d %ux%u of %ux%u)", n,
                             area->offset.x, area->offset.y, area->extent.width, area->extent.height,
                             iview[0]->vk.extent.width, iview[0]->vk.extent.height);
 
@@ -156,7 +152,7 @@ PVR_PER_ARCH(g5p_mrt_pass_check)(struct pvr_cmd_buffer *cmd_buffer,
    for (unsigned a = 0; a < n; a++)
       for (unsigned c = a + 1; c < n; c++)
          if (va[a] < va[c] + bytes[c] && va[c] < va[a] + bytes[a])
-            return G5P_MRT_REFUSE(cmd_buffer, "colour targets %u and %u overlap in memory", a, c);
+            return G5P_REFUSE(cmd_buffer, "colour targets %u and %u overlap in memory", a, c);
 
    return VK_SUCCESS;
 }
@@ -168,13 +164,13 @@ PVR_PER_ARCH(g5p_mrt_draw_check)(struct pvr_cmd_buffer *cmd_buffer, unsigned pip
    const unsigned pn = MAX2(pipeline_targets, 1);
 
    if (!info->pass && !info->dr_info)
-      return G5P_MRT_REFUSE(cmd_buffer, "a draw outside a render pass");
+      return G5P_REFUSE(cmd_buffer, "a draw outside a render pass");
    /* the render of the current subpass (dynamic rendering has one) */
    const struct pvr_renderpass_hwsetup_render *hw_render =
       pvr_arch_pass_info_get_hw_render(info, info->current_hw_subpass);
    /* a 3-target pass runs, and its pipelines compile, as four targets */
    const unsigned rn = hw_render->eot_surface_count == 3 ? 4 : hw_render->eot_surface_count;
    if ((rn > 1 || pn > 1) && pn != rn)
-      return G5P_MRT_REFUSE(cmd_buffer, "the pipeline writes %u colour targets, the pass has %u", pn, rn);
+      return G5P_REFUSE(cmd_buffer, "the pipeline writes %u colour targets, the pass has %u", pn, rn);
    return VK_SUCCESS;
 }

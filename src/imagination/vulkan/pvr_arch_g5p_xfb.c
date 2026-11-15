@@ -15,6 +15,7 @@
 #include <string.h>
 
 #include "util/log.h"
+#include "pvr_g5p.h"
 #include "util/os_time.h"
 #include "util/u_dynarray.h"
 #include "vk_command_buffer.h"
@@ -31,10 +32,6 @@
 #include "pvr_query.h"
 #include "pvr_queue.h"
 
-/* A refusal, by name, on stderr too (vk_errorf() is silent in release builds) */
-#define G5P_XFB_REFUSE(obj, ...)                                                                                   \
-   (mesa_logw("G5P refuses: " __VA_ARGS__),                                                              \
-    vk_errorf((obj), VK_ERROR_FEATURE_NOT_PRESENT, "G5P: " __VA_ARGS__))
 
 /* A buffer range named by a command (a binding or a counter) */
 struct g5p_xfb_range {
@@ -93,7 +90,7 @@ g5p_xfb_rec_new(struct pvr_cmd_buffer *cmd_buffer, struct pvr_g5p_xfb_cmd *st, e
    const struct pvr_sub_cmd *sub = cmd_buffer->state.current_sub_cmd;
    if ((!sub || sub->type != PVR_SUB_CMD_TYPE_GRAPHICS) && kind <= G5P_XFB_DRAW) {
       vk_command_buffer_set_error(&cmd_buffer->vk,
-                                  G5P_XFB_REFUSE(cmd_buffer, "transform feedback outside a graphics sub-command"));
+                                  pvr_refusal_to_api(G5P_REFUSE(cmd_buffer, "transform feedback outside a graphics sub-command")));
       return NULL;
    }
    struct g5p_xfb_rec *r = util_dynarray_grow(&st->recs, struct g5p_xfb_rec, 1);
@@ -143,8 +140,8 @@ PVR_PER_ARCH(g5p_xfb_begin)(struct pvr_cmd_buffer *cmd_buffer, uint32_t first, u
       return;
    if (cmd_buffer->usage_flags & VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT) {
       vk_command_buffer_set_error(&cmd_buffer->vk,
-                                  G5P_XFB_REFUSE(cmd_buffer, "transform feedback in a SIMULTANEOUS_USE command "
-                                                 "buffer (its per-draw blocks are filled per submission)"));
+                                  pvr_refusal_to_api(G5P_REFUSE(cmd_buffer, "transform feedback in a SIMULTANEOUS_USE command "
+                                                 "buffer (its per-draw blocks are filled per submission)")));
       return;
    }
    struct g5p_xfb_rec *r = g5p_xfb_rec_new(cmd_buffer, st, G5P_XFB_BEGIN);
@@ -192,7 +189,7 @@ PVR_PER_ARCH(g5p_xfb_draw_check)(struct pvr_cmd_buffer *cmd_buffer, VkPrimitiveT
    /* the stores follow the vertex invocations: they are the primitive
     * stream only for lists (GLES 3.0 captures lists only) */
    if (!g5p_xfb_vpp(topology))
-      return G5P_XFB_REFUSE(cmd_buffer, "transform feedback with topology %d (point, line and triangle lists)",
+      return G5P_REFUSE(cmd_buffer, "transform feedback with topology %d (point, line and triangle lists)",
                             topology);
    return VK_SUCCESS;
 }
@@ -205,7 +202,7 @@ PVR_PER_ARCH(g5p_xfb_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct g5p_x
    if (!st)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    if (!block)
-      return G5P_XFB_REFUSE(cmd_buffer, "a capturing vertex program without its transform feedback block");
+      return G5P_REFUSE(cmd_buffer, "a capturing vertex program without its transform feedback block");
    struct g5p_xfb_rec *r = g5p_xfb_rec_new(cmd_buffer, st, G5P_XFB_DRAW);
    if (!r)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -232,8 +229,8 @@ g5p_xfb_query_event(struct pvr_cmd_buffer *cmd_buffer, enum g5p_xfb_kind kind, c
       return;
    if (pool->result_elem_stride < 2 * sizeof(uint64_t)) {
       vk_command_buffer_set_error(&cmd_buffer->vk,
-                                  G5P_XFB_REFUSE(cmd_buffer, "a stream query pool of %u bytes per query",
-                                                 pool->result_elem_stride));
+                                  pvr_refusal_to_api(G5P_REFUSE(cmd_buffer, "a stream query pool of %u bytes per query",
+                                                 pool->result_elem_stride)));
       return;
    }
    struct g5p_xfb_rec *r = g5p_xfb_rec_new(cmd_buffer, st, kind);
@@ -250,7 +247,7 @@ PVR_PER_ARCH(g5p_xfb_query_begin)(struct pvr_cmd_buffer *cmd_buffer, const struc
 {
    if (index) {
       vk_command_buffer_set_error(&cmd_buffer->vk,
-                                  G5P_XFB_REFUSE(cmd_buffer, "a stream query of stream %u (stream 0 only)", index));
+                                  pvr_refusal_to_api(G5P_REFUSE(cmd_buffer, "a stream query of stream %u (stream 0 only)", index)));
       return;
    }
    g5p_xfb_query_event(cmd_buffer, G5P_XFB_QUERY_BEGIN, pool, query, 1);
@@ -355,10 +352,10 @@ g5p_xfb_run(struct pvr_device *device, struct pvr_g5p_xfb_cmd *st, unsigned end)
          r->e.query.pool = &r->qview;
       }
       if (!ok)
-         return G5P_XFB_REFUSE(device, "a transform feedback buffer without a CPU mapping");
+         return G5P_REFUSE(device, "a transform feedback buffer without a CPU mapping");
       const char *why = g5p_xfb_execute(x, &r->e);
       if (why)
-         return G5P_XFB_REFUSE(device, "transform feedback: %s", why);
+         return G5P_REFUSE(device, "transform feedback: %s", why);
    }
    return VK_SUCCESS;
 }

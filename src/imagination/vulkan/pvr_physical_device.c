@@ -1360,6 +1360,9 @@ VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
       goto err_vk_physical_device_finish;
    }
 
+   pdevice->skip_refused_work = PVR_HAS_FEATURE(&pdevice->dev_info, apple_g5p) &&
+                                 instance->drirc.misc.pvr_skip_refused_work;
+
    pdevice->sync_type = ws->syncobj_type;
    if (ws->job_sync_size) {
       pdevice->sync_type.size = MAX2(pdevice->sync_type.size, ws->job_sync_size);

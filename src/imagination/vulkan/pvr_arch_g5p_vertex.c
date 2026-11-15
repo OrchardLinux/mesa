@@ -26,10 +26,6 @@
 #include "pvr_pipeline.h"
 #include "pvr_g5p_vertex.h"
 
-/* A refusal, by name, on stderr too (vk_errorf() is silent in release builds) */
-#define G5P_REFUSE(obj, ...)                                                                                       \
-   (mesa_logw("G5P refuses: " __VA_ARGS__),                                                              \
-    vk_errorf((obj), VK_ERROR_FEATURE_NOT_PRESENT, "G5P: " __VA_ARGS__))
 
 VkResult
 PVR_PER_ARCH(g5p_vertex_draw_check)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_pipeline *g,

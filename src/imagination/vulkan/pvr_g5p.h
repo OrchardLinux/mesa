@@ -27,6 +27,23 @@ static inline VkResult pvr_refusal_to_api(VkResult result)
    return result == VK_ERROR_FEATURE_NOT_PRESENT ? VK_ERROR_OUT_OF_HOST_MEMORY : result;
 }
 
+#include "util/log.h"
+#include "util/u_atomic.h"
+#include "vk_log.h"
+
+/* Refusal kinds are keyed by their call site (pipeline validation or pass/draw
+ * validation). Count atomically across recording threads; warn on occurrences
+ * 1, 2, 4, ... so tolerant workloads cannot emit one warning per draw. Keep
+ * vk_errorf for debug callbacks and preserve the internal refusal result. */
+#define G5P_REFUSE(obj, ...)                                                  \
+   ({                                                                        \
+      static uint32_t refusal_count;                                         \
+      uint32_t occurrence = p_atomic_inc_return(&refusal_count);              \
+      if (occurrence && !(occurrence & (occurrence - 1)))                     \
+         mesa_logw("G5P refuses: " __VA_ARGS__);                              \
+      vk_errorf((obj), VK_ERROR_FEATURE_NOT_PRESENT, "G5P: " __VA_ARGS__);     \
+   })
+
 #include "pvr_common.h"
 #include "pvr_limits.h"
 #include "pvr_macros.h"

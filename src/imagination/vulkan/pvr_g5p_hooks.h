@@ -294,7 +294,7 @@
    if (PVR_HAS_FEATURE(&(cmd_buffer)->device->pdevice->dev_info, apple_g5p)) {                        \
       VkResult r_ = pvr_arch_g5p_clear_attachments(cmd_buffer, count, attachments, rect_count, rects); \
       if (r_ != VK_SUCCESS)                                                                           \
-         pvr_cmd_buffer_set_error_unwarned(cmd_buffer, r_);                                           \
+         pvr_cmd_buffer_set_error_unwarned(cmd_buffer, pvr_refusal_to_api(r_));                                           \
       return;                                                                                         \
    }
 

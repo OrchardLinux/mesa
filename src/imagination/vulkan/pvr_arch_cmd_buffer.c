@@ -9679,6 +9679,18 @@ static void pvr_emit_vdm_index_list(struct pvr_cmd_buffer *cmd_buffer,
    pvr_csb_clear_relocation_mark(csb);
 }
 
+/* Refusal reasons are logged by G5P_REFUSE before this boundary. */
+static void
+g5p_draw_result(struct pvr_cmd_buffer *cmd_buffer, VkResult result)
+{
+   if (result == VK_SUCCESS)
+      return;
+   if (result == VK_ERROR_FEATURE_NOT_PRESENT &&
+       cmd_buffer->device->pdevice->skip_refused_work)
+      return;
+   vk_command_buffer_set_error(&cmd_buffer->vk, pvr_refusal_to_api(result));
+}
+
 void PVR_PER_ARCH(CmdDraw)(VkCommandBuffer commandBuffer,
                            uint32_t vertexCount,
                            uint32_t instanceCount,
@@ -9714,8 +9726,7 @@ void PVR_PER_ARCH(CmdDraw)(VkCommandBuffer commandBuffer,
       result = pvr_flush_push_descriptors(cmd_buffer, &cmd_buffer->state.gfx_desc_state);
       if (result == VK_SUCCESS)
          result = pvr_arch_g5p_cmd_draw(cmd_buffer, &g5p_draw);
-      if (result != VK_SUCCESS)
-         vk_command_buffer_set_error(&cmd_buffer->vk, result);
+      g5p_draw_result(cmd_buffer, result);
       goto end_cmd_draw;
    }
    if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g9p)) {
@@ -9796,8 +9807,7 @@ void PVR_PER_ARCH(CmdDrawIndexed)(VkCommandBuffer commandBuffer,
       if (result == VK_SUCCESS)
          result = pvr_arch_g5p_cmd_draw_indexed(cmd_buffer, indexCount, instanceCount, firstIndex,
                                                 vertexOffset, firstInstance);
-      if (result != VK_SUCCESS)
-         vk_command_buffer_set_error(&cmd_buffer->vk, result);
+      g5p_draw_result(cmd_buffer, result);
       goto end_cmd_draw_indexed;
    }
    if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g9p)) {
