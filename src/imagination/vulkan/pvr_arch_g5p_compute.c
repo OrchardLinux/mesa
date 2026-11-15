@@ -219,6 +219,15 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
     * push-constant buffer's address and the thread count.
     */
    for (unsigned k = 0; k < n; k++) {
+      /* gl_NumWorkGroups (the A9 compiler's G9P_NUM_WORKGROUPS slots, g9p_compile.c): x and y in binding 0's
+       * slot, z in binding 1's (G9P's 496e44739dc ("pvr/g9p: gl_NumWorkGroups, workgroup ID z, storage buffer array elements in compute")). An indirect dispatch's counts are the GPU's. */
+      if (state->buffers[k].set == G9P_NUM_WORKGROUPS) {
+         if (indirect_va)
+            return vk_errorf(cmd_buffer, VK_ERROR_OUT_OF_HOST_MEMORY,
+                             "G5P: gl_NumWorkGroups in an indirect dispatch");
+         uniforms[2 * k] = group_count[state->buffers[k].binding ? 2 : 0];
+         uniforms[2 * k + 1] = state->buffers[k].binding ? 0 : group_count[1];
+      }
       if (state->buffers[k].set == G9P_PUSH_CONSTANTS) {
          const struct pvr_push_constants *pc =
             &cmd_buffer->state.push_consts[PVR_STAGE_ALLOCATION_COMPUTE];
@@ -308,15 +317,23 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
          src = uniforms_bo->dev_addr.addr + 4 * (tex0 + 8 * i);
          dest = state->a9_uploads[i].common;
          dwords = state->a9_uploads[i].dwords;
-      } else if (k < n && state->buffers[k].set != G9P_PUSH_CONSTANTS) {
+      } else if (k < n && state->buffers[k].set != G9P_PUSH_CONSTANTS &&
+                 state->buffers[k].set != G9P_NUM_WORKGROUPS) {
          const struct pvr_descriptor_set *set = desc->sets[state->buffers[k].set];
+         /* an array's element (Zink keeps every storage buffer in one array) and the size flag (the
+          * descriptor's size word at byte 8, arrayLength()): G9P's 496e44739dc ("pvr/g9p: gl_NumWorkGroups, workgroup ID z, storage buffer array elements in compute"), 1d51ff5cec6 */
+         const unsigned element = (state->buffers[k].binding & ~G9P_BINDING_SIZE) >> G9P_BINDING_ELEMENT_SHIFT;
+         const unsigned b = state->buffers[k].binding & BITFIELD_MASK(G9P_BINDING_ELEMENT_SHIFT);
          const struct pvr_descriptor_set_layout_binding *binding;
 
-         if (!set)
+         if (!set || b >= set->layout->binding_count)
             return vk_error(cmd_buffer, VK_ERROR_UNKNOWN);
-         binding = &set->layout->bindings[state->buffers[k].binding];
-         /* pvr_buffer_descriptor: the address comes first */
-         src = set->dev_addr.addr + binding->offset;
+         binding = &set->layout->bindings[b];
+         if (element >= MAX2(binding->descriptor_count, 1))
+            return vk_error(cmd_buffer, VK_ERROR_UNKNOWN);
+         /* pvr_buffer_descriptor: the address comes first, the size at byte 8 */
+         src = set->dev_addr.addr + binding->offset + element * binding->stride +
+               (state->buffers[k].binding & G9P_BINDING_SIZE ? 8 : 0);
       } else if(k>n && k<n+1+images) {
          unsigned i=k-n-1;
          const struct pvr_descriptor_set *set=desc->sets[state->a9_images[i].set];
