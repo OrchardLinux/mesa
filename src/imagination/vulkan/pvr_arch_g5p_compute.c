@@ -85,8 +85,9 @@ PVR_PER_ARCH(g5p_compute_pipeline_compile)(
       if (shader.a9) {
          const unsigned t = 8 * DIV_ROUND_UP(MAX2(shader.num_regs, 1), 8);
          const unsigned f = 8 * DIV_ROUND_UP(shader.a9_bank1_regs ? shader.a9_bank1_regs : shader.num_regs, 8);
+         /* bank 1 keeps one task (32 lanes) free, as Apple's bank-0 term does (g9p_a9_bank1_limit()) */
          const unsigned a = (4 * t + 28) & ~31u, b = (64 * f + 448) & ~511u;
-         unsigned max = MIN2(a ? 32 * ((3329 - a) / a) : 512, b ? 393216 / b : 512);
+         unsigned max = MIN2(a ? 32 * ((3329 - a) / a) : 512, b ? 393216 / b - 32 : 512);
          max = MIN2(max, 512);
          if (max > 32)
             max &= ~31u;

@@ -51,12 +51,32 @@ g9p_num_regs(void)
    return e ? MIN2(atoi(e), 63) : 30;
 }
 #define G9P_NUM_REGS g9p_num_regs()
+
+/*
+ * A9 compute: the bank-1 registers per lane (values and the mask stack: the kernel record's register field)
+ * that a workgroup of @threads lanes may use. Apple's limit for a bank-1 allocation of f registers is
+ * 393216 / ((64f + 448) & ~511) lanes (AGXMetalA9 ComputeProgramVariant 0x207d2c4b0 -> +0xb08; its bank-0
+ * term reserves one task's allocation). Apple's kernels always ask for 8 there, and put the rest in bank 0.
+ * Ours took up to 32: at 256 lanes and 24 (field 6), one group fills the whole bank-1 capacity, and 64 such
+ * groups lost the GPU before their stores; one group alone, or 16 registers, ran successfully.
+ * So a group keeps one task (32 lanes) of that capacity free, as Apple's bank-0
+ * term does: 16 at 256 lanes, 24 up to 224, 32 up to 160. What does not fit goes to bank 0 (homes).
+ */
+static unsigned
+g9p_a9_bank1_limit(unsigned threads)
+{
+   for (unsigned f = 32; f > 8; f -= 8) {
+      if (393216 / ((64 * f + 448) & ~511u) >= threads + 32)
+         return f;
+   }
+   return 8;
+}
 /*
  * Registers for values: vertex shaders keep the mask stack in r15 (compile_back()), so
  * r30-r31 hold values too there (G9P_REGS still overrides, for tests)
  */
 #define VALUE_REGS(ctx) ((ctx)->stage == MESA_SHADER_VERTEX && (ctx)->st == 15 && !getenv("G9P_REGS") \
-                            ? 32u : G9P_NUM_REGS)
+                            ? 32u : (ctx)->value_cap ? MIN2(G9P_NUM_REGS, (ctx)->value_cap) : G9P_NUM_REGS)
 #define G9P_MAX_LOOPS 64
 /* nir_tex_instr.backend_flags: a seamful cube's gradients, for the hardware */
 #define G9P_TEX_NATIVE_GRADIENTS 1
@@ -126,6 +146,8 @@ struct g9p_vs_store {
 };
 
 struct g9p_ctx {
+   /* A9 compute: at most this many value registers in bank 1 (0: no cap; g9p_a9_bank1_limit()) */
+   unsigned value_cap;
    /* a sample iterated straight to the sampler has been emitted */
    bool straight_done;
    /*
@@ -4813,6 +4835,11 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
    ctx.c->fragment = stage == MESA_SHADER_FRAGMENT;
    ctx.c->high_bank0 = stage == MESA_SHADER_COMPUTE && out->a9;
    ctx.c->a9_stack = stage == MESA_SHADER_COMPUTE && out->a9;
+   /* A9 compute: values in bank 1 up to the workgroup's limit, the mask stack after them; the rest in
+    * bank-0 homes (g9p_a9_bank1_limit()) */
+   if (stage == MESA_SHADER_COMPUTE && out->a9)
+      ctx.value_cap = g9p_a9_bank1_limit(MAX2(out->local_size[0], 1) * MAX2(out->local_size[1], 1) *
+                                         MAX2(out->local_size[2], 1)) - 1;
    ctx.reg = ralloc_array(mem_ctx, int8_t, impl->ssa_alloc * 4);
    ctx.uni = ralloc_array(mem_ctx, int16_t, impl->ssa_alloc * 4);
    memset(ctx.uni, -1, impl->ssa_alloc * 4 * sizeof(*ctx.uni));
@@ -4901,7 +4928,7 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
       bool victim_decl = false;
 
       ctx.oom = false;
-      if (generate(&ctx, impl, ctx.reserve_st_low ? 15 : G9P_NUM_REGS))
+      if (generate(&ctx, impl, ctx.reserve_st_low ? 15 : out->a9 ? VALUE_REGS(&ctx) : G9P_NUM_REGS))
          break;
       if (ctx.oom && stage == MESA_SHADER_VERTEX &&
           (ctx.reserve_low < 2 || ctx.reserve_low == G9P_RESERVE_LOW_PAIR)) {
