@@ -4340,6 +4340,13 @@ void PVR_PER_ARCH(CmdBeginRenderPass2)(
    assert(!state->render_pass_info.pass);
    assert(cmd_buffer->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY);
 
+   /* G5P: the pass's EXTERNAL -> subpass dependencies, before it begins (pvr_render_pass::ext_begin) */
+   if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g5p) && pass->ext_begin) {
+      const VkDependencyInfo ext = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1,
+                                     .pMemoryBarriers = &pass->ext_begin_barrier };
+      PVR_PER_ARCH(CmdPipelineBarrier2)(commandBuffer, &ext);
+   }
+
    /* FIXME: Create a separate function for everything using pass->subpasses,
     * look at cmd_buffer_begin_subpass() for example. */
    state->render_pass_info.pass = pass;
@@ -10181,6 +10188,7 @@ void PVR_PER_ARCH(CmdEndRenderPass2)(VkCommandBuffer commandBuffer,
 
    assert(state->render_pass_info.pass);
    assert(state->render_pass_info.framebuffer);
+   const struct pvr_render_pass *ended_pass = state->render_pass_info.pass;
 
    result = pvr_arch_cmd_buffer_end_sub_cmd(cmd_buffer);
    if (result != VK_SUCCESS)
@@ -10199,6 +10207,14 @@ void PVR_PER_ARCH(CmdEndRenderPass2)(VkCommandBuffer commandBuffer,
 
    state->render_pass_info.attachments = attachments;
    state->render_pass_info.clear_values = clear_values;
+   /* G5P: the pass's subpass -> EXTERNAL dependencies, after it ended: a transfer or
+    * draw after the pass that the pass declares it must precede (xapi-present V4, arr0:
+    * a copy of the pass's colour read the memory before the render wrote it) */
+   if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g5p) && ended_pass->ext_end) {
+      const VkDependencyInfo ext = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1,
+                                     .pMemoryBarriers = &ended_pass->ext_end_barrier };
+      PVR_PER_ARCH(CmdPipelineBarrier2)(commandBuffer, &ext);
+   }
 }
 
 static VkResult
