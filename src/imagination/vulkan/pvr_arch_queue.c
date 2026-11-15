@@ -59,10 +59,12 @@
 #include "pvr_bo.h"
 #include "pvr_pipeline.h"
 
+#include "util/log.h"
 #include "util/macros.h"
 #include "util/u_atomic.h"
 #include "vk_alloc.h"
 #include "vk_common_entrypoints.h"
+#include "vk_enum_to_str.h"
 #include "vk_fence.h"
 #include "vk_log.h"
 #include "vk_object.h"
@@ -1708,6 +1710,18 @@ static void pvr_signal_unsubmitted(struct vk_device *device,
 static VkResult pvr_driver_queue_submit(struct vk_queue *queue,
                                         struct vk_queue_submit *submit)
 {
+   struct pvr_queue *driver_queue = container_of(queue, struct pvr_queue, vk);
+   const bool is_g5p =
+      PVR_HAS_FEATURE(&driver_queue->device->pdevice->dev_info, apple_g5p);
+
+   if (is_g5p && vk_queue_is_lost(queue)) {
+      for (uint32_t i = 0; i < submit->signal_count; i++)
+         pvr_signal_unsubmitted(&driver_queue->device->vk,
+                                submit->signals[i].sync,
+                                submit->signals[i].signal_value);
+      return VK_SUCCESS;
+   }
+
    const int64_t g9p_t0 = os_time_get_nano();
    VkResult result = pvr_driver_queue_submit_jobs(queue, submit);
 
@@ -1721,8 +1735,6 @@ static VkResult pvr_driver_queue_submit(struct vk_queue *queue,
     * reset, freezing the desktop; signalled, it sees the device lost and can recover
     */
    if (result != VK_SUCCESS) {
-      struct pvr_queue *driver_queue = container_of(queue, struct pvr_queue, vk);
-
       for (uint32_t i = 0; i < submit->signal_count; i++) {
          if (PVR_HAS_FEATURE(&driver_queue->device->pdevice->dev_info, apple_g5p))
             pvr_signal_unsubmitted(&driver_queue->device->vk,
@@ -1732,6 +1744,7 @@ static VkResult pvr_driver_queue_submit(struct vk_queue *queue,
             vk_sync_signal(&driver_queue->device->vk, submit->signals[i].sync,
                            submit->signals[i].signal_value);
       }
+
    }
    if (result == VK_ERROR_DEVICE_LOST)
       return vk_queue_set_lost(queue, "GPU context lost");
