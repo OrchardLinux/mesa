@@ -14,37 +14,50 @@ static bool a9_shared(struct g9p_ctx *ctx, nir_intrinsic_instr *in)
    nir_src offset = in->src[load ? 0 : 1];
    unsigned bits = load ? in->def.bit_size : nir_src_bit_size(in->src[0]);
    unsigned comps = load ? in->def.num_components : nir_src_num_components(in->src[0]);
-   if (!ctx->out->a9 || bits != 32 || comps != 1 || (nir_intrinsic_base(in) & 3))
+   unsigned base = 16 + nir_intrinsic_base(in);
+   unsigned unit = 4 * comps, shift_bits = util_logbase2(unit);
+   unsigned size = comps == 1 ? G9P_SIZE_U32 : comps == 2 ? G9P_SIZE_2X32 : G9P_SIZE_4X32;
+   if (!ctx->out->a9 || bits != 32 || (comps != 1 && comps != 2 && comps != 4) ||
+       base % unit || (!load && nir_intrinsic_write_mask(in) != BITFIELD_MASK(comps)))
       return false;
-   unsigned word = 4 + nir_intrinsic_base(in) / 4;
+   unsigned word = base / unit;
    bool constant = nir_src_is_const(offset);
    int index = -1;
    if (constant) {
       unsigned byte = nir_src_as_uint(offset);
-      if (byte & 3) return false;
-      word += byte / 4;
+      if (byte % unit) return false;
+      word += byte / unit;
    } else {
       int src = src_reg(ctx, nir_get_scalar(offset.ssa, 0));
-      int shift = const_reg(ctx, 2);
+      int shift = const_reg(ctx, shift_bits);
       index = alloc_temp(ctx);
       if (src < 0 || shift < 0 || index < 0) return false;
       g9p_shift(ctx->c, index, src, shift, true);
-      G9P_EMIT(ctx->c, 0x1189, 0x0300 | 2 * index,
-               0x0101 | index << 10, 0x0120, 0x0fa1, 0x4000);
+      g9p_shared_index(ctx->c, index, index, shift_bits);
    }
-   int reg = load ? alloc_reg(ctx) : src_reg(ctx, nir_get_scalar(in->src[0].ssa, 0));
-   if (reg < 0 || word >= 65536) return false;
-   unsigned w1 = 0x0100 | (!load ? 0x80 : 0) | 2 * reg;
-   if (constant) {
-      G9P_EMIT(ctx->c, 0x2314, w1, 0x8100 | (word & 255), 0x0200 | (word >> 8));
+   int reg;
+   if (load) {
+      reg = comps == 1 ? alloc_reg(ctx) : alloc_range(ctx, comps);
+   } else if (comps == 1) {
+      reg = src_reg(ctx, nir_get_scalar(in->src[0].ssa, 0));
    } else {
-      w1 |= (2 * index) << 9;
-      if (word < 256) G9P_EMIT(ctx->c, 0x2314, w1, 0x8800 | word);
-      else G9P_EMIT(ctx->c, 0x2314, w1, 0x8900 | (word & 255), word >> 8);
+      reg = alloc_range(ctx, comps);
+      if (reg < 0) return false;
+      ctx->temps |= BITFIELD64_RANGE(reg, comps);
+      for (unsigned j = 0; j < comps; j++) {
+         int r = src_reg(ctx, nir_get_scalar(in->src[0].ssa, j));
+         if (r < 0) return false;
+         g9p_alu2(ctx->c, G9P_OR, reg + j, r, r, false);
+      }
    }
+   if (reg < 0 || 2 * reg + 2 * comps - 1 >= 128 || word >= 4096) return false;
+   g9p_shared_access(ctx->c, size, !load, reg, word, constant ? -1 : 2 * index);
    g9p_wait(ctx->c);
    release(ctx, &in->instr);
-   if (load) ctx->reg[key(&in->def, 0)] = reg;
+   if (load) for (unsigned j = 0; j < comps; j++) {
+      ctx->reg[key(&in->def, j)] = reg + j;
+      if (!ctx->last_use[key(&in->def, j)]) ctx->busy &= ~BITFIELD64_BIT(reg + j);
+   }
    return true;
 }
 /* Keep the election's local-index source live for every task barrier. */

@@ -264,6 +264,58 @@ g9p_tg_load(struct g9p_code *c, unsigned dst, unsigned word)
 }
 
 /*
+ * Threadgroup-memory access (g9p_tg_load()'s class), Apple's A9 compiler's forms: W0 the class byte, the load's
+ * bank bits (g9p_mem_at()) and the access size at bit 11 (G9P_SIZE_*); W1 the data register's half, the store
+ * bit and the index register's half at bit 9; then the word offset. With no index it takes two words, W2 with
+ * G9P_SHARED_OFFSET and the offset's low byte, W3 with G9P_SHARED_OFFSET_HIGH and its high bits; after an index,
+ * W2 adds G9P_SHARED_INDEXED and holds an offset below 256 alone, a larger one in the same two-word layout without
+ * G9P_SHARED_OFFSET_HIGH. Those three bits are named by their observed roles.
+ */
+#define G9P_CLASS_SHARED       0x14
+#define G9P_MEM_W0_BANKS       0x0300
+#define G9P_SIZE_SHIFT         11
+#define G9P_SIZE_4X32          7
+#define G9P_MEM_STORE          0x0080
+#define G9P_MEM_INDEX_SHIFT    9
+#define G9P_SHARED_OFFSET      0x8000
+#define G9P_SHARED_INDEXED     0x0800
+#define G9P_SHARED_OFFSET_HIGH 0x0200
+static inline void
+g9p_shared_access(struct g9p_code *c, unsigned size, bool store, unsigned reg, unsigned word, int index_half)
+{
+   const uint16_t w0 = size << G9P_SIZE_SHIFT | G9P_MEM_W0_BANKS | G9P_CLASS_SHARED;
+   uint16_t w1 = G9P_CONT | (store ? G9P_MEM_STORE : 0) | 2 * reg;
+
+   if (index_half < 0) {
+      G9P_EMIT(c, w0, w1, G9P_SHARED_OFFSET | G9P_CONT | (word & 255), G9P_SHARED_OFFSET_HIGH | (word >> 8));
+      return;
+   }
+   w1 |= (unsigned)index_half << G9P_MEM_INDEX_SHIFT;
+   if (word < 256)
+      G9P_EMIT(c, w0, w1, G9P_SHARED_OFFSET | G9P_SHARED_INDEXED | word);
+   else
+      G9P_EMIT(c, w0, w1, G9P_SHARED_OFFSET | G9P_SHARED_INDEXED | G9P_CONT | (word & 255), word >> 8);
+}
+
+/*
+ * A shared-memory index after its shift, as Apple's A9 compiler emits it: r[@dst] = 0 + r[@src], an integer add
+ * of the literal 0 (g9p_add_imm()'s literal form) in g9p_addr()'s class, with @shift in g9p_addr()'s shift field.
+ * G9P_INDEX_SHIFT_CTL is named by its observed role (seen in this form only).
+ */
+#define G9P_CLASS_ADDR      0x89 /* g9p_addr()'s class */
+#define G9P_SRC_A_IMM       0x0001 /* source A is a literal, its value from bit 1 (g9p_add_imm()) */
+#define G9P_IMM_SHORT       0x0020 /* g9p_add_imm()'s short-literal word */
+#define G9P_INDEX_SHIFT_CTL 0x0e00
+#define G9P_ADDR_SHIFT_BIT  13 /* g9p_addr()'s shift field */
+static inline void
+g9p_shared_index(struct g9p_code *c, unsigned dst, unsigned src, unsigned shift)
+{
+   G9P_EMIT(c, G9P_CLASS_ADDR | G9P_CONT | G9P_W0_SRC_B_BANK1, G9P_CONT | G9P_W1_BANK1 | 2 * dst,
+            G9P_SRC_A_IMM | G9P_CONT | src << G9P_SRC_B_SHIFT, G9P_CONT | G9P_IMM_SHORT,
+            G9P_CONT | G9P_INDEX_SHIFT_CTL | G9P_IADD, shift << G9P_ADDR_SHIFT_BIT);
+}
+
+/*
  * dst = flat varying component @comp (4 per varying in the DOUTI program's
  * order), the provoking vertex's value bit for bit; follow with g9p_wait().
  */

@@ -41,6 +41,10 @@
 #include "util/format/u_format.h"
 #include "g9p_compile.h"
 #include "g9p_isa.h"
+#include "util/u_debug.h"
+#include "util/log.h"
+
+DEBUG_GET_ONCE_BOOL_OPTION(g9p_pressure, "G9P_PRESSURE", false)
 
 /* r0-r29 for values, the mask stack after them (G9P_REGS: debug override) */
 static unsigned
@@ -4889,7 +4893,7 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
    walk_liveness(&ctx, &impl->body, true);
 
    /* G9P_PRESSURE: the most scalars live at once, from the liveness above */
-   if (getenv("G9P_PRESSURE")) {
+   if (debug_get_option_g9p_pressure()) {
       unsigned *delta = rzalloc_array(mem_ctx, unsigned, ctx.ip + 2), *dec = rzalloc_array(mem_ctx, unsigned, ctx.ip + 2);
       unsigned live = 0, peak = 0, peak_ip = 0, decls = 0;
 
@@ -4920,7 +4924,7 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
          if (live > peak)
             peak = live, peak_ip = i;
       }
-      fprintf(stderr, "g9p: pressure peak %u at instruction %u of %u (%u NIR register scalars)\n",
+      mesa_logi( "g9p: pressure peak %u at instruction %u of %u (%u NIR register scalars)\n",
               peak, peak_ip, ctx.ip, decls);
    }
 
@@ -5027,9 +5031,9 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
             bool free = true;
 
             for (unsigned i = 0; free && i < num_homed; i++)
-               free = homed[i].home != 32 + (int)h + (getenv("G9P_HOME_SKIP") ? atoi(getenv("G9P_HOME_SKIP")) : 0) || homed[i].end < start || end < homed[i].start;
+               free = homed[i].home != 32 + (int)h || homed[i].end < start || end < homed[i].start;
             if (free)
-               home = 32 + h + (getenv("G9P_HOME_SKIP") ? atoi(getenv("G9P_HOME_SKIP")) : 0);
+               home = 32 + h;
          }
          if (home < 0) {
             fprintf(stderr, "g9p: out of registers above r31 at instruction %u\n", ctx.oom_ip);
