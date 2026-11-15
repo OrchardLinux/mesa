@@ -645,6 +645,10 @@ VkResult pvr_drm_winsys_render_submit(
    /* Returns VK_ERROR_OUT_OF_DEVICE_MEMORY to match pvrsrv. */
    const VkResult result = pvr_drm_submit_jobs(drm_ws, &args, "render");
 
+   if (result == VK_SUCCESS) {
+      pvr_drm_tag_job_sync(drm_ws, signal_sync_geom, "geometry");
+      pvr_drm_tag_job_sync(drm_ws, signal_sync_frag, "fragment");
+   }
    if (lock_fd >= 0)
       flock(lock_fd, LOCK_UN);
    return result;

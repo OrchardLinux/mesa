@@ -26,6 +26,8 @@
 
 #include "pvr_device_info.h"
 #include "pvr_formats.h"
+#include "vk_sync.h"
+#include "vk_sync_timeline.h"
 
 #if defined(VK_USE_PLATFORM_DISPLAY_KHR) || \
     defined(VK_USE_PLATFORM_WAYLAND_KHR) || \
@@ -63,6 +65,12 @@ struct pvr_physical_device {
    dev_t render_devid;
 
    struct pvr_winsys *ws;
+   struct vk_sync_type sync_type;
+   const struct vk_sync_type *sync_types[3];
+   struct vk_sync_timeline_type timeline_sync_type;
+   VkResult (*native_wait_many)(struct vk_device *, uint32_t,
+                                const struct vk_sync_wait *,
+                                enum vk_sync_wait_flags, uint64_t);
    struct pvr_device_info dev_info;
    struct pvr_device_runtime_info dev_runtime_info;
 

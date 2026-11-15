@@ -365,6 +365,8 @@ static inline bool pvr_winsys_never_lost(struct pvr_winsys *ws)
 struct pvr_winsys_ops {
    void (*destroy)(struct pvr_winsys *ws);
    bool (*is_lost)(struct pvr_winsys *ws);
+   VkResult (*check_job_fences)(struct pvr_winsys *ws, uint32_t count,
+                                const struct vk_sync_wait *waits);
    VkResult (*device_info_init)(struct pvr_winsys *ws,
                                 struct pvr_device_info *dev_info,
                                 struct pvr_device_runtime_info *runtime_info);
@@ -467,6 +469,7 @@ struct pvr_winsys {
 
    const struct vk_sync_type *sync_types[3];
    const char *loss_source;
+   uint32_t job_sync_size;
    struct vk_sync_type syncobj_type;
    struct vk_sync_timeline_type timeline_syncobj_type;
 

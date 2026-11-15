@@ -281,7 +281,7 @@ g5p_merge_syncs(struct pvr_device *device, struct vk_sync *a, struct vk_sync *b,
       waits[n++] = (struct vk_sync_wait){ .sync = a, .stage_mask = ~(VkPipelineStageFlags2)0 };
    if (b)
       waits[n++] = (struct vk_sync_wait){ .sync = b, .stage_mask = ~(VkPipelineStageFlags2)0 };
-   result = vk_sync_create(&device->vk, &device->pdevice->ws->syncobj_type, 0U, 0UL, out);
+   result = vk_sync_create(&device->vk, &device->pdevice->sync_type, 0U, 0UL, out);
    if (result != VK_SUCCESS)
       return result;
    const struct vk_sync_signal signal = { .sync = *out, .stage_mask = ~(VkPipelineStageFlags2)0 };
@@ -311,7 +311,7 @@ pvr_process_graphics_cmd_for_view(struct pvr_device *device,
    job->view_state.view_index = view_index;
 
    result = vk_sync_create(&device->vk,
-                           &device->pdevice->ws->syncobj_type,
+                           &device->pdevice->sync_type,
                            0U,
                            0UL,
                            &geom_signal_sync);
@@ -320,7 +320,7 @@ pvr_process_graphics_cmd_for_view(struct pvr_device *device,
 
    if (job->run_frag) {
       result = vk_sync_create(&device->vk,
-                              &device->pdevice->ws->syncobj_type,
+                              &device->pdevice->sync_type,
                               0U,
                               0UL,
                               &frag_signal_sync);
@@ -683,7 +683,7 @@ static VkResult pvr_process_compute_cmd(struct pvr_device *device,
    VkResult result;
 
    result = vk_sync_create(&device->vk,
-                           &device->pdevice->ws->syncobj_type,
+                           &device->pdevice->sync_type,
                            0U,
                            0UL,
                            &sync);
@@ -721,7 +721,7 @@ static VkResult pvr_process_transfer_cmds(struct pvr_device *device,
    VkResult result;
 
    result = vk_sync_create(&device->vk,
-                           &device->pdevice->ws->syncobj_type,
+                           &device->pdevice->sync_type,
                            0U,
                            0UL,
                            &sync);
@@ -868,7 +868,7 @@ static VkResult pvr_process_query_cmd(struct pvr_device *device,
     */
 
    result = vk_sync_create(&device->vk,
-                           &device->pdevice->ws->syncobj_type,
+                           &device->pdevice->sync_type,
                            0U,
                            0UL,
                            &sync);
@@ -939,7 +939,7 @@ pvr_process_event_cmd_barrier(struct pvr_device *device,
       struct vk_sync *signal_sync;
 
       result = vk_sync_create(&device->vk,
-                              &device->pdevice->ws->syncobj_type,
+                              &device->pdevice->sync_type,
                               0U,
                               0UL,
                               &signal_sync);
@@ -1008,7 +1008,7 @@ pvr_process_event_cmd_set_or_reset(struct pvr_device *device,
    }
 
    result = vk_sync_create(&device->vk,
-                           &device->pdevice->ws->syncobj_type,
+                           &device->pdevice->sync_type,
                            0U,
                            0UL,
                            &signal_sync);
@@ -1119,7 +1119,7 @@ pvr_process_event_cmd_wait(struct pvr_device *device,
       assert(wait_count <= (sub_cmd->count + 1));
 
       result = vk_sync_create(&device->vk,
-                              &device->pdevice->ws->syncobj_type,
+                              &device->pdevice->sync_type,
                               0U,
                               0UL,
                               &signal_sync);
@@ -1591,7 +1591,7 @@ static VkResult pvr_process_queue_waits(struct pvr_queue *queue,
       }
 
       result = vk_sync_create(&device->vk,
-                              &device->pdevice->ws->syncobj_type,
+                              &device->pdevice->sync_type,
                               0U,
                               0UL,
                               &queue->next_job_wait_sync[i]);

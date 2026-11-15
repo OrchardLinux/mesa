@@ -1356,7 +1356,20 @@ VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
       goto err_vk_physical_device_finish;
    }
 
-   pdevice->vk.supported_sync_types = ws->sync_types;
+   pdevice->sync_type = ws->syncobj_type;
+   if (ws->job_sync_size) {
+      pdevice->sync_type.size = MAX2(pdevice->sync_type.size, ws->job_sync_size);
+      pdevice->native_wait_many = pdevice->sync_type.wait_many;
+      pdevice->sync_type.wait_many = pvr_sync_wait_many;
+   }
+   pdevice->sync_types[0] = &pdevice->sync_type;
+   pdevice->sync_types[1] = NULL;
+   pdevice->sync_types[2] = NULL;
+   if (ws->sync_types[1]) {
+      pdevice->timeline_sync_type = vk_sync_timeline_get_type(&pdevice->sync_type);
+      pdevice->sync_types[1] = &pdevice->timeline_sync_type.sync;
+   }
+   pdevice->vk.supported_sync_types = pdevice->sync_types;
 
    pdevice->pco_ctx =
       pco_ctx_create(&pdevice->dev_info, &pdevice->dev_runtime_info, NULL);

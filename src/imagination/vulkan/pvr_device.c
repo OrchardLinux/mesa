@@ -60,6 +60,7 @@
 #include "pvr_winsys.h"
 #include "pvr_wsi.h"
 #include "util/log.h"
+#include "util/os_time.h"
 #include "util/macros.h"
 #include "util/mesa-blake3.h"
 #include "util/os_misc.h"
@@ -188,6 +189,22 @@ void pvr_rstate_entry_remove(struct pvr_device *device,
    }
 
    simple_mtx_unlock(&device->rs_mtx);
+}
+
+/* Inspect job errors only for blocking completion waits, on the logical
+ * device's winsys. Polling and availability waits retain their usual cost. */
+VkResult pvr_sync_wait_many(struct vk_device *vk, uint32_t count,
+                            const struct vk_sync_wait *waits,
+                            enum vk_sync_wait_flags flags, uint64_t timeout)
+{
+   struct pvr_device *device = container_of(vk, struct pvr_device, vk);
+   const bool slow = !(flags & VK_SYNC_WAIT_PENDING) &&
+                     timeout > (uint64_t)os_time_get_nano();
+   VkResult result = device->pdevice->native_wait_many(vk, count, waits, flags, timeout);
+   if (result == VK_SUCCESS && slow && device->ws->ops->check_job_fences &&
+       device->ws->ops->check_job_fences(device->ws, count, waits) == VK_ERROR_DEVICE_LOST)
+      return vk_device_check_status(vk);
+   return result;
 }
 
 VkResult pvr_AllocateMemory(VkDevice _device,

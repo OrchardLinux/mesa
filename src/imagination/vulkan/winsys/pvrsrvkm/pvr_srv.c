@@ -824,7 +824,7 @@ static VkResult pvr_srv_create_presignaled_sync(struct pvr_device *device,
       goto err_close_sw_fence;
 
    result = vk_sync_create(&device->vk,
-                           &device->pdevice->ws->syncobj_type,
+                           &device->pdevice->sync_type,
                            0U,
                            0UL,
                            &sync);

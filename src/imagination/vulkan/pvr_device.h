@@ -282,6 +282,10 @@ static inline struct pvr_device *vk_to_pvr_device(struct vk_device *device)
    return container_of(device, struct pvr_device, vk);
 }
 
+VkResult pvr_sync_wait_many(struct vk_device *vk, uint32_t count,
+                            const struct vk_sync_wait *waits,
+                            enum vk_sync_wait_flags flags, uint64_t timeout);
+
 VkResult pvr_device_tile_buffer_ensure_cap(struct pvr_device *device,
                                            uint32_t capacity);
 
