@@ -118,9 +118,16 @@ pvr_g5p_vertex_format_info(VkFormat format, struct pvr_g5p_vertex_format *f)
       f->convert = PCO_G5P_VSF_F16;
       return true;
    }
-   /* to float: normalized or scaled; 8- and 16-bit integer inputs are not
-    * converted yet */
-   if (!(is_signed || is_unsigned) || ch->pure_integer)
+   /* 8- and 16-bit pure integers (glVertexAttribIPointer with GL_BYTE ... GL_UNSIGNED_SHORT): the dwords
+    * that hold them fetched raw, each component shifted out (and sign-extended) in NIR, no conversion
+    * (G9P's 4a8c71666d9 ("pvr/g9p: Qt Quick on Zink: packed vertex formats, texelFetch") for the A10) */
+   if ((is_signed || is_unsigned) && ch->pure_integer) {
+      f->convert = -1;
+      f->raw_int = true;
+      return true;
+   }
+   /* to float: normalized or scaled */
+   if (!(is_signed || is_unsigned))
       return false;
    f->convert = (bits == 16 ? PCO_G5P_VSF_U16 : PCO_G5P_VSF_U8) + (ch->normalized ? 2 : 0) + is_signed;
    return true;
@@ -295,6 +302,20 @@ rewrite_load(nir_builder *b, nir_intrinsic_instr *in, void *data)
          c[k] = comp != 3 ? nir_imm_int(b, 0) : is_float ? nir_imm_float(b, 1.0f) : nir_imm_int(b, 1);
          continue;
       }
+      if (f.raw_int) {
+         /* the component's bytes in the attribute's fetched dwords */
+         const unsigned at = lead + f.bytes * f.swizzle[comp], reg = rw->base[loc] + at / 4;
+         const unsigned shift = 8 * (at % 4), bits = 8 * f.bytes;
+         nir_def *word = nir_load_input(b, 1, 32, nir_imm_int(b, 0), .base = reg / 4,
+                                       .component = reg % 4, .dest_type = nir_type_uint32,
+                                       .io_semantics = (nir_io_semantics){
+                                          .location = VERT_ATTRIB_GENERIC0 + reg / 4, .num_slots = 1 });
+         const bool is_signed = vk_format_description(rw->l->vi->attributes[loc].format)->channel[0].type ==
+                                UTIL_FORMAT_TYPE_SIGNED;
+         c[k] = is_signed ? nir_ishr_imm(b, nir_ishl_imm(b, word, 32 - shift - bits), 32 - bits)
+                          : nir_iand_imm(b, nir_ushr_imm(b, word, shift), BITFIELD_MASK(bits));
+         continue;
+      }
       if (f.packed_1010102) {
          unsigned reg = rw->base[loc];
          nir_def *word = nir_load_input(b, 1, 32, nir_imm_int(b, 0), .base = reg / 4,
@@ -332,10 +353,36 @@ rewrite_load(nir_builder *b, nir_intrinsic_instr *in, void *data)
    return true;
 }
 
+/* A load of a location the pipeline gives no attribute: (0, 0, 0, 1) (G9P's 4a8c71666d9 ("pvr/g9p: Qt Quick on Zink: packed vertex formats, texelFetch"); the
+ * refusal "reads location %u, which has no vertex attribute" before) */
+static bool
+unbound_input(nir_builder *b, nir_intrinsic_instr *in, void *data)
+{
+   const uint32_t valid = *(const uint32_t *)data;
+   if (in->intrinsic != nir_intrinsic_load_input)
+      return false;
+   const int loc = generic_location(in);
+   if (loc < 0 || (valid & BITFIELD_BIT(loc)) || in->def.bit_size != 32)
+      return false;
+   const bool is_float = nir_alu_type_get_base_type(nir_intrinsic_dest_type(in)) == nir_type_float;
+   b->cursor = nir_before_instr(&in->instr);
+   nir_def *c[4];
+   for (unsigned k = 0; k < in->def.num_components; k++)
+      c[k] = nir_intrinsic_component(in) + k != 3 ? nir_imm_int(b, 0) : is_float ? nir_imm_float(b, 1.0f)
+                                                                                 : nir_imm_int(b, 1);
+   nir_def_replace(&in->def, nir_vec(b, c, in->def.num_components));
+   return true;
+}
+
 bool
 pvr_g5p_vertex_lower(nir_shader *vs, struct pvr_g5p_vertex_layout *l)
 {
    const struct vk_vertex_input_state *vi = l->vi;
+
+   {
+      uint32_t valid = vi ? vi->attributes_valid : 0;
+      nir_shader_intrinsics_pass(vs, unbound_input, nir_metadata_control_flow, &valid);
+   }
 
    /* the locations the program reads */
    l->read = 0;
@@ -378,14 +425,14 @@ pvr_g5p_vertex_lower(nir_shader *vs, struct pvr_g5p_vertex_layout *l)
       /* the fetch is dword-granular: a 32-bit attribute starts on a dword,
        * a converted one is read from the dwords that hold its bytes */
       const unsigned lead = at->offset % 4;
-      if (f.convert < 0 && lead)
+      if (f.convert < 0 && !f.raw_int && lead)
          return REFUSE(l, "vertex attribute %u at offset %u (the fetch is dword-granular)", loc, at->offset);
       if (lead % f.bytes)
          return REFUSE(l, "vertex attribute %u: %u-byte components at offset %u", loc, f.bytes, at->offset);
       if (!l->dynamic_strides && vi->bindings[at->binding].stride % 4)
          return REFUSE(l, "vertex binding %u: stride %u (the fetch is dword-granular)", at->binding,
                        vi->bindings[at->binding].stride);
-      converted |= f.convert >= 0 || f.packed_1010102;
+      converted |= f.convert >= 0 || f.packed_1010102 || f.raw_int;
       a[n++] = (struct attrib){ loc, at->binding, DIV_ROUND_UP(lead + f.bytes * f.components, 4), at->offset - lead,
                                 lead, f };
    }

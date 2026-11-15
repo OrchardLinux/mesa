@@ -71,6 +71,7 @@ struct pvr_g5p_vertex_format {
    uint8_t components, bytes;
    int8_t convert;
    bool packed_1010102; /* one raw dword; components unpacked in NIR */
+   bool raw_int; /* 8/16-bit pure integers: the dwords fetched raw, each component shifted out in NIR */
    uint8_t swizzle[4];
 };
 
