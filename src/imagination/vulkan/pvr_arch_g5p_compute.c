@@ -75,6 +75,30 @@ PVR_PER_ARCH(g5p_compute_pipeline_compile)(
                             shader.num_regs);
          goto out;
       }
+      /* Apple's per-pipeline limit (AGXMetalA9 ComputeProgramVariant 0x207d2c4b0 -> +0xb08, which
+       * -[AGXA9FamilyComputePipeline maxTotalThreadsPerThreadgroup] returns), from the allocation the
+       * kernel task sends: bank 0 (the DOUTU temps, t) and bank 1 (the record's register field, f
+       * registers). min(32 * floor((3329 - a) / a) with a = (4t + 28) & ~31, 393216 / ((64f + 448) & ~511)),
+       * at most 512, a multiple of 32 above 32. k_hi48 (t 64, f 8) gives 384, the limit Metal reported for it
+       * on iOS. Vulkan has no per-pipeline limit, so a larger workgroup is refused by
+       * name: the USC cannot hold it. */
+      if (shader.a9) {
+         const unsigned t = 8 * DIV_ROUND_UP(MAX2(shader.num_regs, 1), 8);
+         const unsigned f = 8 * DIV_ROUND_UP(shader.a9_bank1_regs ? shader.a9_bank1_regs : shader.num_regs, 8);
+         const unsigned a = (4 * t + 28) & ~31u, b = (64 * f + 448) & ~511u;
+         unsigned max = MIN2(a ? 32 * ((3329 - a) / a) : 512, b ? 393216 / b : 512);
+         max = MIN2(max, 512);
+         if (max > 32)
+            max &= ~31u;
+         if (threads > max) {
+            mesa_logw("G5P refuses: a %u-lane workgroup with %u bank-0 and %u bank-1 registers per lane, above "
+                    "the %u lanes Apple's A9 driver allows for that allocation", threads, t, f, max);
+            result = vk_errorf(device, VK_ERROR_FEATURE_NOT_PRESENT,
+                               "G5P compute: %u-lane workgroup above the %u-lane limit of its allocation", threads,
+                               max);
+            goto out;
+         }
+      }
    }
 
    result = pvr_gpu_upload_usc(device, shader.code, shader.code_size, 64,
