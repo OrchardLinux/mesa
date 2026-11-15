@@ -289,6 +289,47 @@ clamp_dyn_ubo(nir_shader *nir)
 
 static nir_shader *g5p_nir_prepare(nir_shader *nir);
 
+/* Storage-buffer accesses the backend encodes: a 32-bit scalar, or a vec4
+ * load at a 16-byte-aligned offset (one 16-byte addressed load). Wider or
+ * misaligned vectors become scalars at offset + 4k (WGSL's vec2/vec3 and
+ * struct members), and stores become one scalar store per written
+ * component. A constant offset keeps a vec4 that the fixed load already
+ * encodes, so earlier programs are unchanged. */
+static bool
+split_ssbo_access(nir_builder *b, nir_intrinsic_instr *in, void *data)
+{
+   if (in->intrinsic == nir_intrinsic_load_ssbo) {
+      const unsigned n = in->def.num_components;
+      if (in->def.bit_size != 32 || n == 1)
+         return false;
+      if (n == 4 && (nir_intrinsic_align(in) >= 16 ||
+                     (nir_src_is_const(in->src[1]) && !(nir_src_as_uint(in->src[1]) % 16))))
+         return false;
+      b->cursor = nir_before_instr(&in->instr);
+      nir_def *comp[NIR_MAX_VEC_COMPONENTS];
+      for (unsigned k = 0; k < n; k++)
+         comp[k] = nir_load_ssbo(b, 1, 32, in->src[0].ssa, nir_iadd_imm(b, in->src[1].ssa, 4 * k),
+                                 .access = nir_intrinsic_access(in), .align_mul = 4, .align_offset = 0);
+      nir_def_replace(&in->def, nir_vec(b, comp, n));
+      return true;
+   }
+   if (in->intrinsic == nir_intrinsic_store_ssbo) {
+      const unsigned n = in->src[0].ssa->num_components;
+      const unsigned mask = nir_intrinsic_write_mask(in);
+      if (in->src[0].ssa->bit_size != 32 || (n == 1 && mask == 1))
+         return false;
+      b->cursor = nir_before_instr(&in->instr);
+      u_foreach_bit(k, mask)
+         nir_store_ssbo(b, nir_channel(b, in->src[0].ssa, k), in->src[1].ssa,
+                        nir_iadd_imm(b, in->src[2].ssa, 4 * k), .write_mask = 1,
+                        .access = nir_intrinsic_access(in), .align_mul = 4, .align_offset = 0);
+      nir_instr_remove(&in->instr);
+      return true;
+   }
+   return false;
+}
+
+
 /* SPIR-V -> optimised NIR (the ICD's g5p_nir()) */
 static nir_shader *
 g5p_nir(const uint32_t *spv, size_t words, mesa_shader_stage stage, const char *entry)
@@ -339,6 +380,7 @@ g5p_nir_prepare(nir_shader *nir)
       nir_shader_gather_xfb_info(nir);
    nir_lower_io_passes(nir, false);
    nir_lower_explicit_io(nir, nir_var_mem_ssbo | nir_var_mem_ubo, nir_address_format_32bit_index_offset);
+   nir_shader_intrinsics_pass(nir, split_ssbo_access, nir_metadata_control_flow, NULL);
    bool progress;
    do {
       progress = false;

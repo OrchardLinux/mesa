@@ -4880,7 +4880,7 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
 
    ctx.ip = 0;
    walk_liveness(&ctx, &impl->body, false);
-   if (ctx.loop_index > G9P_MAX_LOOPS) {
+   if (ctx.loop_index > (out->a9 ? G9P_MAX_LOOPS : 64)) {
       fprintf(stderr, "g9p: too many loops\n");
       return false;
    }

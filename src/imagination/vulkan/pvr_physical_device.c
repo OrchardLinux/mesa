@@ -695,7 +695,7 @@ static bool pvr_physical_device_get_properties(
       .maxDescriptorSetSamplers = 3U * 16U,
       .maxDescriptorSetUniformBuffers = 3U * 12U,
       .maxDescriptorSetUniformBuffersDynamic = 8U,
-      .maxDescriptorSetStorageBuffers = 3U * 4U,
+      .maxDescriptorSetStorageBuffers = PVR_HAS_FEATURE(dev_info, apple_g5p) ? 16U : 3U * 4U,
       .maxDescriptorSetStorageBuffersDynamic = 4U,
       .maxDescriptorSetSampledImages = 3U * 16U,
       .maxDescriptorSetStorageImages = 3U * 4U,

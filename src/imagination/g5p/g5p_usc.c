@@ -742,6 +742,16 @@ unsigned g5p_usc_mov_shared(uint8_t *out, unsigned dst_half, unsigned src_dword,
    return finish(out, raw, 12);
 }
 
+/* Byte fields of the address add (g5p_usc_address_add_shift()) and later encoders. */
+#define G5P_HEADER_FRAGMENT 0x01    /* the header's continuation into the destination parcel, nothing else */
+#define G5P_HEADER_SRC_B_BANK1 0x10 /* source B in register bank 1 (g9p_w0()'s W0 bit 12; vertex code) */
+#define G5P_PARCEL_CONTINUES 0x01
+#define G5P_SRC_LAST_READ 0x80      /* a register source read for the last time (in the group bit's place) */
+#define G5P_CLASS_ADDR_ADD 0x89     /* the address add's class byte (the binary class with the 16-bit result) */
+#define G5P_ADDR_ADD_ROUTING_NONE 0x00
+#define G5P_ADDR_ADD_CTL 0x06       /* set in every witnessed address add (observed role) */
+#define G5P_ADDR_ADD_SHIFT_BIT 5    /* the shift, bits 5..7 of the control byte */
+
 /* ---- ISA round 2: inline shared sources (g5p_usc_resources.py) ---- */
 static unsigned alu_header(uint8_t *raw, unsigned cls, unsigned dst_half, unsigned bank, unsigned header,
                            unsigned source_extension, unsigned dst_control)
@@ -1037,7 +1047,7 @@ unsigned g5p_usc_sample_ext(uint8_t *out, const struct g5p_tex_ext *t)
    raw[9] = 0;
    if (coupled) {
       /* Complete native operand/result recipe, reconstructed against the
-       * paired Metal programs and exact in r1c's non-cube device rungs.
+       * paired Metal programs and exact in the non-cube device cases.
        * Individual destination/coordinate continuation bits are unknown;
        * keep this suffix indivisible rather than guessing mixed forms. */
       raw[9] = (1u << 7) | 1u;
@@ -1190,10 +1200,25 @@ unsigned g5p_usc_address_add_shift(uint8_t *out, unsigned pair_half, unsigned ba
    CHECK(half_register(pair_half, "pair_half requires a 64-bit aligned register pair") && !(pair_half & 2),
          "pair_half requires a 64-bit aligned register pair");
    CHECK(half_register(index_half, "index_half requires a measured 32-bit register"), g5p_usc_error);
-   CHECK(base_common_dword < 32 && !(base_common_dword & 1), "pointer base must be an even common dword below 32");
+   CHECK(base_common_dword < 256 && !(base_common_dword & 1), "pointer base must be an even common dword below 256");
    CHECK(shift <= 4, "only shifts 0-4 are corpus-verified");
-   uint8_t raw[12] = {0x89, vs ? 0x11 : 0x01, pair_half, vs ? 0x03 : 0x01, 0x81 | 4 * base_common_dword,
-                      (kill ? 0x80 : 0) | 1 | index_half << 1, 0x00, 0x41, 0xa1, 0x01, 0x00, 0x06 | shift << 5};
+   /* The layout of g5p_usc_alu_shared(): alu_header() (vertex code: destination bank 1, and B's bank bit in
+    * the header), A = the pointer base (shared_src(), group 1; above dword 31 its high bits are the field that
+    * the vertex XFB record's address add and every shared ALU operand use), B = the index with its last read,
+    * the integer add, then the last parcel: no routing, and the control byte with the shift. */
+   uint8_t raw[12], a[4];
+   if (!alu_header(raw, G5P_CLASS_ADDR_ADD, pair_half, vs, G5P_HEADER_FRAGMENT | (vs ? G5P_HEADER_SRC_B_BANK1 : 0),
+                   0, 0) ||
+       !shared_src(a, base_common_dword, 1))
+      return 0;
+   raw[4] = a[0];
+   raw[5] = (index_half << 1) | (kill ? G5P_SRC_LAST_READ : 0) | G5P_PARCEL_CONTINUES;
+   raw[6] = a[2];
+   raw[7] = a[3];
+   raw[8] = binop_code[G5P_BIN_IADD];
+   raw[9] = G5P_PARCEL_CONTINUES;
+   raw[10] = G5P_ADDR_ADD_ROUTING_NONE;
+   raw[11] = G5P_ADDR_ADD_CTL | shift << G5P_ADDR_ADD_SHIFT_BIT;
    return finish(out, raw, 12);
 }
 

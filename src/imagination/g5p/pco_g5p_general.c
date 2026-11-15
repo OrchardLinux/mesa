@@ -106,8 +106,8 @@ enum { BLEND_NONE, BLEND_PREMULT, BLEND_STRAIGHT_OVER, BLEND_REPLACE, BLEND_GENE
 /* The general blend epilogue (g5p_blend.c, hyprland-gpu.md §11.2) for
  * settings without a measured epilogue. Premultiplied, straight-over and
  * replace keep their paths. By default only the settings of the device
- * blend ladder (linux-a9 blend-ladder.c, release7 2026-11-02: 45 rungs,
- * every pixel within 1 LSB) and of the bench ladder's three blend rungs
+ * blend ladder (45 cases on the A9,
+ * every pixel within 1 LSB) and of the bench ladder's three blend cases
  * take their original byte-identical shape. All other core equations use
  * the same tile protocol with canonical native-f16 ALU lowering. */
 bool pco_g5p_blend_general(void)
@@ -759,6 +759,7 @@ static bool alu_supported(struct gctx *c, nir_alu_instr *a)
 /* Register-indexed UBO loads (defined with the common-store plan). */
 static bool dyn_offset_alu(nir_alu_instr *a);
 static bool dyn_ubo_load(nir_intrinsic_instr *in);
+static bool eval_offset(nir_def *d, unsigned comp, uint32_t *v);
 static bool dyn_ubo_offset(nir_intrinsic_instr *in, struct ref *idx, unsigned *shift, uint32_t *base);
 
 /* Vertex iadd that only feeds UBO/push offsets folds into the upload plan. */
@@ -1179,7 +1180,8 @@ static void scan_cf(struct gctx *c, struct exec_list *list, struct unsupported *
                ok = in->src[0].ssa->bit_size==32 && in->num_components==1 && nir_intrinsic_write_mask(in)==1;
                break;
             case nir_intrinsic_load_ssbo:
-               ok = !c->vs;
+               /* 4- or 16-byte loads (g5p_nir_prepare splits the rest) */
+               ok = in->def.bit_size == 32 && (in->def.num_components == 1 || in->def.num_components == 4);
                break;
             case nir_intrinsic_load_vertex_id:
             case nir_intrinsic_load_instance_id:
@@ -1723,6 +1725,12 @@ static void liveness(struct gctx *c)
             mark(c, ix, idx);
             continue;
          }
+         if (in->intrinsic == nir_intrinsic_load_ssbo) {
+            uint32_t off;
+            if (!eval_offset(in->src[1].ssa, 0, &off))
+               mark(c, resolve_value(c, in->src[1].ssa, 0), idx);
+            continue;
+         }
          if (in->intrinsic == nir_intrinsic_store_global) {
             unsigned b, k;
             struct ref off;
@@ -2121,25 +2129,33 @@ static void plan_common(struct gctx *c)
          for (unsigned i = 0; i < c->nssbo; i++)
             found |= c->ssbo_set[i] == set && c->ssbo_binding[i] == binding;
          if (!found) {
-            if (c->nssbo == 2)
-               refuse(c, "load_ssbo: only pointer bases common0/common2 are witnessed (two buffers)");
+            if (c->nssbo == PCO_G5P_MAX_SSBOS)
+               refuse(c, "more than %u storage buffers", PCO_G5P_MAX_SSBOS);
             c->ssbo_set[c->nssbo] = set;
             c->ssbo_binding[c->nssbo++] = binding;
          }
       }
    }
    unsigned next = 0;
-   if (!c->vs && c->blend == BLEND_GENERAL && c->binfo.uses_constants) {
-      /* Apple's layout: the blend colour in common 0..3, everything else after it */
-      if (c->nssbo)
-         refuse(c, "blend constants with storage buffers (both want common dwords 0..3)");
+   bool blend_constants = !c->vs && c->blend == BLEND_GENERAL && c->binfo.uses_constants;
+   /* Apple's layout: the blend colour in common 0..3, everything else after
+    * it. Storage buffers keep common0/common2 only when they are at most two
+    * and the blend colour does not want those dwords; otherwise their
+    * pointers follow the stage's other common dwords (below). */
+   c->ssbo_high = c->nssbo > 2 || (c->nssbo && blend_constants);
+   if (blend_constants) {
       add_upload(c, PCO_G5P_UPLOAD_BLEND_CONSTANTS, 0, 0, 0, 0, 4, G5P_BLEND_CONST_BASE);
       next = 4;
    }
-   for (unsigned i = 0; i < c->nssbo; i++)
+   for (unsigned i = 0; !c->ssbo_high && i < c->nssbo; i++) {
+      c->ssbo_common[i] = 2 * i;
       add_upload(c, PCO_G5P_UPLOAD_SSBO_ADDR, c->ssbo_set[i], c->ssbo_binding[i], 0, 0, 2, 2 * i);
-   if (c->nssbo)
+   }
+   if (c->nssbo && !c->ssbo_high)
       next = MAX2(next, 4);
+   /* High storage pointers: an even dword each after the data, so the
+    * plan reserves their dwords (plus one for alignment) at its end. */
+   const unsigned ssbo_reserve = c->ssbo_high ? 2 * c->nssbo + 1 : 0;
    bool qualified = c->vs && g5p_vtex_qualified();
    /* Preserve the flown <=4-texture layout. Larger fragment programs use
     * Apple's f16 capacity layout: all eight-dword images, then samplers.
@@ -2167,7 +2183,7 @@ static void plan_common(struct gctx *c)
       }
       if (!g5p_stage_common_plan(next, c->ntex, sampler_count + fetch_sampler,
                                  compact, c->nuptr, c->nsize, ubos,
-                                 ubo_dwords, push_dwords, &common_plan))
+                                 ubo_dwords, push_dwords + ssbo_reserve, &common_plan))
          refuse(c, "common layout cannot fit pointers below 32 and data below 256 dwords");
       compact = common_plan.compact;
       if (common_plan.low_pointers) {
@@ -2266,7 +2282,16 @@ static void plan_common(struct gctx *c)
                  (r->hi - r->lo) / 4, r->common);
    }
    if (planned)
-      assert(next == common_plan.end);
+      assert(next + ssbo_reserve == common_plan.end);
+   /* addr.add_shift reads a pointer pair at any even common dword below 256
+    * (the shared-operand field's high bits, g5p_usc_address_add_shift). */
+   for (unsigned i = 0; c->ssbo_high && i < c->nssbo; i++) {
+      c->ssbo_common[i] = next = align(next, 2);
+      next += 2;
+      if (next > limit)
+         refuse(c, "storage-buffer pointers exceed %u common-store dwords", limit);
+      add_upload(c, PCO_G5P_UPLOAD_SSBO_ADDR, c->ssbo_set[i], c->ssbo_binding[i], 0, 0, 2, c->ssbo_common[i]);
+   }
    /* Transform feedback block: pointer pairs at even dwords (address add). */
    if (xfb) {
       c->xfb_common = align(next, 2);
@@ -3431,7 +3456,7 @@ static void emit_isub(struct gctx *c, nir_alu_instr *a)
  * tools/mesa-a9-vtx-re/probes.metal, byte-equal to these encoders). The
  * fragment form (bank 0, header 1) in a vertex program reads and writes
  * other registers: x >> 2 then read again gave x on hardware (vertex-input's
- * gl_VertexIndex rungs). Dynamic amounts have no vertex probe. */
+ * gl_VertexIndex cases). Dynamic amounts have no vertex probe. */
 static void emit_shift(struct gctx *c, nir_alu_instr *a)
 {
    struct ref x = alu_src(c, a, 0), amt = alu_src(c, a, 1);
@@ -4343,7 +4368,7 @@ static void stage_ssbo_store(struct gctx *c,nir_intrinsic_instr *in)
       nir_intrinsic_offset_shift(in)!=0 || nir_intrinsic_align_mul(in)<4 || nir_intrinsic_align_offset(in)%4)
       refuse(c,"store_ssbo: aligned scalar32-bit byte offsets only");
    unsigned set,binding,base=0;block_binding(in->src[1].ssa,&set,&binding);
-   for(unsigned i=0;i<c->nssbo;i++)if(c->ssbo_set[i]==set && c->ssbo_binding[i]==binding)base=2*i;
+   for(unsigned i=0;i<c->nssbo;i++)if(c->ssbo_set[i]==set && c->ssbo_binding[i]==binding)base=c->ssbo_common[i];
    struct ref offset=resolve_value(c,in->src[2].ssa,0),value=resolve_value(c,in->src[0].ssa,0);
    unsigned index=reg_of(c,offset,"store_ssbo byte offset"),data=reg_of(c,value,"store_ssbo value");
    if(c->vs)vs_bank1_only(c,"vertex SSBO store",index,data,-1,-1);
@@ -4363,6 +4388,87 @@ static void stage_ssbo_store(struct gctx *c,nir_intrinsic_instr *in)
    put(c,raw,g5p_usc_wait(raw,0),"SSBO store completion");
    c->busy&=~BITFIELD64_RANGE(pair,2);free_scratch(c);
    c->p->evidence|=c->vs?PCO_G5P_EV_VS_STORE:PCO_G5P_EV_FS_STORE;
+}
+
+/* A vertex address operand from bank 0 is copied into bank 1 (the only
+ * witnessed vertex addr.add_shift form reads bank 1). */
+static unsigned vs_bank1_index(struct gctx *c, unsigned reg)
+{
+   if (!c->vs || vbank(c, reg))
+      return reg;
+   uint8_t raw[G5P_USC_MAX];
+   bool bank0 = c->vs_bank0;
+   c->vs_bank0 = false;
+   unsigned b1 = alloc_reg(c, -1);
+   c->vs_bank0 = bank0;
+   put(c, raw, g5p_usc_move(raw, H(c, b1), H(c, reg), 1, 0, vhdr(c, 0x21, reg, -1, -1)),
+       "bank0 address offset into bank1");
+   c->scratch |= BITFIELD64_BIT(b1);
+   vs_bank1_only(c, "vertex storage-buffer address offset", b1, -1, -1, -1);
+   return b1;
+}
+
+/* A storage-buffer load through its pointer pair: pair = pointer + byte
+ * offset (addr.add_shift, shift 0), then the addressed 4/16-byte load that
+ * Apple's register-indexed constant-buffer programs use (emit_dyn_ubo).
+ * The offset is the load's own register, or a scratch immediate for a
+ * constant offset that the fixed form cannot encode. g5p_nir_prepare()
+ * leaves only scalar loads and 16-byte-aligned vec4 loads. */
+static void emit_address_ssbo_load(struct gctx *c, nir_intrinsic_instr *in, unsigned base)
+{
+   uint8_t raw[G5P_USC_MAX];
+   const unsigned n = in->def.num_components, bytes = 4 * n;
+   uint32_t off;
+   bool constant = eval_offset(in->src[1].ssa, 0, &off);
+   if (constant && off % 4)
+      refuse(c, "load_ssbo: unaligned constant offset %u", off);
+   bool kill;
+   unsigned index;
+   struct ref ix = {0};
+   if (constant) {
+      index = scratch_imm(c, off);
+      kill = true;
+   } else {
+      if (n == 4 && nir_intrinsic_align(in) < 16)
+         refuse(c, "load_ssbo: 16-byte load without 16-byte alignment");
+      ix = resolve_value(c, in->src[1].ssa, 0);
+      index = reg_of(c, ix, "load_ssbo byte offset");
+      kill = dies(c, ix);
+   }
+   unsigned raw_index = index;
+   index = vs_bank1_index(c, index);
+   if (index != raw_index)
+      kill = true; /* the bank-1 copy is scratch */
+   if (!constant && kill && index == raw_index)
+      drop(c, V(c, ix.def, ix.comp));
+   unsigned pair;
+   for (pair = 0; pair + 2 <= NUM_DWORDS; pair += 2)
+      if (!((c->busy | c->reserved | c->tex_coord_pending | c->tex_pending) & BITFIELD64_RANGE(pair, 2)))
+         break;
+   if (pair + 2 > NUM_DWORDS)
+      refuse(c, "load_ssbo: register pressure for an address pair");
+   c->busy |= BITFIELD64_RANGE(pair, 2);
+   c->max_dword = MAX2(c->max_dword, pair + 2);
+   c->max_written = MAX2(c->max_written, pair + 2);
+   put(c, raw, g5p_usc_address_add_shift(raw, 2 * pair, base, H(c, index), 0, kill, c->vs),
+       "storage-buffer address");
+   const unsigned dst = alloc_run(c, n, "load_ssbo");
+   if (c->vs) {
+      vs_bank1_only(c, "vertex storage-buffer load", dst, -1, -1, -1);
+      put(c, raw, g5p_usc_vertex_address_load(raw, 2 * dst, bytes, 2 * pair), "vertex storage-buffer load");
+   } else {
+      put(c, raw, g5p_usc_address_load(raw, 2 * dst, bytes, 2 * pair, 0), "fragment storage-buffer load");
+   }
+   put(c, raw, g5p_usc_wait(raw, 0), "wait");
+   c->busy &= ~BITFIELD64_RANGE(pair, 2);
+   free_scratch(c);
+   for (unsigned k = 0; k < n; k++) {
+      struct val *v = V(c, &in->def, k);
+      v->state = VAL_REG;
+      v->reg = dst + k;
+      v->held = true;
+   }
+   c->p->evidence |= PCO_G5P_EV_BUFFER_LOAD;
 }
 
 static void emit_intrinsic(struct gctx *c, nir_intrinsic_instr *in)
@@ -4456,11 +4562,17 @@ static void emit_intrinsic(struct gctx *c, nir_intrinsic_instr *in)
       unsigned base = 0;
       for (unsigned i = 0; i < c->nssbo; i++)
          if (c->ssbo_set[i] == set && c->ssbo_binding[i] == binding)
-            base = 2 * i;
-      unsigned off = load_offset(c, in, 1, 0);
+            base = c->ssbo_common[i];
+      uint32_t off = 0;
       unsigned n = in->def.num_components, bytes = n == 1 ? 4 : n == 4 ? 16 : 0;
-      if (!bytes || off % bytes || off / bytes > 255)
-         refuse(c, "load_ssbo: only 4/16-byte element loads at a constant element index <= 255 are witnessed");
+      if (!bytes || in->def.bit_size != 32)
+         refuse(c, "load_ssbo: only 4/16-byte 32-bit loads");
+      bool fixed = eval_offset(in->src[1].ssa, 0, &off) && !c->vs && base <= 2 &&
+                   !(off % bytes) && off / bytes <= 255;
+      if (!fixed) {
+         emit_address_ssbo_load(c, in, base);
+         break;
+      }
       unsigned dst = alloc_run(c, n, "load_ssbo");
       put(c, raw, g5p_usc_buffer_load(raw, 2 * dst, bytes, base, off / bytes, 0), "fixed buffer load");
       put(c, raw, g5p_usc_wait(raw, 0), "wait");

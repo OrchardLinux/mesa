@@ -33,7 +33,10 @@ struct pco_g5p_program;
 struct pvr_cmd_buffer;
 struct pvr_device;
 
-#define PVR_G5P_MAX_STAGE_UPLOADS 16
+/* 8+ storage-buffer pointers, 13 UBOs, push constants and the XFB block
+ * (WebGPU core per-stage maxima together). The loader's data is one 16-byte
+ * unit per upload; VDMCTRL_PDS_STATE0.pds_data_size holds up to 63. */
+#define PVR_G5P_MAX_STAGE_UPLOADS 24
 
 /* One upload of a stage: what the backend's pco_g5p_upload names */
 struct pvr_g5p_stage_upload {
