@@ -320,6 +320,16 @@ kopper_CreateSwapchain(struct zink_screen *screen, struct kopper_displaytarget *
    }
    cswap->scci.presentMode = cdt->present_mode;
    cswap->scci.minImageCount = cdt->caps.minImageCount;
+   /* Each frame in flight holds an image, besides the one being displayed and
+    * the one being drawn. Otherwise acquisition can throttle the queue to one
+    * frame in flight.
+    */
+   if (screen->frames_in_flight > 1) {
+      uint32_t want = MAX2(cswap->scci.minImageCount, screen->frames_in_flight + 2);
+      if (cdt->caps.maxImageCount)
+         want = MIN2(want, cdt->caps.maxImageCount);
+      cswap->scci.minImageCount = want;
+   }
    cswap->scci.preTransform = cdt->caps.currentTransform;
    if (cdt->formats[1])
       cswap->scci.pNext = &cdt->format_list;

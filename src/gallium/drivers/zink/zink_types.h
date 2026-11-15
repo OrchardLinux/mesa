@@ -1503,6 +1503,7 @@ struct zink_video_format_prop {
 struct zink_screen {
    /* Must stay first: zink_screen() casts a pipe_screen pointer directly. */
    struct pipe_screen base;
+   unsigned frames_in_flight; /* pipe_caps.throttle_frames */
    bool precise_sync;
    bool is_g5p;
 

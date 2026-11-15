@@ -733,6 +733,7 @@ zink_init_screen_caps(struct zink_screen *screen)
 
    u_init_pipe_screen_caps(&screen->base, screen->is_cpu ? 0 : 1);
    caps->r11g11b10f_requires_color_buffer_float = screen->is_g5p;
+   caps->throttle_frames = screen->frames_in_flight;
 
    /* Vulkan spec says the builtins count, so make GL count them towards
     * link-failing.
@@ -3749,6 +3750,26 @@ sort_mem_types(struct zink_screen *screen, enum zink_heap heap)
    }
 }
 
+static unsigned
+zink_default_frames_in_flight(VkDriverId driver_id)
+{
+   /* Tile-based GPUs can overlap one frame's geometry phase with the previous
+    * frame's fragment phase. Add drivers here as measurements justify it.
+    */
+   static const struct {
+      VkDriverId driver_id;
+      unsigned frames;
+   } defaults[] = {
+      { VK_DRIVER_ID_IMAGINATION_OPEN_SOURCE_MESA, 2 },
+   };
+
+   for (unsigned i = 0; i < ARRAY_SIZE(defaults); i++) {
+      if (defaults[i].driver_id == driver_id)
+         return defaults[i].frames;
+   }
+   return 1;
+}
+
 static struct zink_screen *
 zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev_major, int64_t dev_minor, uint64_t adapter_luid)
 {
@@ -3869,6 +3890,7 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
    screen->is_g5p = screen->info.driver_props.driverID == VK_DRIVER_ID_IMAGINATION_OPEN_SOURCE_MESA &&
                     !strcmp(screen->info.driver_props.driverName, "Mesa PowerVR G5P");
    screen->precise_sync = screen->is_g5p;
+   screen->frames_in_flight = zink_default_frames_in_flight(screen->info.driver_props.driverID);
 
    /* after the device is known: G5P has driconf defaults of its own (device "g5p") */
    if (config) {
@@ -3879,6 +3901,9 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
       //screen->driconf.inline_uniforms = driQueryOptionb(config->options, "radeonsi_inline_uniforms");
       screen->driconf.emulate_point_smooth = driQueryOptionb(config->options, "zink_emulate_point_smooth");
       screen->driconf.zink_shader_object_enable = driQueryOptionb(config->options, "zink_shader_object_enable");
+      unsigned frames = driQueryOptioni(config->options, "zink_frames_in_flight");
+      if (frames)
+         screen->frames_in_flight = frames;
    }
 
    if (!screen->info.rb2_feats.nullDescriptor) {
