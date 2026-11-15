@@ -336,7 +336,7 @@ static_assert(4 * PCO_G5P_MAX_FS_VARYINGS == 112, "G5P varying components");
 
 static unsigned
 varying_program(const struct pco_g5p_program *fs, const struct pco_g5p_program *vs, uint32_t *data,
-                uint32_t *code, unsigned *code_dwords)
+                uint32_t *code, unsigned *code_dwords, unsigned pv)
 {
    pdsc_init();
    pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-varying");
@@ -350,8 +350,10 @@ varying_program(const struct pco_g5p_program *fs, const struct pco_g5p_program *
       const bool flat = v->interp == PCO_G5P_INTERP_FLAT;
       item[items++] = (struct pdsc_douti_src0){
          .dest = v->set,
-         /* PPP_CTRL flatshade_vtx is VERTEX_0 */
-         .shademodel = flat ? PDSC_DOUTI_SHADEMODEL_FLAT_VERTEX0 : PDSC_DOUTI_SHADEMODEL_GOURAUD,
+         /* flat: the triangle's vertex pv (0, or 1/2 for a fan / the last provoking vertex:
+          * PVR_G5P_FLATSHADE_CONTROL(), G9P's c74fd92b9fc ("pvr/g9p: flat varyings") + 5a7204430d1) */
+         .shademodel = flat ? (enum pdsc_douti_shademodel)(PDSC_DOUTI_SHADEMODEL_FLAT_VERTEX0 + pv)
+                            : PDSC_DOUTI_SHADEMODEL_GOURAUD,
          .size = PDSC_DOUTI_SIZE_4D,
          .perspective = v->interp == PCO_G5P_INTERP_SMOOTH,
          .f32_offset = off,
@@ -549,6 +551,10 @@ g5p_pipeline_free(struct pvr_device *device, struct pvr_g5p_pipeline *g)
    pvr_arch_g5p_vs_uploads_destroy(device, g->vs_uploads);
    pvr_bo_suballoc_free(g->static_vary);
    pvr_bo_suballoc_free(g->static_frag);
+   for (unsigned i = 0; i < 2; i++) {
+      pvr_bo_suballoc_free(g->varying_pv[i].pvr_bo);
+      pvr_bo_suballoc_free(g->static_frag_pv[i]);
+   }
    g5p_pipeline_free(device, g->xfb);
    g5p_pipeline_free(device, g->punch);
    vk_free(&device->vk.alloc, g);
@@ -844,10 +850,17 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
    unsigned varying_data_dwords = 0;
    if (fs->num_varyings || fs->w_set) {
       unsigned code_dwords;
-      varying_data_dwords = varying_program(fs, vs, data, code, &code_dwords);
+      varying_data_dwords = varying_program(fs, vs, data, code, &code_dwords, 0);
       result = pvr_gpu_upload_pds(device, data, varying_data_dwords, 16, code, code_dwords, 16, 64, &g->varying);
       if (result != VK_SUCCESS)
          return result;
+      for (unsigned pv = 1; g->fs_flat && pv <= 2; pv++) {
+         varying_program(fs, vs, data, code, &code_dwords, pv);
+         result = pvr_gpu_upload_pds(device, data, varying_data_dwords, 16, code, code_dwords, 16, 64,
+                                     &g->varying_pv[pv - 1]);
+         if (result != VK_SUCCESS)
+            return result;
+      }
       if (g->varying.code_offset != g->varying.data_offset + 4 * varying_data_dwords)
          return vk_errorf(device, VK_ERROR_INITIALIZATION_FAILED, "G5P: the coefficient code is at data + %#x, not + %#x",
                           g->varying.code_offset - g->varying.data_offset, 4 * varying_data_dwords);
@@ -925,6 +938,17 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
       result = pvr_gpu_upload(device, device->heaps.general_heap, w, 24, 16, &g->static_frag);
       if (result != VK_SUCCESS)
          return result;
+      /* the same pointers naming the flat programs of vertices 1 and 2 */
+      for (unsigned pv = 1; g->fs_flat && (fs->num_varyings || fs->w_set) && pv <= 2; pv++) {
+         uint32_t *v = g->static_frag_pv_words[pv - 1];
+         memcpy(v, w, sizeof(g->static_frag_words));
+         pvr_csb_pack (&v[5], TA_STATE_PDS_VARYINGBASE, vb) {
+            vb.addr = PVR_DEV_ADDR(g->varying_pv[pv - 1].data_offset);
+         }
+         result = pvr_gpu_upload(device, device->heaps.general_heap, v, 24, 16, &g->static_frag_pv[pv - 1]);
+         if (result != VK_SUCCESS)
+            return result;
+      }
    }
 
    return VK_SUCCESS;
@@ -1816,9 +1840,8 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
          return result;
    }
 
-   /* flat varyings take vertex 0; a fan's first vertex is the hardware's vertex 1 */
-   if (dyn->ia.primitive_topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN && g->fs_flat)
-      return G5P_REFUSE(cmd_buffer, "flat varyings with a triangle fan");
+   /* flat varyings: a fan's triangle takes them from the vertex VDM_STATE0's flatshade_control names
+    * (PVR_G5P_FLATSHADE_CONTROL(): 1 for fans; the refusal "flat varyings with a triangle fan" before) */
    /* a depth/stencil attachment: its tests and bias (pvr_arch_g5p_ds.c) */
    /* rasterizer discard: no depth/stencil aspects (Rogue's rule), the colour-only ISP form */
    const VkImageAspectFlags ds_aspects = discard ? 0 : pvr_arch_g5p_ds_aspects(cmd_buffer);
@@ -2125,6 +2148,7 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
       pvr_csb_pack (&w[0], VDMCTRL_VDM_STATE0, v0) {
          v0.vs_other_present = true;
          v0.cam_size = cam;
+         v0.flatshade_control = PVR_G5P_FLATSHADE_CONTROL(dyn);
       }
       pvr_csb_pack (&w[1], VDMCTRL_VDM_STATE3, v3) {
          v3.vs_pds_code_base_addr = PVR_DEV_ADDR(fetch_code->code_offset);
@@ -2162,6 +2186,7 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
       pvr_csb_pack (&w[0], VDMCTRL_VDM_STATE0, v0) {
          v0.vs_data_addr_present = true;
          v0.cam_size = cam;
+         v0.flatshade_control = PVR_G5P_FLATSHADE_CONTROL(dyn);
       }
       pvr_csb_pack (&w[1], VDMCTRL_VDM_STATE2, v2) {
          v2.vs_pds_data_base_addr = PVR_DEV_ADDR(fetch_data.data_offset);
@@ -2170,7 +2195,14 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
    }
 
    /* 4. the fragment pointers and sizes */
-   emit_ppp(csb, "ppp fragment", g->static_frag->dev_addr.addr, g->static_frag_words, 6);
+   {
+      /* flat varyings from the draw's provoking vertex (PVR_G5P_FLATSHADE_CONTROL()) */
+      const unsigned pv = g->static_frag_pv[0] ? PVR_G5P_FLATSHADE_CONTROL(dyn) : 0;
+      if (pv)
+         emit_ppp(csb, "ppp fragment", g->static_frag_pv[pv - 1]->dev_addr.addr, g->static_frag_pv_words[pv - 1], 6);
+      else
+         emit_ppp(csb, "ppp fragment", g->static_frag->dev_addr.addr, g->static_frag_words, 6);
+   }
    if (g->fs_num_uploads) {
       /* then, as in the ICD's draws, the per-draw loader data pointer */
       emit_ppp(csb, "ppp uniform data", uniform_va, uniform_block, 2);

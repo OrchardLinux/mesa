@@ -252,6 +252,11 @@ struct pvr_g5p_pipeline {
     * pointers and sizes (6 words) */
    struct pvr_suballoc_bo *static_vary, *static_frag;
    uint32_t static_vary_words[4], static_frag_words[6];
+   /* flat varyings from the provoking vertex 1 and 2 (pvr_arch_g5p_gfx.c, PVR_G5P_FLATSHADE_CONTROL()): the
+    * coefficient program with FLAT_VERTEX1/2 and the fragment pointers naming it; [0] is varying/static_frag */
+   struct pvr_pds_upload varying_pv[2];
+   struct pvr_suballoc_bo *static_frag_pv[2];
+   uint32_t static_frag_pv_words[2][6];
    /* the vertex program: DOUTU temps, output dwords, unified-store size,
     * system values the fetch writes (bit 0 vertex index, 1 instance index)
     * and their registers */
@@ -461,5 +466,13 @@ uint32_t PVR_PER_ARCH(g5p_compute_stream)(const struct pvr_device *device, uint6
 #   define pvr_arch_g5p_compute_stream PVR_PER_ARCH(g5p_compute_stream)
 
 #endif /* PVR_PER_ARCH */
+
+/* VDM_STATE0 flatshade_control (Rogue's field, bits 1-2): the vertex of a strip's or fan's triangle whose flat
+ * varyings the triangle takes. 2 for the last provoking vertex, 1 for fans, 0 otherwise (G9P's 5a7204430d1 ("pvr/g9p: the flat colour's vertex in VDM_STATE0"): without it odd strip triangles took another vertex's colour, dEQP
+ * rasterization.flatshading.triangle_strip). @dyn: a vk_dynamic_graphics_state. */
+#define PVR_G5P_FLATSHADE_CONTROL(dyn)                                                                          \
+   ((dyn)->rs.provoking_vertex == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT       ? 2u                          \
+    : (dyn)->ia.primitive_topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN ? 1u                                  \
+                                                                         : 0u)
 
 #endif /* PVR_G5P_H */

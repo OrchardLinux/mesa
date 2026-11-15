@@ -81,6 +81,7 @@ PVR_PER_ARCH(g5p_vertex_index_list)(struct pvr_cmd_buffer *cmd_buffer, const str
          v0.cut_index_present = true;
          v0.cut_index_enable = true;
          v0.cam_size = vector <= 32 ? 95 : vector <= 48 ? 63 : vector <= 64 ? 31 : 15;
+         v0.flatshade_control = PVR_G5P_FLATSHADE_CONTROL(&cmd_buffer->vk.dynamic_graphics_state);
       }
       pvr_csb_pack (&w[(*n)++], VDMCTRL_VDM_STATE1, v1) {
          v1.cut_index = isize == 1 ? 0xff : isize == 2 ? 0xffff : 0xffffffff;
@@ -188,6 +189,7 @@ PVR_PER_ARCH(g5p_vertex_indirect)(struct pvr_cmd_buffer *cmd_buffer, const struc
          state.cut_index_present = true;
          state.cut_index_enable = true;
          state.cam_size = vector <= 32 ? 95 : vector <= 48 ? 63 : vector <= 64 ? 31 : 15;
+         state.flatshade_control = PVR_G5P_FLATSHADE_CONTROL(&cmd_buffer->vk.dynamic_graphics_state);
       }
       pvr_csb_emit (csb, VDMCTRL_VDM_STATE1, state) {
          state.cut_index = isize == 1 ? 0xff : isize == 2 ? 0xffff : 0xffffffff;
