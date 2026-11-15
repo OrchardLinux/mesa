@@ -120,7 +120,13 @@ struct pco_g5p_fs_key {
    bool packed_sint; /* saturate signed channels, then preserve low bits */
    bool packed_scalar8; /* R8: one scalar source; never pack unused G/B/A */
    uint8_t packed_uint_bits; /* 8/10/16: packed output, scalar8 is one word; full mask only */
+   /* Apple's masked form (enabled): no blending, write mask RGB, one 4-byte UNORM8 target, one
+    * sample. AGXMetalA9 runs it OPAQUE (FAST_PUNCH_THROUGH with a discard) with ISPCTL upass 7, the program
+    * keeping the destination alpha from a tile read issued before its kill. 1: the program may discard;
+    * The qualified masked form is selected at pipeline creation. */
+   uint8_t mask_upass;
 };
+#define PCO_G5P_HAS_MASK_UPASS 1
 #define PCO_G5P_FS_KEY_DEFAULT ((struct pco_g5p_fs_key){.write_mask = 0xf})
 
 enum pco_g5p_upload_kind {

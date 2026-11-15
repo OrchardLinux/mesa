@@ -5661,7 +5661,7 @@ static void fs_output(struct gctx *c)
       c->p->depth_feedback = true;
    }
    /* a discarding program whose epilogue reads the tile: the kill waits for that read (fs_put_epilogue()) */
-   const bool defer = kill_after_tile_read() && c->ndiscards + c->discard_always == 1 &&
+   const bool defer = (c->key->mask_upass) && c->ndiscards + c->discard_always == 1 &&
                       c->key->color_output == PCO_G5P_COLOR_F16 && !compact_output(c->key) &&
                       !c->key->mrt_blend_state && any_color(c) &&
                       (c->blend == 1 || c->blend == 2 || c->blend == BLEND_GENERAL);
@@ -5811,7 +5811,7 @@ static void fs_output(struct gctx *c)
        * iPad in Aquarium with that form under depth writes (not bisected
        * yet), so it is off: such a program is refused at pipeline
        * creation, the r39-6 rule. */
-      if (c->ndiscards || c->discard_always)
+      if ((c->ndiscards || c->discard_always) && c->key->mask_upass != 1)
          refuse(c, "discard in a program with a general blend epilogue "
                    "(general-blend punch-through is off)");
       uint8_t buf[512];

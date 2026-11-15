@@ -533,6 +533,17 @@ g5p_check_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo *c
     * discarding program still runs for its feedback) */
    if (!colors)
       key->write_mask = 0;
+   /* Apple's masked form (discarding and non-discarding shaders under write mask RGB,
+    * no blending, BGRA8: kill mode 1 / 0, A none, B 7 -> FAST_PUNCH_THROUGH / OPAQUE, output mask 7; the program
+    * reads the tile's alpha word, then kills, and moves it to its alpha half). Enabled by default: on the
+    * device, masked RGB, overlap and mixed-rendering tests pass (300 s each, every frame exact,
+    * 0 kernel errors); without it a masked discard is skipped and a game scene
+    * stays black. */
+   const unsigned mask_mode = 1;
+   key->mask_upass = mask_mode && colors == 1 && !key->blend &&
+                     key->write_mask == 0x7 && key->color_output == PCO_G5P_COLOR_F16 &&
+                     (cf == VK_FORMAT_B8G8R8A8_UNORM || cf == VK_FORMAT_R8G8B8A8_UNORM) &&
+                     (!s->ms || s->ms->rasterization_samples == VK_SAMPLE_COUNT_1_BIT) ? mask_mode : 0;
    return VK_SUCCESS;
 }
 
@@ -582,6 +593,7 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
    if (result != VK_SUCCESS)
       return result;
    key.punch = g->punch_variant;
+   g->fs_mask_upass = key.mask_upass;
    g->samples = s->ms ? MAX2(s->ms->rasterization_samples, VK_SAMPLE_COUNT_1_BIT) : VK_SAMPLE_COUNT_1_BIT;
    g->bresenham_line_probe = g5p_native_bresenham_line(s);
 
@@ -972,7 +984,7 @@ g5p_pipeline_build_punch(struct pvr_device *device,
     * in Aquarium with it, cause not yet bisected. Without the variant,
     * g5p_pipeline_check_draw_variants() refuses the pipeline at creation
     * when a depth/stencil state could need it, the non-fatal form r39-3 had. */
-   if (g->fs_blend_mode == 4 /* general */) {
+   if (g->fs_blend_mode == 4 /* general */ && !g->fs_mask_upass) {
       g->punch_why = "general blend epilogue";
       return VK_SUCCESS;
    }
@@ -2074,6 +2086,12 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
    {
       struct pvr_g5p_blend_isp isp;
       pvr_arch_g5p_blend_isp(g->fs_blend_mode, g->fs_discard, g->fs_write_mask, discard, &isp);
+      /* Apple's masked form (pco_g5p_fs_key::mask_upass): no destination term in the colour math, so OPAQUE, or
+       * FAST_PUNCH_THROUGH with a discard, and output mask 7 */
+      if (g->fs_mask_upass && !discard)
+         isp.pass_type = !g->fs_discard ? ROGUE_TA_PASSTYPE_OPAQUE
+                                        : ROGUE_TA_PASSTYPE_FAST_PUNCH_THROUGH;
+      const unsigned upass = g->fs_mask_upass && !discard ? 7 : pvr_g5p_msaa_upass(g->samples);
       const enum ROGUE_TA_PASSTYPE pass = g->fs_depth_feedback ? ROGUE_TA_PASSTYPE_DEPTH_FEEDBACK : isp.pass_type;
       /* points rasterize as sprites (g3b-points: SPRITE_01UV, front and back) */
       /* triangles in line/point polygon mode: AGXMetalA9 encodeISPPrimitiveType
@@ -2102,7 +2120,7 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
       pvr_csb_pack (&w[1], TA_STATE_ISPCTL, ctl) {
          /* 0 for a program that writes no colour (pvr_g5p_blend.h), else the sample rate's user pass
           * (pvr_g5p_msaa.h: 15, or 7 at 4x) */
-         ctl.upass = isp.upass ? pvr_g5p_msaa_upass(g->samples) : 0;
+         ctl.upass = isp.upass ? upass : 0;
          ctl.bpres = true;
          ctl.scenable = scissor;
          ctl.tagwritedisable = isp.tag_write_disable;
@@ -2134,7 +2152,7 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
        * Mask-zero kill programs still need feedback, with upass0. */
       struct ROGUE_TA_STATE_ISPCTL ctl;
       ROGUE_TA_STATE_ISPCTL_unpack(&w[1], &ctl);
-      ctl.upass = isp.upass ? pvr_g5p_msaa_upass(g->samples) : 0;
+      ctl.upass = isp.upass ? upass : 0;
       ctl.tagwritedisable = isp.tag_write_disable;
       /* Rogue TA_STATE_ISPCTL: VISTEST enables accumulated sample counting;
        * VISREG selects the counter in ISP_OCLQRY_BASE. Match the generic
