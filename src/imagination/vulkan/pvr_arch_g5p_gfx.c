@@ -981,15 +981,7 @@ g5p_pipeline_build_punch(struct pvr_device *device,
 {
    if (g->fs_discard_tokens < 2 && !g->fs_discard_select)
       return VK_SUCCESS;
-   /* The general-blend punch variant (r39-6.1's form: PUNCH_THROUGH +
-    * general blend + depth write) is not built: r39-6.1 hard-hung the iPad
-    * in Aquarium with it, cause not yet bisected. Without the variant,
-    * g5p_pipeline_check_draw_variants() refuses the pipeline at creation
-    * when a depth/stencil state could need it, the non-fatal form r39-3 had. */
-   if (g->fs_blend_mode == 4 /* general */ && !g->fs_mask_upass) {
-      g->punch_why = "general blend epilogue";
-      return VK_SUCCESS;
-   }
+   /* General-blend punch variants use Apple's tile-read-before-kill order. */
    struct pvr_g5p_pipeline *p =
       vk_zalloc(&device->vk.alloc, sizeof(*p), 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
    if (!p)

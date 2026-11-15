@@ -5730,8 +5730,12 @@ static void fs_output(struct gctx *c)
       put(c, raw, g5p_usc_depth_feedback(raw, 2 * reg), "fragment depth feedback");
       c->p->depth_feedback = true;
    }
-   /* a discarding program whose epilogue reads the tile: the kill waits for that read (fs_put_epilogue()) */
-   const bool defer = (c->key->mask_upass) && c->ndiscards + c->discard_always == 1 &&
+   /* a discarding program whose epilogue reads the tile: the kill waits for that read (fs_put_epilogue()).
+    * A general-blend epilogue always takes Apple's order (a blending Metal probe: test, tile read,
+    * kill, blend), the form its default PUNCH_THROUGH runs in; the premultiplied production form keeps its
+    * bytes. */
+   const bool defer = (c->key->mask_upass || c->blend == BLEND_GENERAL) &&
+                      c->ndiscards + c->discard_always == 1 &&
                       c->key->color_output == PCO_G5P_COLOR_F16 && !compact_output(c->key) &&
                       !c->key->mrt_blend_state && any_color(c) &&
                       (c->blend == 1 || c->blend == 2 || c->blend == BLEND_GENERAL);
@@ -5877,13 +5881,15 @@ static void fs_output(struct gctx *c)
       if (c->ndiscards + c->discard_always > 1)
          refuse(c, "discard in a program with a general blend epilogue needs one merged kill");
       /* A kill before a general epilogue runs PUNCH_THROUGH with a general
-       * blend, base program or punch variant alike. r39-6.1 hard-hung the
-       * iPad in Aquarium with that form under depth writes (not bisected
-       * yet), so it is off: such a program is refused at pipeline
-       * creation, the r39-6 rule. */
-      if ((c->ndiscards || c->discard_always) && c->key->mask_upass != 1)
-         refuse(c, "discard in a program with a general blend epilogue "
-                   "(general-blend punch-through is off)");
+       * blend, base program or punch variant alike, in Apple's order: the
+       * tile read, then the kill, then the blend (fs_output()'s defer;
+       * Apple's straight-alpha punch-through capture runs its draw in the PUNCH_THROUGH pass).
+       * Aquarium hard-hung the iPad with the old
+       * order (the kill before the tile read), which is no longer used. */
+      /* Opaque mode retains the masked form for non-discarding programs only. */
+      if ((c->ndiscards || c->discard_always) && c->deferred_kill == -2 && c->key->mask_upass != 1)
+         refuse(c, "discard in a program with a general blend epilogue: no held kill for Apple's order "
+                   "(several discards, MRT, compact or integer output)");
       uint8_t buf[512];
       const char *err;
       struct g5p_blend_key bk = general_key(c->key);
