@@ -183,6 +183,9 @@ struct gctx {
    nir_def *discards[16]; /* demote_if/terminate_if conditions, emitted before the output */
    unsigned ndiscards;
    bool discard_always;
+   /* the kill held for the destination-reading epilogue (fs_output(): Apple's order, the tile read
+    * issued before the kill): -2 none, -1 unconditional, else the condition register */
+   int deferred_kill;
    int fragcoord;      /* dword of the raw X (Y at +1), -1 when unused */
    bool remat;         /* register-pressure retry: constants/uniforms re-read per use */
    bool count_pass;    /* round 19: first codegen pass only records register reads */
@@ -5577,28 +5580,71 @@ static void fs_prologue(struct gctx *c)
 
 /* Discards run after the body (no derivative work follows them): a test
  * of the 0.0/1.0 condition against 0.0 feeding `04 61`, or `04 68`. */
-static void fs_discards(struct gctx *c)
+static void fs_discards(struct gctx *c, bool defer)
 {
    tex_flush(c);
    uint8_t raw[G5P_USC_MAX];
    c->p->discard_tokens = c->ndiscards + c->discard_always;
+   c->deferred_kill = -2;
    for (unsigned i = 0; i < c->ndiscards; i++) {
       struct cond k = cond_of(c, c->discards[i], 0);
       unsigned b = k.zero_b ? reg_of(c, k.a, "discard condition")
                             : select_into(c, k, NULL, K_ONE, NULL, K_ZERO);
-      unsigned t = alloc_reg(c, -1);
+      /* held past the output moves (halves 0..7: the colour, then the epilogue's tile read at
+       * half 4): a register from dword 4 up */
+      int t = -1;
+      /* above the colour halves (dwords 0..1), the tile read (2..3) and dual-source outputs (halves 8..11) */
+      for (unsigned r = c->has_secondary ? 6 : 4; defer && t < 0 && r < 32; r++)
+         if (!((c->busy | c->reserved | c->tex_coord_pending | c->tex_pending) & BITFIELD64_BIT(r)))
+            t = alloc_reg(c, r);
+      if (t < 0)
+         t = alloc_reg(c, -1);
+      if (defer && t < (c->has_secondary ? 6 : 4))
+         refuse(c, "no free register above the outputs for the held discard condition");
       unsigned z = zero_reg(c);
       unsigned gb = k.zero_b ? vgrp(c, k.a) : 1, gz = kgrp(c, K_ZERO);
       put(c, raw, g5p_usc_discard_test(raw, G5P_FEQ, 2 * t, S(2 * b, gb), S(2 * z, gz), 0), "discard test");
-      put(c, raw, g5p_usc_discard(raw, 2 * t), "discard");
-      c->busy &= ~BITFIELD64_BIT(t);
+      if (defer) {
+         c->deferred_kill = t; /* stays busy until fs_kill() */
+      } else {
+         put(c, raw, g5p_usc_discard(raw, 2 * t), "discard");
+         c->busy &= ~BITFIELD64_BIT(t);
+      }
       free_scratch(c);
       c->p->evidence |= PCO_G5P_EV_DISCARD;
    }
    if (c->discard_always) {
-      put(c, raw, g5p_usc_discard(raw, -1), "discard");
+      if (defer)
+         c->deferred_kill = -1;
+      else
+         put(c, raw, g5p_usc_discard(raw, -1), "discard");
       c->p->evidence |= PCO_G5P_EV_DISCARD;
    }
+}
+
+/* A held kill (fs_discards(defer)), in Apple's place: after the epilogue's tile read is issued,
+ * before its wait. A9 AGXMetalA9 compiles every destination-reading discarding program that way
+ * (three Metal probes of discarding programs with a blended or RGB-masked colour output: the tile read,
+ * then the kill, the wait for the tile read later), PUNCH_THROUGH and FAST_PUNCH_THROUGH alike; ours issued
+ * the kill first and read the tile after it. @epi: the epilogue's bytes; with no leading tile read
+ * the kill goes first, the old order. Used by masked and general-blend programs. */
+static void fs_put_epilogue(struct gctx *c, const uint8_t *epi, unsigned n, const char *what)
+{
+   uint8_t raw[G5P_USC_MAX];
+   if (c->deferred_kill == -2) {
+      put(c, epi, n, what);
+      return;
+   }
+   const unsigned read = n >= 4 && epi[0] == 0x1c && epi[3] == 0x28 ? 4
+                       : n >= 6 && epi[0] == 0x1c && epi[3] == 0x29 ? 6 : 0;
+   if (read)
+      put(c, epi, read, "tile read (before the kill: Apple's order)");
+   put(c, raw, g5p_usc_discard(raw, c->deferred_kill < 0 ? -1 : 2 * c->deferred_kill), "discard");
+   if (c->deferred_kill >= 0)
+      c->busy &= ~BITFIELD64_BIT(c->deferred_kill);
+   c->deferred_kill = -2;
+   if (n > read)
+      put(c, epi + read, n - read, what);
 }
 
 static void fs_output(struct gctx *c)
@@ -5614,7 +5660,12 @@ static void fs_output(struct gctx *c)
       put(c, raw, g5p_usc_depth_feedback(raw, 2 * reg), "fragment depth feedback");
       c->p->depth_feedback = true;
    }
-   fs_discards(c);
+   /* a discarding program whose epilogue reads the tile: the kill waits for that read (fs_put_epilogue()) */
+   const bool defer = kill_after_tile_read() && c->ndiscards + c->discard_always == 1 &&
+                      c->key->color_output == PCO_G5P_COLOR_F16 && !compact_output(c->key) &&
+                      !c->key->mrt_blend_state && any_color(c) &&
+                      (c->blend == 1 || c->blend == 2 || c->blend == BLEND_GENERAL);
+   fs_discards(c, defer);
    c->now = LAST_END;
    if (compact_output(c->key)) {
       /* target t's packed dword: output word t (c->out[4t], lower_compact_store()) */
@@ -5739,7 +5790,7 @@ static void fs_output(struct gctx *c)
       unsigned n = g5p_blend_epilogue(buf, sizeof(buf));
       if (!n)
          refuse(c, "blend epilogue encoder rejected its fields (%s)", g5p_usc_error ? g5p_usc_error : "?");
-      put(c, buf, n, "premultiplied blend epilogue");
+      fs_put_epilogue(c, buf, n, "premultiplied blend epilogue");
       c->max_dword = MAX2(c->max_dword, 7); /* destination halves 4..7, 1-alpha in half 12 */
       c->p->evidence |= PCO_G5P_EV_BLEND;
    } else if (c->blend == BLEND_GENERAL) {
@@ -5771,11 +5822,13 @@ static void fs_output(struct gctx *c)
       if (err)
          refuse(c, "general blend epilogue: %s", err);
       if (n) {
-         put(c, buf, n, "general blend epilogue");
+         fs_put_epilogue(c, buf, n, "general blend epilogue");
          c->max_dword = MAX2(c->max_dword, c->binfo.max_half / 2);
       }
       c->p->evidence |= PCO_G5P_EV_BLEND;
    }
+   if (c->deferred_kill != -2) /* no epilogue took the held kill (a general epilogue of no bytes) */
+      fs_put_epilogue(c, NULL, 0, "no epilogue");
    /* One emitpix carries the total word count over all targets (2/4/8). */
    put(c, raw, g5p_usc_emit_mrt(raw, c->mrt.words, 0), "emit");
    put(c, raw, g5p_usc_special(raw, true), "end");
