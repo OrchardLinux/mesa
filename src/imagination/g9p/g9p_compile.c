@@ -96,6 +96,7 @@ g9p_a9_bank1_limit(unsigned threads)
  */
 #define VALUE_REGS(ctx) ((ctx)->stage == MESA_SHADER_VERTEX && (ctx)->st == 15 && !getenv("G9P_REGS") \
                             ? 32u : (ctx)->value_cap ? MIN2(G9P_NUM_REGS, (ctx)->value_cap) : G9P_NUM_REGS)
+#define LOW_REGS(ctx) MIN2(16u, VALUE_REGS(ctx))
 #define G9P_MAX_LOOPS 64
 /* nir_tex_instr.backend_flags: a seamful cube's gradients, for the hardware */
 #define G9P_TEX_NATIVE_GRADIENTS 1
@@ -417,7 +418,7 @@ reads_def(nir_src *src, void *data)
 static bool
 evict_low(struct g9p_ctx *ctx, unsigned lo, unsigned n)
 {
-   uint64_t high_free = ~ctx->busy & BITFIELD64_RANGE(16, VALUE_REGS(ctx) - 16);
+   uint64_t high_free = VALUE_REGS(ctx) > 16 ? ~ctx->busy & BITFIELD64_RANGE(16, VALUE_REGS(ctx) - 16) : 0;
    int keys[16];
 
    if (ctx->c->fragment || lo + n > 16 || getenv("G9P_NO_EVICT"))
@@ -461,7 +462,7 @@ evict_low(struct g9p_ctx *ctx, unsigned lo, unsigned n)
          return false;
       high_free &= high_free - 1;
    }
-   high_free = ~ctx->busy & BITFIELD64_RANGE(16, VALUE_REGS(ctx) - 16);
+   high_free = VALUE_REGS(ctx) > 16 ? ~ctx->busy & BITFIELD64_RANGE(16, VALUE_REGS(ctx) - 16) : 0;
    for (unsigned r = lo; r < lo + n; r++) {
       if (keys[r - lo] < 0)
          continue;
@@ -483,7 +484,9 @@ evict_low(struct g9p_ctx *ctx, unsigned lo, unsigned n)
 static int
 evict_low_window(struct g9p_ctx *ctx, unsigned n)
 {
-   for (int r = 16 - n; r >= 0; r--) {
+   if (n > LOW_REGS(ctx))
+      return -1;
+   for (int r = LOW_REGS(ctx) - n; r >= 0; r--) {
       if (evict_low(ctx, r, n))
          return r;
    }
@@ -494,7 +497,7 @@ evict_low_window(struct g9p_ctx *ctx, unsigned n)
 static int
 alloc_low_temp(struct g9p_ctx *ctx)
 {
-   for (unsigned r = 0; r < MIN2(16, G9P_NUM_REGS); r++) {
+   for (unsigned r = 0; r < LOW_REGS(ctx); r++) {
       if (!(ctx->busy & BITFIELD64_BIT(r))) {
          ctx->busy |= BITFIELD64_BIT(r);
          ctx->temps |= BITFIELD64_BIT(r);
@@ -524,7 +527,7 @@ alloc_low_temp(struct g9p_ctx *ctx)
 static int
 alloc_low_range(struct g9p_ctx *ctx, unsigned n)
 {
-   for (unsigned r = 0; r + n <= MIN2(16, G9P_NUM_REGS); r++) {
+   for (unsigned r = 0; r + n <= LOW_REGS(ctx); r++) {
       if (!(ctx->busy & BITFIELD64_RANGE(r, n))) {
          ctx->busy |= BITFIELD64_RANGE(r, n);
          ctx->max_reg = MAX2(ctx->max_reg, r + n - 1);
@@ -580,7 +583,7 @@ one_src(struct g9p_ctx *ctx, int r)
 static int
 alloc_pair(struct g9p_ctx *ctx)
 {
-   for (unsigned r = 0; r + 1 < MIN2(16, G9P_NUM_REGS); r++) {
+   for (unsigned r = 0; r + 1 < LOW_REGS(ctx); r++) {
       if (!(ctx->busy & BITFIELD64_RANGE(r, 2))) {
          ctx->busy |= BITFIELD64_RANGE(r, 2);
          ctx->max_reg = MAX2(ctx->max_reg, r + 1);
@@ -5034,6 +5037,11 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
       }
    }
    st = ctx.max_reg + 1;
+   if (ctx.c->high_bank0 && ctx.value_cap && st + 1 > ctx.value_cap + 1) {
+      if (!out->a9_refusal[0])
+         snprintf(out->a9_refusal, sizeof(out->a9_refusal), "bank-1 cap exceeded");
+      return false;
+   }
    /*
     * Vertex shaders: the mask stack below r16, selects use it too (dEQP vertex
     * shaders of 17 registers and more drew wrong values or hung the geometry
