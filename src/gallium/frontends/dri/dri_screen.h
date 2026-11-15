@@ -72,6 +72,7 @@ struct dri_screen
    unsigned int api_mask;
 
    bool throttle;
+   unsigned throttle_frames; /* 1..DRI_THROTTLE_MAX_FRAMES */
    bool dmabuf_import;
    bool has_multibuffer;
 

@@ -264,8 +264,9 @@ dri_destroy_drawable(struct dri_drawable *drawable)
    for (i = 0; i < ST_ATTACHMENT_COUNT; i++)
       pipe_resource_reference(&drawable->msaa_textures[i], NULL);
 
-   screen->base.screen->fence_reference(screen->base.screen,
-         &drawable->throttle_fence, NULL);
+   for (i = 0; i < DRI_THROTTLE_MAX_FRAMES; i++)
+      screen->base.screen->fence_reference(screen->base.screen,
+            &drawable->throttle_fence[i], NULL);
 
    /* Notify the st manager that this drawable is no longer valid */
    st_api_destroy_drawable(&drawable->base);
@@ -686,17 +687,11 @@ dri_flush(struct dri_context *ctx,
        (reason == __DRI2_THROTTLE_SWAPBUFFER ||
         reason == __DRI2_THROTTLE_FLUSHFRONT)) {
 
-      struct pipe_screen *screen = drawable->screen->base.screen;
       struct pipe_fence_handle *new_fence = NULL;
 
       st_context_flush(st, flush_flags, &new_fence, args.ctx ? notify_before_flush_cb : NULL, &args);
 
-      /* throttle on the previous fence */
-      if (drawable->throttle_fence) {
-         screen->fence_finish(screen, NULL, drawable->throttle_fence, OS_TIMEOUT_INFINITE);
-         screen->fence_reference(screen, &drawable->throttle_fence, NULL);
-      }
-      drawable->throttle_fence = new_fence;
+      dri_throttle_frame(drawable, new_fence);
    }
    else if (flags & (__DRI2_FLUSH_DRAWABLE | __DRI2_FLUSH_CONTEXT)) {
       st_context_flush(st, flush_flags, NULL, args.ctx ? notify_before_flush_cb : NULL, &args);
@@ -737,6 +732,29 @@ dri_flush_drawable(struct dri_drawable *dPriv)
 
    if (ctx)
       dri_flush(ctx, dPriv, __DRI2_FLUSH_DRAWABLE, -1);
+}
+
+/**
+ * Throttle on the frame screen->throttle_frames swaps back (the previous one
+ * by default), then keep new_fence (a reference this takes over) for a later
+ * swap.  With throttle_frames N, up to N submitted frames stay in flight while
+ * the application records the next one.
+ */
+void
+dri_throttle_frame(struct dri_drawable *drawable,
+                   struct pipe_fence_handle *new_fence)
+{
+   struct pipe_screen *screen = drawable->screen->base.screen;
+   const unsigned frames = drawable->screen->throttle_frames;
+   struct pipe_fence_handle **slot =
+      &drawable->throttle_fence[drawable->throttle_slot % frames];
+
+   if (*slot) {
+      screen->fence_finish(screen, NULL, *slot, OS_TIMEOUT_INFINITE);
+      screen->fence_reference(screen, slot, NULL);
+   }
+   *slot = new_fence;
+   drawable->throttle_slot = (drawable->throttle_slot + 1) % frames;
 }
 
 /**

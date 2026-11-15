@@ -30,6 +30,7 @@
  */
 
 #include "dri_screen.h"
+#include "dri_drawable.h"
 #include "dri_context.h"
 #include "dri_helpers.h"
 
@@ -636,6 +637,7 @@ dri_init_screen(struct dri_screen *screen,
       screen->target = PIPE_TEXTURE_RECT;
 
    screen->throttle = pscreen->caps.throttle;
+   screen->throttle_frames = CLAMP(pscreen->caps.throttle_frames, 1, DRI_THROTTLE_MAX_FRAMES);
    if (pscreen->caps.device_protected_context)
       screen->has_protected_context = true;
    screen->has_reset_status_query = pscreen->caps.device_reset_status_query;

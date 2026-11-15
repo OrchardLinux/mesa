@@ -383,7 +383,6 @@ kopper_flush_frontbuffer(struct dri_context *ctx,
 
    if (ptex) {
       ctx->st->pipe->flush_resource(ctx->st->pipe, drawable->textures[ST_ATTACHMENT_FRONT_LEFT]);
-      struct pipe_screen *screen = drawable->screen->base.screen;
       struct st_context *st;
       struct pipe_fence_handle *new_fence = NULL;
 
@@ -392,12 +391,7 @@ kopper_flush_frontbuffer(struct dri_context *ctx,
       st_context_flush(st, ST_FLUSH_FRONT, &new_fence, NULL, NULL);
       drawable->flushing = false;
 
-      /* throttle on the previous fence */
-      if (drawable->throttle_fence) {
-         screen->fence_finish(screen, NULL, drawable->throttle_fence, OS_TIMEOUT_INFINITE);
-         screen->fence_reference(screen, &drawable->throttle_fence, NULL);
-      }
-      drawable->throttle_fence = new_fence;
+      dri_throttle_frame(drawable, new_fence);
       kopper_copy_to_front(st->pipe, ctx->draw, ptex, 0, NULL);
    }
 

@@ -1030,6 +1030,7 @@ struct pipe_caps {
    bool image_load_formatted;
    bool image_store_formatted;
    bool throttle;
+   unsigned throttle_frames;
    bool cl_gl_sharing;
    bool prefer_compute_for_multimedia;
    bool fragment_shader_interlock;
