@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 #include "../g5p/g5p_barrier.h"
 #include "../g5p/g5p_atomic.h"
+#include "../g5p/g5p_shared_atomic.h"
 #include "../g5p/g5p_image.h"
 /* Static threadgroup operands: A9 host-compiler forms (compute.md §4).
  * TG0/1 hold the workgroup IDs x/y, TG2 the software-barrier counter, TG3 the ID z (G9P_A9_TG_WGID_Z).
@@ -127,6 +128,51 @@ static bool a9_barrier(struct g9p_ctx *ctx, nir_intrinsic_instr *in)
    g9p_wait(ctx->c);
    return true;
 }
+static bool a9_shared_atomic(struct g9p_ctx *ctx, nir_intrinsic_instr *in)
+{
+   if (!ctx->out->a9 || ctx->stage != MESA_SHADER_COMPUTE ||
+       in->def.bit_size != 32 || in->def.num_components != 1 ||
+       (nir_intrinsic_base(in) & 3)) return false;
+   nir_atomic_op op = nir_intrinsic_atomic_op(in);
+   bool cas = in->intrinsic == nir_intrinsic_shared_atomic_swap;
+   if (cas && op != nir_atomic_op_cmpxchg) return false;
+   switch (op) {
+   case nir_atomic_op_iadd:
+   case nir_atomic_op_imin: case nir_atomic_op_umin:
+   case nir_atomic_op_imax: case nir_atomic_op_umax:
+   case nir_atomic_op_iand: case nir_atomic_op_ior: case nir_atomic_op_ixor:
+   case nir_atomic_op_xchg: break;
+   case nir_atomic_op_cmpxchg: if (!cas) return false; break;
+   default:
+      mesa_logw("g5p: unsupported shared atomic op %u", op);
+      return false;
+   }
+   unsigned word = 4 + nir_intrinsic_base(in) / 4;
+   int index = -1;
+   if (nir_src_is_const(in->src[0])) {
+      unsigned byte = nir_src_as_uint(in->src[0]);
+      if (byte & 3) return false;
+      word += byte / 4;
+   } else {
+      int src = src_reg(ctx, nir_get_scalar(in->src[0].ssa, 0));
+      int shift = const_reg(ctx, 2);
+      index = alloc_temp(ctx);
+      if (src < 0 || shift < 0 || index < 0) return false;
+      g9p_shift(ctx->c, index, src, shift, true);
+      g9p_shared_index(ctx->c, index, index, 2); /* a dword index */
+   }
+   int val = src_reg(ctx, nir_get_scalar(in->src[cas ? 2 : 1].ssa, 0));
+   int cmp = cas ? src_reg(ctx, nir_get_scalar(in->src[1].ssa, 0)) : 0;
+   int old = alloc_reg(ctx), next = alloc_temp(ctx);
+   if (val < 0 || cmp < 0 || old < 0 || next < 0 || word >= 4096) return false;
+   g5p_shared_atomic(ctx->c, op, old, val, cmp, next, word,
+                     index < 0 ? -1 : 2 * index, ctx->st);
+   release(ctx, &in->instr);
+   ctx->reg[key(&in->def, 0)] = old;
+   if (!ctx->last_use[key(&in->def, 0)]) ctx->busy &= ~BITFIELD64_BIT(old);
+   return true;
+}
+
 static bool a9_ssbo_atomic(struct g9p_ctx *ctx, nir_intrinsic_instr *in)
 {
    if (!ctx->out->a9 || ctx->stage != MESA_SHADER_COMPUTE ||
@@ -222,6 +268,7 @@ static bool a9_image(struct g9p_ctx *ctx, nir_intrinsic_instr *in)
 #define G9P_A9_INTRINSICS \
    if (ctx->out->a9) { switch (intr->intrinsic) { \
    case nir_intrinsic_image_deref_store: case nir_intrinsic_image_deref_load: return a9_image(ctx, intr); \
+   case nir_intrinsic_shared_atomic: case nir_intrinsic_shared_atomic_swap: return a9_shared_atomic(ctx, intr); \
    case nir_intrinsic_ssbo_atomic_swap: return a9_ssbo_cas(ctx, intr); \
    case nir_intrinsic_ssbo_atomic: return a9_ssbo_atomic(ctx, intr); \
    case nir_intrinsic_load_shared: case nir_intrinsic_store_shared: return a9_shared(ctx, intr); \
