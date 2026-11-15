@@ -10,6 +10,8 @@ struct g9p_a9_upload {
    unsigned char level;    /* a size block's level */
    unsigned char common, dwords;
 };
+/* g9p_shader::a9_bank1_regs: the kernel record's register field allocates bank 1 (g9p_cdm.h) */
+#define G9P_A9_HAS_BANK1_REGS 1
 #define G9P_A9_FIELDS bool a9; unsigned a9_bank1_regs; bool a9_bodyless; bool a9_unit_z; unsigned a9_local_dwords; bool a9_has_barriers; bool a9_device_fence; \
    unsigned a9_num_uploads; struct g9p_a9_upload a9_uploads[G9P_A9_MAX_UPLOADS]; char a9_refusal[192];
 #define G9P_A9_END_PAD(ctx) do { if ((ctx)->out->a9 && (2*(ctx)->c->n+6)%64==0) G9P_EMIT((ctx)->c,0xc000); } while(0)

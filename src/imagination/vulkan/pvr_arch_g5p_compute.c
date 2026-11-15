@@ -338,6 +338,7 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
    g9p_pds_kick_data(kernel_data, usc_offset(device, state->shader_bo));
    /* the DOUTU temps allocate bank 0 (homes up to r(num_regs - 1)); the record's register field below
     * allocates bank 1, the code's own registers (g9p_cdm.h G9P_CDM_KERNEL_REGS) */
+   const unsigned bank1 = state->a9_bank1_regs ? state->a9_bank1_regs : state->num_regs;
    kernel_data[1] = 0x10 * DIV_ROUND_UP(MAX2(state->num_regs, 1), 8);
    kernel_data[2] = 0x80000000;
    kernel_data[4] = 0x90000002;
@@ -379,7 +380,7 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
          g5p_cdm_dma_task(G9P_CDM_DATA_BLOCKS(bind_dwords / 4), bind.data_offset,
                           bind.code_offset, (state->a9_device_fence || images || nup) ? 4 : DIV_ROUND_UP(2 * n + 1, 16));
       const struct g5p_cdm_record kernel_rec = g5p_cdm_kernel(
-         G9P_CDM_KERNEL_REGS(state->a9_bank1_regs ? state->a9_bank1_regs : state->num_regs) | G9P_CDM_ANY_CLUSTER |
+         G9P_CDM_KERNEL_REGS(bank1) | G9P_CDM_ANY_CLUSTER |
             G9P_CDM_FENCE |
             G9P_CDM_DATA_BLOCKS(kernel_dwords / 4),
          kernel.data_offset, kernel.code_offset, group_count[0], group_count[1],
