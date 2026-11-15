@@ -741,10 +741,14 @@ static bool pvr_physical_device_get_properties(
          [1] = (64U * 1024U) - 1,
          [2] = (64U * 1024U) - 1,
       },
-      .maxComputeWorkGroupInvocations = 128U,
+      /* G5P: 256 (AGXMetalA9: 512 per threadgroup, maxThreadsPerThreadgroup; Rogue's CDM: 32 lanes x 16
+       * tasks per USC). Barriers above 32 lanes are Apple's software barrier (g5p_barrier.h); a pipeline whose
+       * temporaries cannot keep every task of a barriered workgroup resident is refused at creation
+       * (pvr_arch_g5p_compute.c). */
+      .maxComputeWorkGroupInvocations = PVR_HAS_FEATURE(dev_info, apple_g5p) ? 256U : 128U,
       .maxComputeWorkGroupSize = {
-        [0] = 128U,
-        [1] = 128U,
+        [0] = PVR_HAS_FEATURE(dev_info, apple_g5p) ? 256U : 128U,
+        [1] = PVR_HAS_FEATURE(dev_info, apple_g5p) ? 256U : 128U,
         [2] = 64U,
       },
 

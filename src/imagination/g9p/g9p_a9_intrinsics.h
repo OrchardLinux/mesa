@@ -80,7 +80,7 @@ static bool a9_barrier(struct g9p_ctx *ctx, nir_intrinsic_instr *in)
    bool device=modes & (nir_var_mem_ssbo | nir_var_mem_global | nir_var_image);
    if ((modes & ~(nir_var_mem_shared | nir_var_mem_ssbo | nir_var_mem_global | nir_var_image)) ||
        (scope != SCOPE_NONE && scope != SCOPE_INVOCATION && scope != SCOPE_WORKGROUP)) {
-      fprintf(stderr, "g5p: unsupported barrier memory mode or execution scope\n");
+      mesa_logw("g5p: unsupported barrier memory mode or execution scope");
       return false;
    }
    int fence_pair=-1;

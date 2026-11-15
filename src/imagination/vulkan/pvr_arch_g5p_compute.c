@@ -22,6 +22,7 @@
 #include "pvr_physical_device.h"
 #include "pvr_pipeline.h"
 #include "pvr_g5p.h"
+#include "hwdef/rogue_hw_utils.h"
 #include "pvr_g5p_compute.h"
 #include "pvr_job_context.h"
 #include "pvr_winsys.h"
@@ -53,6 +54,25 @@ PVR_PER_ARCH(g5p_compute_pipeline_compile)(
                          "G5P compute: shader not supported by the backend yet");
       goto out;
    }
+   /* A barrier above 32 lanes waits for every task of the workgroup
+    * (Apple's software barrier, g5p_barrier.h), so all of them must be
+    * resident in one USC at once: Rogue's bound on the temporaries per lane
+    * for that workgroup size (rogue_max_wg_temps(), as upstream's compute
+    * pipelines check). A pipeline above it would spin forever: refused. */
+   {
+      const unsigned threads = shader.local_size[0] * shader.local_size[1] * shader.local_size[2];
+      const struct pvr_device_info *dev_info = &device->pdevice->dev_info;
+      if (shader.a9_has_barriers && threads > ROGUE_MAX_INSTANCES_PER_TASK &&
+          rogue_max_wg_temps(dev_info, shader.num_regs, threads, true) < shader.num_regs) {
+         mesa_logw("G5P refuses: a %u-lane workgroup with barriers needs %u temporaries per lane, above "
+                 "the %u that keep every task resident", threads, shader.num_regs,
+                 rogue_max_wg_temps(dev_info, shader.num_regs, threads, true));
+         result = vk_errorf(device, VK_ERROR_FEATURE_NOT_PRESENT,
+                            "G5P compute: %u-lane barriered workgroup needs %u temporaries per lane", threads,
+                            shader.num_regs);
+         goto out;
+      }
+   }
 
    result = pvr_gpu_upload_usc(device, shader.code, shader.code_size, 64,
                                &state->shader_bo);
@@ -80,7 +100,7 @@ PVR_PER_ARCH(g5p_compute_pipeline_compile)(
 
 out:
    ralloc_free(mem_ctx);
-   return result;
+   return pvr_refusal_to_api(result);
 }
 
 static void
@@ -123,13 +143,13 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
    VkResult result;
 
    if (base_group[0] || base_group[1] || base_group[2])
-      return vk_errorf(cmd_buffer, VK_ERROR_FEATURE_NOT_PRESENT, "G5P: base dispatch not implemented yet");
+      return vk_errorf(cmd_buffer, VK_ERROR_OUT_OF_HOST_MEMORY, "G5P: base dispatch not implemented yet");
    if (indirect_va && ((indirect_va & 3) || indirect_va >> 40))
-      return vk_error(cmd_buffer, VK_ERROR_FEATURE_NOT_PRESENT);
+      return vk_error(cmd_buffer, VK_ERROR_OUT_OF_HOST_MEMORY);
    if (!indirect_va && (!group_count[0] || !group_count[1] || !group_count[2]))
       return VK_SUCCESS;
    if (!threads || threads > 512 || group_count[0] > 65536 || group_count[1] > 65536 || group_count[2] > 65536)
-      return vk_error(cmd_buffer, VK_ERROR_FEATURE_NOT_PRESENT);
+      return vk_error(cmd_buffer, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    /* A bodyless shader has no observable invocation.  Apple's standalone
     * empty program does not retire under our CDM launch contract, so do not
@@ -138,7 +158,7 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
    /* The compiler's unit-Z specialization is valid only for these actual
     * dispatch dimensions. Indirect dimensions cannot be checked here. */
    if (state->a9_unit_z && (indirect_va || group_count[2] != 1)) {
-      return vk_errorf(cmd_buffer, VK_ERROR_FEATURE_NOT_PRESENT,
+      return vk_errorf(cmd_buffer, VK_ERROR_OUT_OF_HOST_MEMORY,
                        "compute workgroup Z specialization requires a direct dispatch with one Z group");
    }
 
@@ -166,7 +186,7 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
       }
    }
    unsigned images=state->a9_num_images;
-   if(images && n>15)return vk_errorf(cmd_buffer,VK_ERROR_FEATURE_NOT_PRESENT,"G5P image LOD common31 overlaps the16th buffer pointer");
+   if(images && n>15)return vk_errorf(cmd_buffer,VK_ERROR_OUT_OF_HOST_MEMORY,"G5P image LOD common31 overlaps the16th buffer pointer");
    unsigned transfers=n+1+images+(state->a9_device_fence ? 1 : 0)+(images ? 1 : 0);
    if (state->a9_device_fence) {
       uint32_t zero=0;
@@ -516,7 +536,7 @@ PVR_PER_ARCH(g5p_compute_job_submit)(struct pvr_compute_ctx *ctx,
     * first block here. A chained CDM stream is refused until that form has
     * run on the device. */
    if (cs->pvr_bo != list_first_entry(&cs->pvr_bo_list, struct pvr_bo, link))
-      return vk_errorf(d, VK_ERROR_FEATURE_NOT_PRESENT, "G5P: chained CDM stream not implemented yet");
+      return vk_errorf(d, VK_ERROR_OUT_OF_HOST_MEMORY, "G5P: chained CDM stream not implemented yet");
    struct pvr_winsys_compute_submit_info info = { .wait = wait,
       .frame_num = d->global_queue_present_count, .job_num = d->global_cmd_buffer_submit_count };
    info.fw_stream_len =

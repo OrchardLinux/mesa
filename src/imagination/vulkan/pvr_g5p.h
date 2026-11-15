@@ -20,6 +20,13 @@
 #include <string.h>
 #include <vulkan/vulkan_core.h>
 
+/* Zink retries device-memory errors; wgpu survives only OOM failures.
+ * Keep refusal internal and map it at creation/recording API boundaries. */
+static inline VkResult pvr_refusal_to_api(VkResult result)
+{
+   return result == VK_ERROR_FEATURE_NOT_PRESENT ? VK_ERROR_OUT_OF_HOST_MEMORY : result;
+}
+
 #include "pvr_common.h"
 #include "pvr_limits.h"
 #include "pvr_macros.h"
