@@ -99,6 +99,7 @@ a9_shared_size_align(nir_intrinsic_op op, uint8_t bytes, uint8_t bit_size,
 
 bool g9p_a9_compile_compute(nir_shader *nir, struct g9p_shader *out, void *mem_ctx)
 {
+   nir->options = &nir_options_a9;
    const nir_lower_compute_system_values_options csv = {
       .lower_cs_local_id_to_index = true, .global_id_is_32bit = true,
    };
@@ -107,6 +108,7 @@ bool g9p_a9_compile_compute(nir_shader *nir, struct g9p_shader *out, void *mem_c
    lower_front(nir);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, a9_lower_subgroups_size1,
             nir_metadata_control_flow, NULL);
+   NIR_PASS(_, nir, nir_lower_alu);
    NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_mem_shared, glsl_get_natural_size_align_bytes);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_shared, nir_address_format_32bit_offset);
    const nir_lower_mem_access_bit_sizes_options shared_opts = {

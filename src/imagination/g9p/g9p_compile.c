@@ -133,6 +133,8 @@ static const nir_shader_compiler_options nir_options = {
    .lower_fround_even = true,
    .lower_flrp32 = true,
    .lower_fsat = true,
+   .lower_bit_count = true,
+   .lower_bitfield_reverse = true,
    .lower_find_lsb = true,
    .lower_ifind_msb = true,
    .lower_iadd_sat = true,
@@ -140,6 +142,52 @@ static const nir_shader_compiler_options nir_options = {
    .lower_device_index_to_zero = true,
    .lower_bitfield_insert = true,
    .lower_bitfield_extract = true,
+   .lower_pack_unorm_4x8 = true,
+   .lower_unpack_unorm_4x8 = true,
+   .lower_pack_snorm_4x8 = true,
+   .lower_unpack_snorm_4x8 = true,
+   .lower_pack_snorm_2x16 = true,
+   .lower_unpack_snorm_2x16 = true,
+   .lower_pack_unorm_2x16 = true,
+   .lower_unpack_unorm_2x16 = true,
+   .lower_extract_byte = true,
+   .lower_extract_word = true,
+   .lower_insert_byte = true,
+   .lower_insert_word = true,
+   .max_unroll_iterations = 0,
+};
+
+/* A9 compute options. */
+static const nir_shader_compiler_options nir_options_a9 = {
+   /* multiply-adds as one instruction (g9p_ffma()), not a mul and an add */
+   .float_mul_add32 = nir_float_muladd_support_has_ffma | nir_float_muladd_support_fuse,
+   .lower_int64_options = ~0U,
+   .lower_fdiv = true,
+   .lower_iabs = true,
+   .lower_mul_high = true,
+   .lower_isign = true,
+   .lower_fmod = true,
+   .lower_fpow = true,
+   .lower_fsqrt = true,
+   .lower_ffract = true,
+   .lower_fceil = true,
+   .lower_ftrunc = true,
+   .lower_fround_even = true,
+   .lower_flrp32 = true,
+   .lower_fsat = true,
+   .lower_bit_count = true,
+   .lower_bitfield_reverse = true,
+   .lower_find_lsb = true,
+   .lower_ifind_msb = true,
+   .lower_iadd_sat = true,
+   .lower_mul_2x32_64 = true,
+   .lower_device_index_to_zero = true,
+   .lower_bitfield_insert = true,
+   .lower_bitfield_extract = true,
+   .lower_pack_unorm_4x8 = true,
+   .lower_unpack_unorm_4x8 = true,
+   .lower_pack_snorm_4x8 = true,
+   .lower_unpack_snorm_4x8 = true,
    .lower_pack_snorm_2x16 = true,
    .lower_unpack_snorm_2x16 = true,
    .lower_pack_unorm_2x16 = true,
@@ -4000,6 +4048,27 @@ phis_scalar(const nir_instr *instr, const void *data)
    return 1;
 }
 
+/* No native find-MSB emitter yet: branchless binary search, including zero
+ * and GLSL's signed negative-input convention. */
+static bool
+lower_find_msb(nir_builder *b, nir_alu_instr *alu, void *data)
+{
+   if (alu->op != nir_op_ufind_msb && alu->op != nir_op_ifind_msb)
+      return false;
+   b->cursor = nir_before_instr(&alu->instr);
+   nir_def *x = nir_ssa_for_alu_src(b, alu, 0);
+   if (alu->op == nir_op_ifind_msb)
+      x = nir_bcsel(b, nir_ilt_imm(b, x, 0), nir_inot(b, x), x);
+   nir_def *t = x, *r = nir_imm_int(b, 0);
+   for (unsigned shift = x->bit_size / 2; shift; shift /= 2) {
+      nir_def *upper = nir_ugt_imm(b, t, (1ull << shift) - 1);
+      t = nir_bcsel(b, upper, nir_ushr_imm(b, t, shift), t);
+      r = nir_iadd(b, r, nir_bcsel(b, upper, nir_imm_int(b, shift), nir_imm_int(b, 0)));
+   }
+   nir_def_replace(&alu->def, nir_bcsel(b, nir_ieq_imm(b, x, 0), nir_imm_int(b, -1), r));
+   return true;
+}
+
 static void
 optimize(nir_shader *nir)
 {
@@ -4015,6 +4084,11 @@ optimize(nir_shader *nir)
       NIR_PASS(progress, nir, nir_opt_cse);
       NIR_PASS(progress, nir, nir_opt_constant_folding);
       NIR_PASS(progress, nir, nir_opt_algebraic);
+      /* Algebraic lowering of find_lsb/ifind_msb introduces ufind_msb. */
+      NIR_PASS(progress, nir, nir_shader_alu_pass, lower_find_msb,
+               nir_metadata_control_flow, NULL);
+      /* Algebraic lowering of extended multiplies can introduce mul_high. */
+      NIR_PASS(progress, nir, nir_lower_alu);
       NIR_PASS(progress, nir, nir_opt_dead_cf);
       NIR_PASS(progress, nir, nir_opt_remove_phis);
    } while (progress);
@@ -4226,6 +4300,8 @@ lower_front(nir_shader *nir)
                glsl_get_natural_size_align_bytes);
       NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_shared, nir_address_format_32bit_offset);
    }
+   NIR_PASS(_, nir, nir_shader_alu_pass, lower_find_msb,
+            nir_metadata_control_flow, NULL);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, zero_descriptor_offset,
             nir_metadata_control_flow, NULL);
 }
