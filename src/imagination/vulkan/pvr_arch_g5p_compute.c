@@ -22,6 +22,7 @@
 #include "pvr_physical_device.h"
 #include "pvr_pipeline.h"
 #include "pvr_g5p.h"
+#include "pvr_g5p_tex_encode.h"
 #include "hwdef/rogue_hw_utils.h"
 #include "pvr_g5p_compute.h"
 #include "pvr_job_context.h"
@@ -50,6 +51,8 @@ PVR_PER_ARCH(g5p_compute_pipeline_compile)(
       goto out;
 
    if (!g9p_a9_compile_compute(nir, &shader, mem_ctx)) {
+      mesa_logw("pvr/g5p: compute pipeline refused: %s",
+              shader.a9_refusal[0] ? shader.a9_refusal : "no reason recorded");
       result = vk_errorf(device, VK_ERROR_FEATURE_NOT_PRESENT,
                          "G5P compute: shader not supported by the backend yet");
       goto out;
@@ -95,6 +98,20 @@ PVR_PER_ARCH(g5p_compute_pipeline_compile)(
       state->a9_images[i].set=shader.textures[i].set;
       state->a9_images[i].binding=shader.textures[i].binding;
    }
+   /* sampled textures' descriptor words (g9p_a9_tex.h) */
+   STATIC_ASSERT(ARRAY_SIZE(state->a9_uploads) == G9P_A9_MAX_UPLOADS);
+   state->a9_num_uploads = shader.a9_num_uploads;
+   for (unsigned i = 0; i < shader.a9_num_uploads; i++) {
+      const struct g9p_a9_upload *u = &shader.a9_uploads[i];
+      state->a9_uploads[i].kind = u->kind;
+      state->a9_uploads[i].set = u->set;
+      state->a9_uploads[i].binding = u->binding;
+      state->a9_uploads[i].element = u->element;
+      state->a9_uploads[i].combined = u->combined;
+      state->a9_uploads[i].level = u->level;
+      state->a9_uploads[i].common = u->common;
+      state->a9_uploads[i].dwords = u->dwords;
+   }
    state->uses_workgroup_id = shader.uses_workgroup_id;
    memcpy(state->local_size, shader.local_size, sizeof(state->local_size));
 
@@ -134,9 +151,9 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
    const uint32_t hw_threads = g5p_cdm_workgroup_threads(threads);
    const uint32_t count = threads | threads << 16;
    struct pvr_suballoc_bo *uniforms_bo;
-   uint32_t uniforms[2 * G9P_MAX_BUFFERS + 4] = { 0 };
-   uint32_t bind_data[4 * (G9P_MAX_BUFFERS + 1) + 4] = { 0 };
-   uint32_t bind_code[G9P_MAX_BUFFERS + 5];
+   uint32_t uniforms[2 * G9P_MAX_BUFFERS + 4 + 8 * G9P_A9_MAX_UPLOADS] = { 0 };
+   uint32_t bind_data[4 * (G9P_MAX_BUFFERS + 1) + 4 + 3 * G9P_A9_MAX_UPLOADS] = { 0 };
+   uint32_t bind_code[G9P_MAX_BUFFERS + 5 + G9P_A9_MAX_UPLOADS];
    uint32_t kernel_data[12] = { 0 }, kernel_code[8];
    struct pvr_pds_upload bind, kernel;
    unsigned bind_dwords, ctrl0, nc = 0;
@@ -187,7 +204,55 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
    }
    unsigned images=state->a9_num_images;
    if(images && n>15)return vk_errorf(cmd_buffer,VK_ERROR_OUT_OF_HOST_MEMORY,"G5P image LOD common31 overlaps the16th buffer pointer");
-   unsigned transfers=n+1+images+(state->a9_device_fence ? 1 : 0)+(images ? 1 : 0);
+   const unsigned base_transfers=n+1+images+(state->a9_device_fence ? 1 : 0)+(images ? 1 : 0);
+   const unsigned tex0=2*n+1+(state->a9_device_fence ? 2 : 0)+(images ? 1 : 0);
+   const unsigned nup=state->a9_num_uploads;
+   unsigned transfers=base_transfers+nup;
+   /* sampled textures' words, validated as the fragment path's (pvr_arch_g5p_gfx.c), from the
+    * bound sets' CPU mappings into the uniforms upload, then DMAed to their common dwords */
+   for(unsigned i=0;i<nup;i++) {
+      const __typeof__(state->a9_uploads[0]) *u=&state->a9_uploads[i];
+      uint32_t *out=&uniforms[tex0+8*i];
+      if(u->kind==G9P_A9_UP_FETCH_SAMPLER) {
+         const uint64_t policy=pvr_g5p_fetch_sampler_word();
+         memcpy(out,&policy,sizeof(policy));
+         continue;
+      }
+      const struct pvr_descriptor_set *set=u->set<PVR_MAX_DESCRIPTOR_SETS ? desc->sets[u->set] : NULL;
+      if(!set || !set->layout || !set->mapping || u->binding>=set->layout->binding_count)
+         return vk_errorf(cmd_buffer,VK_ERROR_UNKNOWN,"G5P compute: texture set %u binding %u is not bound",u->set,u->binding);
+      const struct pvr_descriptor_set_layout_binding *lb=&set->layout->bindings[u->binding];
+      if(u->element>=MAX2(lb->descriptor_count,1))
+         return vk_errorf(cmd_buffer,VK_ERROR_UNKNOWN,"G5P compute: set %u binding %u element %u past its descriptors",u->set,u->binding,u->element);
+      const uint32_t *d=(const uint32_t *)((const uint8_t *)set->mapping+lb->offset+(size_t)u->element*lb->stride);
+      switch(u->kind) {
+      case G9P_A9_UP_IMAGE:
+         if(lb->type==VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || !pvr_g5p_tex_state_valid(d)) {
+            mesa_logw("G5P refuses: compute set %u binding %u: a view without A9 texture state",u->set,u->binding);
+            return vk_errorf(cmd_buffer,VK_ERROR_OUT_OF_HOST_MEMORY,"G5P compute: a view without A9 texture state");
+         }
+         memcpy(out,d,4*8);
+         break;
+      case G9P_A9_UP_SAMPLER:
+         /* a combined descriptor's sampler is at +32, a standalone sampler's at +0 */
+         if(lb->type!=VK_DESCRIPTOR_TYPE_SAMPLER)
+            d+=8;
+         if(!pvr_g5p_sampler_valid(d)) {
+            mesa_logw("G5P refuses: compute set %u binding %u: a sampler without A9 words",u->set,u->binding);
+            return vk_errorf(cmd_buffer,VK_ERROR_OUT_OF_HOST_MEMORY,"G5P compute: a sampler without A9 words");
+         }
+         memcpy(out,d,4*2);
+         break;
+      case G9P_A9_UP_SIZE:
+         if(!pvr_g5p_tex_size(d,u->level,out)) {
+            mesa_logw("G5P refuses: compute set %u binding %u: an image size without A9 texture state",u->set,u->binding);
+            return vk_errorf(cmd_buffer,VK_ERROR_OUT_OF_HOST_MEMORY,"G5P compute: an image size without A9 texture state");
+         }
+         break;
+      default:
+         return vk_error(cmd_buffer,VK_ERROR_UNKNOWN);
+      }
+   }
    if (state->a9_device_fence) {
       uint32_t zero=0;
       struct pvr_suballoc_bo *fence;
@@ -198,7 +263,7 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
    }
    uniforms[2 * n] = count;
    result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, uniforms,
-                                               sizeof(uint32_t) * (2 * n + 1 + (state->a9_device_fence ? 2 : 0) + (images ? 1 : 0)),
+                                               sizeof(uint32_t) * (tex0 + 8 * nup),
                                                &uniforms_bo);
    if (result != VK_SUCCESS)
       return result;
@@ -213,7 +278,12 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
       uint64_t src;
       uint32_t dest = 2 * k, dwords = 2;
 
-      if (k < n && state->buffers[k].set != G9P_PUSH_CONSTANTS) {
+      if (k >= base_transfers) {
+         const unsigned i = k - base_transfers;
+         src = uniforms_bo->dev_addr.addr + 4 * (tex0 + 8 * i);
+         dest = state->a9_uploads[i].common;
+         dwords = state->a9_uploads[i].dwords;
+      } else if (k < n && state->buffers[k].set != G9P_PUSH_CONSTANTS) {
          const struct pvr_descriptor_set *set = desc->sets[state->buffers[k].set];
          const struct pvr_descriptor_set_layout_binding *binding;
 
@@ -304,7 +374,7 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
       struct pvr_csb *csb = &sub_cmd->control_stream;
       const struct g5p_cdm_record bind_rec =
          g5p_cdm_dma_task(G9P_CDM_DATA_BLOCKS(bind_dwords / 4), bind.data_offset,
-                          bind.code_offset, (state->a9_device_fence || images) ? 4 : DIV_ROUND_UP(2 * n + 1, 16));
+                          bind.code_offset, (state->a9_device_fence || images || nup) ? 4 : DIV_ROUND_UP(2 * n + 1, 16));
       const struct g5p_cdm_record kernel_rec = g5p_cdm_kernel(
          G9P_CDM_KERNEL_REGS(state->num_regs) | G9P_CDM_ANY_CLUSTER | G9P_CDM_FENCE |
             G9P_CDM_DATA_BLOCKS(kernel_dwords / 4),

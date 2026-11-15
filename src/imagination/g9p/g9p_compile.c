@@ -18,6 +18,7 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <stdio.h>
+#include "c11/threads.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -2827,9 +2828,11 @@ emit_tex_vertex(struct g9p_ctx *ctx, nir_tex_instr *tex)
  * where the sample reads them (as Apple's code for t.sample(s, uv * 2.0 +
  * 0.25) does; r0-r1 are free until the colour output).
  */
+#include "g9p_a9_tex.h"
 static bool
 emit_tex(struct g9p_ctx *ctx, nir_tex_instr *tex)
 {
+   G9P_A9_TEX(ctx, tex);
    int ci = nir_tex_instr_src_index(tex, nir_tex_src_coord);
    int slot = texture_slot(ctx, tex);
    int first, second, dst;
@@ -3622,6 +3625,17 @@ emit_cf_list(struct g9p_ctx *ctx, struct exec_list *list)
                   nir_print_instr(instr, stderr);
                   fprintf(stderr, "\n");
                }
+               /* the refusal for the shader dump (pvr_g5p_shader_dump.h): the backend's own reason
+                * if it gave one, then the instruction */
+               if (ctx->out->a9) {
+                  const size_t used = strnlen(ctx->out->a9_refusal, sizeof(ctx->out->a9_refusal));
+                  FILE *f = fmemopen(ctx->out->a9_refusal + used, sizeof(ctx->out->a9_refusal) - used, "w");
+                  if (f) {
+                     fprintf(f, "%s%s", used ? ": " : "", ctx->oom ? "out of registers at " : "cannot compile ");
+                     nir_print_instr(instr, f);
+                     fclose(f);
+                  }
+               }
                return false;
             }
             nir_foreach_def(instr, park_def, ctx);
@@ -4247,15 +4261,15 @@ lower_coverage(nir_shader *nir, const struct g9p_coverage *coverage)
 }
 
 /* The last attempt at a vertex shader: in program order, every load at its use */
-static _Thread_local bool g9p_no_schedule;
+static thread_local bool g9p_no_schedule;
 /*
  * Registers above r31 only once every attempt without them failed: a shader that fits
  * reloading its values runs far more instances at once (the aquarium's fish vertex shader:
  * 100 registers with homes on the first attempt, 4 instances, geometry 10x slower)
  */
-static _Thread_local bool g9p_no_homes;
+static thread_local bool g9p_no_homes;
 /* vertex shaders: attribute loads moved next to their uses (g9p_compile_vertex() tries both) */
-static _Thread_local bool g9p_move_inputs;
+static thread_local bool g9p_move_inputs;
 
 /*
  * Vertex outputs right after their values, with emit_output() writing each
@@ -4318,7 +4332,7 @@ hoist_vertex_outputs(nir_shader *nir)
    return progress;
 }
 /* the homes an attempt may use: few first (r32-r63), all of them last */
-static _Thread_local unsigned g9p_max_homes = 92;
+static thread_local unsigned g9p_max_homes = 92;
 
 /*
  * Loads that are cheap to repeat (uniform buffers, push constants,
@@ -4717,6 +4731,8 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
          NIR_PASS(_, nir, nir_lower_tex, &offsets);
          NIR_PASS(_, nir, nir_lower_tex, &levels);
       }
+      /* A9 compute reads texels with the sampler's read form and the fetch sampler (g9p_a9_tex.h) */
+      if (!(out->a9 && stage == MESA_SHADER_COMPUTE))
       NIR_PASS(_, nir, nir_shader_tex_pass, lower_txf, nir_metadata_control_flow, NULL);
       NIR_PASS(_, nir, nir_shader_instructions_pass, lower_half_packing, nir_metadata_control_flow, NULL);
    }

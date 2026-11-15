@@ -17,5 +17,24 @@ bool g9p_a9_compile_compute(nir_shader *nir, struct g9p_shader *out, void *mem_c
    out->a9_local_dwords = 4 + DIV_ROUND_UP(nir->info.shared_size, 4);
    NIR_PASS(_, nir, nir_lower_compute_system_values, &csv);
    NIR_PASS(_, nir, nir_lower_undef_to_zero, NULL);
-   return compile_back(nir, out, MESA_SHADER_COMPUTE, NULL, 0, false, false, mem_ctx);
+   if (!compile_back(nir, out, MESA_SHADER_COMPUTE, NULL, 0, false, false, mem_ctx))
+      return false;
+   /* the fixed common-store places of texture words (g9p_a9_tex.h) */
+   bool sizes = false;
+   for (unsigned i = 0; i < out->a9_num_uploads; i++)
+      sizes |= out->a9_uploads[i].kind == G9P_A9_UP_SIZE;
+   if (out->a9_num_uploads && out->num_buffers > 15) {
+      if (!out->a9_refusal[0])
+         snprintf(out->a9_refusal, sizeof(out->a9_refusal),
+               "%u buffers with sampled textures (buffer words reach the texture words at common 32)",
+               out->num_buffers);
+      return false;
+   }
+   if (sizes && out->num_textures) {
+      if (!out->a9_refusal[0])
+         snprintf(out->a9_refusal, sizeof(out->a9_refusal),
+               "a texture size query together with a storage image (both at common 40-47)");
+      return false;
+   }
+   return true;
 }
