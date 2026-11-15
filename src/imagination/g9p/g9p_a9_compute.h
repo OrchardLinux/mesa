@@ -157,6 +157,67 @@ a9_lower_array_layer(nir_builder *b, nir_tex_instr *tex, void *data)
    return true;
 }
 
+/* The grid owns disjoint stride-sized regions. Keep this before shared
+ * vectorisation: the ordinary SSBO lowering handles vectors and atomics. */
+static bool
+a9_spill_shared(nir_builder *b, nir_intrinsic_instr *in, void *data)
+{
+   if (in->intrinsic == nir_intrinsic_barrier) {
+      nir_variable_mode modes = nir_intrinsic_memory_modes(in);
+      if (!(modes & nir_var_mem_shared)) return false;
+      nir_intrinsic_set_memory_modes(in, modes | nir_var_mem_ssbo);
+      return true;
+   }
+   nir_intrinsic_op op;
+   unsigned off_src = 0;
+   switch (in->intrinsic) {
+   case nir_intrinsic_load_shared: op = nir_intrinsic_load_ssbo; break;
+   case nir_intrinsic_store_shared: op = nir_intrinsic_store_ssbo; off_src = 1; break;
+   case nir_intrinsic_shared_atomic: op = nir_intrinsic_ssbo_atomic; break;
+   case nir_intrinsic_shared_atomic_swap: op = nir_intrinsic_ssbo_atomic_swap; break;
+   default: return false;
+   }
+   b->cursor = nir_before_instr(&in->instr);
+   nir_def *wg = nir_load_workgroup_id(b), *nwg = nir_load_num_workgroups(b);
+   nir_def *linear = nir_iadd(b, nir_channel(b, wg, 0),
+      nir_imul(b, nir_channel(b, nwg, 0), nir_iadd(b, nir_channel(b, wg, 1),
+         nir_imul(b, nir_channel(b, nwg, 1), nir_channel(b, wg, 2)))));
+   nir_def *offset = nir_iadd(b, nir_imul_imm(b, linear, *(unsigned *)data),
+      nir_iadd_imm(b, in->src[off_src].ssa, nir_intrinsic_base(in)));
+   nir_def *index = nir_vulkan_resource_index(b, 2, 32, nir_imm_int(b, 0),
+      .desc_set = G9P_SHARED_SPILL, .binding = 0,
+      .desc_type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+   nir_intrinsic_instr *spill = nir_intrinsic_instr_create(b->shader, op);
+   spill->num_components = in->num_components;
+   nir_intrinsic_set_access(spill, nir_intrinsic_access(in));
+   if (op == nir_intrinsic_store_ssbo) {
+      spill->src[0] = nir_src_for_ssa(in->src[0].ssa);
+      spill->src[1] = nir_src_for_ssa(index);
+      spill->src[2] = nir_src_for_ssa(offset);
+      nir_intrinsic_set_write_mask(spill, nir_intrinsic_write_mask(in));
+   } else {
+      spill->src[0] = nir_src_for_ssa(index);
+      spill->src[1] = nir_src_for_ssa(offset);
+      if (op != nir_intrinsic_load_ssbo) {
+         nir_intrinsic_set_atomic_op(spill, nir_intrinsic_atomic_op(in));
+         spill->src[2] = nir_src_for_ssa(in->src[1].ssa);
+         if (op == nir_intrinsic_ssbo_atomic_swap)
+            spill->src[3] = nir_src_for_ssa(in->src[2].ssa);
+      }
+      nir_def_init(&spill->instr, &spill->def, in->def.num_components, in->def.bit_size);
+   }
+   if (op == nir_intrinsic_load_ssbo || op == nir_intrinsic_store_ssbo) {
+      nir_intrinsic_set_align_mul(spill, nir_intrinsic_align_mul(in));
+      nir_intrinsic_set_align_offset(spill,
+         (nir_intrinsic_align_offset(in) + nir_intrinsic_base(in)) % nir_intrinsic_align_mul(in));
+   }
+   nir_builder_instr_insert(b, &spill->instr);
+   if (op != nir_intrinsic_store_ssbo)
+      nir_def_rewrite_uses(&in->def, &spill->def);
+   nir_instr_remove(&in->instr);
+   return true;
+}
+
 bool g9p_a9_compile_compute(nir_shader *nir, struct g9p_shader *out, void *mem_ctx)
 {
    nir->options = &nir_options_a9;
@@ -174,13 +235,16 @@ bool g9p_a9_compile_compute(nir_shader *nir, struct g9p_shader *out, void *mem_c
    NIR_PASS(_, nir, nir_lower_alu);
    /* lower_front() already allocated and lowered shared variables. Doing
     * it again double-counts the allocation after addresses became explicit. */
+   if (nir->info.shared_size > 16384) {
+      out->shared_spill_stride = ALIGN_POT(nir->info.shared_size, 64);
+      NIR_PASS(_, nir, nir_shader_intrinsics_pass, a9_spill_shared,
+               nir_metadata_control_flow, &out->shared_spill_stride);
+      nir->info.shared_size = 0;
+   }
    const nir_lower_mem_access_bit_sizes_options shared_opts = {
       .modes = nir_var_mem_shared, .callback = a9_shared_size_align,
    };
    NIR_PASS(_, nir, nir_lower_mem_access_bit_sizes, &shared_opts);
-   if (nir->info.shared_size > 16384) {
-      return g9p_fail(out, "shared memory %u bytes, above the A9's 16384", nir->info.shared_size);
-   }
    out->a9_local_dwords = 4 + DIV_ROUND_UP(nir->info.shared_size, 4);
    NIR_PASS(_, nir, nir_shader_tex_pass, a9_lower_array_layer, nir_metadata_control_flow, NULL);
    NIR_PASS(_, nir, nir_lower_compute_system_values, &csv);

@@ -8,6 +8,10 @@
 #include "vk_pipeline.h"
 #include "vk_alloc.h"
 #include "util/ralloc.h"
+#include "util/u_atomic.h"
+#include "util/u_debug.h"
+#include "util/u_call_once.h"
+#include "util/log.h"
 #include "g9p_cdm.h"
 #include "g9p_compile.h"
 #include "g5p_cdm.h"
@@ -175,6 +179,7 @@ PVR_PER_ARCH(g5p_compute_pipeline_compile)(
       state->a9_uploads[i].dwords = u->dwords;
       state->a9_uploads[i].value = u->value;
    }
+   state->shared_spill_stride = shader.shared_spill_stride;
    state->uses_workgroup_id = shader.uses_workgroup_id;
    memcpy(state->local_size, shader.local_size, sizeof(state->local_size));
 
@@ -283,6 +288,10 @@ g5p_record_dispatch(struct pvr_cmd_buffer *cmd, struct pvr_sub_cmd_compute *sub,
    return VK_SUCCESS;
 }
 
+/* This translation unit is A9-only. Read the override once, off the hot path. */
+/* Bound per-dispatch shared-memory spill allocations to 64 MiB. */
+#define PVR_G5P_SHARED_SPILL_MAX_BYTES (64u << 20)
+
 /*
  * One dispatch: a DMA task loading the buffer addresses (from the bound
  * descriptor sets) and the thread count into the common store, then the
@@ -341,6 +350,50 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
       return VK_SUCCESS;
    }
 
+   struct pvr_bo *shared_spill = NULL;
+   if (state->shared_spill_stride) {
+      if (indirect_va) {
+         if (p_atomic_cmpxchg(&state->shared_spill_logged, 0, 1) == 0)
+            mesa_logw("G5P refuses: indirect dispatch of a spilling workgroup-memory pipeline");
+         vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+      }
+
+      uint64_t groups = (uint64_t)group_count[0] * group_count[1] * group_count[2];
+      /* Divide before multiplying: even a valid grid can overflow bytes. */
+      if (groups > PVR_G5P_SHARED_SPILL_MAX_BYTES / state->shared_spill_stride) {
+         if (p_atomic_cmpxchg(&state->shared_spill_logged, 0, 1) == 0)
+            mesa_logw("G5P refuses: a dispatch of %" PRIu64 " groups × %u bytes of spilled workgroup memory "
+                      "(%.2f MB, above the cap)", groups, state->shared_spill_stride,
+                      (double)groups * state->shared_spill_stride / (1024 * 1024));
+         vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+      }
+      /* bo_list is freed as pvr_suballoc_bo, despite its pvr_bo comment.
+       * Give the dedicated generic BO a normal ownership wrapper. Reset
+       * may cache it in suballoc_general, so use that allocator's mapping
+       * flags too; a later ordinary upload must find a mapped BO. */
+      struct pvr_suballoc_bo *owner = vk_zalloc(&device->vk.alloc, sizeof(*owner), 8,
+                                                VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+      if (!owner) {
+         vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+      }
+      result = pvr_bo_alloc(device, device->heaps.general_heap,
+                           groups * state->shared_spill_stride, 64,
+                           PVR_BO_ALLOC_FLAG_CPU_MAPPED, &shared_spill);
+      if (result != VK_SUCCESS) {
+         vk_free(&device->vk.alloc, owner);
+         vk_command_buffer_set_error(&cmd_buffer->vk, result);
+         return result;
+      }
+      owner->allocator = &device->suballoc_general;
+      owner->bo = shared_spill;
+      owner->dev_addr = shared_spill->vma->dev_addr;
+      owner->size = groups * state->shared_spill_stride;
+      list_add(&owner->link, &cmd_buffer->bo_list);
+   }
+
    /*
     * Values the DMA copies that are not in descriptor memory: the
     * push-constant buffer's address and the thread count.
@@ -354,6 +407,10 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
                              "G5P: gl_NumWorkGroups in an indirect dispatch");
          uniforms[2 * k] = group_count[state->buffers[k].binding ? 2 : 0];
          uniforms[2 * k + 1] = state->buffers[k].binding ? 0 : group_count[1];
+      }
+      if (state->buffers[k].set == G9P_SHARED_SPILL) {
+         uniforms[2 * k] = shared_spill->vma->dev_addr.addr;
+         uniforms[2 * k + 1] = shared_spill->vma->dev_addr.addr >> 32;
       }
       if (state->buffers[k].set == G9P_PUSH_CONSTANTS) {
          const struct pvr_push_constants *pc =
@@ -449,7 +506,8 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
          dest = state->a9_uploads[i].common;
          dwords = state->a9_uploads[i].dwords;
       } else if (k < n && state->buffers[k].set != G9P_PUSH_CONSTANTS &&
-                 state->buffers[k].set != G9P_NUM_WORKGROUPS) {
+                 state->buffers[k].set != G9P_NUM_WORKGROUPS &&
+                 state->buffers[k].set != G9P_SHARED_SPILL) {
          const struct pvr_descriptor_set *set = desc->sets[state->buffers[k].set];
          /* an array's element (Zink keeps every storage buffer in one array) and the size flag (the
           * descriptor's size word at byte 8, arrayLength()): G9P's 496e44739dc ("pvr/g9p: gl_NumWorkGroups, workgroup ID z, storage buffer array elements in compute"), 1d51ff5cec6 */
