@@ -43,6 +43,7 @@
 #include "util/macros.h"
 #include "vk_alloc.h"
 #include "vk_log.h"
+#include "util/log.h"
 
 static VkResult pvr_drm_create_gem_bo(struct pvr_drm_winsys *drm_ws,
                                       uint32_t drm_flags,
@@ -558,11 +559,21 @@ void pvr_drm_winsys_vma_unmap(struct pvr_winsys_vma *vma)
    /* Address should be mapped. */
    assert(vma->bo);
 
-   pvr_ioctlf(drm_ws->base.render_fd,
-              DRM_IOCTL_PVR_VM_UNMAP,
-              &args,
-              VK_ERROR_UNKNOWN,
-              "Unmap failed");
+   if (p_atomic_read(&drm_ws->lost)) {
+      if (drmIoctl(drm_ws->base.render_fd, DRM_IOCTL_PVR_VM_UNMAP, &args) &&
+          p_atomic_cmpxchg(&drm_ws->unmap_loss_reported, 0, 1) == 0) {
+         const int err = errno;
+         const char *message = strerror(err);
+         mesa_logw("%s: VM_UNMAP after loss ignored (errno %d: %s)",
+                   drm_ws->is_g5p ? "G5P" : "pvr", err, message);
+      }
+   } else {
+      pvr_ioctlf(drm_ws->base.render_fd,
+                 DRM_IOCTL_PVR_VM_UNMAP,
+                 &args,
+                 VK_ERROR_UNKNOWN,
+                 "Unmap failed");
+   }
 
    pvr_drm_buffer_release(drm_bo);
 

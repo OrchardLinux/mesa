@@ -46,6 +46,7 @@ struct pvr_drm_winsys {
    bool is_g5p;
    int loss_reported;
    int lost; /* Atomic and terminal. */
+   int unmap_loss_reported;
 
    /* Protects imported BOs creation/freeing, which includes the bo_map member
     * below.
