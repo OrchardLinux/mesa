@@ -244,10 +244,15 @@ struct gctx {
    bool cube_gradient; /* fixed native bank0 r0..r8 operand tuple */
    struct { unsigned set, binding, element, lod, common; } tsize[4]; /* textureSize/QueryLevels */
    unsigned nsize;
-   struct range ranges[8];
+   struct range ranges[16]; /* 13 UBOs per stage (maxPerStageDescriptorUniformBuffers) + push constants */
    unsigned nranges;
-   unsigned ssbo_set[2], ssbo_binding[2];
+   /* Storage buffers: one pointer pair each. Up to two take Apple's witnessed
+    * fixed-load bases common0/common2 (the hardware-tested layout, byte-identical);
+    * more, or any with blend constants, sit after the stage's other common
+    * dwords (ssbo_high) and every access goes through addr.add_shift. */
+   unsigned ssbo_set[PCO_G5P_MAX_SSBOS], ssbo_binding[PCO_G5P_MAX_SSBOS], ssbo_common[PCO_G5P_MAX_SSBOS];
    unsigned nssbo;
+   bool ssbo_high;
    /* register-indexed UBO loads: one pointer (UBO VA + constant base) each.
     * The pairs sit at even common dwords below 32 (addr.add_shift's base
     * field), so at most 16; plan_common() refuses a pair past dword 30 and
