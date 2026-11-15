@@ -32,5 +32,6 @@ struct g9p_a9_upload {
 } while (0)
 const char *g9p_a9_last_refusal(void);
 struct g9p_shader;
+unsigned g9p_a9_pipeline_max_lanes(const struct g9p_shader *shader);
 bool g9p_a9_compile_compute(nir_shader *, struct g9p_shader *, void *);
 #endif

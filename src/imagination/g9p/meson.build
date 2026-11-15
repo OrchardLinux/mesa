@@ -5,7 +5,7 @@ inc_powervr_g9p = include_directories(['.'])
 
 libpowervr_g9p = static_library(
   'powervr_g9p',
-  files('g9p_compile.c'),
+  files('g9p_compile.c', 'g9p_a9.c'),
   include_directories : [inc_imagination, inc_powervr_g9p, inc_include, inc_src],
   c_args : [imagination_c_args, no_override_init_args],
   dependencies : [idep_mesautil, idep_nir],

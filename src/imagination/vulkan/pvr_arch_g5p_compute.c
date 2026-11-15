@@ -30,7 +30,6 @@
 #include "pvr_g5p.h"
 #include "pvr_g5p_tex_encode.h"
 #include "pvr_g5p_shader_dump.h"
-#include "hwdef/rogue_hw_utils.h"
 #include "pvr_g5p_compute.h"
 #include "pvr_job_context.h"
 #include "pvr_winsys.h"
@@ -97,40 +96,13 @@ PVR_PER_ARCH(g5p_compute_pipeline_compile)(
    } else {
       pvr_g5p_shader_dump(&create_info->stage, create_info->layout, "comp", NULL, 0, "ADMIT", NULL);
    }
-   /* A barrier above 32 lanes waits for every task of the workgroup
-    * (Apple's software barrier, g5p_barrier.h), so all of them must be
-    * resident in one USC at once: Rogue's bound on the temporaries per lane
-    * for that workgroup size (rogue_max_wg_temps(), as upstream's compute
-    * pipelines check). A pipeline above it would spin forever: refused. */
    {
       const unsigned threads = shader.local_size[0] * shader.local_size[1] * shader.local_size[2];
-      const struct pvr_device_info *dev_info = &device->pdevice->dev_info;
-      if (shader.a9_has_barriers && threads > ROGUE_MAX_INSTANCES_PER_TASK &&
-          rogue_max_wg_temps(dev_info, shader.num_regs, threads, true) < shader.num_regs) {
-         mesa_logw("G5P refuses: a %u-lane workgroup with barriers needs %u temporaries per lane, above "
-                 "the %u that keep every task resident", threads, shader.num_regs,
-                 rogue_max_wg_temps(dev_info, shader.num_regs, threads, true));
-         result = vk_errorf(device, VK_ERROR_FEATURE_NOT_PRESENT,
-                            "G5P compute: %u-lane barriered workgroup needs %u temporaries per lane", threads,
-                            shader.num_regs);
-         goto out;
-      }
-      /* Apple's per-pipeline limit (AGXMetalA9 ComputeProgramVariant 0x207d2c4b0 -> +0xb08, which
-       * -[AGXA9FamilyComputePipeline maxTotalThreadsPerThreadgroup] returns), from the allocation the
-       * kernel task sends: bank 0 (the DOUTU temps, t) and bank 1 (the record's register field, f
-       * registers). min(32 * floor((3329 - a) / a) with a = (4t + 28) & ~31, 393216 / ((64f + 448) & ~511)),
-       * at most 512, a multiple of 32 above 32. k_hi48 (t 64, f 8) gives 384, the limit Metal reported for it
-       * on iOS. Vulkan has no per-pipeline limit, so a larger workgroup is refused by
-       * name: the USC cannot hold it. */
+      /* Apple's limit keeps all tasks of a barriered workgroup resident. */
       if (shader.a9) {
          const unsigned t = 8 * DIV_ROUND_UP(MAX2(shader.num_regs, 1), 8);
          const unsigned f = 8 * DIV_ROUND_UP(shader.a9_bank1_regs ? shader.a9_bank1_regs : shader.num_regs, 8);
-         /* bank 1 keeps one task (32 lanes) free, as Apple's bank-0 term does (g9p_a9_bank1_limit()) */
-         const unsigned a = (4 * t + 28) & ~31u, b = (64 * f + 448) & ~511u;
-         unsigned max = MIN2(a ? 32 * ((3329 - a) / a) : 512, b ? 393216 / b - 32 : 512);
-         max = MIN2(max, 512);
-         if (max > 32)
-            max &= ~31u;
+         const unsigned max = g9p_a9_pipeline_max_lanes(&shader);
          if (threads > max) {
             mesa_logw("G5P refuses: a %u-lane workgroup with %u bank-0 and %u bank-1 registers per lane, above "
                     "the %u lanes Apple's A9 driver allows for that allocation", threads, t, f, max);
