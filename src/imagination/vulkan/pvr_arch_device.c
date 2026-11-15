@@ -215,6 +215,14 @@ VkResult pvr_arch_pds_compute_shader_create_and_upload(
    return result;
 }
 
+static VkResult pvr_device_check_status(struct vk_device *vk)
+{
+   struct pvr_device *device = container_of(vk, struct pvr_device, vk);
+   if (device->ws->ops->is_lost(device->ws))
+      return vk_device_set_lost(vk, "device lost (%s)", device->ws->loss_source ? device->ws->loss_source : "kernel job error");
+   return VK_SUCCESS;
+}
+
 static VkResult pvr_device_init_compute_fence_program(struct pvr_device *device)
 {
    struct pvr_pds_compute_shader_program program;
@@ -824,6 +832,7 @@ VkResult PVR_PER_ARCH(create_device)(struct pvr_physical_device *pdevice,
    device->instance = instance;
    device->pdevice = pdevice;
    device->ws = ws;
+   device->vk.check_status = pvr_device_check_status;
 
    /* Before anything that creates a render target dataset. */
    simple_mtx_init(&device->rt_cache_mtx, mtx_plain);

@@ -197,6 +197,9 @@ VkResult pvr_AllocateMemory(VkDevice _device,
 {
    const VkImportMemoryFdInfoKHR *fd_info = NULL;
    VK_FROM_HANDLE(pvr_device, device, _device);
+
+   if (vk_device_is_lost_no_report(&device->vk))
+      return vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
    enum pvr_winsys_bo_type type = PVR_WINSYS_BO_TYPE_GPU;
    struct pvr_device_memory *mem;
    VkResult result;
