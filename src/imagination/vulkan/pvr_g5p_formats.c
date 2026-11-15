@@ -97,6 +97,13 @@ pvr_g5p_image_format_check(const VkPhysicalDeviceImageFormatInfo2 *info, VkImage
       why = "3D block-compressed images (the A9's 3D order is built for texels only)";
    else if (info->type == VK_IMAGE_TYPE_3D && tiling != VK_IMAGE_TILING_OPTIMAL)
       why = "linear 3D images (Apple samples 3D twiddled only)";
+   if (!why && (info->usage & VK_IMAGE_USAGE_STORAGE_BIT)) {
+      const struct pvr_g5p_format *f = pvr_g5p_format_find(info->format);
+      if (!(f->flags & PVR_G5P_FMT_STORAGE))
+         why = "no A9 storage pack path for this format";
+      else if (info->type != VK_IMAGE_TYPE_2D || tiling != VK_IMAGE_TILING_OPTIMAL)
+         why = "A9 storage images require optimal 2D images (including arrays/cube faces)";
+   }
    if (!why)
       return VK_SUCCESS;
    mesa_logd("G5P: no %s image of %s, tiling %s, usage %#x, flags %#x: %s", vk_ImageType_to_str(info->type),

@@ -62,6 +62,7 @@ pvr_g5p_image_layout(struct pvr_image *image, unsigned stride_align)
       return;
 
    const bool twiddled = is3d || image->vk.mip_levels > 1 ||
+                         (image->vk.usage & VK_IMAGE_USAGE_STORAGE_BIT) ||
                          (image->vk.create_flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) ||
                          (image->vk.array_layers > 1 && (image->vk.usage & VK_IMAGE_USAGE_SAMPLED_BIT)) ||
                          vk_format_is_compressed(image->vk.format);

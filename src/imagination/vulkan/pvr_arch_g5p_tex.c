@@ -38,7 +38,7 @@ g5p_tex_format(VkFormat format, struct pvr_g5p_tex_format *out)
 
 /* The three qwords of a view, or the reason it has none */
 static const char *
-g5p_view_state(const struct pvr_image_view *iview, uint64_t q[3])
+g5p_view_state(const struct pvr_image_view *iview, bool storage, uint64_t q[3])
 {
    const struct pvr_image *image = pvr_image_view_get_image(iview);
    const struct pvr_image_plane *plane = pvr_single_plane_const(image);
@@ -57,7 +57,10 @@ g5p_view_state(const struct pvr_image_view *iview, uint64_t q[3])
    const bool meta_2d = (iview->vk.create_flags & VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA) &&
                         iview->vk.view_type == VK_IMAGE_VIEW_TYPE_2D_ARRAY && iview->vk.layer_count == 1 &&
                         image->vk.image_type == VK_IMAGE_TYPE_2D;
-   const VkImageViewType view_type = meta_2d ? VK_IMAGE_VIEW_TYPE_2D : iview->vk.view_type;
+   const bool storage_cube = storage && (iview->vk.view_type == VK_IMAGE_VIEW_TYPE_CUBE ||
+                                          iview->vk.view_type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY);
+   const VkImageViewType view_type = storage_cube ? VK_IMAGE_VIEW_TYPE_2D_ARRAY :
+                                       meta_2d ? VK_IMAGE_VIEW_TYPE_2D : iview->vk.view_type;
 
    if (image->memlayout == PVR_MEMLAYOUT_LINEAR) {
       const struct pvr_mip_level *level = &plane->mip_levels[0];
@@ -164,11 +167,11 @@ g5p_view_state(const struct pvr_image_view *iview, uint64_t q[3])
  * The sampled state of a view: q0, q1 in words[], q2 in meta[0..1],
  * meta[2..3] zero, the 32 bytes the backend's image upload reads.
  */
-const char *
-PVR_PER_ARCH(g5p_pack_image_view)(const struct pvr_image_view *iview, struct pvr_image_descriptor *desc)
+static const char *
+g5p_pack_view(const struct pvr_image_view *iview, bool storage, struct pvr_image_descriptor *desc)
 {
    uint64_t q[3];
-   const char *why = g5p_view_state(iview, q);
+   const char *why = g5p_view_state(iview, storage, q);
 
    static_assert(sizeof(desc->words) + sizeof(desc->meta) == 32, "G5P image state is 32 bytes");
    memset(desc, 0, sizeof(*desc));
@@ -189,6 +192,21 @@ PVR_PER_ARCH(g5p_pack_image_view)(const struct pvr_image_view *iview, struct pvr
    desc->meta[0] = (uint32_t)q[2];
    desc->meta[1] = (uint32_t)(q[2] >> 32);
    return NULL;
+}
+
+const char *
+PVR_PER_ARCH(g5p_pack_image_view)(const struct pvr_image_view *iview, struct pvr_image_descriptor *desc)
+{
+   return g5p_pack_view(iview, false, desc);
+}
+
+/* Vulkan layer_count already counts faces (six for each cube). Storage
+ * descriptors use that same face order as a 2D array; sampled state stays cube. */
+const char *
+PVR_PER_ARCH(g5p_pack_storage_image_view)(const struct pvr_image_view *iview,
+                                        struct pvr_image_descriptor *desc)
+{
+   return g5p_pack_view(iview, true, desc);
 }
 
 /*

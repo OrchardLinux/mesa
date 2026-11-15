@@ -64,6 +64,7 @@ enum pvr_g5p_fmt_flags {
    PVR_G5P_FMT_BLEND = 1u << 3,        /* blending into it (the fragment program's) */
    PVR_G5P_FMT_COMPRESSED = 1u << 4,   /* blocks (4x4 ETC2/EAC, 4x4..12x12 ASTC), twiddled only */
    PVR_G5P_FMT_INTEGER = 1u << 5,      /* integer texel: texelFetch/unfiltered */
+   PVR_G5P_FMT_STORAGE = 1u << 6,      /* compute writes with a declared format */
    /* narrow integer render rows remain unadvertised probes */
    PVR_G5P_FMT_PROBE_SAMPLED = 1u << 8, /* the sampled bits are a probe */
    PVR_G5P_FMT_PROBE_RENDER = 1u << 9,  /* the render (and blend) bits are a probe */
@@ -115,7 +116,7 @@ static const struct pvr_g5p_format pvr_g5p_format_table[] = {
    /* 8_8_8_8: pass/pass-rgba (BGRA8, RGBA8), fmt-srgb8 (q1 bit 45). The
     * A8B8G8R8 packed formats are the R8G8B8A8 bytes on a little-endian GPU. */
    G5P_FMT(B8G8R8A8_UNORM, 4, false, G5P_SF | G5P_RT, G5P1B, 0x28, G5P_SEL_BGRA),
-   G5P_FMT(R8G8B8A8_UNORM, 4, false, G5P_SF | G5P_RT, G5P1B, 0x28, G5P_SEL_RGBA),
+   G5P_FMT(R8G8B8A8_UNORM, 4, false, G5P_SF | G5P_RT | PVR_G5P_FMT_STORAGE, G5P1B, 0x28, G5P_SEL_RGBA),
    G5P_FMT(A8B8G8R8_UNORM_PACK32, 4, false, G5P_SF | G5P_RT, G5P1B, 0x28, G5P_SEL_RGBA),
    G5P_FMT(B8G8R8A8_SRGB, 4, true, G5P_SF | G5P_RT, G5P1B, 0x28, G5P_SEL_BGRA),
    G5P_FMT(R8G8B8A8_SRGB, 4, true, G5P_SF | G5P_RT, G5P1B, 0x28, G5P_SEL_RGBA),
@@ -144,13 +145,13 @@ static const struct pvr_g5p_format pvr_g5p_format_table[] = {
    G5P_FMT(R16G16B16A16_SNORM, 8, false, G5P_SF, G5P1B, 0xb2, G5P_SEL_RGBA),
    /* half float (t9-t11, fmt-rg16f, fmt-rgba16f), rendered with the two-word
     * program (RGBA16F: an 8-byte PBE pixel) */
-   G5P_FMT(R16_SFLOAT, 2, false, G5P_SF | G5P_RT, G5P1B, 0x209, G5P_SEL_R001),
-   G5P_FMT(R16G16_SFLOAT, 4, false, G5P_SF | G5P_RT, G5P1B, 0x223, G5P_SEL_RG01),
-   G5P_FMT(R16G16B16A16_SFLOAT, 8, false, G5P_SF | G5P_RT, G5P1B, 0x232, G5P_SEL_RGBA),
+   G5P_FMT(R16_SFLOAT, 2, false, G5P_SF | G5P_RT | PVR_G5P_FMT_STORAGE, G5P1B, 0x209, G5P_SEL_R001),
+   G5P_FMT(R16G16_SFLOAT, 4, false, G5P_SF | G5P_RT | PVR_G5P_FMT_STORAGE, G5P1B, 0x223, G5P_SEL_RG01),
+   G5P_FMT(R16G16B16A16_SFLOAT, 8, false, G5P_SF | G5P_RT | PVR_G5P_FMT_STORAGE, G5P1B, 0x232, G5P_SEL_RGBA),
    /* 32-bit float (fmt-r32f, t12-t13): the A9 does not filter 32-bit float */
-   G5P_FMT(R32_SFLOAT, 4, false, G5P_S, G5P1B, 0x221, G5P_SEL_R001),
+   G5P_FMT(R32_SFLOAT, 4, false, G5P_S | PVR_G5P_FMT_STORAGE, G5P1B, 0x221, G5P_SEL_R001),
    G5P_FMT(R32G32_SFLOAT, 8, false, G5P_S, G5P1B, 0x231, G5P_SEL_RG01),
-   G5P_FMT(R32G32B32A32_SFLOAT, 16, false, G5P_S, G5P1B, 0x238, G5P_SEL_RGBA),
+   G5P_FMT(R32G32B32A32_SFLOAT, 16, false, G5P_S | PVR_G5P_FMT_STORAGE, G5P1B, 0x238, G5P_SEL_RGBA),
    /* packed float (t14-t15). Apple packs RG11B10F in a 66-byte program; the
     * PBE packs it from the two-word program's f16 too, exactly. */
    G5P_FMT(B10G11R11_UFLOAT_PACK32, 4, false, G5P_SF | G5P_RT, G5P1B, 0x225, G5P_SEL_RGB1),
@@ -190,9 +191,9 @@ static const struct pvr_g5p_format pvr_g5p_format_table[] = {
    G5P_FMT(R16_UINT, 2, false, G5P_SI | PVR_G5P_FMT_RENDER | PVR_G5P_FMT_PROBE_RENDER, G5P1B, 0x109, G5P_SEL_R001),
    G5P_FMT(R16G16_UINT, 4, false, G5P_SI | PVR_G5P_FMT_RENDER | PVR_G5P_FMT_PROBE_RENDER, G5P1B, 0x123, G5P_SEL_RG01),
    G5P_FMT(R16G16B16A16_UINT, 8, false, G5P_SI | PVR_G5P_FMT_RENDER | PVR_G5P_FMT_PROBE_RENDER, G5P1B, 0x132, G5P_SEL_RGBA),
-   G5P_FMT(R32_UINT, 4, false, G5P_SI | PVR_G5P_FMT_RENDER, G5P1B, 0x121, G5P_SEL_R001),
+   G5P_FMT(R32_UINT, 4, false, G5P_SI | PVR_G5P_FMT_RENDER | PVR_G5P_FMT_STORAGE, G5P1B, 0x121, G5P_SEL_R001),
    G5P_FMT(R32G32_UINT, 8, false, G5P_SI | PVR_G5P_FMT_RENDER, G5P1B, 0x131, G5P_SEL_RG01),
-   G5P_FMT(R32G32B32A32_UINT, 16, false, G5P_SI | PVR_G5P_FMT_RENDER, G5P1B, 0x138, G5P_SEL_RGBA),
+   G5P_FMT(R32G32B32A32_UINT, 16, false, G5P_SI | PVR_G5P_FMT_RENDER | PVR_G5P_FMT_STORAGE, G5P1B, 0x138, G5P_SEL_RGBA),
    G5P_FMT(R8_SINT, 1, false, G5P_SI | PVR_G5P_FMT_RENDER | PVR_G5P_FMT_PROBE_RENDER, G5P1B, 0x180, G5P_SEL_R001),
    G5P_FMT(R8G8_SINT, 2, false, G5P_SI | PVR_G5P_FMT_RENDER | PVR_G5P_FMT_PROBE_RENDER, G5P1B, 0x18a, G5P_SEL_RG01),
    G5P_FMT(R8G8B8A8_SINT, 4, false, G5P_SI | PVR_G5P_FMT_RENDER | PVR_G5P_FMT_PROBE_RENDER, G5P1B, 0x1a8, G5P_SEL_RGBA),
@@ -200,9 +201,9 @@ static const struct pvr_g5p_format pvr_g5p_format_table[] = {
    G5P_FMT(R16_SINT, 2, false, G5P_SI | PVR_G5P_FMT_RENDER | PVR_G5P_FMT_PROBE_RENDER, G5P1B, 0x189, G5P_SEL_R001),
    G5P_FMT(R16G16_SINT, 4, false, G5P_SI | PVR_G5P_FMT_RENDER | PVR_G5P_FMT_PROBE_RENDER, G5P1B, 0x1a3, G5P_SEL_RG01),
    G5P_FMT(R16G16B16A16_SINT, 8, false, G5P_SI | PVR_G5P_FMT_RENDER | PVR_G5P_FMT_PROBE_RENDER, G5P1B, 0x1b2, G5P_SEL_RGBA),
-   G5P_FMT(R32_SINT, 4, false, G5P_SI | PVR_G5P_FMT_RENDER, G5P1B, 0x1a1, G5P_SEL_R001),
+   G5P_FMT(R32_SINT, 4, false, G5P_SI | PVR_G5P_FMT_RENDER | PVR_G5P_FMT_STORAGE, G5P1B, 0x1a1, G5P_SEL_R001),
    G5P_FMT(R32G32_SINT, 8, false, G5P_SI | PVR_G5P_FMT_RENDER, G5P1B, 0x1b1, G5P_SEL_RG01),
-   G5P_FMT(R32G32B32A32_SINT, 16, false, G5P_SI | PVR_G5P_FMT_RENDER, G5P1B, 0x1b8, G5P_SEL_RGBA),
+   G5P_FMT(R32G32B32A32_SINT, 16, false, G5P_SI | PVR_G5P_FMT_RENDER | PVR_G5P_FMT_STORAGE, G5P1B, 0x1b8, G5P_SEL_RGBA),
    /* ETC2/EAC (g3b-compressed t0-t7; textypes etc2, etc2-8x8 and eac exact
     * on the device), twiddled 4x4 blocks; sRGB is q1 bit 45 as everywhere.
     * Uploads are upstream's block-unit copies through the CPU twiddle; blits
@@ -298,7 +299,8 @@ pvr_g5p_format_flags(const struct pvr_g5p_format *f, bool probe)
  *    compressed sources decoded per block (pvr_arch_g5p_layout.c);
  *  - COLOR_ATTACHMENT (BLEND, BLIT_DST) for rendered rows, in either tiling
  *    (a linear 2D target is what the PBE writes);
- *  - nothing else: no storage images (no compute on G5P), no texel buffers.
+ *  - STORAGE_IMAGE for the declared-format compute pack paths, optimal only;
+ *    no formatless image writes/reads or storage atomics, no texel buffers.
  * linear: the features of VK_IMAGE_TILING_LINEAR.
  */
 static inline VkFormatFeatureFlags2
@@ -322,6 +324,8 @@ pvr_g5p_format_features(const struct pvr_g5p_format *f, bool linear, bool probe)
       if (flags & PVR_G5P_FMT_BLEND)
          r |= VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BLEND_BIT;
    }
+   if ((flags & PVR_G5P_FMT_STORAGE) && !linear)
+      r |= VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT;
    return r;
 }
 

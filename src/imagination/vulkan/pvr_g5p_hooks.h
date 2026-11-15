@@ -47,6 +47,13 @@
       pvr_arch_g5p_pack_image_view(                                         \
          iview, &(iview)->image_state[PVR_TEXTURE_STATE_SAMPLE]);
 
+/* Only storage descriptors reinterpret cube faces as a 2D array. */
+#define PVR_G5P_HOOK_storage_image(dev_info, iview, desc) \
+   if (PVR_HAS_FEATURE(dev_info, apple_g5p) && \
+       ((iview)->vk.view_type == VK_IMAGE_VIEW_TYPE_CUBE || \
+        (iview)->vk.view_type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY)) \
+      pvr_arch_g5p_pack_storage_image_view(iview, desc);
+
 /* Release integration of the vertex-store capability, preserving shared lines. */
 /* Also the polygon-mode and indirect lanes' feature lines (their
  * pvr_g5p_publish_hooks.h, which this base no longer has): line and point
