@@ -32,6 +32,7 @@
 #include "hwdef/rogue_hw_utils.h"
 #include "pvr_g5p_ds_hooks.h"
 #   include "pvr_g5p_vertex.h"
+#include "pvr_g5p_format_table.h"
 #include "pvr_common.h"
 #include "pvr_csb.h"
 #include "pvr_device.h"
@@ -238,6 +239,21 @@ pvr_get_format(struct pvr_physical_device *pdevice, VkFormat vk_format)
    if (format < pdevice->formats.count &&
        pdevice->formats.formats[format].bind != 0) {
       return &pdevice->formats.formats[format];
+   }
+   /* G5P: ASTC LDR exists only in the A9's own table (Rogue's table, which
+    * G9P shares, has none); the G5P hooks take its features and texture
+    * state from that row (pvr_g5p_format_table.h) */
+   if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g5p) &&
+       vk_format_description(vk_format)->layout == UTIL_FORMAT_LAYOUT_ASTC &&
+       pvr_g5p_format_find(vk_format)) {
+      static const struct pvr_format g5p_astc = {
+         /* Rogue's texture-format codes are not used on G5P (its own key is) */
+         .tex_format = ~0u,
+         .depth_tex_format = ~0u,
+         .stencil_tex_format = ~0u,
+         .bind = PVR_BIND_SAMPLER_VIEW,
+      };
+      return &g5p_astc;
    }
 
    mesa_logd("Format %s(%d) not supported\n",

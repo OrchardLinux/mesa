@@ -89,10 +89,31 @@ pvr_g5p_image_layout(struct pvr_image *image, unsigned stride_align)
       const uint32_t chain = image->vk.mip_levels > 1 ? util_logbase2(MAX2(pw, ph)) + 1 : 1;
       VkDeviceSize size = 0, own = 0;
 
+      /* Blocks other than 4x4 (ASTC 5x4..12x12): each level's block grid is a
+       * power of two per side, pow2(ceil(level / block)), as AGXMetalA9's
+       * TextureGen2 lays them out (0x207dbfe4c: ceil(width / bw), then the
+       * next power of two, per plane level) and as the Morton order needs (a
+       * 7-block side is addressed as 8: g5p_twiddle2d()). Upstream's level
+       * offsets minify the block count instead, so these images take their
+       * offsets from here. 4x4 grids are already powers of two (or one block):
+       * ETC2/EAC and ASTC 4x4 keep upstream's offsets, which are the same. */
+      const bool pow2_blocks = !is3d && vk_format_is_compressed(image->vk.format) && (bw != 4 || bh != 4);
       for (uint32_t l = 0; l < MAX2(chain, image->vk.mip_levels); l++) {
-         const uint32_t ew = DIV_ROUND_UP(u_minify(pw, l), bw), eh = DIV_ROUND_UP(u_minify(ph, l), bh);
+         uint32_t ew = DIV_ROUND_UP(u_minify(pw, l), bw), eh = DIV_ROUND_UP(u_minify(ph, l), bh);
+         if (pow2_blocks) {
+            ew = util_next_power_of_two(ew);
+            eh = util_next_power_of_two(eh);
+         }
          const VkDeviceSize level_size = (VkDeviceSize)cpp * ew * eh;
 
+         if (pow2_blocks && l < image->vk.mip_levels) {
+            struct pvr_mip_level *level = &plane->mip_levels[l];
+
+            level->pitch = cpp * ew;
+            level->height_pitch = eh;
+            level->size = level_size;
+            level->offset = own;
+         }
          if (is3d && l < image->vk.mip_levels) {
             /* a 3D image's levels are one slice's: upstream's 3DTWIDDLED levels hold every slice */
             struct pvr_mip_level *level = &plane->mip_levels[l];

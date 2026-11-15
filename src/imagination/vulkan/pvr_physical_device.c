@@ -268,7 +268,8 @@ static void pvr_physical_device_get_supported_features(
       .multiViewport = false,
       .samplerAnisotropy = true,
       .textureCompressionETC2 = true,
-      .textureCompressionASTC_LDR = false,
+      /* G5P: all 28 ASTC LDR formats sampled, filtered and blit sources (pvr_g5p_format_table.h) */
+      .textureCompressionASTC_LDR = PVR_HAS_FEATURE(dev_info, apple_g5p),
       .textureCompressionBC = false,
       .occlusionQueryPrecise = true,
       .pipelineStatisticsQuery = false,

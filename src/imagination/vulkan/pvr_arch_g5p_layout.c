@@ -31,6 +31,7 @@
 #include "util/format/u_format.h"
 #include "util/log.h"
 #include "util/texcompress_etc.h"
+#include "util/texcompress_astc.h"
 #include "util/u_math.h"
 #include "util/os_time.h"
 #include <unistd.h>
@@ -41,6 +42,9 @@
 #include "pvr_g5p_ds.h"
 #include "pvr_g9p.h"
 #include "pvr_image.h"
+
+/* the most texels one compressed block holds: ASTC 12x12 (ETC2/EAC 16) */
+#define G5P_BLOCK_TEXELS 144
 #include "pvr_job_transfer.h"
 
 
@@ -288,9 +292,22 @@ g5p_etc2_decoded(enum pipe_format p)
 }
 
 /* A 4x4 block as 16 RGBA floats, row by row */
+/* The most texels of one block: ASTC 12x12 */
 static void
-g5p_decode_block(enum pipe_format format, const uint8_t *p, unsigned bpp, float block[16][4])
+g5p_decode_block(enum pipe_format format, const uint8_t *p, unsigned bpp, float block[G5P_BLOCK_TEXELS][4])
 {
+   if (util_format_description(format)->layout == UTIL_FORMAT_LAYOUT_ASTC) {
+      /* util's ASTC LDR decoder: RGBA8 (sRGB-encoded for the sRGB formats),
+       * one block of bw x bh texels, then the 8-bit format's unpack as for
+       * ETC2 below */
+      const unsigned bw = util_format_get_blockwidth(format), bh = util_format_get_blockheight(format);
+      uint8_t texels[G5P_BLOCK_TEXELS * 4];
+
+      _mesa_unpack_astc_2d_ldr(texels, 4 * bw, p, bpp, bw, bh, format);
+      util_format_unpack_rgba(util_format_is_srgb(format) ? PIPE_FORMAT_R8G8B8A8_SRGB : PIPE_FORMAT_R8G8B8A8_UNORM,
+                              block, texels, bw * bh);
+      return;
+   }
    const enum pipe_format dec = g5p_etc2_decoded(format);
 
    if (dec != PIPE_FORMAT_NONE) {
@@ -311,7 +328,7 @@ g5p_decode_block(enum pipe_format format, const uint8_t *p, unsigned bpp, float 
  * the last block decoded is kept */
 static bool
 g5p_block_texel(const struct g5p_surface *s, unsigned x, unsigned y, float out[4], const uint8_t **last,
-                float block[16][4])
+                float block[G5P_BLOCK_TEXELS][4])
 {
    const unsigned bw = util_format_get_blockwidth(s->format), bh = util_format_get_blockheight(s->format);
    struct g5p_surface b = *s;
@@ -325,7 +342,7 @@ g5p_block_texel(const struct g5p_surface *s, unsigned x, unsigned y, float out[4
 
    const uint8_t *p = g5p_element(&b, x / bw, y / bh);
 
-   assert(bw == 4 && bh == 4);
+   assert(bw * bh <= G5P_BLOCK_TEXELS);
    if (!p)
       return false;
    if (p != *last) {
@@ -356,7 +373,7 @@ g5p_normalize_axis(int32_t *offset, uint32_t *extent, bool *flip)
  * util_format_unpack_rgba() looks it up (a call_once) on every call. */
 static bool
 g5p_texel(struct g5p_surface *s, const struct util_format_unpack_description *unpack, unsigned x, unsigned y,
-          float out[4], const uint8_t **last, float block[16][4])
+          float out[4], const uint8_t **last, float block[G5P_BLOCK_TEXELS][4])
 {
    if (s->blocks)
       return g5p_block_texel(s, x, y, out, last, block);
@@ -377,7 +394,7 @@ g5p_texel(struct g5p_surface *s, const struct util_format_unpack_description *un
 static bool
 g5p_linear_sample(struct g5p_surface *src, const struct util_format_unpack_description *unpack,
                   const struct pvr_rect_mapping *m, unsigned x, unsigned y, float out[4],
-                  const uint8_t **last, float block[16][4])
+                  const uint8_t **last, float block[G5P_BLOCK_TEXELS][4])
 {
    const double sw = m->src_rect.extent.width, sh = m->src_rect.extent.height;
    const double dw = m->dst_rect.extent.width, dh = m->dst_rect.extent.height;
@@ -591,7 +608,7 @@ g5p_copy(const struct pvr_rect_mapping *mapping, struct g5p_surface *src, struct
    const unsigned dw = m->dst_rect.extent.width, dh = m->dst_rect.extent.height;
    const unsigned sw = m->src_rect.extent.width, sh = m->src_rect.extent.height;
    const uint8_t *last = NULL;
-   float block[16][4];
+   float block[G5P_BLOCK_TEXELS][4];
 
    if (!dw || !dh || !sw || !sh)
       return true;

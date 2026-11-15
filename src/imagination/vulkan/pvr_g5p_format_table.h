@@ -16,13 +16,13 @@
  * 0x21 32, 0x31 32_32, 0x38 32_32_32_32, 0x26 10_10_10_2, 0x25 11_11_10,
  * 0x27 9_9_9_e5, 0x0b 5_6_5, 0x0d 1_5_5_5, 0x0c 4_4_4_4; block compressed
  * 0x58 ETC2 RGB8, 0x5a ETC2 RGB8A1, 0x59 ETC2 RGBA8 (EAC alpha), 0x5b EAC R11,
- * 0x5c EAC RG11. Selectors: 0-3 a component (component 0 is the lowest
+ * 0x5c EAC RG11, 0x60..0x6d ASTC LDR 4x4..12x12. Selectors: 0-3 a component (component 0 is the lowest
  * field of a packed format), 4 one, 5 zero.
  *
  * What a row advertises is what has run on the A9 through this driver: every
- * row's rungs of the formats hardware test (src/imagination/g5p/tests/formats)
- * passed on the device, every pixel exact (2026-11-04: 118 rungs of the rows
- * advertised then, and 39 rungs of the rows decoded but not yet run, the
+ * row's cases of the formats hardware test (src/imagination/g5p/tests/formats)
+ * passed on the device, every pixel exact (2026-11-04: 118 cases of the rows
+ * advertised then, and 39 cases of the rows decoded but not yet run, the
  * probes, promoted since). Before that:
  *  - sampling: the texture state is format-independent (lane b's
  *    pvr_arch_g5p_tex.c); each key below was sampled exactly on the device by
@@ -36,7 +36,7 @@
  *    packs R8, RG8, R16F, RG16F and RG11B10F from the two-word program too:
  *    exact on the device. Blending is the fragment program's, on the tile's
  *    f16 values before the PBE, for every rendered row;
- *  - probes (for a device rung only): rows decoded or
+ *  - probes (for a device case only): rows decoded or
  *    derived but not yet run, not advertised by default. None at present.
  */
 
@@ -62,7 +62,7 @@ enum pvr_g5p_fmt_flags {
    PVR_G5P_FMT_FILTER = 1u << 1,       /* linear filtering */
    PVR_G5P_FMT_RENDER = 1u << 2,       /* colour attachment: the two-word program + this PBE key */
    PVR_G5P_FMT_BLEND = 1u << 3,        /* blending into it (the fragment program's) */
-   PVR_G5P_FMT_COMPRESSED = 1u << 4,   /* 4x4 blocks, twiddled only */
+   PVR_G5P_FMT_COMPRESSED = 1u << 4,   /* blocks (4x4 ETC2/EAC, 4x4..12x12 ASTC), twiddled only */
    PVR_G5P_FMT_INTEGER = 1u << 5,      /* integer texel: texelFetch/unfiltered */
    /* not advertised (none at present) */
    PVR_G5P_FMT_PROBE_SAMPLED = 1u << 8, /* the sampled bits are a probe */
@@ -72,7 +72,7 @@ enum pvr_g5p_fmt_flags {
 
 /* Where a row's key and its advertised use come from */
 enum pvr_g5p_fmt_evidence {
-   PVR_G5P_FMT_EV_G5P1B,   /* device-proven on g5p-1b (tex-blend 22/22, formats 118 + 39 rungs) */
+   PVR_G5P_FMT_EV_G5P1B,   /* device-proven on g5p-1b (tex-blend 22/22, formats 118 + 39 cases) */
    PVR_G5P_FMT_EV_ICD,     /* captured key, device-proven by our ICD (gles3tex, textypes) */
    PVR_G5P_FMT_EV_RULE,    /* derived from the decoded code rule, not captured */
    PVR_G5P_FMT_EV_CAPTURE, /* captured key, never run on the device */
@@ -81,7 +81,7 @@ enum pvr_g5p_fmt_evidence {
 struct pvr_g5p_format {
    VkFormat format;
    uint32_t key;
-   uint8_t cpp; /* bytes per texel, or per 4x4 block */
+   uint8_t cpp; /* bytes per texel, or per block */
    bool srgb;
    uint16_t flags;
    uint8_t evidence;
@@ -163,7 +163,7 @@ static const struct pvr_g5p_format pvr_g5p_format_table[] = {
    G5P_FMT(B4G4R4A4_UNORM_PACK16, 2, false, G5P_SF, G5P1B, 0x0c, 1, 2, 3, 0),
    /* integer (g3b-sample-b t5-t18, fmt-rgba8ui; textypes int-fetch and
     * int-sample on the device). RGBA32 UINT/SINT clear/draw/LOAD/masks
-    * passed the integer-r4 core/compat device rungs. Narrow integer render
+    * passed the integer-r4 core/compat device cases. Narrow integer render
     * targets remain absent or probe-only; integer blending is not exposed. */
    G5P_FMT(R8_UINT, 1, false, G5P_SI | PVR_G5P_FMT_RENDER | PVR_G5P_FMT_PROBE_RENDER, G5P1B, 0x100, G5P_SEL_R001),
    G5P_FMT(R8G8_UINT, 2, false, G5P_SI | PVR_G5P_FMT_RENDER | PVR_G5P_FMT_PROBE_RENDER, G5P1B, 0x10a, G5P_SEL_RG01),
@@ -199,6 +199,40 @@ static const struct pvr_g5p_format pvr_g5p_format_table[] = {
    G5P_FMT(EAC_R11_SNORM_BLOCK, 8, false, G5P_CT, G5P1B, 0xdb, G5P_SEL_R001),
    G5P_FMT(EAC_R11G11_UNORM_BLOCK, 16, false, G5P_CT, G5P1B, 0x5c, G5P_SEL_RG01),
    G5P_FMT(EAC_R11G11_SNORM_BLOCK, 16, false, G5P_CT, G5P1B, 0xdc, G5P_SEL_RG01),
+   /* ASTC LDR, all 14 block sizes, 16 bytes per block: AGXMetalA9's texFormat
+    * rows (chooseTextureFormatOBJC 0x207dc25b4): codes 0x60..0x6d in Vulkan's
+    * size order, sRGB as gamma 3 (q1 bit 45); -[AGXA9FamilyDevice
+    * isASTCPixelFormatsSupported] returns 1 on the A9.
+    * Twiddled over power-of-two block grids
+    * (pvr_g5p_image.c); copies and blits decode with util's ASTC decoder. */
+   G5P_FMT(ASTC_4x4_UNORM_BLOCK, 16, false, G5P_CT, CAPTURE, 0x60, G5P_SEL_RGBA),
+   G5P_FMT(ASTC_4x4_SRGB_BLOCK, 16, true, G5P_CT, CAPTURE, 0x60, G5P_SEL_RGBA),
+   G5P_FMT(ASTC_5x4_UNORM_BLOCK, 16, false, G5P_CT, CAPTURE, 0x61, G5P_SEL_RGBA),
+   G5P_FMT(ASTC_5x4_SRGB_BLOCK, 16, true, G5P_CT, CAPTURE, 0x61, G5P_SEL_RGBA),
+   G5P_FMT(ASTC_5x5_UNORM_BLOCK, 16, false, G5P_CT, CAPTURE, 0x62, G5P_SEL_RGBA),
+   G5P_FMT(ASTC_5x5_SRGB_BLOCK, 16, true, G5P_CT, CAPTURE, 0x62, G5P_SEL_RGBA),
+   G5P_FMT(ASTC_6x5_UNORM_BLOCK, 16, false, G5P_CT, CAPTURE, 0x63, G5P_SEL_RGBA),
+   G5P_FMT(ASTC_6x5_SRGB_BLOCK, 16, true, G5P_CT, CAPTURE, 0x63, G5P_SEL_RGBA),
+   G5P_FMT(ASTC_6x6_UNORM_BLOCK, 16, false, G5P_CT, CAPTURE, 0x64, G5P_SEL_RGBA),
+   G5P_FMT(ASTC_6x6_SRGB_BLOCK, 16, true, G5P_CT, CAPTURE, 0x64, G5P_SEL_RGBA),
+   G5P_FMT(ASTC_8x5_UNORM_BLOCK, 16, false, G5P_CT, CAPTURE, 0x65, G5P_SEL_RGBA),
+   G5P_FMT(ASTC_8x5_SRGB_BLOCK, 16, true, G5P_CT, CAPTURE, 0x65, G5P_SEL_RGBA),
+   G5P_FMT(ASTC_8x6_UNORM_BLOCK, 16, false, G5P_CT, CAPTURE, 0x66, G5P_SEL_RGBA),
+   G5P_FMT(ASTC_8x6_SRGB_BLOCK, 16, true, G5P_CT, CAPTURE, 0x66, G5P_SEL_RGBA),
+   G5P_FMT(ASTC_8x8_UNORM_BLOCK, 16, false, G5P_CT, CAPTURE, 0x67, G5P_SEL_RGBA),
+   G5P_FMT(ASTC_8x8_SRGB_BLOCK, 16, true, G5P_CT, CAPTURE, 0x67, G5P_SEL_RGBA),
+   G5P_FMT(ASTC_10x5_UNORM_BLOCK, 16, false, G5P_CT, CAPTURE, 0x68, G5P_SEL_RGBA),
+   G5P_FMT(ASTC_10x5_SRGB_BLOCK, 16, true, G5P_CT, CAPTURE, 0x68, G5P_SEL_RGBA),
+   G5P_FMT(ASTC_10x6_UNORM_BLOCK, 16, false, G5P_CT, CAPTURE, 0x69, G5P_SEL_RGBA),
+   G5P_FMT(ASTC_10x6_SRGB_BLOCK, 16, true, G5P_CT, CAPTURE, 0x69, G5P_SEL_RGBA),
+   G5P_FMT(ASTC_10x8_UNORM_BLOCK, 16, false, G5P_CT, CAPTURE, 0x6a, G5P_SEL_RGBA),
+   G5P_FMT(ASTC_10x8_SRGB_BLOCK, 16, true, G5P_CT, CAPTURE, 0x6a, G5P_SEL_RGBA),
+   G5P_FMT(ASTC_10x10_UNORM_BLOCK, 16, false, G5P_CT, CAPTURE, 0x6b, G5P_SEL_RGBA),
+   G5P_FMT(ASTC_10x10_SRGB_BLOCK, 16, true, G5P_CT, CAPTURE, 0x6b, G5P_SEL_RGBA),
+   G5P_FMT(ASTC_12x10_UNORM_BLOCK, 16, false, G5P_CT, CAPTURE, 0x6c, G5P_SEL_RGBA),
+   G5P_FMT(ASTC_12x10_SRGB_BLOCK, 16, true, G5P_CT, CAPTURE, 0x6c, G5P_SEL_RGBA),
+   G5P_FMT(ASTC_12x12_UNORM_BLOCK, 16, false, G5P_CT, CAPTURE, 0x6d, G5P_SEL_RGBA),
+   G5P_FMT(ASTC_12x12_SRGB_BLOCK, 16, true, G5P_CT, CAPTURE, 0x6d, G5P_SEL_RGBA),
 };
 
 #undef G5P_FMT
