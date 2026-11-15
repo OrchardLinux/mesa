@@ -677,7 +677,7 @@ static bool pvr_physical_device_get_properties(
       .maxImageDimensionCube = 4096U,
       .maxImageArrayLayers = rogue_get_render_size_max_z(dev_info),
       .maxTexelBufferElements = 64U * 1024U,
-      .maxUniformBufferRange = 16U * 1024U,
+      .maxUniformBufferRange = PVR_HAS_FEATURE(dev_info, apple_g5p) ? 64U * 1024U : 16U * 1024U,
       .maxStorageBufferRange = 128U * 1024U * 1024U,
       .maxPushConstantsSize = 128U,
       .maxMemoryAllocationCount = 4096U,

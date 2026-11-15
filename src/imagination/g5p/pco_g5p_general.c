@@ -4202,11 +4202,14 @@ static void emit_dyn_ubo(struct gctx *c, nir_intrinsic_instr *in)
    uint32_t base;
    block_binding_element(in->src[0].ssa, &set, &binding, &element);
    dyn_ubo_offset(in, &ix, &shift, &base);
-   unsigned bytes = 4 * n;
    /* Witnessed: 16-byte loads (Apple's v_cexpr, vec4 elements at shift 4) and
     * 4-byte loads (G9P's, at any byte offset); the shift field is
-    * corpus-verified 0-4. vec2/vec3 (8-byte, 12-byte) loads are not. */
-   if (in->def.bit_size != 32 || !((n == 4 && shift == 4) || (n == 1 && shift != 1)) || base % bytes)
+    * corpus-verified 0-4. vec2/vec3 (8-byte, 12-byte) loads are not: a
+    * vec2/vec3 at the start of a 16-byte element (nir_opt_shrink_vectors of
+    * a vec4 read) loads the whole element and drops the unused registers. */
+   const unsigned loaded = (n == 2 || n == 3) && shift == 4 && !(base % 16) ? 4 : n;
+   unsigned bytes = 4 * loaded;
+   if (in->def.bit_size != 32 || !((loaded == 4 && shift == 4) || (n == 1 && shift != 1)) || base % bytes)
       refuse(c, "load_ubo: register-indexed %u x %u-bit at shift %u, base %u (witnessed: vec4 at shift 4, "
                 "scalar at shift 0/2-4, element-aligned base)", n, in->def.bit_size, shift, base);
    /* Apple's form for an unsigned index is this one: umin, then addr.add_shift
@@ -4246,18 +4249,22 @@ static void emit_dyn_ubo(struct gctx *c, nir_intrinsic_instr *in)
    c->max_dword = MAX2(c->max_dword, pair + 2);
    put(c, raw, g5p_usc_address_add_shift(raw, 2 * pair, common, 2 * index, shift, kill, c->vs), "addr.add_shift");
    unsigned dst = 0;
-   for (dst = 0; dst + n <= NUM_DWORDS; dst += n)
-      if (!((c->busy | c->reserved | c->tex_coord_pending | c->tex_pending) & BITFIELD64_RANGE(dst, n)))
+   for (dst = 0; dst + loaded <= NUM_DWORDS; dst += loaded)
+      if (!((c->busy | c->reserved | c->tex_coord_pending | c->tex_pending) & BITFIELD64_RANGE(dst, loaded)))
          break;
-   if (dst + n > NUM_DWORDS)
-      refuse(c, "register pressure: load_ubo needs %u aligned dword(s)", n);
-   c->busy |= BITFIELD64_RANGE(dst, n);
-   c->max_dword = MAX2(c->max_dword, dst + n);
+   if (dst + loaded > NUM_DWORDS)
+      refuse(c, "register pressure: load_ubo needs %u aligned dword(s)", loaded);
+   c->busy |= BITFIELD64_RANGE(dst, loaded);
+   c->max_dword = MAX2(c->max_dword, dst + loaded);
+   if (loaded != n) /* the new whole-element form; hardware-tested forms keep their bytes */
+      c->max_written = MAX2(c->max_written, dst + loaded);
    if (c->vs)
       put(c, raw, g5p_usc_vertex_address_load(raw, 2 * dst, bytes, 2 * pair), "vertex address load");
    else
       put(c, raw, g5p_usc_address_load(raw, 2 * dst, bytes, 2 * pair, 0), "fragment address load");
    put(c, raw, g5p_usc_wait(raw, 0), "wait");
+   /* the load has completed (wait): the element's unused tail is free */
+   c->busy &= ~BITFIELD64_RANGE(dst + n, loaded - n);
    for (unsigned k = 0; k < n; k++) {
       struct val *v = V(c, &in->def, k);
       v->state = VAL_REG;

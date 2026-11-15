@@ -329,6 +329,26 @@ split_ssbo_access(nir_builder *b, nir_intrinsic_instr *in, void *data)
    return false;
 }
 
+/* After constant folding: a register-indexed vec2/vec3 UBO load becomes
+ * scalars at offset + 4k (the backend encodes scalar and vec4 forms;
+ * vec4_dyn_ubo() then merges complete quads). Constant-offset loads are
+ * preloaded and stay as they are. */
+static bool
+split_dyn_ubo(nir_builder *b, nir_intrinsic_instr *in, void *data)
+{
+   const unsigned n = in->def.num_components;
+   if (in->intrinsic != nir_intrinsic_load_ubo || in->def.bit_size != 32 || (n != 2 && n != 3) ||
+       nir_src_is_const(in->src[1]))
+      return false;
+   b->cursor = nir_before_instr(&in->instr);
+   nir_def *comp[NIR_MAX_VEC_COMPONENTS];
+   for (unsigned k = 0; k < n; k++)
+      comp[k] = nir_load_ubo(b, 1, 32, in->src[0].ssa, nir_iadd_imm(b, in->src[1].ssa, 4 * k),
+                             .access = nir_intrinsic_access(in), .align_mul = 4, .align_offset = 0,
+                             .range_base = 0, .range = ~0u);
+   nir_def_replace(&in->def, nir_vec(b, comp, n));
+   return true;
+}
 
 /* SPIR-V -> optimised NIR (the ICD's g5p_nir()) */
 static nir_shader *
@@ -393,6 +413,11 @@ g5p_nir_prepare(nir_shader *nir)
       NIR_PASS(progress, nir, nir_opt_dead_cf);
    } while (progress);
    progress = false;
+   if (nir_shader_intrinsics_pass(nir, split_dyn_ubo, nir_metadata_control_flow, NULL)) {
+      NIR_PASS(_, nir, nir_opt_constant_folding);
+      NIR_PASS(_, nir, nir_opt_algebraic);
+      NIR_PASS(_, nir, nir_opt_cse);
+   }
    NIR_PASS(progress, nir, vec4_dyn_ubo);
    if (stage == MESA_SHADER_FRAGMENT && pco_g5p_fs_dyn_ubo())
       NIR_PASS(progress, nir, clamp_dyn_ubo);
