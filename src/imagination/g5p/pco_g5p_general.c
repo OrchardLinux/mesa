@@ -6243,6 +6243,43 @@ static bool layer0_as_2d(nir_builder *b, nir_tex_instr *t, void *data)
    return true;
 }
 
+/* A 4-sample texture (texture_multisampled_2d, sampler2DMS) is sampled as the 2W x 2H 2D
+ * texture of its samples (pvr_arch_g5p_tex.c): sample s of texel p is texel
+ * 2p + (s >> 1, s & 1); its size is half that texture's; it has 4 samples. */
+static bool ms_as_2d(nir_builder *b, nir_tex_instr *t, void *data)
+{
+   if (t->sampler_dim != GLSL_SAMPLER_DIM_MS || t->is_array)
+      return false;
+   b->cursor = nir_after_instr(&t->instr);
+   if (t->op == nir_texop_texture_samples) {
+      nir_def_replace(&t->def, nir_imm_int(b, 4));
+      return true;
+   }
+   if (t->op == nir_texop_txs) {
+      t->sampler_dim = GLSL_SAMPLER_DIM_2D;
+      nir_def *half = nir_ushr_imm(b, &t->def, 1);
+      nir_def_rewrite_uses_after(&t->def, half);
+      return true;
+   }
+   if (t->op != nir_texop_txf_ms)
+      return false;
+   const int ci = nir_tex_instr_src_index(t, nir_tex_src_coord);
+   const int si = nir_tex_instr_src_index(t, nir_tex_src_ms_index);
+   if (ci < 0 || si < 0)
+      return false;
+   b->cursor = nir_before_instr(&t->instr);
+   nir_def *c = t->src[ci].src.ssa, *s = t->src[si].src.ssa;
+   nir_def *x = nir_iadd(b, nir_ishl_imm(b, nir_channel(b, c, 0), 1), nir_ushr_imm(b, s, 1));
+   nir_def *y = nir_iadd(b, nir_ishl_imm(b, nir_channel(b, c, 1), 1), nir_iand_imm(b, s, 1));
+   nir_tex_instr_remove_src(t, si);
+   nir_src_rewrite(&t->src[nir_tex_instr_src_index(t, nir_tex_src_coord)].src, nir_vec2(b, x, y));
+   if (nir_tex_instr_src_index(t, nir_tex_src_lod) < 0)
+      nir_tex_instr_add_src(t, nir_tex_src_lod, nir_imm_int(b, 0));
+   t->op = nir_texop_txf;
+   t->sampler_dim = GLSL_SAMPLER_DIM_2D;
+   return true;
+}
+
 static bool lower(nir_shader *nir, bool preserve_cf)
 {
    bool progress;
@@ -6266,6 +6303,7 @@ static bool lower(nir_shader *nir, bool preserve_cf)
                        (nir->info.stage == MESA_SHADER_VERTEX && g5p_vtex_size_lod_probe()),
    };
    NIR_PASS(_, nir, nir_lower_tex, &txp);
+   NIR_PASS(_, nir, nir_shader_tex_pass, ms_as_2d, nir_metadata_control_flow, NULL);
    NIR_PASS(_, nir, nir_shader_tex_pass, layer0_as_2d, nir_metadata_control_flow, NULL);
    pvr_g5p_tbo_lower(nir);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const, nir_address_format_32bit_offset);

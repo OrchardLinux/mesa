@@ -214,7 +214,9 @@ pvr_g5p_msaa_limits(struct pvr_physical_device *pdevice, struct vk_properties *p
    p->framebufferStencilSampleCounts = fb;
    p->framebufferNoAttachmentsSampleCounts = fb;
    p->framebufferIntegerColorSampleCounts = VK_SAMPLE_COUNT_1_BIT;
-   p->sampledImageColorSampleCounts = VK_SAMPLE_COUNT_1_BIT;
+   /* 4-sample colour images are sampled (texelFetch of a 2D multisample texture,
+    * pvr_arch_g5p_tex.c's 2Wx2H view state and the compiler's txf_ms lowering) */
+   p->sampledImageColorSampleCounts = fb;
    p->sampledImageIntegerSampleCounts = VK_SAMPLE_COUNT_1_BIT;
    p->sampledImageDepthSampleCounts = VK_SAMPLE_COUNT_1_BIT;
    p->sampledImageStencilSampleCounts = VK_SAMPLE_COUNT_1_BIT;
@@ -237,9 +239,12 @@ pvr_g5p_msaa_image_samples(struct pvr_physical_device *pdevice, const VkPhysical
    const bool format_ok = pvr_g5p_ds_format(info->format) ||
                           (vk_format_is_color(info->format) && !vk_format_is_compressed(info->format) &&
                            !vk_format_is_int(info->format) && vk_format_get_blocksize(info->format) == 4);
+   /* a 4-sample colour attachment may also be sampled (its view is the 2Wx2H twiddled texture of
+    * its samples, pvr_arch_g5p_tex.c); depth/stencil, storage and input attachments stay 1x */
+   const VkImageUsageFlags colour_read = vk_format_is_color(info->format) ? VK_IMAGE_USAGE_SAMPLED_BIT : 0;
    const bool four = tiling == VK_IMAGE_TILING_OPTIMAL &&
                      info->type == VK_IMAGE_TYPE_2D && !(info->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) &&
-                     (info->usage & attach) && !(info->usage & read) && format_ok;
+                     (info->usage & attach) && !(info->usage & read & ~colour_read) && format_ok;
 
    props->sampleCounts &= four ? VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT : VK_SAMPLE_COUNT_1_BIT;
 }

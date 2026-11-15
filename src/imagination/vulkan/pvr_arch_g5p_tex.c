@@ -96,6 +96,27 @@ g5p_view_state(const struct pvr_image_view *iview, uint64_t q[3])
       return NULL;
    }
 
+   /* A 4-sample colour image: each pixel's four samples are 16 consecutive bytes over the
+    * twiddled power-of-two surface (pvr_g5p_msaa_layout(), the PBE's multisample store), which is
+    * the 2W x 2H twiddled 2D texture whose texel (2x + (s >> 1), 2y + (s & 1)) is sample s of
+    * pixel (x, y) (Morton order, y in bit 0). The compiler reads sample s there (txf_ms lowered
+    * to txf, layer0/txs halved: pco_g5p_general.c ms_as_2d()). */
+   if (image->vk.samples == VK_SAMPLE_COUNT_4_BIT) {
+      if (image->vk.image_type != VK_IMAGE_TYPE_2D || iview->vk.base_mip_level || iview->vk.layer_count != 1 ||
+          (view_type != VK_IMAGE_VIEW_TYPE_2D && view_type != VK_IMAGE_VIEW_TYPE_2D_ARRAY) ||
+          vk_format_get_blocksize(iview->vk.format) != 4)
+         return "a 4-sample view other than one layer of a 2D 4-byte colour image";
+      const struct pvr_g5p_tex_twiddled_view v = {
+         .key = key, .layout = PVR_G5P_TEX_LAYOUT_2D,
+         .width = 2 * image->vk.extent.width, .height = 2 * image->vk.extent.height, .depth = 1,
+         .level_count = 1, .srgb = f->srgb,
+         .va = image->dev_addr.addr + plane->offset + iview->vk.base_array_layer * plane->layer_size,
+      };
+      if (v.va % 64)
+         return "a 4-sample view off a 64-byte base";
+      pvr_g5p_tex_twiddled(q, &v);
+      return NULL;
+   }
    if (image->vk.image_type == VK_IMAGE_TYPE_3D && iview->vk.view_type != VK_IMAGE_VIEW_TYPE_3D)
       return "2D view of a 3D image (a slice of the A9's 3D bricks is no 2D texture)";
 
