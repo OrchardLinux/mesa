@@ -285,9 +285,8 @@ packed_fetches(struct pvr_g5p_vertex_layout *l, struct attrib *a, unsigned n, un
       }
       slot += a[i].dwords;
    }
-   if (slot > PVR_G5P_VERTEX_INPUT_DWORDS)
-      return REFUSE(l, "vertex attributes of %u dwords (the unified store holds %u)", slot,
-                    PVR_G5P_VERTEX_INPUT_DWORDS);
+   if (slot > PVR_G5P_VERTEX_INPUT_MAX_DWORDS)
+      return REFUSE(l, "vertex attributes of %u dwords (%u are built)", slot, PVR_G5P_VERTEX_INPUT_MAX_DWORDS);
    for (unsigned v = 0; 4 * v < slot; v++)
       l->components[v] = MIN2(4, slot - 4 * v);
    return true;

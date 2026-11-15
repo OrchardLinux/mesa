@@ -2290,6 +2290,35 @@ unsigned g5p_usc_alu2_wide(uint8_t *out, unsigned op, unsigned dst, unsigned a, 
    return put_words(out, w, 5);
 }
 
+#define G5P_CLASS_BINARY 0x99        /* g5p_usc_binary()'s class byte with the 32-bit result */
+#define G5P_HEADER_SRC_A_BANK1 0x20  /* source A in register bank 1 (g9p_w0()'s W0 bit 13) */
+unsigned g5p_usc_vs_or_wide(uint8_t *out, unsigned dst_half, unsigned dst_bank, unsigned a, unsigned a_group,
+                            unsigned b, unsigned b_group)
+{
+   CHECK(dst_half < 256 && !(dst_half & 1) && dst_bank <= 1 && a < 128 && b < 128, "registers r0..r127");
+   /* g5p_usc_binary()'s layout for A | B with both sources' bank bits in the header; a source above r31 keeps
+    * r & 31 in its selector, sets A's selector bit 0 and puts r >> 5 in an extension parcel (A at bit 1, B at
+    * bit 9 of the parcel, as g5p_usc_alu2_wide()). */
+   const bool wide = a >= 32 || b >= 32;
+   uint8_t raw[10];
+   raw[0] = G5P_CLASS_BINARY;
+   raw[1] = G5P_HEADER_FRAGMENT | G5P_HEADER_SRC_A_BANK1 | G5P_HEADER_SRC_B_BANK1;
+   if (!destination(raw + 2, dst_half, dst_bank))
+      return 0;
+   SEL(sa, 2 * (a & 31), a_group & 1, wide);
+   SEL(sb, 2 * (b & 31), b_group & 1, G5P_PARCEL_CONTINUES);
+   raw[4] = sa;
+   raw[5] = sb;
+   unsigned n = 6;
+   if (wide) {
+      raw[n++] = (a >> 5) << 1;
+      raw[n++] = (b >> 5) << 1 | G5P_PARCEL_CONTINUES;
+   }
+   raw[n++] = binop_code[G5P_BIN_OR];
+   raw[n++] = 0;
+   return finish(out, raw, n);
+}
+
 /* Graphics storage differential host compiles, compute-gfx-storage-isa.md.
  * Unlike compute/vertex class10, fragment stores use the pixel side-effect
  * port70/71 and the observed active-fragment predicate. */

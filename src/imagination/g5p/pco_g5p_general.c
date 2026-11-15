@@ -62,6 +62,9 @@
  * buffer starts at CODE_INITIAL and doubles. */
 #define CODE_INITIAL 16384
 #define NUM_DWORDS 32
+/* Vertex input dwords: the PDS fetches up to this many into bank 1. Those above r31 are read through a move
+ * (g5p_usc_vs_or_wide(), Apple's vertex form for attributes above r31), as the fragment homes are. */
+#define VS_INPUT_DWORDS 64
 #define F32_ONE 0x3f800000u
 #define LAST_END (INT_MAX - 1) /* read by the output block */
 #define DISCARD_AT (INT_MAX - 2) /* read by the deferred discards, before the output */
@@ -2444,7 +2447,11 @@ static unsigned reg_of(struct gctx *c, struct ref r, const char *what)
    case VAL_HOME: {
       /* parked above r31: back into a register for this instruction */
       unsigned reg = alloc_reg(c, -1);
-      put(c, raw, g5p_usc_alu2_wide(raw, G5P_OP_OR, reg, v->reg, 0, v->reg, 0), "move from a home above r31");
+      if (c->vs) /* a vertex input fetched above r31 (setup_inputs()): v->reg is its bank-1 register */
+         put(c, raw, g5p_usc_vs_or_wide(raw, H(c, reg), vbank(c, reg), v->reg, 0, v->reg, 0),
+             "move a vertex input from above r31");
+      else
+         put(c, raw, g5p_usc_alu2_wide(raw, G5P_OP_OR, reg, v->reg, 0, v->reg, 0), "move from a home above r31");
       c->scratch |= BITFIELD64_BIT(reg);
       return reg;
    }
@@ -5239,6 +5246,14 @@ static void vs_converts(struct gctx *c, struct vs_convert *cv, unsigned n)
    c->alloc_out = true; /* converted attributes stay in bank 1, where they are fetched */
    qsort(cv, n, sizeof(*cv), vs_convert_order);
    for (unsigned i = 0; i < n; i++) {
+      if (cv[i].reg >= NUM_DWORDS) {
+         /* a dword fetched above r31 (sorted last, after the low converts freed their registers): moved into a
+          * register first (Apple's vertex OR form, g5p_usc_vs_or_wide()), its converts then read it there */
+         const unsigned hi = cv[i].reg, lo = alloc_reg(c, -1);
+         put(c, raw, g5p_usc_vs_or_wide(raw, H(c, lo), vbank(c, lo), hi, 0, hi, 0), "move a vertex input from above r31");
+         for (unsigned k = i; k < n && cv[k].reg == hi; k++)
+            cv[k].reg = lo;
+      }
       const unsigned half = 2 * cv[i].reg + (cv[i].byte >> 1);
       bool last_half = true, last_reg = true;
       for (unsigned k = i + 1; k < n; k++) {
@@ -5280,8 +5295,8 @@ static void setup_inputs(struct gctx *c)
           !nir_src_is_const(in->src[0]) || nir_src_as_uint(in->src[0]) || in->def.bit_size != 32)
          refuse(c, "load_input: only direct 32-bit generic attributes");
       unsigned l = loc - VERT_ATTRIB_GENERIC0, first = nir_intrinsic_component(in);
-      if (4 * l + 4 > NUM_DWORDS)
-         refuse(c, "vertex input location %u: its fetch lands beyond r%u", l, NUM_DWORDS - 1);
+      if (4 * l + 4 > VS_INPUT_DWORDS)
+         refuse(c, "vertex input location %u: its fetch lands beyond r%u", l, VS_INPUT_DWORDS - 1);
       c->p->input_mask |= 1u << l;
       for (unsigned k = 0; k < in->def.num_components; k++) {
          unsigned comp = first + k;
@@ -5303,7 +5318,9 @@ static void setup_inputs(struct gctx *c)
             if (fmt >= PCO_G5P_VSF_COUNT || in->def.num_components != 1 ||
                 (fmt >= PCO_G5P_VSF_U16 && (byte & 1)))
                refuse(c, "vertex input location %u: converted load %#x", l, base);
-            raw_regs |= BITFIELD64_BIT(4 * l + comp);
+            /* a fetched dword above r31: vs_converts() moves it down first (not in the low-register masks) */
+            if (4 * l + comp < NUM_DWORDS)
+               raw_regs |= BITFIELD64_BIT(4 * l + comp);
             if (v->uses) {
                if (ncv == ARRAY_SIZE(cv))
                   refuse(c, "more than %u converted vertex input components", (unsigned)ARRAY_SIZE(cv));
@@ -5312,6 +5329,13 @@ static void setup_inputs(struct gctx *c)
             continue;
          }
          v->input = true;
+         if (4 * l + comp >= NUM_DWORDS) {
+            /* above r31: read through a move at each use */
+            v->state = VAL_HOME;
+            v->reg = 4 * l + comp;
+            c->p->evidence |= PCO_G5P_EV_VS_ALU;
+            continue;
+         }
          if (v->uses)
             hold(c, v, 4 * l + comp);
       }
@@ -5345,12 +5369,17 @@ static void setup_inputs(struct gctx *c)
    for (unsigned i = 0; i < 2; i++) {
       if (!ids[i])
          continue;
-      if (next >= NUM_DWORDS)
+      if (next >= VS_INPUT_DWORDS)
          refuse(c, "%s index: no register after the last attribute", i ? "instance" : "vertex");
       struct val *v = V(c, ids[i], 0);
-      v->state = VAL_REG;
       v->input = true;
-      hold(c, v, next);
+      if (next >= NUM_DWORDS) { /* after attributes above r31: read through a move, as they are */
+         v->state = VAL_HOME;
+         v->reg = next;
+      } else {
+         v->state = VAL_REG;
+         hold(c, v, next);
+      }
       c->p->id_mask |= 1u << i;
       c->p->id_reg[i] = next++;
       c->p->evidence |= PCO_G5P_EV_VS_IDS;

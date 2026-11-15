@@ -26,8 +26,11 @@
 struct nir_shader;
 struct vk_vertex_input_state;
 
-/* The backend's unified store for vertex inputs: dwords r0..r31 */
+/* The backend's unified store for vertex inputs: dwords r0..r31 (the one-location-per-vec4 layout's range) */
 #define PVR_G5P_VERTEX_INPUT_DWORDS 32
+/* The packed layout's limit: attributes above r31 are read through a move (pco_g5p_general.c VS_INPUT_DWORDS,
+ * Apple's vertex form for attributes above r31: 44 dwords from r0 in applegpu_g5p) */
+#define PVR_G5P_VERTEX_INPUT_MAX_DWORDS 64
 
 /*
  * A pipeline's vertex input layout. pvr_g5p_vertex_layout_init() takes the

@@ -517,6 +517,12 @@ unsigned g5p_usc_cf_compare_imm(uint8_t *out, enum g5p_cmp op, unsigned reg, uns
  * r31 takes the extension word. op: the binop code. */
 unsigned g5p_usc_alu2_wide(uint8_t *out, unsigned op, unsigned dst, unsigned a, unsigned a_group, unsigned b,
                            unsigned b_group);
+/* The vertex form: A | B with both sources in bank 1 (both bank bits in the header), any of r0..r127 (above r31 the extension
+ * word), into dst_half of bank dst_bank. Apple's A9 vertex programs read attributes above r31 in place this way
+ * (Apple's compiler, 44 attribute dwords: r44 <- r40 | r36 with the extension word). With a == b it copies
+ * a register (the G9P home move). */
+unsigned g5p_usc_vs_or_wide(uint8_t *out, unsigned dst_half, unsigned dst_bank, unsigned a, unsigned a_group,
+                            unsigned b, unsigned b_group);
 
 /* Derivatives (Apple's A9 dfdx/dfdy, tools/mesa-a9-hypr-re f_ddx_*, f_ddy_*):
  * the class-98 unary form with op 44 and a modifier word, 0200 across x and
