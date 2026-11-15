@@ -24,6 +24,7 @@
 
 #include "pvr_buffer.h"
 #include "pvr_cmd_buffer.h"
+#include "pvr_g5p_shader_dump.h"
 #include "pvr_descriptor_set.h"
 #include "pvr_device.h"
 #include "pvr_g5p.h"
@@ -183,7 +184,9 @@ PVR_PER_ARCH(g5p_meta_blit)(struct pvr_cmd_buffer *cmd_buffer, const VkBlitImage
    struct list_head *mark = cmd_buffer->sub_cmds.prev;
 
    g5p_meta_begin(cmd_buffer, save);
+   pvr_g5p_internal_pipeline++;
    vk_meta_blit_image2(&cmd_buffer->vk, &cmd_buffer->device->g5p->meta, info);
+   pvr_g5p_internal_pipeline--;
    g5p_meta_end(cmd_buffer, save);
    free(save);
 

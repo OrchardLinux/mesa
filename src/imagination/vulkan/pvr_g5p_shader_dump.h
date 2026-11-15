@@ -54,4 +54,8 @@ const VkPipelineShaderStageCreateInfo *pvr_g5p_stub_stage(VkShaderStageFlagBits 
                                                            VkPipelineShaderStageCreateInfo *info,
                                                            VkShaderModuleCreateInfo *module);
 
+/* Pipelines the driver makes for itself (clear quads, vk_meta blits) are created with this
+ * raised: a refused one fails as before instead of being admitted without programs */
+extern thread_local unsigned pvr_g5p_internal_pipeline;
+
 #endif

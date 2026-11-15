@@ -153,6 +153,9 @@ struct pvr_dynamic_render_info {
 struct pvr_sub_cmd_gfx {
    /* a vk_meta blit's render pass: transfer work for barriers (pvr_arch_g5p_meta.c) */
    bool g5p_transfer;
+   /* a render pass G5P refuses (pvr_arch_g5p_job_init(): a shape it cannot run yet, named on stderr):
+    * not submitted, its draws lost, the command buffer valid (pvr_arch_queue.c) */
+   bool g5p_refused;
    struct pvr_dynamic_render_info *dr_info;
    struct pvr_renderpass_hwsetup_render *hw_render;
    uint32_t attachment_count;

@@ -45,6 +45,7 @@
 #include "pvr_cmd_buffer.h"
 #include "pvr_csb.h"
 #include "pvr_device.h"
+#include "pvr_physical_device.h"
 #include "pvr_framebuffer.h"
 #include "pvr_g5p.h"
 #include "pvr_g5p_vdm.h"
@@ -929,8 +930,10 @@ g5p_pipeline_build_punch(struct pvr_device *device,
     * in Aquarium with it, cause not yet bisected. Without the variant,
     * g5p_pipeline_check_draw_variants() refuses the pipeline at creation
     * when a depth/stencil state could need it, the non-fatal form r39-3 had. */
-   if (g->fs_blend_mode == 4 /* general */)
+   if (g->fs_blend_mode == 4 /* general */) {
+      g->punch_why = "general blend epilogue";
       return VK_SUCCESS;
+   }
    struct pvr_g5p_pipeline *p =
       vk_zalloc(&device->vk.alloc, sizeof(*p), 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
    if (!p)
@@ -947,8 +950,10 @@ g5p_pipeline_build_punch(struct pvr_device *device,
       g5p_pipeline_free(device, p);
       /* A normal colour-only shader remains valid. A draw that requires the
        * absent punch variant refuses by name before emitting any draw state. */
-      if (result == VK_ERROR_FEATURE_NOT_PRESENT)
+      if (result == VK_ERROR_FEATURE_NOT_PRESENT) {
+         g->punch_why = "the variant's compile was refused (see the refusal above)";
          return VK_SUCCESS;
+      }
    }
    return result;
 }
@@ -965,8 +970,13 @@ g5p_pipeline_check_draw_variants(struct pvr_device *device,
    if (state->rs && !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_RS_RASTERIZER_DISCARD_ENABLE) &&
        state->rs->rasterizer_discard_enable)
       return VK_SUCCESS;
-   const bool depth = !state->rp || state->rp->depth_attachment_format != VK_FORMAT_UNDEFINED;
-   const bool stencil = !state->rp || state->rp->stencil_attachment_format != VK_FORMAT_UNDEFINED;
+   /* VkRenderPass supplies attachment bits without formats; dynamic rendering
+    * supplies both. Include both representations when deciding which
+    * depth/stencil variants this pipeline can select. */
+   const bool depth = !state->rp || (state->rp->attachments & MESA_VK_RP_ATTACHMENT_DEPTH_BIT) ||
+                      state->rp->depth_attachment_format != VK_FORMAT_UNDEFINED;
+   const bool stencil = !state->rp || (state->rp->attachments & MESA_VK_RP_ATTACHMENT_STENCIL_BIT) ||
+                        state->rp->stencil_attachment_format != VK_FORMAT_UNDEFINED;
    const struct vk_depth_stencil_state *ds = state->ds;
 #define G5P_DYN_DS(x) BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_DS_##x)
    const bool depth_test = depth && (G5P_DYN_DS(DEPTH_TEST_ENABLE) || (ds && ds->depth.test_enable));
@@ -975,10 +985,21 @@ g5p_pipeline_check_draw_variants(struct pvr_device *device,
 #undef G5P_DYN_DS
    const bool testing = depth_test || stencil_test, writing = depth_write || stencil_test;
    const bool needs_punch = (testing && g->fs_discard_tokens > 1) || (writing && g->fs_discard_select);
-   if (needs_punch && !g->punch)
-      return G5P_REFUSE(device, "pipeline: discard under depth/stencil requires an unsupported punch-through variant");
-   if (testing && (g->fs_discard || needs_punch) && g->samples != 1)
-      return G5P_REFUSE(device, "pipeline: discard under multisample depth/stencil is not hardware-qualified");
+   /* The draws decide (g5p_cmd_draw()): a draw whose depth/stencil state needs the missing form is
+    * refused and skipped there, the command buffer valid, while the pipeline's other draws run.
+    * Refusing the pipeline instead loses a WebGPU device (wgpu-hal: any creation error but OOM).
+    * the default policy refuses at creation. */
+   const char *why = needs_punch && !g->punch ? "discard under depth/stencil requires an unsupported punch-through variant"
+                   : testing && (g->fs_discard || needs_punch) && g->samples != 1
+                      ? "discard under multisample depth/stencil is not hardware-qualified" : NULL;
+   if (!why)
+      return VK_SUCCESS;
+   if (!device->pdevice->skip_refused_work)
+      return G5P_REFUSE(device, "pipeline: %s", why);
+   mesa_logw("G5P: pipeline admitted; its draws under depth/stencil will be refused: %s (discard tokens %u, "
+           "select %u, blend mode %u, write mask %#x, samples %u%s%s)", why, g->fs_discard_tokens,
+           g->fs_discard_select, g->fs_blend_mode, g->fs_write_mask, g->samples,
+           g->punch_why ? "; no punch variant: " : "", g->punch_why ? g->punch_why : "");
    return VK_SUCCESS;
 }
 
@@ -1000,14 +1021,22 @@ PVR_PER_ARCH(g5p_graphics_pipeline_compile)(struct pvr_device *device,
    free(fs.code);
    if (result != VK_SUCCESS) {
       g5p_pipeline_free(device, g);
-      return result;
+      /* Unsupported programs fail creation unless the application explicitly
+       * opts into incorrect pixels. Internal pipelines always fail. */
+      if (result == VK_ERROR_FEATURE_NOT_PRESENT && !pvr_g5p_internal_pipeline &&
+          device->pdevice->skip_refused_work) {
+         mesa_logw("pvr/g5p: pipeline admitted without programs after a compile refusal");
+         pipeline->g5p = NULL;
+         return VK_SUCCESS;
+      }
+      return pvr_refusal_to_api(result);
    }
    result = g5p_pipeline_build_punch(device, create_info, vk_state, g);
    if (result == VK_SUCCESS)
       result = g5p_pipeline_check_draw_variants(device, vk_state, g);
    if (result != VK_SUCCESS) {
       g5p_pipeline_free(device, g);
-      return result;
+      return pvr_refusal_to_api(result);
    }
    pipeline->g5p = g;
 
@@ -1038,7 +1067,7 @@ PVR_PER_ARCH(g5p_graphics_pipeline_compile)(struct pvr_device *device,
          if (result != VK_SUCCESS) {
             g5p_pipeline_free(device, g);
             pipeline->g5p = NULL;
-            return result;
+            return pvr_refusal_to_api(result);
          }
       }
    }
@@ -1125,7 +1154,9 @@ g5p_clear_pipeline(struct pvr_cmd_buffer *cmd_buffer, VkFormat format, uint8_t w
       .pStages = stages, .pVertexInputState = &vi, .pInputAssemblyState = &ia, .pViewportState = &vp,
       .pRasterizationState = &rs, .pMultisampleState = &ms, .pColorBlendState = &cb, .pDynamicState = &dy,
       .layout = gd->clear_layout };
+   pvr_g5p_internal_pipeline++;
    result = device->vk.dispatch_table.CreateGraphicsPipelines(vk_dev, VK_NULL_HANDLE, 1, &gci, NULL, &pipe);
+   pvr_g5p_internal_pipeline--;
    pvr_g5p_clear_nir_free(vs);
    pvr_g5p_clear_nir_free(fs);
    if (result != VK_SUCCESS) {
@@ -1609,7 +1640,7 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
    bool lines;
 
    if (!g)
-      return G5P_REFUSE(cmd_buffer, "a draw without a G5P graphics pipeline");
+      return G5P_REFUSE(cmd_buffer, "a draw of a pipeline without G5P programs (refused at creation, named there)");
    /* transform feedback: while capturing, the pipeline's capturing variant
     * (pvr_g5p_xfb.h); a pipeline that captures nothing draws as it is */
    const bool xfb = g->xfb && pvr_arch_g5p_xfb_capturing(cmd_buffer);

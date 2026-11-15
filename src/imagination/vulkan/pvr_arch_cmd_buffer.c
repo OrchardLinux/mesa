@@ -2696,8 +2696,13 @@ VkResult pvr_arch_cmd_buffer_end_sub_cmd(struct pvr_cmd_buffer *cmd_buffer)
          result = pvr_sub_cmd_gfx_job_init(&device->pdevice->dev_info,
                                            cmd_buffer,
                                            gfx_sub_cmd);
+         if (result == VK_ERROR_FEATURE_NOT_PRESENT &&
+             device->pdevice->skip_refused_work) {
+            gfx_sub_cmd->g5p_refused = true;
+            break;
+         }
          if (result != VK_SUCCESS)
-            return pvr_cmd_buffer_set_error_unwarned(cmd_buffer, result);
+            return pvr_cmd_buffer_set_error_unwarned(cmd_buffer, pvr_refusal_to_api(result));
       }
 
       if (pvr_sub_cmd_gfx_requires_split_submit(gfx_sub_cmd)) {

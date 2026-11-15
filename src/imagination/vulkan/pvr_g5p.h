@@ -259,6 +259,7 @@ struct pvr_g5p_pipeline {
     * Original colour-only programs remain byte-identical. */
    struct pvr_g5p_pipeline *punch;
    bool punch_variant;
+   const char *punch_why; /* no punch variant: why (static string; g5p_pipeline_build_punch()) */
    /* the program writes memory (pco_g5p_program::side_effects): a fragment
     * program's draws bound the shaded pixels with the ISP scissor; a vertex
     * program's draws run even when no pixel is left (pvr_arch_g5p_gfx.c) */

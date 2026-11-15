@@ -1199,6 +1199,16 @@ static VkResult pvr_process_cmd_buffer(struct pvr_device *device,
       const int64_t g9p_t0 = getenv("G9P_TIME") ? os_time_get_nano() : 0;
       switch (sub_cmd->type) {
       case PVR_SUB_CMD_TYPE_GRAPHICS: {
+         /* a refused render pass (pvr_arch_cmd_buffer.c): nothing to submit */
+         if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p) &&
+             sub_cmd->gfx.g5p_refused) {
+            if (!sub_cmd->is_resume) {
+               suspended_data->rts = NULL;
+               suspended_data->query_pool = NULL;
+            }
+            result = VK_SUCCESS;
+            break;
+         }
          /* If the fragment job utilizes queries, for data integrity
           * it needs to wait for the query to be processed.
           */

@@ -292,3 +292,5 @@ pvr_g5p_stub_stage(VkShaderStageFlagBits stage, VkPipelineShaderStageCreateInfo 
                                               .pNext = module, .stage = stage, .pName = "main" };
    return info;
 }
+
+thread_local unsigned pvr_g5p_internal_pipeline;
