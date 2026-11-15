@@ -356,8 +356,15 @@ struct pvr_winsys_render_submit_info {
    } fragment, fragment_pr;
 };
 
+static inline bool pvr_winsys_never_lost(struct pvr_winsys *ws)
+{
+   (void)ws;
+   return false;
+}
+
 struct pvr_winsys_ops {
    void (*destroy)(struct pvr_winsys *ws);
+   bool (*is_lost)(struct pvr_winsys *ws);
    VkResult (*device_info_init)(struct pvr_winsys *ws,
                                 struct pvr_device_info *dev_info,
                                 struct pvr_device_runtime_info *runtime_info);
@@ -459,6 +466,7 @@ struct pvr_winsys {
    uint32_t log2_page_size;
 
    const struct vk_sync_type *sync_types[3];
+   const char *loss_source;
    struct vk_sync_type syncobj_type;
    struct vk_sync_timeline_type timeline_syncobj_type;
 

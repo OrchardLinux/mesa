@@ -172,8 +172,8 @@ VkResult pvr_drm_winsys_compute_submit(
    UNUSED const struct pvr_device_info *dev_info,
    struct vk_sync *signal_sync)
 {
-   const struct pvr_drm_winsys *drm_ws = to_pvr_drm_winsys(ctx->ws);
-   const struct pvr_drm_winsys_compute_ctx *drm_ctx =
+   struct pvr_drm_winsys *drm_ws = to_pvr_drm_winsys(ctx->ws);
+   struct pvr_drm_winsys_compute_ctx *drm_ctx =
       to_pvr_drm_winsys_compute_ctx(ctx);
 
    struct drm_pvr_sync_op sync_ops[2];
@@ -215,9 +215,5 @@ VkResult pvr_drm_winsys_compute_submit(
    }
 
    /* Returns VK_ERROR_OUT_OF_DEVICE_MEMORY to match pvrsrv. */
-   return pvr_ioctlf(drm_ws->base.render_fd,
-                     DRM_IOCTL_PVR_SUBMIT_JOBS,
-                     &args,
-                     VK_ERROR_OUT_OF_DEVICE_MEMORY,
-                     "Failed to submit compute job");
+   return pvr_drm_submit_jobs(drm_ws, &args, "compute");
 }

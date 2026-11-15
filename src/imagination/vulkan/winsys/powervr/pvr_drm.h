@@ -43,6 +43,10 @@ struct pvr_drm_winsys {
    /* Packed bvnc */
    uint64_t bvnc;
 
+   bool is_g5p;
+   int loss_reported;
+   int lost; /* Atomic and terminal. */
+
    /* Protects imported BOs creation/freeing, which includes the bo_map member
     * below.
     */
@@ -84,6 +88,13 @@ struct pvr_drm_winsys {
 
    uint32_t vm_context;
 };
+
+struct drm_pvr_ioctl_submit_jobs_args;
+VkResult pvr_drm_submit_jobs(struct pvr_drm_winsys *ws,
+                             struct drm_pvr_ioctl_submit_jobs_args *args,
+                             const char *job_type);
+void pvr_drm_report_loss(struct pvr_drm_winsys *ws, const char *job_type,
+                         const char *source, int status);
 
 /*******************************************
     helper macros

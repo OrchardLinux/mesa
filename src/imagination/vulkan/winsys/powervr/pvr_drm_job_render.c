@@ -474,7 +474,7 @@ VkResult pvr_drm_winsys_render_submit(
    struct vk_sync *signal_sync_frag)
 
 {
-   const struct pvr_drm_winsys *drm_ws = to_pvr_drm_winsys(ctx->ws);
+   struct pvr_drm_winsys *drm_ws = to_pvr_drm_winsys(ctx->ws);
    const struct pvr_drm_winsys_render_ctx *drm_ctx =
       to_pvr_drm_winsys_render_ctx(ctx);
    const struct pvr_winsys_geometry_state *const geom_state =
@@ -643,11 +643,7 @@ VkResult pvr_drm_winsys_render_submit(
       flock(lock_fd, LOCK_EX);
 
    /* Returns VK_ERROR_OUT_OF_DEVICE_MEMORY to match pvrsrv. */
-   const VkResult result = pvr_ioctlf(drm_ws->base.render_fd,
-                                      DRM_IOCTL_PVR_SUBMIT_JOBS,
-                                      &args,
-                                      VK_ERROR_OUT_OF_DEVICE_MEMORY,
-                                      "Failed to submit render job");
+   const VkResult result = pvr_drm_submit_jobs(drm_ws, &args, "render");
 
    if (lock_fd >= 0)
       flock(lock_fd, LOCK_UN);
