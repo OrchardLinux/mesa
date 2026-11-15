@@ -142,7 +142,9 @@
       (surface)->g5p_aspect = (aspect);                                    \
    }                                                                      \
    if (PVR_G5P_IMAGE_IS_SLICED_3D(image)) {                                  \
-      (surface)->dev_addr.addr += (info)->depthPitch * (uint32_t)(fdepth);   \
+      /* the slice's offset, info->depthPitch * z, is added once after this \
+       * hook by pvr_setup_transfer_surface() itself, as for any non-3D     \
+       * surface: adding it here too put slice z at 2z (observed in 3D transfers) */ \
       (surface)->mem_layout = PVR_MEMLAYOUT_TWIDDLED;                        \
       (surface)->depth = 1;                                                  \
    }
