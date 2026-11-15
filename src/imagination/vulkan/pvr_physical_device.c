@@ -833,7 +833,7 @@ static bool pvr_physical_device_get_properties(
       .nonCoherentAtomSize = 1U,
 
       /* Vulkan 1.1 */
-      .subgroupSize = ROGUE_MAX_INSTANCES_PER_TASK,
+      .subgroupSize = PVR_HAS_FEATURE(dev_info, apple_g5p) ? 1U : ROGUE_MAX_INSTANCES_PER_TASK,
       .subgroupSupportedStages = VK_SHADER_STAGE_COMPUTE_BIT,
       .subgroupSupportedOperations = VK_SUBGROUP_FEATURE_BASIC_BIT |
                                      VK_SUBGROUP_FEATURE_VOTE_BIT |
@@ -973,9 +973,10 @@ static bool pvr_physical_device_get_properties(
       .integerDotProductAccumulatingSaturating64BitMixedSignednessAccelerated = false,
 
       /* Vulkan 1.3 / VK_EXT_subgroup_size_control */
-      .minSubgroupSize = ROGUE_MAX_INSTANCES_PER_TASK,
-      .maxSubgroupSize = ROGUE_MAX_INSTANCES_PER_TASK,
-      .maxComputeWorkgroupSubgroups = 128U / ROGUE_MAX_INSTANCES_PER_TASK,
+      .minSubgroupSize = PVR_HAS_FEATURE(dev_info, apple_g5p) ? 1U : ROGUE_MAX_INSTANCES_PER_TASK,
+      .maxSubgroupSize = PVR_HAS_FEATURE(dev_info, apple_g5p) ? 1U : ROGUE_MAX_INSTANCES_PER_TASK,
+      .maxComputeWorkgroupSubgroups = PVR_HAS_FEATURE(dev_info, apple_g5p) ?
+                                       256U : 128U / ROGUE_MAX_INSTANCES_PER_TASK,
       .requiredSubgroupSizeStages = VK_SHADER_STAGE_COMPUTE_BIT,
 
       /* Vulkan 1.2 / VK_KHR_timeline_semaphore */

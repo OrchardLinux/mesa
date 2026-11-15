@@ -38,6 +38,7 @@ a9_tex_refuse(struct g9p_ctx *ctx, const char *why)
       if (!ctx->out->a9_refusal[0])
       if (!ctx->out->a9_refusal[0])
       if (!ctx->out->a9_refusal[0])
+      if (!ctx->out->a9_refusal[0])
       snprintf(ctx->out->a9_refusal, sizeof(ctx->out->a9_refusal), "%s", why);
 }
 
