@@ -1217,6 +1217,7 @@ emit_alu(struct g9p_ctx *ctx, nir_alu_instr *alu)
    }
    for (unsigned i = 0; i < num_inputs; i++)
       s[i] = nir_get_scalar(alu->src[i].src.ssa, alu->src[i].swizzle[0]);
+   G9P_A9_ALU_PACK_HALF();
    G9P_A9_ALU_LITERAL_FMA();
    /* compared where it is used (emit_branch_cmp()) */
    if (branch_compare(&alu->def))
@@ -4862,7 +4863,8 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
       /* A9 compute reads texels with the sampler's read form and the fetch sampler (g9p_a9_tex.h) */
       if (!(out->a9 && stage == MESA_SHADER_COMPUTE))
       NIR_PASS(_, nir, nir_shader_tex_pass, lower_txf, nir_metadata_control_flow, NULL);
-      NIR_PASS(_, nir, nir_shader_instructions_pass, lower_half_packing, nir_metadata_control_flow, NULL);
+      NIR_PASS(_, nir, nir_shader_instructions_pass, lower_half_packing, nir_metadata_control_flow,
+               (void *)(uintptr_t)(out->a9 && stage == MESA_SHADER_COMPUTE));
    }
    /* integer division through floats: no such instruction (GLSL ES 1.00 int and ivec /) */
    {
@@ -5387,6 +5389,11 @@ lower_half_packing(nir_builder *b, nir_instr *instr, void *data)
    nir_def *src = nir_ssa_for_alu_src(b, alu, 0);
 
    if (alu->op == nir_op_pack_half_2x16) {
+      if (data) {
+         nir_def_replace(&alu->def, nir_pack_half_2x16_split(b, nir_channel(b, src, 0),
+                                                            nir_channel(b, src, 1)));
+         return true;
+      }
       nir_def_replace(&alu->def, nir_ior(b, f32_to_half(b, nir_channel(b, src, 0)),
                                          nir_ishl_imm(b, f32_to_half(b, nir_channel(b, src, 1)), 16)));
    } else {

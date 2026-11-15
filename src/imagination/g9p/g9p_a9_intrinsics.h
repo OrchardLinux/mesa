@@ -226,47 +226,93 @@ static bool a9_ssbo_cas(struct g9p_ctx *ctx, nir_intrinsic_instr *in)
 }
 static bool a9_image(struct g9p_ctx *ctx, nir_intrinsic_instr *in)
 {
-   bool store=in->intrinsic==nir_intrinsic_image_deref_store;
-   if(!ctx->out->a9 || ctx->stage!=MESA_SHADER_COMPUTE ||
-      nir_intrinsic_image_dim(in)!=GLSL_SAMPLER_DIM_2D || nir_intrinsic_image_array(in))return false;
-   nir_deref_instr *deref=nir_src_as_deref(in->src[0]);
-   nir_variable *v=nir_deref_instr_get_variable(deref);
-   if(!v || deref->deref_type!=nir_deref_type_var || v->data.image.format!=PIPE_FORMAT_R32_UINT ||
-      !nir_src_is_const(in->src[store?4:3]) || nir_src_as_uint(in->src[store?4:3])!=0)return false;
-   if(ctx->out->num_textures && (ctx->out->textures[0].set!=v->data.descriptor_set ||
-      ctx->out->textures[0].binding!=v->data.binding))return false;
-   ctx->out->num_textures=1;
-   ctx->out->textures[0].set=v->data.descriptor_set;
-   ctx->out->textures[0].binding=v->data.binding;
-   int co=alloc_pair(ctx);
-   if(co<0 || co>30)return false;
-   ctx->temps |= BITFIELD64_RANGE(co,2);
-   for(unsigned j=0;j<2;j++) {
-      int r=src_reg(ctx,nir_get_scalar(in->src[1].ssa,j));
-      if(r<0)return false;
-      g9p_alu2(ctx->c,G9P_OR,co+j,r,r,false);
+   bool store = in->intrinsic == nir_intrinsic_image_deref_store;
+   enum glsl_sampler_dim dim = nir_intrinsic_image_dim(in);
+   bool array = nir_intrinsic_image_array(in);
+   if (!ctx->out->a9 || ctx->stage != MESA_SHADER_COMPUTE)
+      return false;
+   if ((dim != GLSL_SAMPLER_DIM_2D && !(store && dim == GLSL_SAMPLER_DIM_CUBE)) ||
+       (!store && array)) {
+      char why[128];
+      snprintf(why, sizeof(why), "image %s dimension %s is_array=%u unsupported",
+               store ? "store" : "load", (dim == GLSL_SAMPLER_DIM_CUBE ? "cube" : dim == GLSL_SAMPLER_DIM_3D ? "3D" :
+               dim == GLSL_SAMPLER_DIM_2D ? "2D" : "other"), array);
+      a9_tex_refuse(ctx, why);
+      return false;
    }
-   int data=alloc_range(ctx,4);
-   if(data<0 || data>28)return false;
-   if(store) {
-      if(nir_src_bit_size(in->src[3])!=32 || nir_src_num_components(in->src[3])!=4)return false;
-      ctx->temps |= BITFIELD64_RANGE(data,4);
-      for(unsigned j=0;j<4;j++) {
-         int r=src_reg(ctx,nir_get_scalar(in->src[3].ssa,j));
-         if(r<0)return false;
-         g9p_alu2(ctx->c,G9P_OR,data+j,r,r,false);
+   nir_deref_instr *deref = nir_src_as_deref(in->src[0]);
+   nir_variable *v = nir_deref_instr_get_variable(deref);
+   if (!v || deref->deref_type != nir_deref_type_var) {
+      a9_tex_refuse(ctx, "image access without a constant storage binding");
+      return false;
+   }
+   enum pipe_format format = v->data.image.format;
+   bool packed = false, supported = format == PIPE_FORMAT_R32_UINT;
+   if (store) switch (format) {
+   case PIPE_FORMAT_R32_UINT: case PIPE_FORMAT_R32_SINT: case PIPE_FORMAT_R32_FLOAT:
+   case PIPE_FORMAT_R32G32B32A32_UINT: case PIPE_FORMAT_R32G32B32A32_SINT:
+   case PIPE_FORMAT_R32G32B32A32_FLOAT:
+      supported = true; break;
+   case PIPE_FORMAT_R8G8B8A8_UNORM: case PIPE_FORMAT_R16G16B16A16_FLOAT:
+   case PIPE_FORMAT_R16G16_FLOAT: case PIPE_FORMAT_R16_FLOAT:
+      supported = packed = true; break;
+   default: break;
+   }
+   if (!supported) {
+      char why[160];
+      snprintf(why, sizeof(why), "image %s format %s (%s)", store ? "store" : "load",
+               util_format_short_name(format), store ? "no A9 pack path yet" : "R32_UINT only");
+      a9_tex_refuse(ctx, why);
+      return false;
+   }
+   if (!nir_src_is_const(in->src[store ? 4 : 3]) ||
+       nir_src_as_uint(in->src[store ? 4 : 3]) != 0) {
+      a9_tex_refuse(ctx, "image access at a nonzero or dynamic level");
+      return false;
+   }
+   if (ctx->out->num_textures && (ctx->out->textures[0].set != v->data.descriptor_set ||
+       ctx->out->textures[0].binding != v->data.binding)) {
+      a9_tex_refuse(ctx, "more than one storage image binding");
+      return false;
+   }
+   ctx->out->num_textures = 1;
+   ctx->out->textures[0].set = v->data.descriptor_set;
+   ctx->out->textures[0].binding = v->data.binding;
+   unsigned coords = array || dim == GLSL_SAMPLER_DIM_CUBE ? 3 : 2;
+   int co = alloc_range(ctx, coords);
+   if (co < 0 || co + coords > 32) return false;
+   ctx->temps |= BITFIELD64_RANGE(co, coords);
+   for (unsigned j = 0; j < coords; j++) {
+      int r = src_reg(ctx, nir_get_scalar(in->src[1].ssa, j));
+      if (r < 0) return false;
+      g9p_alu2(ctx->c, G9P_OR, co + j, r, r, false);
+   }
+   unsigned words = packed ? 2 : 4;
+   int data = alloc_range(ctx, words);
+   if (data < 0 || data + words > 32) return false;
+   if (store) {
+      if (nir_src_bit_size(in->src[3]) != 32 || nir_src_num_components(in->src[3]) != words)
+         return false;
+      ctx->temps |= BITFIELD64_RANGE(data, words);
+      for (unsigned j = 0; j < words; j++) {
+         int r = src_reg(ctx, nir_get_scalar(in->src[3].ssa, j));
+         if (r < 0) return false;
+         g9p_alu2(ctx->c, G9P_OR, data + j, r, r, false);
       }
-   } else if(in->def.bit_size!=32 || in->def.num_components>4)return false;
-   g5p_image_raw32(ctx->c,store,data,co,40,31);
-   release(ctx,&in->instr);
-   if(!store) for(unsigned j=0;j<4;j++) {
-      ctx->reg[key(&in->def,j)]=data+j;
-      if(j>=in->def.num_components || !ctx->last_use[key(&in->def,j)])ctx->busy &= ~BITFIELD64_BIT(data+j);
+   } else if (in->def.bit_size != 32 || in->def.num_components > 4) return false;
+   g5p_image_access(ctx->c, store, packed, coords == 3, data, co, 40, 31);
+   release(ctx, &in->instr);
+   if (!store) for (unsigned j = 0; j < 4; j++) {
+      ctx->reg[key(&in->def, j)] = data + j;
+      if (j >= in->def.num_components || !ctx->last_use[key(&in->def, j)])
+         ctx->busy &= ~BITFIELD64_BIT(data + j);
    }
    return true;
 }
 #define G9P_A9_INTRINSICS \
    if (ctx->out->a9) { switch (intr->intrinsic) { \
+   case nir_intrinsic_image_deref_atomic: case nir_intrinsic_image_deref_atomic_swap: \
+      a9_tex_refuse(ctx, "image atomics unsupported on A9"); return false; \
    case nir_intrinsic_image_deref_store: case nir_intrinsic_image_deref_load: return a9_image(ctx, intr); \
    case nir_intrinsic_shared_atomic: case nir_intrinsic_shared_atomic_swap: return a9_shared_atomic(ctx, intr); \
    case nir_intrinsic_ssbo_atomic_swap: return a9_ssbo_cas(ctx, intr); \

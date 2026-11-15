@@ -97,6 +97,49 @@ a9_shared_size_align(nir_intrinsic_op op, uint8_t bytes, uint8_t bit_size,
    return (nir_mem_access_size_align) { n, 32, 4 * n, nir_mem_access_shift_method_scalar };
 }
 
+/* Specialise storage writes before ALU lowering. Two data components mark
+ * Apple's packed 0x18 form; raw 0x1a always has four dwords. Cube image
+ * coordinates are already x,y,face (or 6*cube+face) in SPIR-V/NIR. */
+static bool
+a9_pack_image_store(nir_builder *b, nir_intrinsic_instr *in, void *data)
+{
+   if (in->intrinsic != nir_intrinsic_image_deref_store)
+      return false;
+   nir_variable *v = nir_deref_instr_get_variable(nir_src_as_deref(in->src[0]));
+   if (!v || nir_src_bit_size(in->src[3]) != 32)
+      return false;
+   b->cursor = nir_before_instr(&in->instr);
+   nir_def *value = in->src[3].ssa, *lo, *hi = nir_imm_int(b, 0);
+   switch (v->data.image.format) {
+   case PIPE_FORMAT_R32_UINT: case PIPE_FORMAT_R32_SINT: case PIPE_FORMAT_R32_FLOAT:
+      value = nir_vec4(b, nir_channel(b, value, 0), hi, hi, hi);
+      break;
+   case PIPE_FORMAT_R32G32B32A32_UINT: case PIPE_FORMAT_R32G32B32A32_SINT:
+   case PIPE_FORMAT_R32G32B32A32_FLOAT:
+      return false;
+   case PIPE_FORMAT_R8G8B8A8_UNORM:
+      lo = nir_pack_unorm_4x8(b, value);
+      value = nir_vec2(b, lo, hi);
+      break;
+   case PIPE_FORMAT_R16G16B16A16_FLOAT:
+      hi = nir_pack_half_2x16(b, nir_channels(b, value, 0xc));
+      FALLTHROUGH;
+   case PIPE_FORMAT_R16G16_FLOAT:
+      lo = nir_pack_half_2x16(b, nir_channels(b, value, 0x3));
+      value = nir_vec2(b, lo, hi);
+      break;
+   case PIPE_FORMAT_R16_FLOAT:
+      lo = nir_pack_half_2x16(b, nir_vec2(b, nir_channel(b, value, 0), nir_imm_float(b, 0)));
+      value = nir_vec2(b, lo, hi);
+      break;
+   default:
+      return false; /* a9_image() records the format by name */
+   }
+   nir_src_rewrite(&in->src[3], value);
+   in->num_components = value->num_components;
+   return true;
+}
+
 bool g9p_a9_compile_compute(nir_shader *nir, struct g9p_shader *out, void *mem_ctx)
 {
    nir->options = &nir_options_a9;
@@ -107,6 +150,8 @@ bool g9p_a9_compile_compute(nir_shader *nir, struct g9p_shader *out, void *mem_c
    out->a9 = true;
    lower_front(nir);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, a9_lower_subgroups_size1,
+            nir_metadata_control_flow, NULL);
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, a9_pack_image_store,
             nir_metadata_control_flow, NULL);
    NIR_PASS(_, nir, nir_lower_alu);
    NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_mem_shared, glsl_get_natural_size_align_bytes);
