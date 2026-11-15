@@ -138,13 +138,14 @@ enum pco_g5p_upload_kind {
 /* Varyings (docs/gpu/experiments/varyings.md). Apple's A9 compiler takes at
  * most 60 interpolated components ("Number of varying components(64)
  * exceeds the limit (60)"): 15 vec4 fragment inputs. */
-/* Plan row R2 (desktop-gl-varyings.md section 5): 16 vec4, the 64 components
- * the driver reports (maxVertexOutputComponents, maxFragmentInputComponents)
- * and stock Zink's IMG GL limit at 64 (16 varyings). Beyond Apple's per-target
- * 60, inside the hardware-proven range (varyings-capacity-1: exact to 124 on
- * the A9, flat included). With the position, a point size and 8 clip
- * distances the vertex is 4 + 64 + 1 + 8 = 77 dwords, inside the TA's 128. */
-#define PCO_G5P_MAX_FS_VARYINGS 16
+/* 28 vec4, the 112 components the driver reports (maxVertexOutputComponents,
+ * maxFragmentInputComponents): WebGPU core wants 16 inter-stage locations
+ * (wgpu: components / 4 - 1). With the position, a point size
+ * and 8 clip distances the vertex is 4 + 112 + 1 + 8 = 125 dwords, inside the
+ * TA's 128. Beyond Apple's per-target 60, inside the hardware-proven range
+ * (varying-capacity and geometry-shader probes: exact to 124 on the A9, flat
+ * included). Before: 16 vec4, 64 components. */
+#define PCO_G5P_MAX_FS_VARYINGS 28
 #define PCO_G5P_VARYING_SLOTS 32 /* VARYING_SLOT_VAR0..VAR31 */
 
 enum pco_g5p_interp {

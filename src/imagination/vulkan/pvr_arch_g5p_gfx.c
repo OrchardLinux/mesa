@@ -331,6 +331,9 @@ launch_program(uint32_t *dest)
  * the TA vertex, which drops x, y, z: dword d is TA dword d - 3, in 16-bit
  * units). Returns the data dwords; *code_dwords the code's.
  */
+/* pvr_physical_device.c reports what the fragment compiler admits */
+static_assert(4 * PCO_G5P_MAX_FS_VARYINGS == 112, "G5P varying components");
+
 static unsigned
 varying_program(const struct pco_g5p_program *fs, const struct pco_g5p_program *vs, uint32_t *data,
                 uint32_t *code, unsigned *code_dwords)

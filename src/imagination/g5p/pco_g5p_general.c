@@ -1535,8 +1535,8 @@ static void plan_varyings(struct gctx *c)
       mask[n] |= BITFIELD64_MASK(in->def.num_components) << nir_intrinsic_component(in);
    }
    if (util_bitcount(read) > PCO_G5P_MAX_FS_VARYINGS)
-      refuse(c, "%u varying locations read (%u vec4: the reported 64 components)", util_bitcount(read),
-             PCO_G5P_MAX_FS_VARYINGS);
+      refuse(c, "%u varying locations read (%u vec4: the reported %u components)", util_bitcount(read),
+             PCO_G5P_MAX_FS_VARYINGS, 4 * PCO_G5P_MAX_FS_VARYINGS);
    bool smooth = false;
    u_foreach_bit(n, read)
       smooth |= interp[n] == PCO_G5P_INTERP_SMOOTH;
