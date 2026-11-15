@@ -83,7 +83,7 @@ a9_alu_pack_half(struct g9p_ctx *ctx, nir_alu_instr *alu, nir_scalar s[3])
       if (r < 0 || (r = one_src(ctx, r)) < 0) return false;
       unsigned at = ctx->c->n;
       g9p_f16_of(ctx->c, dst, r);
-      ctx->c->w[at + 1] |= i; /* the high half: bit 0 of the destination half index, as Apple's half packs */
+      (*g9p_code_word(ctx->c, at + 1)) |= i; /* the high half: bit 0 of the destination half index, as Apple's half packs */
    }
    release(ctx, &alu->instr);
    ctx->busy |= BITFIELD64_BIT(dst);

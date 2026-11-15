@@ -16,11 +16,22 @@
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <limits.h>
+#include <string.h>
+#include "util/ralloc.h"
 
-#define G9P_MAX_CODE_WORDS 65536
+#define G9P_INITIAL_CODE_WORDS 65536
 
 struct g9p_code {
-   uint16_t w[G9P_MAX_CODE_WORDS];
+   uint16_t *w;
+   unsigned capacity;
+   void *alloc_ctx;
+   const char *error;
+   /* Small generated graphics helpers are calloc/free objects, not ralloc
+    * objects. Preserve their inline storage and lifetime. Compiler programs
+    * grow beyond this initial storage under alloc_ctx. */
+   uint16_t initial_w[G9P_INITIAL_CODE_WORDS];
+   uint16_t failed_patch;
    unsigned n;
    /* a fragment shader: registers in the other bank, see g9p_w0() */
    bool fragment;
@@ -57,9 +68,51 @@ g9p_dst(const struct g9p_code *c, unsigned r)
 static inline void
 g9p_emit(struct g9p_code *c, const uint16_t *w, unsigned count)
 {
-   assert(c->n + count <= G9P_MAX_CODE_WORDS);
-   for (unsigned i = 0; i < count; i++)
-      c->w[c->n++] = w[i];
+   if (c->error) return;
+   if (!c->w) {
+      c->w = c->initial_w;
+      c->capacity = G9P_INITIAL_CODE_WORDS;
+   }
+   /* Signed 32-bit byte-relative jumps and unsigned byte code_size. */
+   if (count > INT_MAX / 2u - c->n) {
+      c->error = "program exceeds the 32-bit jump-offset range";
+      return;
+   }
+   if (count > c->capacity - c->n) {
+      unsigned capacity = c->capacity;
+      while (capacity < c->n + count)
+         capacity = capacity > INT_MAX / 4u ? INT_MAX / 2u : capacity * 2;
+      if (!c->alloc_ctx) {
+         c->error = "generated helper exceeds inline code storage";
+         return;
+      }
+      uint16_t *w = reralloc(c->alloc_ctx, c->w == c->initial_w ? NULL : c->w,
+                            uint16_t, capacity);
+      if (!w) {
+         c->error = "allocation failure growing program code";
+         return;
+      }
+      if (c->w == c->initial_w)
+         memcpy(w, c->w, c->n * sizeof(*w));
+      c->w = w;
+      c->capacity = capacity;
+   }
+   memcpy(c->w + c->n, w, count * sizeof(*w));
+   c->n += count;
+}
+
+/* Patches retain word indices, never pointers across an emit/reallocation.
+ * A failed append must not turn its following patch into an out-of-bounds
+ * write. The compile reports error before exporting code. */
+static inline uint16_t *
+g9p_code_word(struct g9p_code *c, unsigned at)
+{
+   if (c->error) return &c->failed_patch;
+   if (at >= c->n) {
+      c->error = "program back-patch outside emitted code";
+      return &c->failed_patch;
+   }
+   return &c->w[at];
 }
 
 #define G9P_EMIT(c, ...)                                     \
@@ -136,10 +189,10 @@ g9p_end(struct g9p_code *c)
    unsigned end = (jump + 6 + 63) / 64 * 64;
 
    G9P_EMIT(c, 0x0100, 0x0100 | (end - jump), 0x0000);
-   while (2 * c->n < end)
+   while (!c->error && 2 * c->n < end)
       G9P_EMIT(c, 0xc000);
    G9P_EMIT(c, 0x8000);
-   while (c->n % 32)
+   while (!c->error && c->n % 32)
       G9P_EMIT(c, 0xc000);
 }
 
@@ -568,8 +621,8 @@ g9p_jump_patch(struct g9p_code *c, unsigned at, int offset)
 {
    uint32_t off = (uint32_t)offset;
 
-   c->w[at + 1] = (off & 0xfefe) | 0x0100 | ((off >> 8) & 1);
-   c->w[at + 2] = ((off >> 16) & 0xfefe) | ((off >> 24) & 1);
+   *g9p_code_word(c, at + 1) = (off & 0xfefe) | 0x0100 | ((off >> 8) & 1);
+   *g9p_code_word(c, at + 2) = ((off >> 16) & 0xfefe) | ((off >> 24) & 1);
 }
 
 static inline unsigned
@@ -602,10 +655,10 @@ g9p_end_vertex(struct g9p_code *c, unsigned reg, unsigned slot)
    unsigned end = (jump + 6 + 63) / 64 * 64;
 
    G9P_EMIT(c, 0x0100, 0x0100 | (end - jump), 0x0000);
-   while (2 * c->n < end)
+   while (!c->error && 2 * c->n < end)
       G9P_EMIT(c, 0xc000);
    G9P_EMIT(c, 0x155e, 0xc100 | 2 * reg, slot);
-   while (c->n % 32)
+   while (!c->error && c->n % 32)
       G9P_EMIT(c, 0x0000);
 }
 
@@ -617,10 +670,10 @@ g9p_end_vertex_stores(struct g9p_code *c)
    unsigned end = (jump + 6 + 63) / 64 * 64;
 
    G9P_EMIT(c, 0x0100, 0x0100 | (end - jump), 0x0000);
-   while (2 * c->n < end)
+   while (!c->error && 2 * c->n < end)
       G9P_EMIT(c, 0xc000);
    G9P_EMIT(c, 0x015e, 0xa000);
-   while (c->n % 32)
+   while (!c->error && c->n % 32)
       G9P_EMIT(c, 0x0000);
 }
 
@@ -835,7 +888,7 @@ g9p_end_fragment(struct g9p_code *c, unsigned words)
    if (words)
       G9P_EMIT(c, (words & 7) << 12 | 0x011c, 0x0800);
    G9P_EMIT(c, 0x8000);
-   while (c->n % 32)
+   while (!c->error && c->n % 32)
       G9P_EMIT(c, 0x0000);
 }
 

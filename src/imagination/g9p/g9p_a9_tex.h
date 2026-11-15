@@ -271,7 +271,7 @@ a9_tex(struct g9p_ctx *ctx, nir_tex_instr *tex)
       if (!read) {
          const unsigned at = ctx->c->n;
          g9p_f16_of(ctx->c, lod, 0);
-         ctx->c->w[at + 2] |= copy << G9P_SRC_A_SHIFT | G9P_SRC_A_LAST_READ;
+         (*g9p_code_word(ctx->c, at + 2)) |= copy << G9P_SRC_A_SHIFT | G9P_SRC_A_LAST_READ;
       }
       /* ra_d loads its uint LOD directly into r0: no f16 conversion. */
    } else if (layered) {

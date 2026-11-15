@@ -140,7 +140,9 @@ g9p_a9_bank1_limit(unsigned threads)
 #define VALUE_REGS(ctx) ((ctx)->stage == MESA_SHADER_VERTEX && (ctx)->st == 15 && !getenv("G9P_REGS") \
                             ? 32u : (ctx)->value_cap ? MIN2(G9P_NUM_REGS, (ctx)->value_cap) : G9P_NUM_REGS)
 #define LOW_REGS(ctx) MIN2(16u, VALUE_REGS(ctx))
-#define G9P_MAX_LOOPS 64
+/* The immediate source of a break's stack word is six bits (W2[6:1]);
+ * bit 7 is last-read, bit 8 continuation. It encodes if_depth + 3. */
+#define G9P_MAX_IF_DEPTH (63 - 3)
 /* nir_tex_instr.backend_flags: a seamful cube's gradients, for the hardware */
 #define G9P_TEX_NATIVE_GRADIENTS 1
 
@@ -349,7 +351,7 @@ struct g9p_ctx {
 
    struct {
       unsigned start, end;
-   } loops[G9P_MAX_LOOPS];
+   } *loops;
    unsigned num_loops, loop_index;
 
    /* Jumps to the innermost loop's exit (after a break), patched at its end */
@@ -362,6 +364,11 @@ struct g9p_ctx {
 static bool
 backend_failure(struct g9p_shader *out, const struct g9p_ctx *ctx)
 {
+   if (ctx->c && debug_get_option_g9p_pressure())
+      mesa_logi("g9p: failed attempt reached %u bytes of code, %u loop records, instruction %u\n",
+              2 * ctx->c->n, ctx->num_loops, ctx->ip);
+   if (ctx->c && ctx->c->error)
+      return g9p_fail(out, "%s", ctx->c->error);
    if (out->a9) {
       if (out->a9_refusal[0]) {
          char why[sizeof(out->a9_refusal)];
@@ -409,9 +416,9 @@ helper_samples_end(struct g9p_ctx *ctx)
       const unsigned at = ctx->frag_samples[i];
 
       /* Apple's word pair for a sample before the last: W3 0600, W4 044d */
-      if (at != last && ctx->c->w[at + 4] == 0x0200) {
-         ctx->c->w[at + 3] &= ~0x0100;
-         ctx->c->w[at + 4] = 0x044d;
+      if (at != last && (*g9p_code_word(ctx->c, at + 4)) == 0x0200) {
+         (*g9p_code_word(ctx->c, at + 3)) &= ~0x0100;
+         (*g9p_code_word(ctx->c, at + 4)) = 0x044d;
       }
    }
 }
@@ -1089,12 +1096,11 @@ walk_liveness(struct g9p_ctx *ctx, struct exec_list *list, bool uses)
          nir_loop *loop = nir_cf_node_as_loop(node);
          unsigned l = ctx->loop_index++;
 
-         if (!uses && l < G9P_MAX_LOOPS) {
+         if (!uses && l < ctx->num_loops) {
             ctx->loops[l].start = ctx->ip + 1;
-            ctx->num_loops = MAX2(ctx->num_loops, l + 1);
          }
          walk_liveness(ctx, &loop->body, uses);
-         if (!uses && l < G9P_MAX_LOOPS)
+         if (!uses && l < ctx->num_loops)
             ctx->loops[l].end = ctx->ip;
          break;
       }
@@ -1102,6 +1108,23 @@ walk_liveness(struct g9p_ctx *ctx, struct exec_list *list, bool uses)
          break;
       }
    }
+}
+
+/* Exactly the loop records visited by walk_liveness(), including nested
+ * loops in either arm. Allocate before its two traversals. */
+static unsigned
+count_loop_records(struct exec_list *list)
+{
+   unsigned count = 0;
+   foreach_list_typed(nir_cf_node, node, node, list) {
+      if (node->type == nir_cf_node_loop) {
+         count += 1 + count_loop_records(&nir_cf_node_as_loop(node)->body);
+      } else if (node->type == nir_cf_node_if) {
+         nir_if *nif = nir_cf_node_as_if(node);
+         count += count_loop_records(&nif->then_list) + count_loop_records(&nif->else_list);
+      }
+   }
+   return count;
 }
 
 /* --- Code ---------------------------------------------------------------- */
@@ -2628,9 +2651,9 @@ sample_lod(struct g9p_ctx *ctx, nir_tex_instr *tex, unsigned at, int lod)
 {
    if (lod < 0)
       return;
-   ctx->c->w[at + 3] = (ctx->c->w[at + 3] & 0xff00) | 0x80 |
+   (*g9p_code_word(ctx->c, at + 3)) = ((*g9p_code_word(ctx->c, at + 3)) & 0xff00) | 0x80 |
                        (tex->op == nir_texop_txl ? 0x40 : 0x20) | lod;
-   ctx->c->w[at + 4] = (ctx->c->w[at + 4] & 0xff00) | 0x80;
+   (*g9p_code_word(ctx->c, at + 4)) = ((*g9p_code_word(ctx->c, at + 4)) & 0xff00) | 0x80;
 }
 
 /*
@@ -2774,11 +2797,11 @@ extras_patch(struct g9p_ctx *ctx, unsigned at, const struct tex_extras *e)
 {
    if (e->half < 0)
       return;
-   ctx->c->w[at + 4] |= 0x40 | e->half;
+   (*g9p_code_word(ctx->c, at + 4)) |= 0x40 | e->half;
    if (e->compare)
-      ctx->c->w[at + 3] |= 0x8000;
+      (*g9p_code_word(ctx->c, at + 3)) |= 0x8000;
    if (e->offset)
-      ctx->c->w[at + 2] |= 0x4000;
+      (*g9p_code_word(ctx->c, at + 2)) |= 0x4000;
 }
 
 /*
@@ -2836,7 +2859,7 @@ emit_tex_layered(struct g9p_ctx *ctx, nir_tex_instr *tex)
       return false;
    at = ctx->c->n;
    g9p_sample_regs(ctx->c, dst, tex_state_dword(ctx, slot), tex_sampler_dword(ctx, slot));
-   ctx->c->w[at] = (ctx->c->w[at] & ~0x0f00) |
+   (*g9p_code_word(ctx->c, at)) = ((*g9p_code_word(ctx->c, at)) & ~0x0f00) |
                    (cube ? G9P_TEX_CUBE : is3d ? G9P_TEX_3D : G9P_TEX_2D_ARRAY) << 8;
    sample_lod(ctx, tex, at, lod);
    extras_patch(ctx, at, &extras);
@@ -2952,18 +2975,18 @@ emit_tex_vertex(struct g9p_ctx *ctx, nir_tex_instr *tex)
    g9p_sample_vertex(ctx->c, dst, tex_state_dword(ctx, slot), tex_sampler_dword(ctx, slot), coord,
                      lod);
    if (cube) {
-      ctx->c->w[at] = (ctx->c->w[at] & ~0x0f00) | G9P_TEX_CUBE << 8;
-      ctx->c->w[at + 2] |= 0x8000;
+      (*g9p_code_word(ctx->c, at)) = ((*g9p_code_word(ctx->c, at)) & ~0x0f00) | G9P_TEX_CUBE << 8;
+      (*g9p_code_word(ctx->c, at + 2)) |= 0x8000;
    } else if (is3d) {
-      ctx->c->w[at] = (ctx->c->w[at] & ~0x0f00) | G9P_TEX_3D << 8;
+      (*g9p_code_word(ctx->c, at)) = ((*g9p_code_word(ctx->c, at)) & ~0x0f00) | G9P_TEX_3D << 8;
    } else if (tex->is_array) {
-      ctx->c->w[at] = (ctx->c->w[at] & ~0x0f00) | G9P_TEX_2D_ARRAY << 8;
-      ctx->c->w[at + 2] |= 0x8000;
+      (*g9p_code_word(ctx->c, at)) = ((*g9p_code_word(ctx->c, at)) & ~0x0f00) | G9P_TEX_2D_ARRAY << 8;
+      (*g9p_code_word(ctx->c, at + 2)) |= 0x8000;
    }
    extras_patch(ctx, at, &extras);
    /* the vertex form's compare also sets bit 15 of W6 (Apple's sample_compare at a level) */
    if (extras.compare)
-      ctx->c->w[at + 6] |= 0x8000;
+      (*g9p_code_word(ctx->c, at + 6)) |= 0x8000;
    g9p_wait(ctx->c);
    release(ctx, &tex->instr);
    for (unsigned c = 0; c < 4; c++) {
@@ -3640,8 +3663,13 @@ emit_break(struct g9p_ctx *ctx, bool when_true)
    }
    g9p_loop_break(ctx->c, ctx->st, when_true);
    if (ctx->num_exit_jumps == ctx->max_exit_jumps) {
-      fprintf(stderr, "g9p: too many breaks\n");
-      return false;
+      unsigned capacity = ctx->max_exit_jumps * 2;
+      unsigned *jumps = capacity > ctx->max_exit_jumps ?
+         reralloc(ctx->c, ctx->exit_jumps, unsigned, capacity) : NULL;
+      if (!jumps)
+         return g9p_fail(ctx->out, "allocation failure growing loop exits");
+      ctx->exit_jumps = jumps;
+      ctx->max_exit_jumps = capacity;
    }
    ctx->exit_jumps[ctx->num_exit_jumps++] = g9p_jump(ctx->c, G9P_JMP_NONE, 0);
    return true;
@@ -3657,6 +3685,8 @@ emit_if_else(struct g9p_ctx *ctx, nir_if *nif, bool sense)
 {
    unsigned to_else, to_pop;
 
+   if (ctx->if_depth >= G9P_MAX_IF_DEPTH)
+      return g9p_fail(ctx->out, "control flow nested deeper than %u", G9P_MAX_IF_DEPTH);
    /* keep the lanes for which the condition holds */
    g9p_push_if(ctx->c, ctx->st, !sense);
    ctx->if_depth++;
@@ -3755,6 +3785,7 @@ emit_cf_list(struct g9p_ctx *ctx, struct exec_list *list)
       switch (node->type) {
       case nir_cf_node_block:
          nir_foreach_instr(instr, nir_cf_node_as_block(node)) {
+            if (ctx->c->error) return false;
             ctx->ip++;
             /* NIR registers whose live range starts here (a loop's start) */
             for (unsigned d = 0; d < ctx->num_decls; d++) {
@@ -3910,11 +3941,12 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
     * write is the end.
     */
    stack = ctx->stage == MESA_SHADER_COMPUTE || ctx->c->uses_stack;
+   if (ctx->c->error) return g9p_fail(ctx->out, "%s", ctx->c->error);
    body_n = ctx->c->n;
    G9P_A9_SET_BODYLESS(ctx, body_n);
    body = malloc(body_n * sizeof(uint16_t) + 1);
    if (!body)
-      return false;
+      return g9p_fail(ctx->out, "allocation failure framing program code");
    memcpy(body, ctx->c->w, body_n * sizeof(uint16_t));
    ctx->c->n = 0;
    if (ctx->stage == MESA_SHADER_COMPUTE)
@@ -4027,7 +4059,7 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
                g9p_mov_from_high(ctx->c, data, st->data);
             }
             g9p_mem_at(ctx->c, true, G9P_SIZE_U32, data, addrs[k].pair);
-            ctx->c->w[ctx->c->n - 1] |= st->dword;
+            (*g9p_code_word(ctx->c, ctx->c->n - 1)) |= st->dword;
             if (++batch == 8 && i + 1 < ctx->num_vs_stores) {
                g9p_wait(ctx->c);
                batch = 0;
@@ -4079,7 +4111,7 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
       G9P_A9_END_PAD(ctx); g9p_end(ctx->c);
       break;
    }
-   return true;
+   return !ctx->c->error || g9p_fail(ctx->out, "%s", ctx->c->error);
 }
 
 int
@@ -5000,6 +5032,10 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
    ctx.attribs = attribs;
    ctx.frag_coord_slot = frag_coord_slot;
    ctx.c = rzalloc(mem_ctx, struct g9p_code);
+   if (!ctx.c) return g9p_fail(out, "allocation failure allocating program code");
+   ctx.c->alloc_ctx = ctx.c;
+   ctx.c->w = ctx.c->initial_w;
+   ctx.c->capacity = G9P_INITIAL_CODE_WORDS;
    ctx.c->fragment = stage == MESA_SHADER_FRAGMENT;
    ctx.c->high_bank0 = stage == MESA_SHADER_COMPUTE && out->a9;
    ctx.c->a9_stack = stage == MESA_SHADER_COMPUTE && out->a9;
@@ -5018,14 +5054,14 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
    memset(ctx.reg_first, 0xff, impl->ssa_alloc * sizeof(unsigned));
    ctx.decls = ralloc_array(mem_ctx, nir_def *, impl->ssa_alloc);
    ctx.max_exit_jumps = 256;
-   ctx.exit_jumps = ralloc_array(mem_ctx, unsigned, ctx.max_exit_jumps);
+   ctx.exit_jumps = ralloc_array(ctx.c, unsigned, ctx.max_exit_jumps);
+   ctx.num_loops = count_loop_records(&impl->body);
+   ctx.loops = ralloc_array(ctx.c, __typeof__(*ctx.loops), MAX2(ctx.num_loops, 1));
+   if (!ctx.loops || !ctx.exit_jumps)
+      return g9p_fail(out, "allocation failure allocating loop records or exits");
 
    ctx.ip = 0;
    walk_liveness(&ctx, &impl->body, false);
-   if (ctx.loop_index > (out->a9 ? G9P_MAX_LOOPS : 64)) {
-      g9p_fail(out, "too many loops (%u, maximum %u)", ctx.loop_index, out->a9 ? G9P_MAX_LOOPS : 64);
-      return backend_failure(out, &ctx);
-   }
    ctx.ip = 0;
    ctx.loop_index = 0;
    walk_liveness(&ctx, &impl->body, true);
@@ -5064,6 +5100,16 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
       }
       mesa_logi( "g9p: pressure peak %u at instruction %u of %u (%u NIR register scalars)\n",
               peak, peak_ip, ctx.ip, decls);
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            nir_def *def = nir_instr_def(instr);
+            if (def && ctx.def_ip[def->index] == peak_ip) {
+               mesa_logi( "g9p: pressure peak instruction: ");
+               nir_print_instr(instr, stderr);
+               fputc('\n', stderr);
+            }
+         }
+      }
    }
 
    /*
@@ -5080,8 +5126,10 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
    struct {
       unsigned start, end;
       int8_t home;
-   } *homed = ralloc_array(mem_ctx, __typeof__(*homed), 1024);
-   unsigned num_homed = 0;
+   } *homed = NULL;
+   unsigned num_homed = 0, homed_capacity = 1024;
+   homed = ralloc_array(mem_ctx, __typeof__(*homed), homed_capacity);
+   if (!homed) return g9p_fail(out, "allocation failure allocating parked live ranges");
    /* retries that ran out at the same instruction: parking more does not help there */
    unsigned stuck = 0, last_oom_ip = UINT_MAX;
 
@@ -5105,7 +5153,7 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
          continue;
       }
       /* A9 compute parks values above its bank-1 limit in bank 0. */
-      if (!ctx.oom || (stage == MESA_SHADER_COMPUTE && !(out->a9)) || num_homed >= 1024 ||
+      if (!ctx.oom || (stage == MESA_SHADER_COMPUTE && !(out->a9)) ||
           g9p_no_homes)
          return backend_failure(out, &ctx);
       stuck = ctx.oom_ip == last_oom_ip ? stuck + 1 : 0;
@@ -5175,6 +5223,15 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
          if (home < 0) {
             g9p_fail(out, "out of registers above r31 at instruction %u (bank-0 homes exhausted)", ctx.oom_ip);
             return backend_failure(out, &ctx);
+         }
+         if (num_homed == homed_capacity) {
+            unsigned capacity = homed_capacity * 2;
+            __typeof__(homed) ranges = capacity > homed_capacity ?
+               reralloc(mem_ctx, homed, __typeof__(*homed), capacity) : NULL;
+            if (!ranges)
+               return g9p_fail(out, "allocation failure growing parked live ranges");
+            homed = ranges;
+            homed_capacity = capacity;
          }
          homed[num_homed++] = (__typeof__(*homed)){ start, end, (int8_t)home };
          ctx.home[victim] = home;

@@ -109,7 +109,8 @@ static bool a9_barrier(struct g9p_ctx *ctx, nir_intrinsic_instr *in)
    }
    if (scope == SCOPE_WORKGROUP) {
       unsigned N = ctx->a9_barriers_remaining--;
-      if (!N || N > 31) return false;
+      if (!N || N > 31)
+         return g9p_fail(ctx->out, "more than 31 workgroup barrier sites in a compute shader");
       if (n > 32) {
          int r = alloc_temp(ctx), t = alloc_temp(ctx);
          if (r < 0 || t < 0) return false;
