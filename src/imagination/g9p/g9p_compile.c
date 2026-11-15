@@ -62,6 +62,25 @@ g9p_num_regs(void)
  * So a group keeps one task (32 lanes) of that capacity free, as Apple's bank-0
  * term does: 16 at 256 lanes, 24 up to 224, 32 up to 160. What does not fit goes to bank 0 (homes).
  */
+/*
+ * A9 compute: the homes (bank-0 registers above r31) a workgroup of @threads lanes may use. Apple's bank-0
+ * limit for t DOUTU temps is 32 * floor((3329 - a) / a) lanes, a = (4t + 28) & ~31 (the same +0xb08 value);
+ * the temps are 32 + homes rounded up to 8. 256 lanes allow 88 temps (56 homes); at most 64 homes as before.
+ * A kernel that needs more is refused by name here, instead of at pipeline creation.
+ */
+static unsigned
+g9p_a9_max_homes(unsigned threads)
+{
+   unsigned homes = 64;
+   while (homes > 0) {
+      const unsigned t = 8 * DIV_ROUND_UP(32 + homes, 8), a = (4 * t + 28) & ~31u;
+      if (32 * ((3329 - a) / a) >= threads)
+         break;
+      homes -= 8;
+   }
+   return homes;
+}
+
 static unsigned
 g9p_a9_bank1_limit(unsigned threads)
 {
@@ -4989,7 +5008,12 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
          /* a NIR register's range takes in the loops it is used in (use_scalar()) */
          const unsigned end = ctx.last_use[victim];
          /* compute: at most 64 homes, bank 0 up to r95 (the DOUTU temps; residency) */
-         const unsigned max_homes = stage == MESA_SHADER_COMPUTE ? MIN2(g9p_max_homes, 64) : g9p_max_homes;
+         const unsigned max_homes =
+            stage != MESA_SHADER_COMPUTE ? g9p_max_homes
+            : out->a9 ? MIN2(g9p_max_homes, g9p_a9_max_homes(MAX2(out->local_size[0], 1) *
+                                                             MAX2(out->local_size[1], 1) *
+                                                             MAX2(out->local_size[2], 1)))
+                      : MIN2(g9p_max_homes, 64);
          int home = -1;
 
          for (unsigned h = 0; home < 0 && h < max_homes; h++) {
