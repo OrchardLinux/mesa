@@ -14,6 +14,7 @@
 
 #include "vk_enum_to_str.h"
 #include "vk_format.h"
+#include "pvr_g5p_shader_dump.h"
 #include "vk_internal_exts.h"
 #include "vk_log.h"
 #include "vk_util.h"
@@ -165,7 +166,7 @@ g5p_view_state(const struct pvr_image_view *iview, bool storage, uint64_t q[3])
 
 /*
  * The sampled state of a view: q0, q1 in words[], q2 in meta[0..1],
- * meta[2..3] zero, the 32 bytes the backend's image upload reads.
+ * meta[2..3] diagnostic view pointer when logging, otherwise zero.
  */
 static const char *
 g5p_pack_view(const struct pvr_image_view *iview, bool storage, struct pvr_image_descriptor *desc)
@@ -191,6 +192,14 @@ g5p_pack_view(const struct pvr_image_view *iview, bool storage, struct pvr_image
    desc->words[1] = q[1];
    desc->meta[0] = (uint32_t)q[2];
    desc->meta[1] = (uint32_t)(q[2] >> 32);
+   /* q3 is CPU metadata, not one of the three A9 texture-state qwords.
+    * Descriptor copies/templates preserve it. Dispatch logging snapshots the
+    * view immediately, never retaining this pointer in a recorded command. */
+   if (pvr_g5p_compute_log()) {
+      const uintptr_t ptr = (uintptr_t)iview;
+      static_assert(sizeof(ptr) == 8, "A9 userspace pointers");
+      memcpy(&desc->meta[2], &ptr, sizeof(ptr));
+   }
    return NULL;
 }
 

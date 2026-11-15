@@ -276,6 +276,8 @@ struct pvr_sub_cmd_compute {
    /* A kernel record was emitted since the last end of pass: the next one
     * starts with iOS's barrier task (pvr_arch_g5p_compute.c). */
    bool g5p_kernel_since_end;
+   struct pvr_g5p_dispatch_log *g5p_log_first, *g5p_log_last;
+   unsigned g5p_log_count;
 };
 
 struct pvr_sub_cmd_transfer {

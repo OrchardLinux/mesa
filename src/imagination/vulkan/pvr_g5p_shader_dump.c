@@ -30,6 +30,7 @@ DEBUG_GET_ONCE_OPTION(pvr_shader_dump_dir, "PVR_SHADER_DUMP_DIR", "/tmp/pvr-shad
 
 static const char *dump_dir;
 static bool stub_on;
+static bool compute_log;
 static util_once_flag env_once = UTIL_ONCE_FLAG_INIT;
 
 static void
@@ -45,6 +46,7 @@ read_env(void)
       else
          mesa_logi("G5P shader dump: %s (pid %ld)", d, (long)getpid());
    }
+   compute_log = PVR_IS_DEBUG_SET(COMPUTE_LOG);
    stub_on = PVR_IS_DEBUG_SET(CAPTURE_STUB);
    if (stub_on)
       mesa_logw("G5P capture stub: ON (refused shaders are replaced; pictures will be wrong)");
@@ -64,6 +66,13 @@ pvr_g5p_capture_stub(void)
    return stub_on;
 }
 
+bool
+pvr_g5p_compute_log(void)
+{
+   util_call_once(&env_once, read_env);
+   return compute_log;
+}
+
 static bool
 stage_spirv(const VkPipelineShaderStageCreateInfo *info, const uint32_t **words, size_t *bytes)
 {
@@ -80,6 +89,22 @@ stage_spirv(const VkPipelineShaderStageCreateInfo *info, const uint32_t **words,
       return true;
    }
    return false; /* a driver-internal NIR module */
+}
+
+void
+pvr_g5p_shader_id(const VkPipelineShaderStageCreateInfo *info, char id[13])
+{
+   const uint32_t *words;
+   size_t bytes;
+   memcpy(id, "internal-nir", 13);
+   if (stage_spirv(info, &words, &bytes)) {
+      blake3_hash hash;
+      char hex[BLAKE3_OUT_LEN * 2 + 1];
+      _mesa_blake3_compute(words, bytes, hash);
+      _mesa_blake3_format(hex, hash);
+      memcpy(id, hex, 12);
+      id[12] = 0;
+   }
 }
 
 /* write @size bytes to @path through a temporary name and a rename */

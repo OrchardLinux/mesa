@@ -292,7 +292,11 @@ struct pvr_winsys_transfer_submit_info {
    struct pvr_winsys_transfer_cmd cmds[PVR_TRANSFER_MAX_PREPARES_PER_SUBMIT];
 };
 
+struct pvr_g5p_dispatch_log;
+
 struct pvr_winsys_compute_submit_info {
+   const struct pvr_g5p_dispatch_log *g5p_log;
+   unsigned g5p_log_count;
    uint32_t frame_num;
    uint32_t job_num;
 

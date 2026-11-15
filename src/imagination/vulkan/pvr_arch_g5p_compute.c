@@ -18,6 +18,8 @@
 #include "pvr_csb.h"
 #include "pds/pvr_rogue_pds_defs.h"
 #include "pvr_descriptor_set.h"
+#include "pvr_image.h"
+#include "vk_enum_to_str.h"
 #include "pvr_device.h"
 #include "pvr_physical_device.h"
 #include "pvr_pipeline.h"
@@ -38,6 +40,8 @@ PVR_PER_ARCH(g5p_compute_pipeline_compile)(
    struct pvr_compute_pipeline *pipeline)
 {
    struct pvr_g9p_compute_state *state = &pipeline->g9p;
+   state->a9_compute_log = pvr_g5p_compute_log();
+   pvr_g5p_shader_id(&create_info->stage, state->a9_pipeline_id);
    void *mem_ctx = ralloc_context(NULL);
    struct g9p_shader shader;
    nir_shader *nir;
@@ -54,8 +58,11 @@ PVR_PER_ARCH(g5p_compute_pipeline_compile)(
       goto out;
    }
 
-   if (!g9p_a9_compile_compute(nir, &shader, mem_ctx)) {
-      /* Shader capture and diagnostic stubs (pvr_g5p_shader_dump.h). */
+   const bool compiled = g9p_a9_compile_compute(nir, &shader, mem_ctx);
+   for (unsigned i = 0; i < 3; i++) state->a9_log_local[i] = nir->info.workgroup_size[i];
+   state->a9_log_shared = nir->info.shared_size;
+   if (!compiled) {
+      /* PVR_DEBUG=shader_dump / PVR_DEBUG=capture_stub (pvr_g5p_shader_dump.h) */
       const bool stub = pvr_g5p_capture_stub();
       char reason[sizeof(shader.a9_refusal)];
       snprintf(reason, sizeof(reason), "%s", shader.a9_refusal[0] ? shader.a9_refusal : g9p_a9_last_refusal());
@@ -67,6 +74,7 @@ PVR_PER_ARCH(g5p_compute_pipeline_compile)(
                             "G5P compute: shader not supported by the backend yet");
          goto out;
       }
+      state->a9_capture_stub = true;
       mesa_logw("G5P capture stub: compute shader refused (%s): empty kernel, dispatches omitted", reason);
       VkPipelineShaderStageCreateInfo stub_info;
       VkShaderModuleCreateInfo stub_module;
@@ -75,7 +83,10 @@ PVR_PER_ARCH(g5p_compute_pipeline_compile)(
                                                g9p_spirv_options(), g9p_nir_options(), mem_ctx, &nir);
       if (result != VK_SUCCESS)
          goto out;
-      if (!g9p_a9_compile_compute(nir, &shader, mem_ctx)) {
+      const bool compiled = g9p_a9_compile_compute(nir, &shader, mem_ctx);
+   for (unsigned i = 0; i < 3; i++) state->a9_log_local[i] = nir->info.workgroup_size[i];
+   state->a9_log_shared = nir->info.shared_size;
+   if (!compiled) {
          result = vk_errorf(device, VK_ERROR_FEATURE_NOT_PRESENT, "G5P compute: the capture stub was refused");
          goto out;
       }
@@ -181,6 +192,97 @@ emit_record(struct pvr_csb *csb, const struct g5p_cdm_record *rec)
       memcpy(w, rec->w, sizeof(rec->w));
 }
 
+/* Capture complete bound compute resources, including a stub's original
+ * descriptors. No descriptor or pipeline pointers survive command recording. */
+static VkResult
+g5p_record_dispatch(struct pvr_cmd_buffer *cmd, struct pvr_sub_cmd_compute *sub,
+                    uint64_t indirect_va, uint64_t indirect_offset, const uint32_t groups[3])
+{
+   const struct pvr_g9p_compute_state *s = &cmd->state.compute_pipeline->g9p;
+   struct pvr_g5p_dispatch_log *l = calloc(1, sizeof(*l));
+   if (!l) return vk_error(cmd, VK_ERROR_OUT_OF_HOST_MEMORY);
+   size_t size;
+   FILE *f = open_memstream(&l->line, &size);
+   if (!f) { free(l); return vk_error(cmd, VK_ERROR_OUT_OF_HOST_MEMORY); }
+   memcpy(l->pipeline, s->a9_pipeline_id, sizeof(l->pipeline));
+   l->stub = s->a9_capture_stub;
+   fprintf(f, "pipe=%s stub=%u local=%ux%ux%u shared=%u ", l->pipeline, l->stub,
+           s->a9_log_local[0], s->a9_log_local[1], s->a9_log_local[2], s->a9_log_shared);
+   if (indirect_va)
+      fprintf(f, "groups=indirect buffer_va=%#" PRIx64 " offset=%" PRIu64 " args_va=%#" PRIx64,
+              indirect_va - indirect_offset, indirect_offset, indirect_va);
+   else
+      fprintf(f, "groups=%ux%ux%u", groups[0], groups[1], groups[2]);
+   fprintf(f, " res=[");
+   const struct pvr_descriptor_state *desc = &cmd->state.compute_desc_state;
+   const char *sep = "";
+   for (unsigned si = 0; si < PVR_MAX_DESCRIPTOR_SETS; si++) {
+      const struct pvr_descriptor_set *set = desc->sets[si];
+      if (!set || !set->layout || !set->mapping) continue;
+      for (unsigned bi = 0; bi < set->layout->binding_count; bi++) {
+         const struct pvr_descriptor_set_layout_binding *b = &set->layout->bindings[bi];
+         if (!(b->stage_flags & VK_SHADER_STAGE_COMPUTE_BIT)) continue;
+         for (unsigned e = 0; e < b->descriptor_count; e++) {
+            const uint8_t *d = (uint8_t *)set->mapping + b->offset + e * b->stride;
+            switch (b->type) {
+            case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+            case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+            case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+            case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC: {
+               struct pvr_buffer_descriptor buf;
+               if (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC ||
+                   b->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC)
+                  buf = set->dynamic_buffers[b->dynamic_buffer_idx + e];
+               else
+                  memcpy(&buf, d, sizeof(buf));
+               fprintf(f, "%sbuffer %u/%u[%u] VA=%#" PRIx64 " range=%u", sep, si, bi, e, buf.addr + buf.offset, buf.size);
+               sep = "; ";
+               break;
+            }
+            case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+            case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+            case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE: {
+               const struct pvr_image_view *v;
+               uintptr_t ptr;
+               memcpy(&ptr, d + 24, sizeof(ptr));
+               v = (const struct pvr_image_view *)ptr;
+               if (!v) {
+                  fprintf(f, "%simage %u/%u[%u] unbound", sep, si, bi, e);
+               } else {
+                  const struct pvr_image *im = pvr_image_view_get_image(v);
+                  uint64_t q[3];
+                  memcpy(q, d, sizeof(q));
+                  const bool linear = !(q[0] & PVR_G5P_TEX_TWIDDLED);
+                  uint64_t va = (q[1] & ((UINT64_C(1) << 39) - 1) & ~UINT64_C(31)) << 1;
+                  if (linear && (q[1] >> 63)) va |= ((q[2] >> 58) & 3) << 4;
+                  fprintf(f, "%s%s %u/%u[%u] VA=%#" PRIx64 " bytes=%" PRIu64
+                          " %ux%ux%u format=%s view=%s", sep,
+                          b->type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ? "storage" : "sampled",
+                          si, bi, e, va, im->total_size,
+                          u_minify(im->vk.extent.width, v->vk.base_mip_level),
+                          u_minify(im->vk.extent.height, v->vk.base_mip_level), v->vk.layer_count,
+                          vk_Format_to_str(v->vk.format), vk_ImageViewType_to_str(v->vk.view_type));
+                  if (b->type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+                     fprintf(f, " dim=%#x", (q[0] & 7) == PVR_G5P_TEX_LAYOUT_2D_ARRAY ? 0xf7 : 0xf5);
+               }
+               sep = "; ";
+               break;
+            }
+            default: break;
+            }
+         }
+      }
+   }
+   fprintf(f, "]");
+   const bool failed = ferror(f);
+   if (fclose(f) || failed) { free(l->line); free(l); return vk_error(cmd, VK_ERROR_OUT_OF_HOST_MEMORY); }
+   if (sub->g5p_log_last) sub->g5p_log_last->next = l;
+   else sub->g5p_log_first = l;
+   sub->g5p_log_last = l;
+   sub->g5p_log_count++;
+   return VK_SUCCESS;
+}
+
 /*
  * One dispatch: a DMA task loading the buffer addresses (from the bound
  * descriptor sets) and the thread count into the common store, then the
@@ -190,7 +292,7 @@ emit_record(struct pvr_csb *csb, const struct g5p_cdm_record *rec)
 VkResult
 PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
                                struct pvr_sub_cmd_compute *sub_cmd,
-                               uint64_t indirect_va, const uint32_t base_group[static 3],
+                               uint64_t indirect_va, uint64_t indirect_offset, const uint32_t base_group[static 3],
                                const uint32_t group_count[static 3])
 {
    struct pvr_device *device = cmd_buffer->device;
@@ -210,6 +312,11 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
    struct pvr_pds_upload bind, kernel;
    unsigned bind_dwords, ctrl0, nc = 0;
    VkResult result;
+
+   if (state->a9_compute_log) {
+      result = g5p_record_dispatch(cmd_buffer, sub_cmd, indirect_va, indirect_offset, group_count);
+      if (result != VK_SUCCESS) return result;
+   }
 
    if (base_group[0] || base_group[1] || base_group[2])
       return vk_errorf(cmd_buffer, VK_ERROR_OUT_OF_HOST_MEMORY, "G5P: base dispatch not implemented yet");
@@ -695,6 +802,7 @@ PVR_PER_ARCH(g5p_compute_job_submit)(struct pvr_compute_ctx *ctx,
    if (cs->pvr_bo != list_first_entry(&cs->pvr_bo_list, struct pvr_bo, link))
       return vk_errorf(d, VK_ERROR_OUT_OF_HOST_MEMORY, "G5P: chained CDM stream not implemented yet");
    struct pvr_winsys_compute_submit_info info = { .wait = wait,
+      .g5p_log = sub->g5p_log_first, .g5p_log_count = sub->g5p_log_count,
       .frame_num = d->global_queue_present_count, .job_num = d->global_cmd_buffer_submit_count };
    info.fw_stream_len =
       pvr_arch_g5p_compute_stream(d, pvr_csb_get_start_address(cs).addr,

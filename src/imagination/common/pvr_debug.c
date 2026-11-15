@@ -41,6 +41,7 @@ static const struct debug_named_value debug_control[] = {
    { "shader_dump", PVR_DEBUG_SHADER_DUMP, "Capture shader compilation inputs and results." },
    { "capture_stub", PVR_DEBUG_CAPTURE_STUB, "Replace refused shaders with diagnostic stubs; renders incorrect pixels." },
    { "errors", PVR_DEBUG_ERRORS, "Log every Vulkan error the driver returns, with its origin." },
+   { "compute_log", PVR_DEBUG_COMPUTE_LOG, "Log compute pipelines and dispatches." },
    DEBUG_NAMED_VALUE_END
 };
 /* clang-format on */

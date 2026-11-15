@@ -42,6 +42,8 @@ struct pvr_g5p_dump_blob {
 /* NULL when PVR_DEBUG=shader_dump is unset (read once) */
 const char *pvr_g5p_shader_dump_dir(void);
 bool pvr_g5p_capture_stub(void);
+bool pvr_g5p_compute_log(void);
+void pvr_g5p_shader_id(const VkPipelineShaderStageCreateInfo *info, char id[13]);
 
 /* Record one compile of @stage_info (no-op without PVR_DEBUG=shader_dump).
  * @result: "ADMIT", "REFUSE" or "STUB" (refused, then stubbed). */

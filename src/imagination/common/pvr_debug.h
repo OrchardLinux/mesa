@@ -45,6 +45,8 @@ extern uint32_t PVR_DEBUG;
 
 #define PVR_DEBUG_ERRORS BITFIELD_BIT(8)
 
+#define PVR_DEBUG_COMPUTE_LOG BITFIELD_BIT(9)
+
 void pvr_process_debug_variable(void);
 
 #endif /* PVR_DEBUG_H */

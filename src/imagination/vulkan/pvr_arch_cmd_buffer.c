@@ -227,6 +227,11 @@ static void pvr_cmd_buffer_free_sub_cmd(struct pvr_cmd_buffer *cmd_buffer,
       case PVR_SUB_CMD_TYPE_COMPUTE:
       case PVR_SUB_CMD_TYPE_QUERY:
          vk_free(&cmd_buffer->vk.pool->alloc, sub_cmd->compute.g9p_query);
+         for (struct pvr_g5p_dispatch_log *l = sub_cmd->compute.g5p_log_first, *next; l; l = next) {
+            next = l->next;
+            free(l->line);
+            free(l);
+         }
          pvr_csb_finish(&sub_cmd->compute.control_stream);
          break;
 
@@ -7147,6 +7152,7 @@ static VkResult pvr_cmd_upload_push_consts(struct pvr_cmd_buffer *cmd_buffer,
 static void pvr_cmd_dispatch(
    struct pvr_cmd_buffer *const cmd_buffer,
    const pvr_dev_addr_t indirect_addr,
+   const uint64_t indirect_offset,
    const uint32_t base_group[static const PVR_WORKGROUP_DIMENSIONS],
    const uint32_t workgroup_size[static const PVR_WORKGROUP_DIMENSIONS])
 {
@@ -7224,7 +7230,7 @@ void PVR_PER_ARCH(CmdDispatchBase)(VkCommandBuffer commandBuffer,
       return;
 
    pvr_cmd_dispatch(cmd_buffer,
-                    PVR_DEV_ADDR_INVALID,
+                    PVR_DEV_ADDR_INVALID, 0,
                     (uint32_t[]){ baseGroupX, baseGroupY, baseGroupZ },
                     (uint32_t[]){ groupCountX, groupCountY, groupCountZ });
 }
@@ -7239,7 +7245,7 @@ void PVR_PER_ARCH(CmdDispatchIndirect)(VkCommandBuffer commandBuffer,
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
 
    pvr_cmd_dispatch(cmd_buffer,
-                    PVR_DEV_ADDR_OFFSET(buffer->dev_addr, offset),
+                    PVR_DEV_ADDR_OFFSET(buffer->dev_addr, offset), offset,
                     (uint32_t[]){ 0, 0, 0 },
                     (uint32_t[]){ 1, 1, 1 });
 }
