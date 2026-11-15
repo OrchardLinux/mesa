@@ -6359,6 +6359,9 @@ static bool lower(nir_shader *nir, bool preserve_cf)
        * This adds no TPU instruction or shadow-sampling recipe. */
       .lower_txs_lod = nir->info.stage == MESA_SHADER_FRAGMENT ||
                        (nir->info.stage == MESA_SHADER_VERTEX && g5p_vtex_size_lod_probe()),
+      /* Explicit gradients in a vertex program as an explicit level, GL's isotropic formula (G9P's 2e5d5bc3e2f ("pvr/g9p: explicit gradients as explicit levels")): the qualified vertex txl instead of the unqualified gradient recipe. Fragment
+       * gradients keep their device-qualified recipe (R24). */
+      .lower_txd = nir->info.stage == MESA_SHADER_VERTEX && !g5p_vtex_gradient_probe(),
    };
    NIR_PASS(_, nir, nir_lower_tex, &txp);
    NIR_PASS(_, nir, nir_shader_tex_pass, ms_as_2d, nir_metadata_control_flow, NULL);
