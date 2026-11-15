@@ -140,6 +140,23 @@ a9_pack_image_store(nir_builder *b, nir_intrinsic_instr *in, void *data)
    return true;
 }
 
+/* The texture unit takes an integer array layer even for filtered samples. */
+static bool
+a9_lower_array_layer(nir_builder *b, nir_tex_instr *tex, void *data)
+{
+   if (tex->op != nir_texop_txl || tex->sampler_dim != GLSL_SAMPLER_DIM_2D || !tex->is_array)
+      return false;
+   int ci = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   if (ci < 0) return false;
+   b->cursor = nir_before_instr(&tex->instr);
+   nir_def *co = tex->src[ci].src.ssa;
+   nir_def *layer = nir_f2u32(b, nir_fround_even(b, nir_fmax(b, nir_channel(b, co, 2),
+                                                             nir_imm_float(b, 0))));
+   nir_src_rewrite(&tex->src[ci].src,
+                  nir_vec3(b, nir_channel(b, co, 0), nir_channel(b, co, 1), layer));
+   return true;
+}
+
 bool g9p_a9_compile_compute(nir_shader *nir, struct g9p_shader *out, void *mem_ctx)
 {
    nir->options = &nir_options_a9;
@@ -166,14 +183,23 @@ bool g9p_a9_compile_compute(nir_shader *nir, struct g9p_shader *out, void *mem_c
       return false;
    }
    out->a9_local_dwords = 4 + DIV_ROUND_UP(nir->info.shared_size, 4);
+   NIR_PASS(_, nir, nir_shader_tex_pass, a9_lower_array_layer, nir_metadata_control_flow, NULL);
    NIR_PASS(_, nir, nir_lower_compute_system_values, &csv);
    NIR_PASS(_, nir, nir_lower_undef_to_zero, NULL);
    if (!compile_back(nir, out, MESA_SHADER_COMPUTE, NULL, 0, false, false, mem_ctx))
       return false;
    /* the fixed common-store places of texture words (g9p_a9_tex.h) */
-   bool sizes = false;
-   for (unsigned i = 0; i < out->a9_num_uploads; i++)
+   bool sizes = false, lods = false;
+   for (unsigned i = 0; i < out->a9_num_uploads; i++) {
       sizes |= out->a9_uploads[i].kind == G9P_A9_UP_SIZE;
+      lods |= out->a9_uploads[i].kind == G9P_A9_UP_LOD;
+   }
+   if (lods && out->num_buffers > 13) {
+      if (!out->a9_refusal[0])
+         snprintf(out->a9_refusal, sizeof(out->a9_refusal),
+               "more than 13 buffers with shared texture levels (common 28-30)");
+      return false;
+   }
    if (out->a9_num_uploads && out->num_buffers > 15) {
       if (!out->a9_refusal[0])
          snprintf(out->a9_refusal, sizeof(out->a9_refusal),

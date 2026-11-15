@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 #include "../g5p/g5p_usc.h"
+#include "util/half_float.h"
 /*
  * A9 compute samples (WGSL textureSampleLevel/Grad/Load/Dimensions in a
  * compute shader). Apple's A9 kernels (sample(s, uv, level(l)),
@@ -27,6 +28,7 @@ static void
 a9_tex_refuse(struct g9p_ctx *ctx, const char *why)
 {
    if (!ctx->out->a9_refusal[0])
+      if (!ctx->out->a9_refusal[0])
       if (!ctx->out->a9_refusal[0])
       if (!ctx->out->a9_refusal[0])
       if (!ctx->out->a9_refusal[0])
@@ -81,6 +83,36 @@ a9_tex_upload(struct g9p_ctx *ctx, unsigned kind, unsigned set, unsigned binding
       .dwords = kind == G9P_A9_UP_IMAGE ? 8 : kind == G9P_A9_UP_SIZE ? 4 : 2,
    };
    return slots[used];
+}
+
+/* ra_f/sla_f/slc_f use common-store integer/f16 levels, not the
+ * temporary continuation of the older 2D samples. Three literal slots
+ * precede the storage-image level at 31; buffer pointers must end at 27. */
+static int
+a9_tex_shared_lod(struct g9p_ctx *ctx, nir_tex_instr *tex, bool read)
+{
+   int li = nir_tex_instr_src_index(tex, nir_tex_src_lod);
+   if (li >= 0 && !nir_src_is_const(tex->src[li].src)) {
+      a9_tex_refuse(ctx, "dynamic LOD on a compute 2D array or cube (no A9 witness yet)");
+      return -1;
+   }
+   uint32_t value = li < 0 ? 0 : read ? nir_src_as_uint(tex->src[li].src) :
+                                       _mesa_float_to_half(nir_src_as_float(tex->src[li].src));
+   unsigned used = 0;
+   for (unsigned i = 0; i < ctx->out->a9_num_uploads; i++) {
+      const struct g9p_a9_upload *u = &ctx->out->a9_uploads[i];
+      if (u->kind != G9P_A9_UP_LOD) continue;
+      if (u->value == value) return u->common;
+      used++;
+   }
+   if (used == 3 || ctx->out->a9_num_uploads == G9P_A9_MAX_UPLOADS) {
+      a9_tex_refuse(ctx, "more than 3 shared texture levels in a compute shader");
+      return -1;
+   }
+   ctx->out->a9_uploads[ctx->out->a9_num_uploads++] = (struct g9p_a9_upload) {
+      .kind = G9P_A9_UP_LOD, .common = 28 + used, .dwords = 1, .value = value,
+   };
+   return 28 + used;
 }
 
 static bool
@@ -185,9 +217,18 @@ a9_tex(struct g9p_ctx *ctx, nir_tex_instr *tex)
       a9_tex_refuse(ctx, "texture operation not supported in compute shaders yet");
       return false;
    }
-   if (tex->sampler_dim != GLSL_SAMPLER_DIM_2D || tex->is_array || tex->is_shadow) {
-      a9_tex_refuse(ctx, tex->is_shadow ? "a depth-compare sample in a compute shader" :
-                         "only 2D (not array, cube or 3D) samples in compute shaders so far");
+   const bool array = tex->sampler_dim == GLSL_SAMPLER_DIM_2D && tex->is_array;
+   const bool cube = tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE;
+   const bool layered = array || cube;
+   if (tex->is_shadow ||
+       (tex->sampler_dim != GLSL_SAMPLER_DIM_2D && !cube) ||
+       (cube && (tex->is_array || tex->op != nir_texop_txl)) || (array && grad)) {
+      char why[160];
+      const char *dim = cube ? "cube" : tex->sampler_dim == GLSL_SAMPLER_DIM_3D ? "3D" :
+                        array ? "2D array" : tex->sampler_dim == GLSL_SAMPLER_DIM_2D ? "2D" : "other";
+      snprintf(why, sizeof(why), "compute %s on %s is_array=%u is_shadow=%u unsupported",
+               (read ? "txf" : grad ? "txd" : "txl"), dim, tex->is_array, tex->is_shadow);
+      a9_tex_refuse(ctx, why);
       return false;
    }
    if (nir_alu_type_get_base_type(tex->dest_type) != nir_type_float) {
@@ -222,17 +263,21 @@ a9_tex(struct g9p_ctx *ctx, nir_tex_instr *tex)
       return false;
 
    /* coordinates: a fresh block, consumed by the sample */
-   const int block = alloc_range(ctx, 2);
-   if (block < 0 || block > 30)
+   const unsigned coords = layered ? 3 : 2;
+   const int block = alloc_range(ctx, coords);
+   if (block < 0 || block + coords > 32)
       return false;
-   ctx->temps |= BITFIELD64_RANGE(block, 2);
-   for (unsigned c = 0; c < 2; c++)
+   ctx->temps |= BITFIELD64_RANGE(block, coords);
+   for (unsigned c = 0; c < coords; c++)
       if (!a9_tex_copy(ctx, block + c, tex->src[ci].src.ssa, c))
          return false;
 
    /* level (f16 for samples, u32 for reads) or gradients */
    int lod;
-   if (grad) {
+   if (layered) {
+      lod = a9_tex_shared_lod(ctx, tex, read);
+      if (lod < 0) return false;
+   } else if (grad) {
       const int dxi = nir_tex_instr_src_index(tex, nir_tex_src_ddx);
       const int dyi = nir_tex_instr_src_index(tex, nir_tex_src_ddy);
       lod = alloc_range(ctx, 4);
@@ -262,6 +307,13 @@ a9_tex(struct g9p_ctx *ctx, nir_tex_instr *tex)
          g9p_f16_of(ctx->c, lod, r);
       }
    }
+   if (cube) {
+      /* slc_f's cube coordinates (g9p_cube_coords()): bank0 r0..2 directions -> bank1 coords.
+       * Bank0 homes start at r32, so this scratch cannot overwrite them. */
+      for (unsigned c = 0; c < 3; c++)
+         g9p_mov_to_high(ctx->c, c, block + c);
+      g9p_cube_coords(ctx->c, 2 * block, 0);
+   }
    release(ctx, &tex->instr);
    const int dst = alloc_range(ctx, 4);
    if (dst < 0 || dst > 28)
@@ -269,9 +321,11 @@ a9_tex(struct g9p_ctx *ctx, nir_tex_instr *tex)
 
    struct g5p_tex_ext x = {
       .dst_half = 2 * dst, .image_qword = image / 2, .sampler_qword = sampler / 2,
-      .coord_dword = block, .dim = G5P_TEX_2D, .mask = 0xf, .read = read,
+      .coord_dword = block, .dim = cube ? G5P_TEX_CUBE : array ? G5P_TEX_2D_ARRAY : G5P_TEX_2D, .mask = 0xf, .read = read,
       .lod = grad ? G5P_TEX_LOD_GRAD : G5P_TEX_LOD_LEVEL, .lod_dword = lod,
-      .tuple = grad ? G5P_TEX_TUPLE_COUPLED_GRAD : G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL,
+      .lod_shared = layered,
+      .tuple = layered ? G5P_TEX_TUPLE_COUPLED_SHARED_LEVEL :
+               grad ? G5P_TEX_TUPLE_COUPLED_GRAD : G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL,
    };
    uint8_t raw[G5P_USC_MAX];
    const unsigned n = g5p_usc_sample_ext(raw, &x);

@@ -162,6 +162,7 @@ PVR_PER_ARCH(g5p_compute_pipeline_compile)(
       state->a9_uploads[i].level = u->level;
       state->a9_uploads[i].common = u->common;
       state->a9_uploads[i].dwords = u->dwords;
+      state->a9_uploads[i].value = u->value;
    }
    state->uses_workgroup_id = shader.uses_workgroup_id;
    memcpy(state->local_size, shader.local_size, sizeof(state->local_size));
@@ -266,6 +267,10 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
    for(unsigned i=0;i<nup;i++) {
       const __typeof__(state->a9_uploads[0]) *u=&state->a9_uploads[i];
       uint32_t *out=&uniforms[tex0+8*i];
+      if (u->kind == G9P_A9_UP_LOD) {
+         out[0] = u->value;
+         continue;
+      }
       if(u->kind==G9P_A9_UP_FETCH_SAMPLER) {
          const uint64_t policy=pvr_g5p_fetch_sampler_word();
          memcpy(out,&policy,sizeof(policy));

@@ -2,13 +2,14 @@
 #ifndef G9P_A9_H
 #define G9P_A9_H
 /* Compute texture words the dispatch puts in the common store (g9p_a9_tex.h) */
-#define G9P_A9_MAX_UPLOADS 7
-enum g9p_a9_upload_kind { G9P_A9_UP_IMAGE = 1, G9P_A9_UP_SAMPLER, G9P_A9_UP_FETCH_SAMPLER, G9P_A9_UP_SIZE };
+#define G9P_A9_MAX_UPLOADS 10
+enum g9p_a9_upload_kind { G9P_A9_UP_IMAGE = 1, G9P_A9_UP_SAMPLER, G9P_A9_UP_FETCH_SAMPLER, G9P_A9_UP_SIZE, G9P_A9_UP_LOD };
 struct g9p_a9_upload {
    unsigned char kind, set, binding, element;
    unsigned char combined; /* a sampler in a combined image sampler: its words at +32 */
    unsigned char level;    /* a size block's level */
    unsigned char common, dwords;
+   uint32_t value; /* literal common-store LOD */
 };
 /* g9p_shader::a9_bank1_regs: the kernel record's register field allocates bank 1 (g9p_cdm.h) */
 #define G9P_A9_HAS_BANK1_REGS 1
