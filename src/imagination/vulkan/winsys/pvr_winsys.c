@@ -29,10 +29,26 @@
 #include "powervr/pvr_drm_public.h"
 #include "pvr_winsys.h"
 #include "vk_log.h"
+#include "util/u_atomic.h"
 
 #if defined(PVR_SUPPORT_SERVICES_DRIVER)
 #   include "pvrsrvkm/pvr_srv_public.h"
 #endif
+
+/* The kernel charges CREATE_BO memory per process, across winsys instances. */
+static int64_t counted_bytes[2];
+
+void pvr_winsys_count_bo(int kind, int64_t delta)
+{
+   assert(kind >= 0 && kind < ARRAY_SIZE(counted_bytes));
+   p_atomic_add(&counted_bytes[kind], delta);
+}
+
+uint64_t pvr_winsys_counted_bytes(int kind)
+{
+   assert(kind >= 0 && kind < ARRAY_SIZE(counted_bytes));
+   return p_atomic_read(&counted_bytes[kind]);
+}
 
 void pvr_winsys_destroy(struct pvr_winsys *ws)
 {

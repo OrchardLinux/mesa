@@ -37,6 +37,7 @@
 #endif
 
 #include "hwdef/rogue_hw_utils.h"
+#include "pvr_bo_log.h"
 #include "pvr_bo.h"
 #include "pvr_debug.h"
 #include "pvr_device.h"
@@ -338,12 +339,13 @@ static inline void pvr_bo_free_bo(const struct pvr_device *const device,
  *
  * \sa #pvr_bo_free()
  */
-VkResult pvr_bo_alloc(struct pvr_device *device,
-                      struct pvr_winsys_heap *heap,
-                      uint64_t size,
-                      uint64_t alignment,
-                      uint64_t flags,
-                      struct pvr_bo **const pvr_bo_out)
+VkResult pvr_bo_alloc_tagged(const char *tag,
+                             struct pvr_device *device,
+                             struct pvr_winsys_heap *heap,
+                             uint64_t size,
+                             uint64_t alignment,
+                             uint64_t flags,
+                             struct pvr_bo **const pvr_bo_out)
 {
    struct pvr_bo *pvr_bo;
    VkResult result;
@@ -383,6 +385,14 @@ VkResult pvr_bo_alloc(struct pvr_device *device,
 
    pvr_bo_store_insert(device->bo_store, pvr_bo);
    *pvr_bo_out = pvr_bo;
+   if (unlikely(device->bo_log))
+      pvr_bo_log_driver_alloc(device,
+                              tag,
+                              heap,
+                              size,
+                              flags,
+                              pvr_bo,
+                              VK_SUCCESS);
 
    return VK_SUCCESS;
 
@@ -400,6 +410,8 @@ err_free_bo:
    pvr_bo_free_bo(device, pvr_bo);
 
 err_out:
+   if (unlikely(device->bo_log))
+      pvr_bo_log_driver_alloc(device, tag, heap, size, flags, NULL, result);
    return result;
 }
 
@@ -478,6 +490,9 @@ void pvr_bo_free(struct pvr_device *device, struct pvr_bo *pvr_bo)
 #if defined(HAVE_VALGRIND)
    vk_free(&device->vk.alloc, pvr_bo->bo->vbits);
 #endif /* defined(HAVE_VALGRIND) */
+
+   if (unlikely(device->bo_log))
+      pvr_bo_log_free(device, pvr_bo);
 
    pvr_bo_store_remove(device->bo_store, pvr_bo);
 

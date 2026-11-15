@@ -27,6 +27,7 @@
  * SOFTWARE.
  */
 
+#include "pvr_bo_log.h"
 #include "pvr_device.h"
 
 #include <assert.h>
@@ -215,8 +216,14 @@ VkResult pvr_AllocateMemory(VkDevice _device,
    const VkImportMemoryFdInfoKHR *fd_info = NULL;
    VK_FROM_HANDLE(pvr_device, device, _device);
 
-   if (vk_device_is_lost_no_report(&device->vk))
+   if (vk_device_is_lost_no_report(&device->vk)) {
+      if (unlikely(device->bo_log))
+         pvr_bo_log_memory_alloc(device,
+                                 pAllocateInfo,
+                                 NULL,
+                                 VK_ERROR_OUT_OF_DEVICE_MEMORY);
       return vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+   }
    enum pvr_winsys_bo_type type = PVR_WINSYS_BO_TYPE_GPU;
    struct pvr_device_memory *mem;
    VkResult result;
@@ -232,15 +239,27 @@ VkResult pvr_AllocateMemory(VkDevice _device,
    VkDeviceSize aligned_alloc_size =
       ALIGN_POT(pAllocateInfo->allocationSize, device->ws->page_size);
 
-   if (aligned_alloc_size > mem_heap->size)
+   if (aligned_alloc_size > mem_heap->size) {
+      if (unlikely(device->bo_log))
+         pvr_bo_log_memory_alloc(device,
+                                 pAllocateInfo,
+                                 NULL,
+                                 VK_ERROR_OUT_OF_DEVICE_MEMORY);
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   }
 
    mem = vk_device_memory_create(&device->vk,
                                  pAllocateInfo,
                                  pAllocator,
                                  sizeof(*mem));
-   if (!mem)
+   if (!mem) {
+      if (unlikely(device->bo_log))
+         pvr_bo_log_memory_alloc(device,
+                                 pAllocateInfo,
+                                 NULL,
+                                 VK_ERROR_OUT_OF_HOST_MEMORY);
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+   }
 
    vk_foreach_struct_const (sType, ext, pAllocateInfo->pNext) {
       switch ((unsigned)sType) {
@@ -335,6 +354,8 @@ VkResult pvr_AllocateMemory(VkDevice _device,
    }
 
    *pMem = pvr_device_memory_to_handle(mem);
+   if (unlikely(device->bo_log))
+      pvr_bo_log_memory_alloc(device, pAllocateInfo, mem, VK_SUCCESS);
 
    vk_device_memory_report_emit(&device->vk, VK_SUCCESS, /* is_alloc */ true,
                                 mem->vk.import_handle_type != 0,
@@ -346,6 +367,8 @@ VkResult pvr_AllocateMemory(VkDevice _device,
    return VK_SUCCESS;
 
 err_vk_device_memory_destroy:
+   if (unlikely(device->bo_log))
+      pvr_bo_log_memory_alloc(device, pAllocateInfo, NULL, result);
    vk_device_memory_report_emit(&device->vk, result, /* is_alloc */ true,
                                 mem->vk.import_handle_type != 0,
                                 mem->bo ? (uintptr_t)mem->bo : 0,
@@ -428,6 +451,8 @@ void pvr_FreeMemory(VkDevice _device,
    if (mem->bo->map)
       device->ws->ops->buffer_unmap(mem->bo, false);
 
+   if (unlikely(device->bo_log))
+      pvr_bo_log_free(device, mem);
    device->ws->ops->buffer_destroy(mem->bo);
 
    vk_device_memory_destroy(&device->vk, pAllocator, &mem->vk);
@@ -663,11 +688,15 @@ VkResult pvr_BindBufferMemory2(VkDevice _device,
       if (result != VK_SUCCESS) {
          while (i--) {
             VK_FROM_HANDLE(pvr_buffer, buffer, pBindInfos[i].buffer);
+            if (unlikely(device->bo_log))
+               pvr_bo_log_unbind(device, buffer);
             pvr_unbind_memory(device, buffer->vma);
          }
 
          return result;
       }
+      if (unlikely(device->bo_log))
+         pvr_bo_log_buffer(device, buffer, mem, pBindInfos[i].memoryOffset);
    }
 
    return VK_SUCCESS;
@@ -851,6 +880,9 @@ void pvr_DestroyBuffer(VkDevice _device,
 
    if (!buffer)
       return;
+
+   if (unlikely(device->bo_log))
+      pvr_bo_log_unbind(device, buffer);
 
    if (buffer->vma)
       pvr_unbind_memory(device, buffer->vma);

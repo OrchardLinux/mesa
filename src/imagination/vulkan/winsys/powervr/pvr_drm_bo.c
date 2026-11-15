@@ -36,6 +36,7 @@
 
 #include "drm-uapi/pvr_drm.h"
 #include "pvr_drm.h"
+#include "pvr_debug.h"
 #include "pvr_drm_bo.h"
 #include "pvr_macros.h"
 #include "pvr_winsys_helper.h"
@@ -150,6 +151,9 @@ static void pvr_drm_buffer_release(struct pvr_drm_winsys_bo *drm_bo)
    if (p_atomic_dec_return(&drm_bo->ref_count) == 0) {
       uint32_t handle = drm_bo->handle;
 
+      if (PVR_IS_DEBUG_SET(BO_LOG) && drm_bo->count_kind < 2)
+         pvr_winsys_count_bo(drm_bo->count_kind, -(int64_t)drm_bo->base.size);
+
       /* Our BO structs are stored in a sparse array in the winsys structure,
        * so we don't want to free the BO pointer, instead we want to reset it
        * to 0, to signal that array entry as being free.
@@ -193,6 +197,10 @@ pvr_drm_display_buffer_create(struct pvr_drm_winsys *drm_ws,
       return result;
 
    assert((*bo_out)->size >= size);
+
+   to_pvr_drm_winsys_bo(*bo_out)->count_kind = 1;
+   if (PVR_IS_DEBUG_SET(BO_LOG))
+      pvr_winsys_count_bo(1, (*bo_out)->size);
 
    return VK_SUCCESS;
 }
@@ -251,6 +259,9 @@ VkResult pvr_drm_winsys_buffer_create(struct pvr_winsys *ws,
    drm_bo->base.ws = ws;
    drm_bo->handle = handle;
    drm_bo->flags = drm_flags;
+   drm_bo->count_kind = 0;
+   if (PVR_IS_DEBUG_SET(BO_LOG))
+      pvr_winsys_count_bo(0, size);
 
    p_atomic_set(&drm_bo->ref_count, 1);
    g9p_bolog('+', handle, size);
@@ -295,6 +306,7 @@ pvr_drm_winsys_buffer_create_from_fd(struct pvr_winsys *ws,
       drm_bo->base.ws = ws;
       drm_bo->base.size = (uint64_t)size;
       drm_bo->base.is_imported = true;
+      drm_bo->count_kind = 2;
       drm_bo->handle = handle;
 
       p_atomic_set(&drm_bo->ref_count, 1);

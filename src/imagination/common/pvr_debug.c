@@ -42,6 +42,8 @@ static const struct debug_named_value debug_control[] = {
    { "capture_stub", PVR_DEBUG_CAPTURE_STUB, "Replace refused shaders with diagnostic stubs; renders incorrect pixels." },
    { "errors", PVR_DEBUG_ERRORS, "Log every Vulkan error the driver returns, with its origin." },
    { "compute_log", PVR_DEBUG_COMPUTE_LOG, "Log compute pipelines and dispatches." },
+   { "bo_log", PVR_DEBUG_BO_LOG,
+     "Log device-memory and driver BO allocations with size, heap and purpose; live-set summary on any failed allocation and at device destroy." },
    DEBUG_NAMED_VALUE_END
 };
 /* clang-format on */

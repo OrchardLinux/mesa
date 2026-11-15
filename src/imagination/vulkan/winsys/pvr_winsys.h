@@ -489,6 +489,9 @@ struct pvr_winsys {
    const struct pvr_winsys_ops *ops;
 };
 
+void pvr_winsys_count_bo(int kind, int64_t delta);
+uint64_t pvr_winsys_counted_bytes(int kind);
+
 void pvr_winsys_destroy(struct pvr_winsys *ws);
 VkResult pvr_winsys_create(const char *render_path,
                            const char *display_path,

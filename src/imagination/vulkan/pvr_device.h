@@ -217,6 +217,7 @@ struct pvr_device {
    struct pvr_spm_scratch_buffer_store spm_scratch_buffer_store;
 
    struct pvr_bo_store *bo_store;
+   struct pvr_bo_log *bo_log;
 
    struct pvr_bo *robustness_buffer;
 

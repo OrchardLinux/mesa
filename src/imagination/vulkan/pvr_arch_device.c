@@ -10,6 +10,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "pvr_bo_log.h"
 #include "pvr_device.h"
 
 #include "vk_log.h"
@@ -858,6 +859,8 @@ VkResult PVR_PER_ARCH(create_device)(struct pvr_physical_device *pdevice,
    if (result != VK_SUCCESS)
       goto err_vk_device_finish;
 
+   pvr_bo_log_device_init(device);
+
    pvr_bo_suballocator_init(&device->suballoc_general,
                             device->heaps.general_heap,
                             device,
@@ -1057,6 +1060,10 @@ err_pvr_finish_null_pages:
 err_dec_device_count:
    p_atomic_dec(&device->instance->active_device_count);
 
+   if (unlikely(device->bo_log)) {
+      pvr_bo_log_summary(device, "destroy");
+      pvr_bo_log_device_finish(device);
+   }
    pvr_bo_suballocator_fini(&device->suballoc_vis_test);
    pvr_bo_suballocator_fini(&device->suballoc_usc);
    pvr_bo_suballocator_fini(&device->suballoc_transfer);
@@ -1129,6 +1136,10 @@ void PVR_PER_ARCH(destroy_device)(struct pvr_device *device,
    pvr_bo_suballoc_free(device->nop_program.usc);
    pvr_free_list_destroy(device->global_free_list);
    pvr_finish_null_pages(device);
+   if (unlikely(device->bo_log)) {
+      pvr_bo_log_summary(device, "destroy");
+      pvr_bo_log_device_finish(device);
+   }
    pvr_bo_suballocator_fini(&device->suballoc_vis_test);
    pvr_bo_suballocator_fini(&device->suballoc_usc);
    pvr_bo_suballocator_fini(&device->suballoc_transfer);

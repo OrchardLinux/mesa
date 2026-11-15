@@ -117,12 +117,15 @@ struct pvr_suballoc_bo {
  */
 #define PVR_BO_ALLOC_FLAG_PM_FW_PROTECT BITFIELD_BIT(3U)
 
-VkResult pvr_bo_alloc(struct pvr_device *device,
-                      struct pvr_winsys_heap *heap,
-                      uint64_t size,
-                      uint64_t alignment,
-                      uint64_t flags,
-                      struct pvr_bo **const bo_out);
+VkResult pvr_bo_alloc_tagged(const char *tag,
+                             struct pvr_device *device,
+                             struct pvr_winsys_heap *heap,
+                             uint64_t size,
+                             uint64_t alignment,
+                             uint64_t flags,
+                             struct pvr_bo **const bo_out);
+#define pvr_bo_alloc(...) pvr_bo_alloc_tagged(__func__, __VA_ARGS__)
+
 VkResult pvr_bo_cpu_map(struct pvr_device *device, struct pvr_bo *bo);
 void pvr_bo_cpu_unmap(struct pvr_device *device, struct pvr_bo *bo);
 void pvr_bo_free(struct pvr_device *device, struct pvr_bo *bo);
