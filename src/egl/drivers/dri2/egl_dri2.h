@@ -353,6 +353,9 @@ struct dri2_egl_surface {
       bool locked;
       int age;
    } color_buffers[4], *back, *current;
+   /* Wayland: how many of color_buffers this surface may use (2..4,
+    * MESA_EGL_WAYLAND_MAX_BUFFERS). */
+   unsigned max_color_buffers;
 #endif
 
 #ifdef HAVE_ANDROID_PLATFORM

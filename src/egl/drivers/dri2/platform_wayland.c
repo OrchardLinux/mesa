@@ -42,6 +42,7 @@
 #include <vulkan/vulkan_wayland.h>
 
 #include "util/anon_file.h"
+#include "util/u_debug.h"
 #include "util/perf/cpu_trace.h"
 #include "util/u_vector.h"
 #include "util/format/u_formats.h"
@@ -758,6 +759,18 @@ dri2_wl_create_window_surface(_EGLDisplay *disp, _EGLConfig *conf,
    dri2_surf->base.Width = window->width;
    dri2_surf->base.Height = window->height;
 
+   /* A surface takes a third (and fourth) color buffer while the compositor
+    * holds two, and frees a spare only after it has gone unused for
+    * BUFFER_TRIM_AGE_HYSTERESIS frames. A surface that stops drawing, such as
+    * a desktop shell's wallpaper after its first frames, keeps the spare for
+    * good: a whole surface-sized buffer. A client that redraws rarely can
+    * stay double buffered instead and wait for a release when it draws. */
+   int max_buffers = ARRAY_SIZE(dri2_surf->color_buffers);
+   dri2GalliumConfigQueryi(dri2_dpy->dri_screen_render_gpu,
+                          "egl_wayland_max_buffers", &max_buffers);
+   dri2_surf->max_color_buffers =
+      CLAMP(max_buffers, 2, ARRAY_SIZE(dri2_surf->color_buffers));
+
    visual_idx = dri2_wl_visual_idx_from_config(config);
    assert(visual_idx != -1);
    assert(dri2_wl_visuals[visual_idx].pipe_format != PIPE_FORMAT_NONE);
@@ -1292,8 +1305,10 @@ wait_for_free_buffer(struct dri2_egl_display *dri2_dpy,
    /* There might be a buffer release already queued that wasn't processed */
    wl_display_dispatch_queue_pending(dri2_dpy->wl_dpy, dri2_surf->wl_queue);
 
+   const unsigned max_buffers = dri2_surf->max_color_buffers;
+
    while (dri2_surf->back == NULL) {
-      for (int i = 0; i < ARRAY_SIZE(dri2_surf->color_buffers); i++) {
+      for (int i = 0; i < max_buffers; i++) {
          /* Get an unlocked buffer, preferably one with a dri_buffer
           * already allocated and with minimum age.
           */

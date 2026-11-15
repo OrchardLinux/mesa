@@ -66,6 +66,8 @@ driOptionDescription __dri2ConfigOptions[] = {
 
       DRI_CONF_SECTION_PERFORMANCE
          DRI_CONF_VBLANK_MODE(DRI_CONF_VBLANK_DEF_INTERVAL_1)
+         DRI_CONF_OPT_I(egl_wayland_max_buffers, 4, 2, 4,
+                        "Cap on EGL Wayland window-surface colour buffers")
          DRI_CONF_BLOCK_ON_DEPLETED_BUFFERS(false)
       DRI_CONF_SECTION_END
 };
