@@ -18,6 +18,7 @@
 #include "g5p_usc.h"
 #include "g5p_end_barrier.h"
 #include "pvr_bo.h"
+#include "pvr_compute_limits.h"
 #include "pvr_cmd_buffer.h"
 #include "pvr_csb.h"
 #include "pds/pvr_rogue_pds_defs.h"
@@ -98,19 +99,21 @@ PVR_PER_ARCH(g5p_compute_pipeline_compile)(
    }
    {
       const unsigned threads = shader.local_size[0] * shader.local_size[1] * shader.local_size[2];
-      /* Apple's limit keeps all tasks of a barriered workgroup resident. */
-      if (shader.a9) {
+      unsigned max;
+      if (!pvr_compute_wg_residency_ok(&device->pdevice->dev_info,
+                                      shader.num_regs,
+                                      shader.a9_bank1_regs,
+                                      threads,
+                                      shader.a9_has_barriers,
+                                      &max)) {
          const unsigned t = 8 * DIV_ROUND_UP(MAX2(shader.num_regs, 1), 8);
          const unsigned f = 8 * DIV_ROUND_UP(shader.a9_bank1_regs ? shader.a9_bank1_regs : shader.num_regs, 8);
-         const unsigned max = g9p_a9_pipeline_max_lanes(&shader);
-         if (threads > max) {
-            mesa_logw("G5P refuses: a %u-lane workgroup with %u bank-0 and %u bank-1 registers per lane, above "
-                    "the %u lanes Apple's A9 driver allows for that allocation", threads, t, f, max);
-            result = vk_errorf(device, VK_ERROR_FEATURE_NOT_PRESENT,
-                               "G5P compute: %u-lane workgroup above the %u-lane limit of its allocation", threads,
-                               max);
-            goto out;
-         }
+         mesa_logw("G5P refuses: a %u-lane workgroup with %u bank-0 and %u bank-1 registers per lane, above "
+                   "the %u lanes Apple's A9 driver allows for that allocation", threads, t, f, max);
+         result = vk_errorf(device, VK_ERROR_FEATURE_NOT_PRESENT,
+                            "G5P compute: %u-lane workgroup above the %u-lane limit of its allocation", threads,
+                            max);
+         goto out;
       }
    }
 
