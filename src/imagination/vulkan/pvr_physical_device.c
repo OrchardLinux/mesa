@@ -716,7 +716,8 @@ static bool pvr_physical_device_get_properties(
       .maxVertexInputAttributeOffset = 2048U - 1U,
       .maxVertexInputBindingStride = 2048U,
       /* G9P: its 30 varyings (Zink exposes an eighth of this as GL varyings) */
-      .maxVertexOutputComponents = PVR_HAS_FEATURE(dev_info, apple_g9p) ? 120U : 64U,
+      .maxVertexOutputComponents = PVR_HAS_FEATURE(dev_info, apple_g9p) ? 120U :
+         PVR_HAS_FEATURE(dev_info, apple_g5p) ? 112U : 64U, /* G5P: 4 * PCO_G5P_MAX_FS_VARYINGS */
 
       /* Tessellation Limits */
       /* Requires tessellationShader */
@@ -738,7 +739,8 @@ static bool pvr_physical_device_get_properties(
       .maxGeometryTotalOutputComponents = 0U,
 
       /* Fragment Shader Limits */
-      .maxFragmentInputComponents = PVR_HAS_FEATURE(dev_info, apple_g9p) ? 120U : 64U,
+      .maxFragmentInputComponents = PVR_HAS_FEATURE(dev_info, apple_g9p) ? 120U :
+         PVR_HAS_FEATURE(dev_info, apple_g5p) ? 112U : 64U, /* G5P: 4 * PCO_G5P_MAX_FS_VARYINGS */
       .maxFragmentOutputAttachments = PVR_HAS_FEATURE(dev_info, apple_g5p) ? 8U : 4U, /* G5P: 5..8 compact UNORM8 targets */
       .maxFragmentDualSrcAttachments = 0U, /* Requires dualSrcBlend */
       .maxFragmentCombinedOutputResources = PVR_HAS_FEATURE(dev_info, apple_g5p) ? 8U : 4U,
