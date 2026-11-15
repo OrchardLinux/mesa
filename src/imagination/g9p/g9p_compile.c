@@ -313,6 +313,11 @@ struct g9p_ctx {
    /* The decl_reg defs */
    nir_def **decls;
    unsigned num_decls;
+   bool pressure;
+   /* Keys grouped by last use, and ownership released in this generation. */
+   unsigned *dies_at, *dies_keys;
+   uint8_t *released, *is_decl;
+   unsigned emit_loop_index;
 
    /*
     * Fragment NIR registers parked above r31 (per decl_reg key, -1: none),
@@ -320,6 +325,7 @@ struct g9p_ctx {
     */
    int8_t *home;
    unsigned num_homes;
+   bool oom_low;      /* the failed allocation needs r0-r15 */
    bool oom;          /* the last generate() ran out of registers */
    unsigned oom_ip;
 
@@ -498,6 +504,7 @@ alloc_reg(struct g9p_ctx *ctx)
       flush_loads(ctx);
       return alloc_reg(ctx);
    }
+   ctx->oom_low = false;
    dump_busy(ctx);
    return -1;
 }
@@ -634,6 +641,7 @@ alloc_low_temp(struct g9p_ctx *ctx)
          return r;
       }
    }
+   ctx->oom_low = true;
    dump_busy(ctx);
    return -1;
 }
@@ -662,6 +670,7 @@ alloc_low_range(struct g9p_ctx *ctx, unsigned n)
          return r;
       }
    }
+   ctx->oom_low = true;
    dump_busy(ctx);
    return -1;
 }
@@ -718,6 +727,7 @@ alloc_pair(struct g9p_ctx *ctx)
          return r;
       }
    }
+   ctx->oom_low = true;
    dump_busy(ctx);
    return -1;
 }
@@ -733,6 +743,7 @@ alloc_range(struct g9p_ctx *ctx, unsigned n)
          return r;
       }
    }
+   ctx->oom_low = false;
    dump_busy(ctx);
    return -1;
 }
@@ -835,6 +846,8 @@ release_scalar(struct g9p_ctx *ctx, nir_def *def, unsigned comp)
 
    if (ctx->last_use[k] > ctx->ip || ctx->reg[k] < 0)
       return;
+   if (ctx->released)
+      ctx->released[k] = 1;
    /* a NIR register's last use: unpinned and free */
    if (nir_def_is_intrinsic(def) &&
        nir_def_as_intrinsic(def)->intrinsic == nir_intrinsic_decl_reg) {
@@ -1109,6 +1122,160 @@ walk_liveness(struct g9p_ctx *ctx, struct exec_list *list, bool uses)
       }
    }
 }
+
+/* Register ranges from CFG liveness, intersected with reaching writes. SSA
+ * ranges stay as recorded by walk_liveness(). */
+struct reg_block_range { unsigned first, last; };
+
+static void
+number_reg_blocks(struct exec_list *list, unsigned *ip, struct reg_block_range *blk, unsigned *instr_ip)
+{
+   foreach_list_typed(nir_cf_node, node, node, list) {
+      switch (node->type) {
+      case nir_cf_node_block: {
+         nir_block *b = nir_cf_node_as_block(node);
+         blk[b->index].first = *ip + 1;
+         nir_foreach_instr(instr, b) {
+            (*ip)++;
+            instr_ip[instr->index] = *ip;
+         }
+         blk[b->index].last = *ip;
+         if (blk[b->index].first > blk[b->index].last)
+            blk[b->index].first = blk[b->index].last; /* empty block */
+         break;
+      }
+      case nir_cf_node_if: {
+         nir_if *nif = nir_cf_node_as_if(node);
+         (*ip)++;
+         number_reg_blocks(&nif->then_list, ip, blk, instr_ip);
+         number_reg_blocks(&nif->else_list, ip, blk, instr_ip);
+         break;
+      }
+      case nir_cf_node_loop:
+         number_reg_blocks(&nir_cf_node_as_loop(node)->body, ip, blk, instr_ip);
+         break;
+      default:
+         break;
+      }
+   }
+}
+
+static void
+reg_liveness(struct g9p_ctx *ctx, nir_function_impl *impl, void *mem_ctx)
+{
+   const unsigned nd = ctx->num_decls, words = BITSET_WORDS(MAX2(nd, 1));
+   unsigned *decl_of = rzalloc_array(mem_ctx, unsigned, impl->ssa_alloc); /* decl def index -> d + 1 */
+
+   for (unsigned d = 0; d < nd; d++)
+      decl_of[ctx->decls[d]->index] = d + 1;
+   nir_metadata_require(impl, nir_metadata_block_index);
+   const unsigned ni = nir_index_instrs(impl);
+   const unsigned nb = impl->num_blocks;
+   struct reg_block_range *blk = rzalloc_array(mem_ctx, struct reg_block_range, nb);
+   unsigned *instr_ip = rzalloc_array(mem_ctx, unsigned, MAX2(ni, 1)); /* by instr index */
+   BITSET_WORD *gen = rzalloc_array(mem_ctx, BITSET_WORD, nb * words);
+   BITSET_WORD *kill = rzalloc_array(mem_ctx, BITSET_WORD, nb * words);
+   BITSET_WORD *in = rzalloc_array(mem_ctx, BITSET_WORD, nb * words);
+   BITSET_WORD *out = rzalloc_array(mem_ctx, BITSET_WORD, nb * words);
+   unsigned ip = 0;
+
+   number_reg_blocks(&impl->body, &ip, blk, instr_ip);
+   nir_foreach_block(b, impl) {
+      BITSET_WORD *g = gen + b->index * words, *k = kill + b->index * words;
+      nir_foreach_instr(instr, b) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic == nir_intrinsic_load_reg) {
+            const unsigned d = decl_of[intr->src[0].ssa->index] - 1;
+            if (!BITSET_TEST(k, d))
+               BITSET_SET(g, d);
+         } else if (intr->intrinsic == nir_intrinsic_store_reg) {
+            BITSET_SET(k, decl_of[intr->src[1].ssa->index] - 1);
+         }
+      }
+   }
+   for (bool progress = true; progress;) {
+      progress = false;
+      nir_foreach_block_reverse(b, impl) {
+         BITSET_WORD *o = out + b->index * words, *i = in + b->index * words;
+         for (unsigned s = 0; s < 2; s++) {
+            if (!b->successors[s] || b->successors[s] == impl->end_block)
+               continue;
+            const BITSET_WORD *si = in + b->successors[s]->index * words;
+            for (unsigned w = 0; w < words; w++)
+               o[w] |= si[w];
+         }
+         for (unsigned w = 0; w < words; w++) {
+            const BITSET_WORD n = gen[b->index * words + w] | (o[w] & ~kill[b->index * words + w]);
+            if (n != i[w]) {
+               i[w] = n;
+               progress = true;
+            }
+         }
+      }
+   }
+   /* forward: a write reaches the block (an undefined value needs no register: uninitialised paths) */
+   BITSET_WORD *din = rzalloc_array(mem_ctx, BITSET_WORD, nb * words);
+   BITSET_WORD *dout = rzalloc_array(mem_ctx, BITSET_WORD, nb * words);
+   for (bool progress = true; progress;) {
+      progress = false;
+      nir_foreach_block(b, impl) {
+         BITSET_WORD *di = din + b->index * words, *dd = dout + b->index * words;
+         nir_foreach_pred(p, b) {
+            if (p->index >= nb)
+               continue;
+            for (unsigned w = 0; w < words; w++)
+               di[w] |= dout[p->index * words + w];
+         }
+         for (unsigned w = 0; w < words; w++) {
+            const BITSET_WORD n = di[w] | kill[b->index * words + w];
+            if (n != dd[w]) {
+               dd[w] = n;
+               progress = true;
+            }
+         }
+      }
+   }
+   for (unsigned i = 0; i < nb * words; i++) {
+      in[i] &= din[i];
+      out[i] &= dout[i];
+   }
+   unsigned *lo = ralloc_array(mem_ctx, unsigned, MAX2(nd, 1)), *hi = rzalloc_array(mem_ctx, unsigned, MAX2(nd, 1));
+   memset(lo, 0xff, MAX2(nd, 1) * sizeof(unsigned));
+#define REG_SPAN(d, a, z) do { lo[d] = MIN2(lo[d], (a)); hi[d] = MAX2(hi[d], (z)); } while (0)
+   nir_foreach_block(b, impl) {
+      for (unsigned d = 0; d < nd; d++) {
+         if (BITSET_TEST(in + b->index * words, d))
+            REG_SPAN(d, blk[b->index].first, blk[b->index].first);
+         if (BITSET_TEST(out + b->index * words, d))
+            REG_SPAN(d, blk[b->index].last, blk[b->index].last);
+      }
+      nir_foreach_instr(instr, b) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         const unsigned at = instr_ip[instr->index];
+         if (intr->intrinsic == nir_intrinsic_load_reg) {
+            const unsigned d = decl_of[intr->src[0].ssa->index] - 1;
+            REG_SPAN(d, at, MAX2(at, ctx->last_use[key(&intr->def, 0)]));
+         } else if (intr->intrinsic == nir_intrinsic_store_reg) {
+            const unsigned d = decl_of[intr->src[1].ssa->index] - 1;
+            REG_SPAN(d, at, at);
+         }
+      }
+   }
+   /* in+out over a loop: a register live into a block of a loop is live over the whole block range
+    * between; the hull covers it. Replace the walk's stretched ranges. */
+   for (unsigned d = 0; d < nd; d++) {
+      const unsigned k = key(ctx->decls[d], 0);
+      if (lo[d] == UINT_MAX)
+         continue;
+      ctx->reg_first[ctx->decls[d]->index] = lo[d];
+      ctx->last_use[k] = hi[d];
+   }
+}
+#undef REG_SPAN
 
 /* Exactly the loop records visited by walk_liveness(), including nested
  * loops in either arm. Allocate before its two traversals. */
@@ -2384,6 +2551,7 @@ emit_fb_fetch(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
       }
    }
    if (pair < 0) {
+      ctx->oom_low = false;
       dump_busy(ctx);
       return false;
    }
@@ -3754,10 +3922,33 @@ emit_if(struct g9p_ctx *ctx, nir_if *nif)
    return true;
 }
 
+/* A stretched range may end without an instruction reading its key. */
+static void
+expire_keys(struct g9p_ctx *ctx, unsigned end, bool decls_only)
+{
+   if (!ctx->pressure)
+      return;
+   for (unsigned i = ctx->dies_at[end]; i < ctx->dies_at[end + 1]; i++) {
+      const unsigned k = ctx->dies_keys[i];
+      const int r = ctx->reg[k];
+      if (r < 0 || ctx->released[k] ||
+          (decls_only && (!ctx->is_decl[k] || r >= 32)))
+         continue;
+      ctx->released[k] = 1;
+      if (ctx->is_decl[k]) {
+         ctx->pinned &= ~BITFIELD64_BIT(r);
+         ctx->busy &= ~BITFIELD64_BIT(r);
+      } else if (!(ctx->pinned & BITFIELD64_BIT(r))) {
+         ctx->busy &= ~BITFIELD64_BIT(r);
+      }
+   }
+}
+
 static bool
 emit_loop(struct g9p_ctx *ctx, nir_loop *loop)
 {
    unsigned body;
+   const unsigned lidx = ctx->emit_loop_index++;
 
    unsigned first_exit = ctx->num_exit_jumps;
    const unsigned outer_depth = ctx->if_depth;
@@ -3775,6 +3966,8 @@ emit_loop(struct g9p_ctx *ctx, nir_loop *loop)
                      2 * (int)(ctx->c->n - ctx->exit_jumps[j]));
    ctx->num_exit_jumps = first_exit;
    g9p_pop_levels(ctx->c, ctx->st, 2);
+   if (ctx->pressure)
+      expire_keys(ctx, ctx->loops[lidx].end, false);
    return true;
 }
 
@@ -3827,6 +4020,7 @@ emit_cf_list(struct g9p_ctx *ctx, struct exec_list *list)
                return false;
             }
             nir_foreach_def(instr, park_def, ctx);
+            expire_keys(ctx, ctx->ip, true);
          }
          break;
       case nir_cf_node_if:
@@ -3862,6 +4056,9 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
 
    memset(ctx->reg, -1, impl->ssa_alloc * 4);
    memset(ctx->uni, -1, impl->ssa_alloc * 4 * sizeof(*ctx->uni));
+   if (ctx->released)
+      memset(ctx->released, 0, ctx->num_keys);
+   ctx->emit_loop_index = 0;
    ctx->c->n = 0;
    ctx->c->uses_stack = false;
    ctx->busy = ctx->pinned = ctx->temps = 0;
@@ -4920,12 +5117,13 @@ size_of_sampled_level(nir_builder *b, nir_tex_instr *tex, void *data)
 static bool
 compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
              const struct g9p_vertex_attrib *attribs, unsigned frag_coord_slot,
-             bool repeat_loads, bool point_size, void *mem_ctx)
+             bool repeat_loads, bool point_size, void *mem_ctx, bool pressure)
 {
    /* G9P_LATE_OUTPUTS: outputs held to the end unless out of registers, as before */
    /* not with transform feedback: its capture reads the outputs at the end */
    const bool xfb = nir->xfb_info && nir->xfb_info->buffers_written;
-   struct g9p_ctx ctx = { .point_size = point_size, .repeat_loads = repeat_loads,
+   struct g9p_ctx ctx = { .pressure = pressure && stage == MESA_SHADER_COMPUTE && out->a9,
+                          .point_size = point_size, .repeat_loads = repeat_loads,
                           .flush_outputs = repeat_loads ||
                                            (!xfb && !getenv("G9P_LATE_OUTPUTS")) };
    nir_function_impl *impl;
@@ -4973,6 +5171,13 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
             NULL, NULL);
    NIR_PASS(_, nir, nir_opt_algebraic_late);
    optimize(nir);
+   if (ctx.pressure) {
+      /* Fold constant shared addresses into a9_shared()'s word immediate;
+       * CSE otherwise keeps an iadd per inlined copy live. */
+      const nir_opt_offsets_options off = { .shared_max = 16336 };
+      NIR_PASS(_, nir, nir_opt_offsets, &off);
+      optimize(nir);
+   }
    if (stage == MESA_SHADER_FRAGMENT) {
       NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_dynamic_ubo_instr,
                nir_metadata_control_flow, NULL);
@@ -5065,6 +5270,29 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
    ctx.ip = 0;
    ctx.loop_index = 0;
    walk_liveness(&ctx, &impl->body, true);
+
+   if (ctx.pressure) {
+      reg_liveness(&ctx, impl, mem_ctx);
+      const unsigned nip = ctx.ip + 2;
+      unsigned total = 0;
+      ctx.dies_at = rzalloc_array(mem_ctx, unsigned, nip + 1);
+      ctx.released = rzalloc_array(mem_ctx, uint8_t, ctx.num_keys);
+      ctx.is_decl = rzalloc_array(mem_ctx, uint8_t, ctx.num_keys);
+      for (unsigned d = 0; d < ctx.num_decls; d++)
+         ctx.is_decl[key(ctx.decls[d], 0)] = 1;
+      for (unsigned k = 0; k < ctx.num_keys; k++)
+         if (ctx.last_use[k] && ctx.last_use[k] < nip)
+            ctx.dies_at[ctx.last_use[k] + 1]++, total++;
+      for (unsigned i = 1; i <= nip; i++)
+         ctx.dies_at[i] += ctx.dies_at[i - 1];
+      ctx.dies_keys = ralloc_array(mem_ctx, unsigned, MAX2(total, 1));
+      unsigned *fill = ralloc_array(mem_ctx, unsigned, nip);
+      memcpy(fill, ctx.dies_at, nip * sizeof(unsigned));
+      for (unsigned k = 0; k < ctx.num_keys; k++)
+         if (ctx.last_use[k] && ctx.last_use[k] < nip)
+            ctx.dies_keys[fill[ctx.last_use[k]]++] = k;
+   }
+
 
    /* G9P_PRESSURE: the most scalars live at once, from the liveness above */
    if (debug_get_option_g9p_pressure()) {
@@ -5163,79 +5391,116 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
          g9p_fail(out, "out of registers at instruction %u (parking does not help)", ctx.oom_ip);
          return backend_failure(out, &ctx);
       }
-      for (unsigned d = 0; d < ctx.num_decls; d++) {
-         const unsigned k = key(ctx.decls[d], 0);
-
-         if (ctx.home[k] < 0 && ctx.reg_first[ctx.decls[d]->index] <= ctx.oom_ip &&
-             ctx.last_use[k] >= ctx.oom_ip && ctx.last_use[k] > best) {
-            best = ctx.last_use[k];
-            victim = k;
-            victim_decl = true;
+      for (unsigned batch = 0; batch < (ctx.pressure ? 4 : 1); batch++) {
+         best = 0;
+         victim = -1;
+         victim_decl = false;
+         if (ctx.pressure) {
+            const int lim = ctx.oom_low ? 16 : 32;
+            for (unsigned d = 0; d < ctx.num_decls; d++) {
+               const unsigned k = key(ctx.decls[d], 0);
+               const int r = ctx.reg[k];
+               if (ctx.home[k] < 0 && r >= 0 && r < lim &&
+                   (ctx.pinned & BITFIELD64_BIT(r)) &&
+                   ctx.reg_first[ctx.decls[d]->index] <= ctx.oom_ip &&
+                   ctx.last_use[k] >= ctx.oom_ip && ctx.last_use[k] > best) {
+                  best = ctx.last_use[k];
+                  victim = k;
+                  victim_decl = true;
+               }
+            }
+            if (victim < 0) {
+               for (unsigned k = 0; k < ctx.num_keys; k++) {
+                  const int r = ctx.reg[k];
+                  if (!ctx.is_decl[k] && r >= 0 && r < lim && ctx.home[k] < 0 &&
+                      ctx.last_use[k] > ctx.oom_ip && ctx.last_use[k] > best &&
+                      !((ctx.pinned | ctx.temps) & BITFIELD64_BIT(r))) {
+                     best = ctx.last_use[k];
+                     victim = k;
+                  }
+               }
+            }
          }
-      }
-      /* else any NIR register, even past its last use: they stay pinned (dEQP tmp_array) */
-      for (unsigned d = 0; victim < 0 && d < ctx.num_decls; d++) {
-         const unsigned k = key(ctx.decls[d], 0);
+         if (victim < 0) {
+            for (unsigned d = 0; d < ctx.num_decls; d++) {
+               const unsigned k = key(ctx.decls[d], 0);
 
-         if (ctx.home[k] < 0 && ctx.reg_first[ctx.decls[d]->index] <= ctx.oom_ip) {
-            victim = k;
-            victim_decl = true;
+               if (ctx.home[k] < 0 && ctx.reg_first[ctx.decls[d]->index] <= ctx.oom_ip &&
+                   ctx.last_use[k] >= ctx.oom_ip && ctx.last_use[k] > best) {
+                  best = ctx.last_use[k];
+                  victim = k;
+                  victim_decl = true;
+               }
+            }
+            /* else any NIR register, even past its last use: they stay pinned (dEQP tmp_array) */
+            for (unsigned d = 0; victim < 0 && d < ctx.num_decls; d++) {
+               const unsigned k = key(ctx.decls[d], 0);
+
+               if (ctx.home[k] < 0 && ctx.reg_first[ctx.decls[d]->index] <= ctx.oom_ip) {
+                  victim = k;
+                  victim_decl = true;
+               }
+            }
+            /* else the live value (not a NIR register's) with the furthest last use */
+            for (unsigned k = 0, ssa_best = 0; victim < 0 && k < ctx.num_keys; k++) {
+               const int r = ctx.reg[k];
+
+               if (r < 0 || r >= 32 || ctx.home[k] >= 0 || ctx.last_use[k] <= ctx.oom_ip ||
+                   (ctx.pinned | ctx.temps) & BITFIELD64_BIT(r) || ctx.last_use[k] <= ssa_best)
+                  continue;
+               ssa_best = ctx.last_use[k];
+               best = k + 1;
+            }
+            if (victim < 0 && best && best <= ctx.num_keys && ctx.home[best - 1] < 0 &&
+                ctx.reg[best - 1] >= 0)
+               victim = best - 1;
          }
-      }
-      /* else the live value (not a NIR register's) with the furthest last use */
-      for (unsigned k = 0, ssa_best = 0; victim < 0 && k < ctx.num_keys; k++) {
-         const int r = ctx.reg[k];
-
-         if (r < 0 || r >= 32 || ctx.home[k] >= 0 || ctx.last_use[k] <= ctx.oom_ip ||
-             (ctx.pinned | ctx.temps) & BITFIELD64_BIT(r) || ctx.last_use[k] <= ssa_best)
-            continue;
-         ssa_best = ctx.last_use[k];
-         best = k + 1;
-      }
-      if (victim < 0 && best && best <= ctx.num_keys && ctx.home[best - 1] < 0 &&
-          ctx.reg[best - 1] >= 0)
-         victim = best - 1;
-      if (victim < 0) {
-         g9p_fail(out, "out of registers at instruction %u (no parking victim)", ctx.oom_ip);
-         return backend_failure(out, &ctx);
-      }
-      {
-         const unsigned start = victim_decl ? ctx.reg_first[victim / 4] : ctx.def_ip[victim / 4];
-         /* a NIR register's range takes in the loops it is used in (use_scalar()) */
-         const unsigned end = ctx.last_use[victim];
-         /* compute: at most 64 homes, bank 0 up to r95 (the DOUTU temps; residency) */
-         const unsigned max_homes =
-            stage != MESA_SHADER_COMPUTE ? g9p_max_homes
-            : out->a9 ? MIN2(g9p_max_homes, g9p_a9_max_homes(MAX2(out->local_size[0], 1) *
-                                                             MAX2(out->local_size[1], 1) *
-                                                             MAX2(out->local_size[2], 1)))
-                      : MIN2(g9p_max_homes, 64);
-         int home = -1;
-
-         for (unsigned h = 0; home < 0 && h < max_homes; h++) {
-            bool free = true;
-
-            for (unsigned i = 0; free && i < num_homed; i++)
-               free = homed[i].home != 32 + (int)h || homed[i].end < start || end < homed[i].start;
-            if (free)
-               home = 32 + h;
-         }
-         if (home < 0) {
-            g9p_fail(out, "out of registers above r31 at instruction %u (bank-0 homes exhausted)", ctx.oom_ip);
+         if (victim < 0 && batch)
+            break;
+         if (victim < 0) {
+            g9p_fail(out, "out of registers at instruction %u (no parking victim)", ctx.oom_ip);
             return backend_failure(out, &ctx);
          }
-         if (num_homed == homed_capacity) {
-            unsigned capacity = homed_capacity * 2;
-            __typeof__(homed) ranges = capacity > homed_capacity ?
-               reralloc(mem_ctx, homed, __typeof__(*homed), capacity) : NULL;
-            if (!ranges)
-               return g9p_fail(out, "allocation failure growing parked live ranges");
-            homed = ranges;
-            homed_capacity = capacity;
+         {
+            const unsigned start = victim_decl ? ctx.reg_first[victim / 4] : ctx.def_ip[victim / 4];
+            /* a NIR register's range takes in the loops it is used in (use_scalar()) */
+            const unsigned end = ctx.last_use[victim];
+            /* compute: at most 64 homes, bank 0 up to r95 (the DOUTU temps; residency) */
+            const unsigned max_homes =
+               stage != MESA_SHADER_COMPUTE ? g9p_max_homes
+               : out->a9 ? MIN2(g9p_max_homes, g9p_a9_max_homes(MAX2(out->local_size[0], 1) *
+                                                                MAX2(out->local_size[1], 1) *
+                                                                MAX2(out->local_size[2], 1)))
+                         : MIN2(g9p_max_homes, 64);
+            int home = -1;
+
+            for (unsigned h = 0; home < 0 && h < max_homes; h++) {
+               bool free = true;
+
+               for (unsigned i = 0; free && i < num_homed; i++)
+                  free = homed[i].home != 32 + (int)h || homed[i].end < start || end < homed[i].start;
+               if (free)
+                  home = 32 + h;
+            }
+            if (home < 0) {
+               if (batch)
+                  break;
+               g9p_fail(out, "out of registers above r31 at instruction %u (bank-0 homes exhausted)", ctx.oom_ip);
+               return backend_failure(out, &ctx);
+            }
+            if (num_homed == homed_capacity) {
+               unsigned capacity = homed_capacity * 2;
+               __typeof__(homed) ranges = capacity > homed_capacity ?
+                  reralloc(mem_ctx, homed, __typeof__(*homed), capacity) : NULL;
+               if (!ranges)
+                  return g9p_fail(out, "allocation failure growing parked live ranges");
+               homed = ranges;
+               homed_capacity = capacity;
+            }
+            homed[num_homed++] = (__typeof__(*homed)){ start, end, (int8_t)home };
+            ctx.home[victim] = home;
+            ctx.num_homes = MAX2(ctx.num_homes, (unsigned)home - 31);
          }
-         homed[num_homed++] = (__typeof__(*homed)){ start, end, (int8_t)home };
-         ctx.home[victim] = home;
-         ctx.num_homes = MAX2(ctx.num_homes, (unsigned)home - 31);
       }
    }
    st = ctx.max_reg + 1;
@@ -5393,7 +5658,7 @@ g9p_compile_compute(nir_shader *nir, struct g9p_shader *out, void *mem_ctx)
    memset(out, 0, sizeof(*out));
    lower_front(nir);
    NIR_PASS(_, nir, nir_lower_compute_system_values, &csv);
-   return compile_back(nir, out, MESA_SHADER_COMPUTE, NULL, 0, false, false, mem_ctx);
+   return compile_back(nir, out, MESA_SHADER_COMPUTE, NULL, 0, false, false, mem_ctx, false);
 }
 #include "g9p_a9_compute.h"
 /*
@@ -5782,7 +6047,7 @@ g9p_compile_vertex_attempts(nir_shader *nir, const struct g9p_vertex_attrib *att
          nir_shader *n = nir_shader_clone(mem_ctx, attempt[i]);
 
          g9p_no_schedule = i == 2;
-         if (compile_back(n, out, MESA_SHADER_VERTEX, attribs, 0, i > 0, point_size, mem_ctx)) {
+         if (compile_back(n, out, MESA_SHADER_VERTEX, attribs, 0, i > 0, point_size, mem_ctx, false)) {
             g9p_no_schedule = g9p_no_homes = false;
             g9p_max_homes = 92;
             return true;
@@ -6174,7 +6439,7 @@ g9p_compile_fragment(nir_shader *nir, unsigned frag_coord_slot,
          nir_shader *n = nir_shader_clone(mem_ctx, attempt[i]);
 
          g9p_no_schedule = i == 2;
-         if (compile_back(n, out, MESA_SHADER_FRAGMENT, NULL, frag_coord_slot, i > 0, false, mem_ctx)) {
+         if (compile_back(n, out, MESA_SHADER_FRAGMENT, NULL, frag_coord_slot, i > 0, false, mem_ctx, false)) {
             g9p_no_schedule = g9p_no_homes = false;
             g9p_max_homes = 92;
             return true;

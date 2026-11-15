@@ -218,6 +218,7 @@ a9_spill_shared(nir_builder *b, nir_intrinsic_instr *in, void *data)
    return true;
 }
 
+
 bool g9p_a9_compile_compute(nir_shader *nir, struct g9p_shader *out, void *mem_ctx)
 {
    nir->options = &nir_options_a9;
@@ -249,8 +250,17 @@ bool g9p_a9_compile_compute(nir_shader *nir, struct g9p_shader *out, void *mem_c
    NIR_PASS(_, nir, nir_shader_tex_pass, a9_lower_array_layer, nir_metadata_control_flow, NULL);
    NIR_PASS(_, nir, nir_lower_compute_system_values, &csv);
    NIR_PASS(_, nir, nir_lower_undef_to_zero, NULL);
-   if (!compile_back(nir, out, MESA_SHADER_COMPUTE, NULL, 0, false, false, mem_ctx))
-      return false;
+   /* A kernel that ran out of registers is compiled again in pressure mode
+    * (g9p_compile.c "pressure"). Clone before compile_back mutates nir. */
+   nir_shader *again = nir_shader_clone(mem_ctx, nir);
+   const struct g9p_shader saved = *out;
+   if (!compile_back(nir, out, MESA_SHADER_COMPUTE, NULL, 0, false, false, mem_ctx, false)) {
+      if (!again || strncmp(out->a9_refusal, "out of registers", 16))
+         return false;
+      *out = saved;
+      if (!compile_back(again, out, MESA_SHADER_COMPUTE, NULL, 0, false, false, mem_ctx, true))
+         return false;
+   }
    /* the fixed common-store places of texture words (g9p_a9_tex.h) */
    bool sizes = false, lods = false;
    for (unsigned i = 0; i < out->a9_num_uploads; i++) {
