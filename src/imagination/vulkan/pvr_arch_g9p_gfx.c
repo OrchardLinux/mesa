@@ -1640,13 +1640,7 @@ binding_needs_copy(const struct pvr_vertex_binding *vb, uint32_t stride)
  * The copy reads the buffer when the job is submitted: a transfer recorded
  * before the draw (they run on the CPU at submission) may be what fills it.
  */
-struct g9p_realign {
-   const uint8_t *src;
-   uint8_t *dst;
-   uint64_t size, count;
-   uint32_t stride, new_stride;
-   bool gpu_written; /* the source may be written by an earlier GPU job */
-};
+/* struct g9p_realign: pvr_g9p.h (G5P's draws queue them too) */
 
 static void
 realign_copy(const struct g9p_realign *r)

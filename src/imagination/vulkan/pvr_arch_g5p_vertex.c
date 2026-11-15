@@ -41,15 +41,13 @@ PVR_PER_ARCH(g5p_vertex_draw_check)(struct pvr_cmd_buffer *cmd_buffer, const str
       if (t != VK_INDEX_TYPE_UINT16 && t != VK_INDEX_TYPE_UINT32 && t != VK_INDEX_TYPE_UINT8_KHR)
          return G5P_REFUSE(cmd_buffer, "index type %d", t);
    }
-   /* the DDMAD reads dwords: every fetch's base and stride are dword-aligned */
+   /* the DDMAD reads dwords: a binding whose address or stride is off dwords draws from a dword-aligned copy
+    * (pvr_arch_g5p_gfx.c g5p_realign_binding()) */
    for (unsigned f = 0; f < g->fetch_count; f++) {
       const struct pvr_g5p_fetch *fe = &g->fetch_list[f];
       const struct pvr_vertex_binding *vb = &cs->vertex_bindings[fe->binding];
       if (!vb->buffer)
          return G5P_REFUSE(cmd_buffer, "no vertex buffer bound at binding %u", fe->binding);
-      if ((vb->offset + fe->offset) % 4 || dyn->vi_binding_strides[fe->binding] % 4)
-         return G5P_REFUSE(cmd_buffer, "vertex binding %u at offset %" PRIu64 ", stride %u (the fetch is dword-granular)",
-                           fe->binding, (uint64_t)(vb->offset + fe->offset), dyn->vi_binding_strides[fe->binding]);
    }
    return VK_SUCCESS;
 }

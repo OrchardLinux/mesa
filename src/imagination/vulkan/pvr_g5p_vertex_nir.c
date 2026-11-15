@@ -344,6 +344,19 @@ rewrite_load(nir_builder *b, nir_intrinsic_instr *in, void *data)
       /* the component's byte in the fetched dwords; a converted one names
        * its format and byte in the load's base */
       const unsigned at = lead + f.bytes * f.swizzle[comp], reg = rw->base[loc] + at / 4;
+      /* a 32-bit component off dwords (an attribute at an unaligned offset): the two dwords it straddles,
+       * funnel-shifted (the binding itself is dword-aligned, pvr_arch_g5p_gfx.c g5p_realign_binding()) */
+      if (f.convert < 0 && at % 4) {
+         nir_def *w[2];
+         for (unsigned i = 0; i < 2; i++)
+            w[i] = nir_load_input(b, 1, 32, nir_imm_int(b, 0), .base = (reg + i) / 4, .component = (reg + i) % 4,
+                                  .dest_type = nir_type_uint32,
+                                  .io_semantics = (nir_io_semantics){ .location = VERT_ATTRIB_GENERIC0 + (reg + i) / 4,
+                                                                      .num_slots = 1 });
+         const unsigned sh = 8 * (at % 4);
+         c[k] = nir_ior(b, nir_ushr_imm(b, w[0], sh), nir_ishl_imm(b, w[1], 32 - sh));
+         continue;
+      }
       const unsigned base = f.convert < 0 ? reg / 4 : PCO_G5P_VS_CONVERT_BASE + 4 * f.convert + at % 4;
       c[k] = nir_load_input(b, 1, 32, nir_imm_int(b, 0), .base = base, .component = reg % 4, .dest_type = type,
                             .io_semantics = (nir_io_semantics){ .location = VERT_ATTRIB_GENERIC0 + reg / 4,
@@ -425,14 +438,12 @@ pvr_g5p_vertex_lower(nir_shader *vs, struct pvr_g5p_vertex_layout *l)
       /* the fetch is dword-granular: a 32-bit attribute starts on a dword,
        * a converted one is read from the dwords that hold its bytes */
       const unsigned lead = at->offset % 4;
-      if (f.convert < 0 && !f.raw_int && lead)
-         return REFUSE(l, "vertex attribute %u at offset %u (the fetch is dword-granular)", loc, at->offset);
-      if (lead % f.bytes)
+      /* a 32-bit attribute at an offset off dwords: read from the two dwords it straddles (rewrite_load()) */
+      const bool straddle = f.convert < 0 && !f.raw_int && !f.packed_1010102 && lead;
+      if (!straddle && lead % f.bytes)
          return REFUSE(l, "vertex attribute %u: %u-byte components at offset %u", loc, f.bytes, at->offset);
-      if (!l->dynamic_strides && vi->bindings[at->binding].stride % 4)
-         return REFUSE(l, "vertex binding %u: stride %u (the fetch is dword-granular)", at->binding,
-                       vi->bindings[at->binding].stride);
-      converted |= f.convert >= 0 || f.packed_1010102 || f.raw_int;
+      /* a stride off dwords: the draw's copy (pvr_arch_g5p_gfx.c g5p_realign_binding()) */
+      converted |= f.convert >= 0 || f.packed_1010102 || f.raw_int || straddle;
       a[n++] = (struct attrib){ loc, at->binding, DIV_ROUND_UP(lead + f.bytes * f.components, 4), at->offset - lead,
                                 lead, f };
    }

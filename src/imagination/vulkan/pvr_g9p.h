@@ -7,6 +7,7 @@
 #ifndef PVR_G9P_H
 #define PVR_G9P_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include <vulkan/vulkan_core.h>
@@ -23,6 +24,17 @@ struct pvr_graphics_pipeline;
 struct pvr_render_job;
 struct pvr_renderpass_hwsetup_render;
 struct pvr_sub_cmd_compute;
+/* A vertex binding copied to a dword-aligned stride when its job is submitted (pvr_arch_g9p_gfx.c; G5P's draws
+ * queue them too, pvr_arch_g5p_gfx.c): src's count elements of stride bytes to dst at new_stride */
+struct g9p_realign {
+   const uint8_t *src;
+   uint8_t *dst;
+   uint64_t size, count;
+   uint32_t stride, new_stride;
+   bool gpu_written; /* the source may be written by an earlier GPU job */
+   uint64_t dst_addr; /* the copy's device address (G5P reuses a copy across the sub-command's draws) */
+};
+
 struct pvr_sub_cmd_gfx;
 struct vk_graphics_pipeline_state;
 
