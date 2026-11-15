@@ -10,7 +10,7 @@ struct g9p_a9_upload {
    unsigned char level;    /* a size block's level */
    unsigned char common, dwords;
 };
-#define G9P_A9_FIELDS bool a9; bool a9_bodyless; bool a9_unit_z; unsigned a9_local_dwords; bool a9_has_barriers; bool a9_device_fence; \
+#define G9P_A9_FIELDS bool a9; unsigned a9_bank1_regs; bool a9_bodyless; bool a9_unit_z; unsigned a9_local_dwords; bool a9_has_barriers; bool a9_device_fence; \
    unsigned a9_num_uploads; struct g9p_a9_upload a9_uploads[G9P_A9_MAX_UPLOADS]; char a9_refusal[192];
 #define G9P_A9_END_PAD(ctx) do { if ((ctx)->out->a9 && (2*(ctx)->c->n+6)%64==0) G9P_EMIT((ctx)->c,0xc000); } while(0)
 /* Keep main's G9P numbering; only the A9 backend uses NIR-order breaks. */

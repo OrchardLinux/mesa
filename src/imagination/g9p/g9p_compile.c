@@ -4960,7 +4960,7 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
          const unsigned start = victim_decl ? ctx.reg_first[victim / 4] : ctx.def_ip[victim / 4];
          /* a NIR register's range takes in the loops it is used in (use_scalar()) */
          const unsigned end = ctx.last_use[victim];
-         /* compute: at most 96 registers per lane (G9P_CDM_KERNEL_REGS' field; residency) */
+         /* compute: at most 64 homes, bank 0 up to r95 (the DOUTU temps; residency) */
          const unsigned max_homes = stage == MESA_SHADER_COMPUTE ? MIN2(g9p_max_homes, 64) : g9p_max_homes;
          int home = -1;
 
@@ -5100,6 +5100,12 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
    out->num_regs = MAX2(st + 1, ctx.num_homes || ctx.num_vs_high
                                    ? 32 + ctx.num_homes + ctx.num_vs_high
                                    : 0);
+   /* A9 compute: the code's own registers (bank 1, r0..r@st) are what the CDM record's register field
+    * allocates; its homes are bank 0's, which the DOUTU temps (num_regs) allocate (g9p_mov_to_high()) */
+   if (ctx.c->high_bank0) {
+      assert(st + 1 <= 32);
+      out->a9_bank1_regs = st + 1;
+   }
    out->code = ctx.c->w;
    out->code_size = 2 * ctx.c->n;
    if (stage != MESA_SHADER_COMPUTE && st + 1 > 32) {
