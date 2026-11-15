@@ -38,6 +38,8 @@ static const struct debug_named_value debug_control[] = {
      "Dump descriptor set and pipeline layouts." },
    { "info", PVR_DEBUG_INFO,
      "Display information about the driver and device." },
+   { "shader_dump", PVR_DEBUG_SHADER_DUMP, "Capture shader compilation inputs and results." },
+   { "capture_stub", PVR_DEBUG_CAPTURE_STUB, "Replace refused shaders with diagnostic stubs; renders incorrect pixels." },
    { "errors", PVR_DEBUG_ERRORS, "Log every Vulkan error the driver returns, with its origin." },
    DEBUG_NAMED_VALUE_END
 };

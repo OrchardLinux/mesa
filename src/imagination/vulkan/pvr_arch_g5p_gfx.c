@@ -55,6 +55,7 @@
 #include "pvr_g5p_tex_encode.h"
 #include "pvr_g5p_upload.h"
 #include "pvr_g5p_xfb.h"
+#include "pvr_g5p_shader_dump.h"
 #include "pvr_g5p_ds.h"
 #include "pvr_g5p_msaa.h"
 #include "pvr_g5p_vertex.h"
@@ -594,8 +595,26 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
    key.depth_feedback = false;
    /* the fragment program first: the vertex program is compiled against the
     * varyings it reads (Apple's VertexProgramKey; Rogue's pco_rev_link_nir) */
-   if (!pvr_g5p_compile_stage(fs_info, true, g->samples, NULL, &key, NULL, fs))
-      return G5P_REFUSE(device, "fragment shader: %s", fs->refusal);
+   /* PVR_G5P_SHADER_DUMP / PVR_G5P_CAPTURE_STUB (pvr_g5p_shader_dump.h) */
+   VkPipelineShaderStageCreateInfo stub_info, fs_stub_info;
+   VkShaderModuleCreateInfo stub_module, fs_stub_module;
+   const uint32_t dump_samples = g->samples;
+   const struct pvr_g5p_dump_blob fs_blobs[] = { { "fs_key", &key, sizeof(key) },
+                                                 { "samples", &dump_samples, sizeof(dump_samples) } };
+   if (!pvr_g5p_compile_stage(fs_info, true, g->samples, NULL, &key, NULL, fs)) {
+      const bool stub = pvr_g5p_capture_stub();
+      pvr_g5p_shader_dump(fs_info, create_info->layout, "frag", fs_blobs, ARRAY_SIZE(fs_blobs),
+                          stub ? "STUB" : "REFUSE", fs->refusal);
+      if (!stub)
+         return G5P_REFUSE(device, "fragment shader: %s", fs->refusal);
+      mesa_logw("G5P capture stub: fragment shader refused (%s): magenta stub", fs->refusal);
+      *fs = (struct pco_g5p_program){ 0 };
+      fs_info = pvr_g5p_stub_stage(VK_SHADER_STAGE_FRAGMENT_BIT, &fs_stub_info, &fs_stub_module);
+      if (!pvr_g5p_compile_stage(fs_info, true, g->samples, NULL, &key, NULL, fs))
+         return G5P_REFUSE(device, "fragment shader stub: %s", fs->refusal);
+   } else {
+      pvr_g5p_shader_dump(fs_info, create_info->layout, "frag", fs_blobs, ARRAY_SIZE(fs_blobs), "ADMIT", NULL);
+   }
    struct pco_g5p_vs_link link = { .valid = true };
    /* points (Apple's g3b-points): the point size after the position; the
     * topology class is fixed per pipeline even when the topology is dynamic */
@@ -605,9 +624,35 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
    for (unsigned i = 0; i < fs->num_varyings; i++)
       link.interp[fs->vary[i].location] = fs->vary[i].interp;
    /* the transform feedback variant (pvr_g5p_xfb.h): the capturing vertex program */
+   /* the vertex input state itself (the layout holds a pointer to it) and the link, for replay */
+   const struct pvr_g5p_dump_blob vs_blobs[] = { { "vertex_input", s->vi, s->vi ? sizeof(*s->vi) : 0 },
+                                                 { "dynamic_strides", &vertex.dynamic_strides, 1 },
+                                                 { "vs_link", &link, sizeof(link) } };
    if (g->xfb_variant ? !pvr_g5p_compile_vs_xfb(vs_info, &vertex, &link, &g->xfb_layout, vs)
-                      : !pvr_g5p_compile_stage(vs_info, false, 1, &vertex, NULL, &link, vs))
-      return G5P_REFUSE(device, "vertex shader%s: %s", g->xfb_variant ? " (transform feedback)" : "", vs->refusal);
+                      : !pvr_g5p_compile_stage(vs_info, false, 1, &vertex, NULL, &link, vs)) {
+      const bool stub = pvr_g5p_capture_stub() && !g->xfb_variant;
+      pvr_g5p_shader_dump(vs_info, create_info->layout, g->xfb_variant ? "vert-xfb" : "vert", vs_blobs,
+                          ARRAY_SIZE(vs_blobs), stub ? "STUB" : "REFUSE", vs->refusal);
+      if (!stub)
+         return G5P_REFUSE(device, "vertex shader%s: %s", g->xfb_variant ? " (transform feedback)" : "", vs->refusal);
+      mesa_logw("G5P capture stub: vertex shader refused (%s): point stub, nothing drawn", vs->refusal);
+      *vs = (struct pco_g5p_program){ 0 };
+      vs_info = pvr_g5p_stub_stage(VK_SHADER_STAGE_VERTEX_BIT, &stub_info, &stub_module);
+      /* the stub writes no varyings: a fragment program reading some becomes the magenta stub too */
+      if (fs->num_varyings) {
+         free(fs->code);
+         *fs = (struct pco_g5p_program){ 0 };
+         fs_info = pvr_g5p_stub_stage(VK_SHADER_STAGE_FRAGMENT_BIT, &fs_stub_info, &fs_stub_module);
+         if (!pvr_g5p_compile_stage(fs_info, true, g->samples, NULL, &key, NULL, fs))
+            return G5P_REFUSE(device, "fragment shader stub: %s", fs->refusal);
+         memset(link.interp, 0, sizeof(link.interp));
+      }
+      if (!pvr_g5p_compile_stage(vs_info, false, 1, &vertex, NULL, &link, vs))
+         return G5P_REFUSE(device, "vertex shader stub: %s", vs->refusal);
+   } else {
+      pvr_g5p_shader_dump(vs_info, create_info->layout, g->xfb_variant ? "vert-xfb" : "vert", vs_blobs,
+                          ARRAY_SIZE(vs_blobs), "ADMIT", NULL);
+   }
    if (g->xfb_variant && !g->xfb_layout.buffers)
       return VK_SUCCESS; /* captures nothing: no variant */
    /* point fill rasterizes ISP points of one size per draw (pointlinewidth): a per-vertex

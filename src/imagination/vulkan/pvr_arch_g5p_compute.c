@@ -23,6 +23,7 @@
 #include "pvr_pipeline.h"
 #include "pvr_g5p.h"
 #include "pvr_g5p_tex_encode.h"
+#include "pvr_g5p_shader_dump.h"
 #include "hwdef/rogue_hw_utils.h"
 #include "pvr_g5p_compute.h"
 #include "pvr_job_context.h"
@@ -47,15 +48,39 @@ PVR_PER_ARCH(g5p_compute_pipeline_compile)(
                                             &create_info->stage,
                                             g9p_spirv_options(),
                                             g9p_nir_options(), mem_ctx, &nir);
-   if (result != VK_SUCCESS)
+   if (result != VK_SUCCESS) {
+      pvr_g5p_shader_dump(&create_info->stage, create_info->layout, "comp", NULL, 0, "REFUSE",
+                          "SPIR-V to NIR failed");
       goto out;
+   }
 
    if (!g9p_a9_compile_compute(nir, &shader, mem_ctx)) {
-      mesa_logw("pvr/g5p: compute pipeline refused: %s",
-              shader.a9_refusal[0] ? shader.a9_refusal : "no reason recorded");
-      result = vk_errorf(device, VK_ERROR_FEATURE_NOT_PRESENT,
-                         "G5P compute: shader not supported by the backend yet");
-      goto out;
+      /* Shader capture and diagnostic stubs (pvr_g5p_shader_dump.h). */
+      const bool stub = pvr_g5p_capture_stub();
+      char reason[sizeof(shader.a9_refusal)];
+      snprintf(reason, sizeof(reason), "%s", shader.a9_refusal[0] ? shader.a9_refusal : "no reason recorded");
+      pvr_g5p_shader_dump(&create_info->stage, create_info->layout, "comp", NULL, 0, stub ? "STUB" : "REFUSE",
+                          reason);
+      if (!stub) {
+         mesa_logw("pvr/g5p: compute pipeline refused: %s", reason);
+         result = vk_errorf(device, VK_ERROR_FEATURE_NOT_PRESENT,
+                            "G5P compute: shader not supported by the backend yet");
+         goto out;
+      }
+      mesa_logw("G5P capture stub: compute shader refused (%s): empty kernel, dispatches omitted", reason);
+      VkPipelineShaderStageCreateInfo stub_info;
+      VkShaderModuleCreateInfo stub_module;
+      pvr_g5p_stub_stage(VK_SHADER_STAGE_COMPUTE_BIT, &stub_info, &stub_module);
+      result = vk_pipeline_shader_stage_to_nir(&device->vk, pipeline->base.pipeline_flags, &stub_info,
+                                               g9p_spirv_options(), g9p_nir_options(), mem_ctx, &nir);
+      if (result != VK_SUCCESS)
+         goto out;
+      if (!g9p_a9_compile_compute(nir, &shader, mem_ctx)) {
+         result = vk_errorf(device, VK_ERROR_FEATURE_NOT_PRESENT, "G5P compute: the capture stub was refused");
+         goto out;
+      }
+   } else {
+      pvr_g5p_shader_dump(&create_info->stage, create_info->layout, "comp", NULL, 0, "ADMIT", NULL);
    }
    /* A barrier above 32 lanes waits for every task of the workgroup
     * (Apple's software barrier, g5p_barrier.h), so all of them must be

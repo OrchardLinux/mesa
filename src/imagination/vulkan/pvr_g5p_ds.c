@@ -21,6 +21,7 @@
 #include "csbgen/rogue/ppp.h"
 
 #include "pvr_g5p_ds.h"
+#include "pvr_g5p_shader_dump.h"
 
 static uint32_t
 g5p_pot(uint32_t v)
@@ -129,10 +130,13 @@ pvr_g5p_ds_zls(const struct pvr_g5p_ds_target *t, struct pvr_g5p_zls_words *out)
    if (!pvr_g5p_ds_layout(t->format, t->width, t->height, t->samples, &plane))
       return "a depth/stencil attachment of 0 pixels, or not 1 or 4 samples";
    const bool d = t->depth && f->depth, s = t->stencil && f->stencil;
-   const bool zload = d && t->zload, zstore = d && t->zstore;
-   const bool sload = s && t->sload, sstore = s && t->sstore;
-   if (t->samples == 4 && (zload || zstore || sload || sstore))
-      return "a load or store of a 4-sample depth/stencil attachment (no multisample ZLS capture: it stays on chip)";
+   bool zload = d && t->zload, zstore = d && t->zstore;
+   bool sload = s && t->sload, sstore = s && t->sstore;
+   if (t->samples == 4 && (zload || zstore || sload || sstore)) {
+      if (!pvr_g5p_capture_stub())
+         return "a load or store of a 4-sample depth/stencil attachment (no multisample ZLS capture: it stays on chip)";
+      zload = zstore = sload = sstore = false; /* PVR_G5P_CAPTURE_STUB: dropped, logged at the pass */
+   }
 
    const struct ROGUE_CR_ISP_ZLSCTL ctl = {
       .loadtwiddled = true,

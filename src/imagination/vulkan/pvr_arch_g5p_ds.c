@@ -22,6 +22,7 @@
 #include "pvr_cmd_buffer.h"
 #include "pvr_csb.h"
 #include "pvr_g5p_ds.h"
+#include "pvr_g5p_shader_dump.h"
 #include "pvr_g5p_tex_encode.h"
 #include "pvr_hw_pass.h"
 #include "pvr_image.h"
@@ -74,9 +75,18 @@ PVR_PER_ARCH(g5p_ds_admit)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_r
                            " (pvr_g5p_ds_layout())", (uint64_t)image->total_size, plane.size);
    if (image->vk.samples == VK_SAMPLE_COUNT_4_BIT &&
        (hw_render->depth_init == VK_ATTACHMENT_LOAD_OP_LOAD || hw_render->stencil_init == VK_ATTACHMENT_LOAD_OP_LOAD ||
-        hw_render->depth_store || hw_render->stencil_store))
-      return G5P_DS_REFUSE(cmd_buffer, "a load or store of a 4-sample depth/stencil attachment "
-                           "(no multisample ZLS capture: it stays on chip)");
+        hw_render->depth_store || hw_render->stencil_store)) {
+      if (!pvr_g5p_capture_stub())
+         return G5P_DS_REFUSE(cmd_buffer, "a load or store of a 4-sample depth/stencil attachment "
+                              "(no multisample ZLS capture: it stays on chip)");
+      /* PVR_G5P_CAPTURE_STUB: the pass goes on, its ZLS load/store dropped (pvr_g5p_ds_zls()) */
+      static bool told;
+      if (!told) {
+         told = true;
+         fprintf(stderr, "G5P capture stub: 4-sample depth/stencil load/store dropped (depth is not kept between "
+                         "passes)\n");
+      }
+   }
    return VK_SUCCESS;
 }
 
