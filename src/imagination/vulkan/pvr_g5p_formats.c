@@ -18,6 +18,7 @@
 #include <string.h>
 
 #include "util/log.h"
+#include "util/u_debug.h"
 #include "vk_enum_to_str.h"
 #include "vk_format.h"
 
@@ -30,6 +31,7 @@ pvr_g5p_formats_probe(void)
 {
    return false;
 }
+
 
 bool
 pvr_g5p_format_tex(VkFormat format, uint32_t *key, bool *srgb)

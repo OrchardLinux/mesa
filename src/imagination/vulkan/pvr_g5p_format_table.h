@@ -64,7 +64,7 @@ enum pvr_g5p_fmt_flags {
    PVR_G5P_FMT_BLEND = 1u << 3,        /* blending into it (the fragment program's) */
    PVR_G5P_FMT_COMPRESSED = 1u << 4,   /* blocks (4x4 ETC2/EAC, 4x4..12x12 ASTC), twiddled only */
    PVR_G5P_FMT_INTEGER = 1u << 5,      /* integer texel: texelFetch/unfiltered */
-   /* not advertised (none at present) */
+   /* narrow integer render rows remain unadvertised probes */
    PVR_G5P_FMT_PROBE_SAMPLED = 1u << 8, /* the sampled bits are a probe */
    PVR_G5P_FMT_PROBE_RENDER = 1u << 9,  /* the render (and blend) bits are a probe */
    PVR_G5P_FMT_PROBE_BLEND = 1u << 10,  /* the blend bit alone is a probe */
