@@ -59,6 +59,11 @@ uint64_t pvr_g5p_msaa_sample_offset(uint32_t width, uint32_t height, uint32_t cp
 void pvr_g5p_msaa_pbe_store(uint64_t q[3], uint32_t key, uint64_t va, uint32_t width, uint32_t height,
                             bool srgb);
 void pvr_g5p_msaa_pbe_resolve(uint64_t q[3]);
+/* The texture state the 4x LOAD background samples (the 2D-multisample fetch, g5p_usc.h
+ * G5P_TEX_2D_MS): the store's surface, W x H pixels, layout 4 twiddled and q0 bit 55, no PBE bit
+ * (Apple's 4x colour load of a 64x64 BGRA8 target differs from its PBE store words in exactly those
+ * fields). */
+void pvr_g5p_msaa_tex_state(uint64_t q[3], uint32_t key, uint64_t va, uint32_t width, uint32_t height, bool srgb);
 
 /* The end-of-tile program of a one-target 4x store: the one-target program
  * (g5p_mrt_eot_usc(out, 1)) with the emitpix's sample field 2 instead of 1
@@ -100,8 +105,8 @@ struct pvr_cmd_buffer;
 struct pvr_renderpass_hwsetup_render;
 
 /* job_init: refuses, by name, a multisample render this lane does not
- * build (only 1 and 4 samples; at 4: one colour target, no LOAD, no
- * multisample depth/stencil load or store). VK_SUCCESS at one sample. */
+ * build (only 1 and 4 samples; at 4: one colour target, stored or resolved;
+ * its LOAD is Apple's 4x loader, pvr_arch_g5p.c). VK_SUCCESS at one sample. */
 VkResult PVR_PER_ARCH(g5p_msaa_admit)(struct pvr_cmd_buffer *cmd_buffer,
                                       const struct pvr_renderpass_hwsetup_render *hw_render);
 

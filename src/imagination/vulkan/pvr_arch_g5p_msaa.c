@@ -19,9 +19,9 @@
 
 
 /*
- * The captured 4x pass: one colour target of 4-byte samples, cleared or
- * don't-care, either stored with its samples (msaa4-store) or resolved by
- * the PBE into a one-sample target at the end of each tile (msaa4-resolve),
+ * The captured 4x pass: one colour target of 4-byte samples, cleared,
+ * loaded or don't-care, either stored with its samples or resolved by
+ * the PBE into a one-sample target at the end of each tile,
  * a depth/stencil attachment on chip only. Upstream's hardware setup lists
  * the resolve as an end-of-tile surface with need_resolve and resolve_type
  * PVR_RESOLVE_TYPE_PBE.
@@ -39,9 +39,7 @@ PVR_PER_ARCH(g5p_msaa_admit)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr
       return G5P_REFUSE(cmd_buffer, "4x with %u end-of-tile surfaces (one target, stored or resolved: a "
                              "STORE with a resolve needs the CPU resolve after the job)",
                              hw_render->eot_surface_count);
-   for (unsigned i = 0; i < hw_render->color_init_count; i++)
-      if (hw_render->color_init[i].op == VK_ATTACHMENT_LOAD_OP_LOAD)
-         return G5P_REFUSE(cmd_buffer, "LOAD of a 4-sample attachment (no multisample background loader)");
+   /* a LOAD of the target: Apple's 4x loader (pvr_arch_g5p.c) */
 
    const struct pvr_renderpass_hwsetup_eot_surface *eot = &hw_render->eot_surfaces[0];
    const struct pvr_image_view *iview = info->attachments[eot->need_resolve ? eot->src_attachment_idx

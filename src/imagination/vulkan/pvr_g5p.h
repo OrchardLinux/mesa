@@ -123,6 +123,8 @@ struct pvr_g5p_programs {
    struct pvr_g5p_programs *raw_load[11]; /* scalar R8 uses10/11, separate fromRGBA8 */
    /* Lazy compact LOAD programs: 5..8 targets, BGRA8 [0..3] and RGBA8 [4..7] */
    struct pvr_g5p_programs *mrt_load[8];
+   /* Lazy 4x LOAD (one UNORM/float target, pvr_g5p_compile_load_ms()), kicked at sample rate */
+   struct pvr_g5p_programs *ms_load;
    /* raw clear programs by total output words: 2, 4, 8 (two 32-bit integer targets) */
    struct pvr_suballoc_bo *raw_clear_usc[4]; /*2/4/8 words, then scalar1 */
    /* raw end-of-tile programs by target count: 1, 2 */
@@ -355,6 +357,9 @@ bool pvr_g5p_compile_load_rgb10a2ui(struct pco_g5p_program *out);
 bool pvr_g5p_compile_load_rgba8ui(struct pco_g5p_program *out);
 bool pvr_g5p_compile_load_rgba16ui(struct pco_g5p_program *out);
 bool pvr_g5p_compile_load_raw(struct pco_g5p_program *out, bool is_signed);
+/* the 4x LOAD background (Apple's loader at sample rate, pvr_g5p_nir.c) */
+#define PVR_G5P_HAVE_LOAD_MS 1
+bool pvr_g5p_compile_load_ms(struct pco_g5p_program *out);
 /* The compact LOAD background of 5..8 UNORM8 targets: texelFetch of every
  * target (set 0, binding t), packed as the compact output. */
 bool pvr_g5p_compile_load_mrt(struct pco_g5p_program *out, unsigned targets, bool bgra);

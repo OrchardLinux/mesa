@@ -125,6 +125,15 @@ struct pco_g5p_fs_key {
     * keeping the destination alpha from a tile read issued before its kill. 1: the program may discard;
     * The qualified masked form is selected at pipeline creation. */
    uint8_t mask_upass;
+   /* The 4x LOAD background only (pvr_g5p_compile_load_ms()): its one plain 2D sample reads the target's
+    * 2D-multisample state at the task's own sample, as Apple's loader (an iOS capture of a
+    * 4x colour load): the operand g5p_usc_ms_own_sample() in the register after the coordinates, then the
+    * narrow sample with dimension code f9. False everywhere else. */
+   bool ms_own_sample;
+   /* 4 raster samples: a program's one conditional discard kills all four samples (g5p_usc_discard_test_ms4(),
+    * Apple's 4x form); several discards keep the one-sample test (Apple's several-discard 4x form is not
+    * ported: such draws are refused at 4x) */
+   bool ms4_kill;
 };
 #define PCO_G5P_HAS_MASK_UPASS 1
 #define PCO_G5P_FS_KEY_DEFAULT ((struct pco_g5p_fs_key){.write_mask = 0xf})

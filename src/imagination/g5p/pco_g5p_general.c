@@ -5111,6 +5111,35 @@ static void emit_vertex_qualified_texture(struct gctx *c, nir_tex_instr *t)
    c->p->evidence |= PCO_G5P_EV_TEX_TYPES;
 }
 
+/* The 4x LOAD background's sample (key ms_own_sample): Apple's loader form. The coordinates in a
+ * three-register run, the own-sample operand in its third register (the fetch reads it implicitly, so it is
+ * part of the run), then the narrow sample of dimension G5P_TEX_2D_MS with coordinate control. Only the narrow form
+ * is witnessed: anything else is refused. */
+static void emit_tex_ms_own_sample(struct gctx *c, nir_tex_instr *t, struct tex_bind *b, bool narrow)
+{
+   uint8_t raw[G5P_USC_MAX];
+   if (!narrow || varying_coord_slot(c, t) >= 0 || c->mrt.targets != 1) {
+      refuse(c, "the 4x LOAD sample: only Apple's narrow form with computed coordinates is witnessed");
+      return;
+   }
+   tex_flush(c);
+   nir_def *cd = nir_get_tex_src(t, nir_tex_src_coord);
+   struct ref x = resolve_value(c, cd, 0), y = resolve_value(c, cd, 1);
+   unsigned xr = reg_of(c, x, "texture coordinate"), yr = reg_of(c, y, "texture coordinate");
+   const unsigned coord = alloc_run(c, 3, "multisample coordinates and sample operand");
+   put(c, raw, g5p_usc_move(raw, 2 * coord, 2 * xr, 0, vgrp(c, x), 1), "coordinate x");
+   put(c, raw, g5p_usc_move(raw, 2 * coord + 2, 2 * yr, 0, vgrp(c, y), 1), "coordinate y");
+   put(c, raw, g5p_usc_ms_own_sample(raw, 2 * coord + 4), "the task's own sample");
+   c->scratch |= BITFIELD64_RANGE(coord, 3);
+   struct g5p_tex s = {.image_qword = b->image / 2, .sampler_qword = b->sampler / 2, .coord_dword = coord,
+                       .coord_control = true, .dim = G5P_TEX_2D_MS, .narrow = true, .dst_half = 0};
+   put(c, raw, g5p_usc_sample(raw, &s), "texture sample (2D multisample)");
+   c->tex_coord_pending |= BITFIELD64_RANGE(coord, 3);
+   c->tex_batch++;
+   tex_flush(c);
+   c->p->evidence |= PCO_G5P_EV_TEX_CAPTURE;
+}
+
 static void emit_tex(struct gctx *c, nir_tex_instr *t)
 {
    if (c->tex_batch == 4 || c->vs || !plain_tex(t) || size_query(t) || c->narrow_tex == t)
@@ -5132,6 +5161,10 @@ static void emit_tex(struct gctx *c, nir_tex_instr *t)
    int slot = varying_coord_slot(c, t);
    bool narrow = c->narrow_tex == t;
    unsigned coord;
+   if (c->key && c->key->ms_own_sample) {
+      emit_tex_ms_own_sample(c, t, b, narrow);
+      return;
+   }
    if (slot >= 0) {
       tex_flush(c);
       coord = narrow ? 0 : alloc_run(c, 2, "texture coordinate");
@@ -5601,9 +5634,17 @@ static void fs_discards(struct gctx *c, bool defer)
          t = alloc_reg(c, -1);
       if (defer && t < (c->has_secondary ? 6 : 4))
          refuse(c, "no free register above the outputs for the held discard condition");
+      if (c->key && c->key->ms4_kill && c->ndiscards == 1 && !c->discard_always) {
+         /* 4 samples, one conditional discard: b != 0.0 writes the kill's sample mask 15 (Apple's 4x form, the
+          * same relation as the one-sample test below).
+          * Several discards keep the one-sample test; their draws are refused at 4x (pvr_arch_g5p_gfx.c). */
+         unsigned gb = k.zero_b ? vgrp(c, k.a) : 1;
+         put(c, raw, g5p_usc_discard_test_ms4(raw, 2 * t, S(2 * b, gb)), "discard test (4 samples)");
+      } else {
       unsigned z = zero_reg(c);
       unsigned gb = k.zero_b ? vgrp(c, k.a) : 1, gz = kgrp(c, K_ZERO);
       put(c, raw, g5p_usc_discard_test(raw, G5P_FEQ, 2 * t, S(2 * b, gb), S(2 * z, gz), 0), "discard test");
+      }
       if (defer) {
          c->deferred_kill = t; /* stays busy until fs_kill() */
       } else {

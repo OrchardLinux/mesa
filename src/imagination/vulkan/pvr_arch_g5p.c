@@ -236,6 +236,10 @@ g5p_free_programs(struct pvr_device *device, struct pvr_g5p_programs *p)
          vk_free(&device->vk.alloc, p->mrt_load[i]);
       }
    }
+   if (p->ms_load) {
+      g5p_free_programs(device, p->ms_load);
+      vk_free(&device->vk.alloc, p->ms_load);
+   }
    for (unsigned i = 0; i < ARRAY_SIZE(p->raw_clear_usc); i++) {
       pvr_bo_suballoc_free(p->raw_clear_usc[i]);
       pvr_bo_suballoc_free(p->raw_clear_kick[i].pvr_bo);
@@ -263,14 +267,18 @@ g5p_free_programs(struct pvr_device *device, struct pvr_g5p_programs *p)
  * the backend compiles from NIR, its kick, its uploads' DMA code. A program
  * the backend refuses is not an error here: a LOAD render is refused by
  * name then. */
+/* g5p_upload_load()'s variant of the 4x LOAD */
+#define G5P_LOAD_MS4 20u
+
 static VkResult
 g5p_upload_load(struct pvr_device *device, struct pvr_g5p_programs *p, unsigned raw)
 {
    struct pco_g5p_program prog;
    VkResult result = VK_SUCCESS;
 
-   /* raw 12..19: the compact LOAD of 5..8 targets, BGRA8 (12..15) then RGBA8 (16..19) */
-   if (!(raw >= 12 ? pvr_g5p_compile_load_mrt(&prog, 5 + (raw - 12) % 4, raw < 16) :
+   /* raw 12..19: the compact LOAD of 5..8 targets, BGRA8 (12..15) then RGBA8 (16..19); G5P_LOAD_MS4: the 4x
+    * LOAD (Apple's loader, kicked at sample rate) */
+   if (!(raw == G5P_LOAD_MS4 ? pvr_g5p_compile_load_ms(&prog) : raw >= 12 ? pvr_g5p_compile_load_mrt(&prog, 5 + (raw - 12) % 4, raw < 16) :
          raw == 10 || raw == 11 ? pvr_g5p_compile_load_scalar8(&prog, raw == 11) : (raw == 8 || raw == 9) ? pvr_g5p_compile_load_packed_sint(&prog, raw == 8 ? 8 : 16) : raw == 7 ? pvr_g5p_compile_load_rgb10a2ui(&prog) : raw == 6 ? pvr_g5p_compile_load_rgba8ui(&prog) : raw == 5 ? pvr_g5p_compile_load_rgba16ui(&prog) : raw ? pvr_g5p_compile_load_raw(&prog, raw == 2) : pvr_g5p_compile_load(&prog))) {
       snprintf(p->load_refusal, sizeof(p->load_refusal), "%s", prog.refusal);
       free(prog.code);
@@ -284,7 +292,8 @@ g5p_upload_load(struct pvr_device *device, struct pvr_g5p_programs *p, unsigned 
    for (unsigned i = 0; i < prog.num_uploads; i++) {
       const struct pco_g5p_upload *u = &prog.uploads[i];
       if ((u->kind != PCO_G5P_UPLOAD_IMAGE && u->kind != PCO_G5P_UPLOAD_SAMPLER &&
-           u->kind != PCO_G5P_UPLOAD_IMAGE_SIZE) || u->set || u->binding >= (raw >= 12 ? 8u : 1u)) {
+           u->kind != PCO_G5P_UPLOAD_IMAGE_SIZE) || u->set ||
+          u->binding >= (raw >= 12 && raw != G5P_LOAD_MS4 ? 8u : 1u)) {
          snprintf(p->load_refusal, sizeof(p->load_refusal), "a load program upload of kind %u at %u.%u",
                   u->kind, u->set, u->binding);
          free(prog.code);
@@ -303,7 +312,8 @@ g5p_upload_load(struct pvr_device *device, struct pvr_g5p_programs *p, unsigned 
    free(prog.code);
    if (result != VK_SUCCESS)
       return result;
-   result = g5p_upload_kick_temps(device, p->load_usc, p->load_temps, 1, &p->load_kick);
+   /* the 4x loader runs once per sample (Apple's DOUTU has src0[34:33] = 2, pvr_g5p_msaa_doutu()) */
+   result = g5p_upload_kick_temps(device, p->load_usc, p->load_temps, raw == G5P_LOAD_MS4 ? 4 : 1, &p->load_kick);
    if (result != VK_SUCCESS)
       return result;
    uint32_t code[2 * ARRAY_SIZE(p->load_upload) + 2];
@@ -882,12 +892,45 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
       if (lr != VK_SUCCESS)
          return lr;
    }
+   if (load && g->samples == 4) {
+      /* Apple's 4x loader (an iOS capture of a 4x colour load): kicked at sample rate, each instance
+       * samples the multisample surface at its own sample (pvr_g5p_compile_load_ms()), from the 4x texture
+       * state of that surface (pvr_g5p_msaa_tex_state()). One target (pvr_arch_g5p_msaa.c); integer targets
+       * are refused above at 4x. */
+      const struct pvr_renderpass_hwsetup_eot_surface *eot = &hw_render->eot_surfaces[0];
+      if (eot->need_resolve && (partial || sub_cmd->barrier_load))
+         return G5P_REFUSE(cmd_buffer, "a 4x %s with a resolve: the pass stores no samples to reload",
+                           partial ? "partial render area" : "VDM continuation");
+      const struct pvr_image_view *src = info->attachments[eot->need_resolve ? eot->src_attachment_idx
+                                                                             : eot->attachment_idx];
+      const struct pvr_image *image = pvr_image_view_get_image(src);
+      const struct pvr_image_plane *plane = pvr_single_plane_const(image);
+      const uint64_t addr = image->dev_addr.addr + plane->offset;
+      uint32_t key;
+      bool srgb;
+      if (image->vk.samples != VK_SAMPLE_COUNT_4_BIT || !g5p_pbe_key(src->vk.format, &key, &srgb) || addr % 64)
+         return G5P_REFUSE(cmd_buffer, "a 4x LOAD of %s at %#" PRIx64 " (a 64-byte based 4-sample image)",
+                           vk_Format_to_str(src->vk.format), addr);
+      pvr_g5p_msaa_tex_state(load_state[0], key, addr, src->vk.extent.width, src->vk.extent.height,
+                             vk_format_is_srgb(src->vk.format));
+      load_state[0][3] = 0;
+      struct pvr_g5p_programs *programs = &device->g5p->programs;
+      VkResult lr = VK_SUCCESS;
+      simple_mtx_lock(&device->g5p->clear_lock);
+      if (!programs->ms_load) {
+         programs->ms_load = vk_zalloc(&device->vk.alloc, sizeof(*programs), 8, VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
+         lr = programs->ms_load ? g5p_upload_load(device, programs->ms_load, G5P_LOAD_MS4)
+                                : vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+      }
+      load_program = programs->ms_load;
+      simple_mtx_unlock(&device->g5p->clear_lock);
+      if (lr != VK_SUCCESS)
+         return lr;
+   }
    if (load && !load_program->load_usc)
-      return G5P_REFUSE(cmd_buffer, "LOAD of a colour attachment%s: the load program: %s",
-                        partial ? " (a partial render area)" : "", load_program->load_refusal);
-   if (load && g->samples == 4)
-      return G5P_REFUSE(cmd_buffer, "LOAD of a 4x colour attachment%s (the load program runs per pixel)",
-                        partial ? " (a partial render area)" : "");
+      return G5P_REFUSE(cmd_buffer, "LOAD of a %scolour attachment%s: the load program: %s",
+                        g->samples == 4 ? "4x " : "", partial ? " (a partial render area)" : "",
+                        load_program->load_refusal);
    g->targets = nt;
 
    /* per render: the clear floats and the PBE block, then their DOUTD data */

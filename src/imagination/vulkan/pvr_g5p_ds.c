@@ -130,13 +130,11 @@ pvr_g5p_ds_zls(const struct pvr_g5p_ds_target *t, struct pvr_g5p_zls_words *out)
    if (!pvr_g5p_ds_layout(t->format, t->width, t->height, t->samples, &plane))
       return "a depth/stencil attachment of 0 pixels, or not 1 or 4 samples";
    const bool d = t->depth && f->depth, s = t->stencil && f->stencil;
-   bool zload = d && t->zload, zstore = d && t->zstore;
-   bool sload = s && t->sload, sstore = s && t->sstore;
-   if (t->samples == 4 && (zload || zstore || sload || sstore)) {
-      if (!pvr_g5p_capture_stub())
-         return "a load or store of a 4-sample depth/stencil attachment (no multisample ZLS capture: it stays on chip)";
-      zload = zstore = sload = sstore = false; /* PVR_G5P_CAPTURE_STUB: dropped, logged at the pass */
-   }
+   const bool zload = d && t->zload, zstore = d && t->zstore;
+   const bool sload = s && t->sload, sstore = s && t->sstore;
+   /* 4 samples: the same words over the 4x plane (iOS captures of 4x depth store, depth load
+    * and stencil: ZLSCTL 0xe2004 / 0xaa006 / 0x26002 and ZLS_PIXELS 0x1f803f at 64x64, as at one sample; the
+    * stencil plane at depth + 0x10000, four times the one-sample plane) */
 
    const struct ROGUE_CR_ISP_ZLSCTL ctl = {
       .loadtwiddled = true,

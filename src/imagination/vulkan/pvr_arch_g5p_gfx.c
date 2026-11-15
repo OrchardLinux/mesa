@@ -595,6 +595,8 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
    key.punch = g->punch_variant;
    g->fs_mask_upass = key.mask_upass;
    g->samples = s->ms ? MAX2(s->ms->rasterization_samples, VK_SAMPLE_COUNT_1_BIT) : VK_SAMPLE_COUNT_1_BIT;
+   /* 4x: a discard kills the four samples (Apple's 4x discard test) */
+   key.ms4_kill = g->samples == 4;
    g->bresenham_line_probe = g5p_native_bresenham_line(s);
 
    for (uint32_t i = 0; i < create_info->stageCount; i++) {
@@ -1039,13 +1041,14 @@ g5p_pipeline_check_draw_variants(struct pvr_device *device,
 #undef G5P_DYN_DS
    const bool testing = depth_test || stencil_test, writing = depth_write || stencil_test;
    const bool needs_punch = (testing && g->fs_discard_tokens > 1) || (writing && g->fs_discard_select);
-   /* The draws decide (g5p_cmd_draw()): a draw whose depth/stencil state needs the missing form is
-    * refused and skipped there, the command buffer valid, while the pipeline's other draws run.
-    * Refusing the pipeline instead loses a WebGPU device (wgpu-hal: any creation error but OOM).
-    * the default policy refuses at creation. */
+   /* Strict mode rejects a pipeline at creation if any permitted dynamic
+    * depth/stencil state requires an unavailable program variant. Tolerant
+    * mode admits it and skips only draws that select the missing variant. */
+   /* 4x: one conditional discard kills the four samples (Apple's 4x test, pco_g5p_fs_key::ms4_kill), run
+    * FAST_PUNCH_THROUGH as at one sample (an iOS 4x punch-through capture); several discards are not ported */
    const char *why = needs_punch && !g->punch ? "discard under depth/stencil requires an unsupported punch-through variant"
-                   : testing && (g->fs_discard || needs_punch) && g->samples != 1
-                      ? "discard under multisample depth/stencil is not hardware-qualified" : NULL;
+                   : g->fs_discard && g->samples != 1 && (g->fs_discard_tokens != 1 || g->fs_discard_select)
+                      ? "several discards at 4 samples (Apple's several-discard 4x form is not ported)" : NULL;
    if (!why)
       return VK_SUCCESS;
    if (!device->pdevice->skip_refused_work)
@@ -1872,9 +1875,9 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
             return G5P_REFUSE(cmd_buffer, "discard under depth/stencil requires an unsupported punch-through variant");
          g = g->punch;
       }
-      if (testing && g->fs_discard && g->samples != 1)
-         return G5P_REFUSE(cmd_buffer, "discard under multisample depth/stencil is not hardware-qualified");
    }
+   if (g->fs_discard && g->samples != 1 && (g->fs_discard_tokens != 1 || g->fs_discard_select))
+      return G5P_REFUSE(cmd_buffer, "several discards at 4 samples (Apple's several-discard 4x form is not ported)");
    result = pvr_arch_g5p_vertex_draw_check(cmd_buffer, g, draw);
    if (result != VK_SUCCESS)
       return result;
