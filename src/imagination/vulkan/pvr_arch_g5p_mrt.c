@@ -132,10 +132,22 @@ PVR_PER_ARCH(g5p_mrt_pass_check)(struct pvr_cmd_buffer *cmd_buffer,
       va[t] = g5p_mrt_target_va(iview[t], &bytes[t]);
    }
 
-   /* The background programs clear or leave every target; a LOAD would need
-    * an N-target LOAD background (none exists) */
+   /* 5..8 compact targets: the compact LOAD background loads every target, so a pass mixing CLEAR and LOAD
+    * would load the cleared ones */
+   if (n > 4) {
+      bool has_clear = false, has_load = false;
+      for (unsigned i = 0; i < hw_render->color_init_count; i++) {
+         has_clear |= hw_render->color_init[i].op == VK_ATTACHMENT_LOAD_OP_CLEAR;
+         has_load |= hw_render->color_init[i].op == VK_ATTACHMENT_LOAD_OP_LOAD;
+      }
+      if (has_clear && has_load)
+         return G5P_REFUSE(cmd_buffer, "%u colour targets mixing CLEAR and LOAD (the compact background loads or "
+                               "clears every target)", n);
+   }
+   /* The background programs clear or leave every target; a LOAD of 2..4 targets would need an N-target LOAD
+    * background (none exists; 5..8 have the compact one) */
    for (unsigned i = 0; i < hw_render->color_init_count; i++)
-      if (hw_render->color_init[i].op == VK_ATTACHMENT_LOAD_OP_LOAD)
+      if (n <= 4 && hw_render->color_init[i].op == VK_ATTACHMENT_LOAD_OP_LOAD)
          return G5P_REFUSE(cmd_buffer, "LOAD of a colour attachment with %u colour targets (no N-target LOAD "
                                "background)", n);
 

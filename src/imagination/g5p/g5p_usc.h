@@ -217,6 +217,13 @@ unsigned g5p_usc_cube_gradient_tuple(uint8_t *out);
 /* f32 -> u16 (truncating) into one half: Apple's array-layer conversion
  * `89 01 DH 01 09 SS 20 01 60 06`. */
 unsigned g5p_usc_f2u16_half(uint8_t *out, unsigned dst_half, unsigned src_half, unsigned group);
+/* One byte of a packed UNORM8 colour: the f32 in common-store dword src_dword as an unsigned normalized byte in
+ * byte 0 or 1 of dst_half, bank 0; the byte-1 form keeps byte 0 of dst_half (the fields are listed at the
+ * encoder). The clear of 5..8 colour targets (g5p_mrt_programs.h). */
+/* Common-store dword src_dword (group 1) into the 16-bit dst_half of bank 0 (fields at the encoder): the
+ * end-of-tile program's state moves (g5p_mrt_programs.h). */
+unsigned g5p_usc_mov_shared_half(uint8_t *out, unsigned dst_half, unsigned src_dword);
+unsigned g5p_usc_unorm8_byte(uint8_t *out, unsigned dst_half, unsigned byte, unsigned src_dword);
 /* length 0 = minimum */
 unsigned g5p_usc_buffer_load(uint8_t *out, unsigned dst_half, unsigned byte_count,
                              unsigned base_common_dword, unsigned index, unsigned length);

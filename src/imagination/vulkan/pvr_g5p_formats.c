@@ -43,6 +43,14 @@ pvr_g5p_format_tex(VkFormat format, uint32_t *key, bool *srgb)
    return true;
 }
 
+/* The physical one-dword store of already packed bytes (5..8 compact
+ * targets): R32UI's PBE key, no format admission of its own. */
+uint32_t
+pvr_g5p_packed_word_pbe_key(void)
+{
+   return pvr_g5p_format_find(VK_FORMAT_R32_UINT)->key;
+}
+
 bool
 pvr_g5p_format_pbe(VkFormat format, uint32_t *key, bool *srgb)
 {

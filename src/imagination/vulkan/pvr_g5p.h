@@ -59,8 +59,9 @@ struct pvr_renderpass_hwsetup_render;
 struct pvr_sub_cmd_gfx;
 struct pvr_suballoc_bo;
 
-/* Colour-target counts with programs: 1, 2 and 4, the counts with an Apple witness (others are refused) */
-#define PVR_G5P_MRT_VARIANTS 3
+/* Colour-target counts with programs: 1, 2 and 4 (Apple's packed-f16 pass), then 5..8 compact UNORM8
+ * with a BGRA8 clear (variants 3..6) and an RGBA8 clear (7..10). 3 runs as 4. */
+#define PVR_G5P_MRT_VARIANTS 11
 
 /*
  * The device-level programs every G5P render uses, uploaded once per
@@ -108,11 +109,13 @@ struct pvr_g5p_programs {
    unsigned load_temps, load_common_dwords, load_uploads;
    struct {
       unsigned kind; /* PCO_G5P_UPLOAD_IMAGE, _SAMPLER or _IMAGE_SIZE */
-      unsigned dwords, common;
-   } load_upload[3];
+      unsigned dwords, common, binding; /* binding: the target an IMAGE upload reads (5..8 targets) */
+   } load_upload[32];
    char load_refusal[128];
    /* Lazy integer variants: float device allocation order remains identical. */
    struct pvr_g5p_programs *raw_load[11]; /* scalar R8 uses10/11, separate fromRGBA8 */
+   /* Lazy compact LOAD programs: 5..8 targets, BGRA8 [0..3] and RGBA8 [4..7] */
+   struct pvr_g5p_programs *mrt_load[8];
    /* raw clear programs by total output words: 2, 4, 8 (two 32-bit integer targets) */
    struct pvr_suballoc_bo *raw_clear_usc[4]; /*2/4/8 words, then scalar1 */
    /* raw end-of-tile programs by target count: 1, 2 */
@@ -335,6 +338,9 @@ bool pvr_g5p_compile_load_rgb10a2ui(struct pco_g5p_program *out);
 bool pvr_g5p_compile_load_rgba8ui(struct pco_g5p_program *out);
 bool pvr_g5p_compile_load_rgba16ui(struct pco_g5p_program *out);
 bool pvr_g5p_compile_load_raw(struct pco_g5p_program *out, bool is_signed);
+/* The compact LOAD background of 5..8 UNORM8 targets: texelFetch of every
+ * target (set 0, binding t), packed as the compact output. */
+bool pvr_g5p_compile_load_mrt(struct pco_g5p_program *out, unsigned targets, bool bgra);
 /* The clear quad's stages, built with nir_builder (pvr_g5p_nir.c): the
  * vertex stage passes its vec4 position at location 0 through, the
  * fragment stage writes the push constant's colour (bytes 0..15) to colour

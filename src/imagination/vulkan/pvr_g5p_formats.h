@@ -32,6 +32,8 @@ bool pvr_g5p_format_tex(VkFormat format, uint32_t *key, bool *srgb);
 /* The PBE key and sRGB bit of a colour target format, or false: the A9
  * doesn't render it (the pipeline and the render job refuse it by name) */
 bool pvr_g5p_format_pbe(VkFormat format, uint32_t *key, bool *srgb);
+/* Physical one-dword stores for already packed bytes; no public format admission. */
+uint32_t pvr_g5p_packed_word_pbe_key(void);
 
 /* pvr_get_image_format_features2(): the features of a colour format on
  * the A9, in place of upstream's (flags) */

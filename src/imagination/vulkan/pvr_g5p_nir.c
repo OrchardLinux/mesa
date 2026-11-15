@@ -965,6 +965,42 @@ pvr_g5p_compile_load_raw(struct pco_g5p_program *out, bool is_signed)
    return g5p_compile_load_type(out, is_signed ? 2 : 1);
 }
 
+bool
+pvr_g5p_compile_load_mrt(struct pco_g5p_program *out, unsigned targets, bool bgra)
+{
+   static util_once_flag once = UTIL_ONCE_FLAG_INIT;
+   util_call_once(&once, g5p_init_options);
+   memset(out, 0, sizeof(*out));
+   glsl_type_singleton_init_or_ref();
+
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT, &g5p_options, "g5p-load-mrt");
+   nir_def *xy = nir_f2i32(&b, nir_trim_vector(&b, nir_load_frag_coord(&b), 2));
+   for (unsigned t = 0; t < targets; t++) {
+      nir_variable *prev = nir_variable_create(b.shader, nir_var_uniform,
+                                               glsl_sampler_type(GLSL_SAMPLER_DIM_2D, false, false, GLSL_TYPE_FLOAT),
+                                               "prev");
+      prev->data.descriptor_set = 0;
+      prev->data.binding = t;
+      nir_variable *color = nir_variable_create(b.shader, nir_var_shader_out, glsl_vec4_type(), "color");
+      color->data.location = FRAG_RESULT_DATA0 + t;
+      nir_def *texel = nir_txf(&b, xy, .texture_deref = nir_build_deref_var(&b, prev), .lod = nir_imm_int(&b, 0),
+                               .dim = GLSL_SAMPLER_DIM_2D, .dest_type = nir_type_float32);
+      nir_store_var(&b, color, texel, 0xf);
+   }
+   bool sample_mask = false;
+   nir_shader *nir = graphics_lower(g5p_nir_prepare(b.shader), targets, &sample_mask, false, NULL);
+   struct pco_g5p_fs_key key = PCO_G5P_FS_KEY_DEFAULT;
+   key.last_read_groups = true;
+   key.color_targets = targets;
+   key.color_output = bgra ? PCO_G5P_COLOR_PACKED_BGRA8 : PCO_G5P_COLOR_PACKED_RGBA8;
+   bool ok = nir && pco_g5p_compile_general_link(nir, true, NULL, &key, NULL, out);
+   if (!nir)
+      snprintf(out->refusal, sizeof(out->refusal), "the compact load program's NIR");
+   ralloc_free(nir);
+   glsl_type_singleton_decref();
+   return ok;
+}
+
 nir_shader *
 pvr_g5p_clear_nir(bool vertex)
 {

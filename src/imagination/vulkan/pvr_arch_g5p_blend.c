@@ -42,8 +42,21 @@ PVR_PER_ARCH(g5p_blend_fs_key)(const struct vk_graphics_pipeline_state *state, u
        BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_CB_WRITE_MASKS) ||
        BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_CB_COLOR_WRITE_ENABLES))
       return "dynamic blend enables, equations, write masks or colour-write enables";
-   if (targets > 4)
-      return "more than four colour blend targets";
+   if (targets > 8)
+      return "more than eight colour blend targets";
+   /* 5..8: the compact UNORM8 output writes every channel of
+    * every target unblended; blending and masks there need its tile-read
+    * merge, which is not built */
+   if (targets > 4) {
+      for (unsigned i = 0; i < targets; i++) {
+         const struct vk_color_blend_attachment_state *a = &cb->attachments[i];
+         const unsigned mask = (cb->color_write_enables & BITFIELD_BIT(i)) ? a->write_mask : 0;
+         if (a->blend_enable || mask != 15)
+            return "five to eight colour targets with blending or a partial write mask (compact MRT is "
+                   "full-write and unblended)";
+      }
+      return NULL;
+   }
    if (targets > 1) {
       bool special = false;
       unsigned union_mask = 0;

@@ -507,6 +507,10 @@ g5p_check_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo *c
    /* three colour targets compile as four: the fourth (the pass's null target) is written zeros */
    if (colors == 3)
       key->color_targets = 4;
+   /* five to eight: one packed UNORM8 dword per target (pvr_arch_g5p_mrt_pipeline_check() admits RGBA8 or
+    * BGRA8, one format; pvr_arch_g5p_blend_fs_key() full-write and unblended) */
+   if (colors > 4)
+      key->color_output = cf == VK_FORMAT_B8G8R8A8_UNORM ? PCO_G5P_COLOR_PACKED_BGRA8 : PCO_G5P_COLOR_PACKED_RGBA8;
    /* 32-bit integer targets: the raw32 output (four raw words, pvr_g5p_raw32_kind()); the PBE stores the
     * target's own channels from them */
    const unsigned raw32 = colors ? pvr_g5p_raw32_kind(cf) : 0;

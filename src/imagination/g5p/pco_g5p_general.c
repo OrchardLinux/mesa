@@ -5379,9 +5379,43 @@ static bool out_const(struct gctx *c, unsigned k, uint16_t *h)
    return true;
 }
 
+static bool compact_output(const struct pco_g5p_fs_key *key)
+{
+   return key->color_output == PCO_G5P_COLOR_PACKED_BGRA8 ||
+          key->color_output == PCO_G5P_COLOR_PACKED_RGBA8;
+}
+
+/* Semantic UNORM8 conversion, the same saturate/round-even rule as
+ * nir_format_float_to_unorm(), lowered through existing G5P ALU encoders.
+ * Packing occurs at each output store, so eight targets keep eight dwords
+ * rather than 32 live float components. */
+static bool lower_compact_store(nir_builder *b, nir_intrinsic_instr *in, void *data)
+{
+   const struct pco_g5p_fs_key *key = data;
+   if (in->intrinsic != nir_intrinsic_store_output)
+      return false;
+   if (nir_intrinsic_component(in) || in->src[0].ssa->num_components != 4 || nir_intrinsic_write_mask(in) != 15)
+      return false; /* refused in fs_output: no partial packed output contract */
+   b->cursor = nir_before_instr(&in->instr);
+   nir_def *rgba = in->src[0].ssa;
+   nir_def *packed = nir_imm_int(b, 0);
+   for (unsigned c = 0; c < 4; c++) {
+      const unsigned channel = key->color_output == PCO_G5P_COLOR_PACKED_BGRA8 && !(c & 1) ? 2 - c : c;
+      nir_def *v = nir_fsat(b, nir_channel(b, rgba, channel));
+      v = nir_f2u32(b, nir_fround_even(b, nir_fmul_imm(b, v, 255.0f)));
+      packed = nir_ior(b, packed, nir_ishl_imm(b, v, 8 * c));
+   }
+   nir_src_rewrite(&in->src[0], packed);
+   nir_intrinsic_set_write_mask(in, 1);
+   in->num_components = 1;
+   return true;
+}
+
 /* Output-plan decisions that need use counts. */
 static void plan_fs_output(struct gctx *c)
 {
+   if (compact_output(c->key))
+      return; /* g5p_mrt_out_plan_make(): one word per target, width 8 */
    if (c->key->color_output != PCO_G5P_COLOR_F16) {
       /* four raw words per target: 4, or 8 for two targets (emitpix field 0, Apple's 4-target width) */
       if (c->mrt.targets > 1) { /* one emitpix writes both targets: both need their stores */
@@ -5519,6 +5553,32 @@ static void fs_output(struct gctx *c)
    }
    fs_discards(c);
    c->now = LAST_END;
+   if (compact_output(c->key)) {
+      /* target t's packed dword: output word t (c->out[4t], lower_compact_store()) */
+      struct pvr_g5p_dgl_source sources[8] = {0};
+      for (unsigned t = 0; t < c->mrt.targets; t++) {
+         if (c->slot_written[t] != 1)
+            refuse(c, "compact MRT requires a full four-channel store to each target");
+         struct ref r = c->out[4 * t];
+         sources[t].immediate = is_const(c, r);
+         if (sources[t].immediate) {
+            sources[t].value = V(c, r.def, r.comp)->imm;
+         } else {
+            sources[t].value = reg_of(c, r, "compact MRT output");
+            sources[t].group = vgrp(c, r);
+            for (unsigned j = t + 1; j < c->mrt.targets; j++)
+               if (c->out[4 * j].def == r.def && c->out[4 * j].comp == r.comp)
+                  sources[t].group = 0;
+         }
+      }
+      uint8_t code[10 * G5P_USC_MAX];
+      size_t size = pvr_g5p_dgl_output_words(code, sizeof(code), sources, c->mrt.words, 0xf);
+      if (!size)
+         refuse(c, "compact MRT output source cannot be encoded");
+      put(c, code, size, "compact MRT packed output and emitpix");
+      free_scratch(c);
+      return;
+   }
    if (c->key->color_output != PCO_G5P_COLOR_F16) {
       /* target t's channels: output words 4t..4t+3 (c->out[] is indexed 4 * slot + component) */
       const unsigned words = c->mrt.words;
@@ -7794,7 +7854,15 @@ static bool compile_general_link(nir_shader *nir, bool half_output, const uint8_
          mr = g5p_mrt_check_key(&c->mrt, c->key->blend, c->key->write_mask);
       if (mr != G5P_MRT_OK)
          refuse(c, "%s", g5p_mrt_refusal_str(mr));
-      if (c->key->color_output != PCO_G5P_COLOR_F16) {
+      if (compact_output(c->key) != (c->mrt.targets > 4))
+         refuse(c, "five to eight colour targets take the compact UNORM8 output, fewer do not");
+      if (compact_output(c->key)) {
+         if (c->key->blend || c->key->write_mask != 15 || c->key->mrt_blend_state)
+            refuse(c, "five to eight colour targets: blending and partial write masks are not built "
+                      "(compact MRT is full-write and unblended)");
+         NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_compact_store, nir_metadata_control_flow,
+                  (void *)c->key);
+      } else if (c->key->color_output != PCO_G5P_COLOR_F16) {
          if (c->key->mrt_blend_state)
             refuse(c, "raw32 MRT blend or masks are not qualified");
          if (c->key->color_output != PCO_G5P_COLOR_UINT32 &&

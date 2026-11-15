@@ -793,6 +793,74 @@ static unsigned add_route(uint8_t *raw, unsigned n, int route)
    return n;
 }
 
+/* Names shared by the fragment encoders. */
+#define G5P_CLASS_TERNARY_RESULT_HALF 0x8a /* g5p_usc_literal_ternary() with result_half */
+#define G5P_TERNARY_CTL_RESULT_HALF 0x02
+
+/* One byte of a packed UNORM8 colour, for the clear of 5..8 colour targets (g5p_mrt_programs.h): the f32 in
+ * common-store dword src_dword, converted to an unsigned normalized byte, into byte 0 or byte 1 of the 16-bit
+ * dst_half, bank 0. Two of them fill one half: the byte-1 form reads dst_half as B and keeps the byte that the
+ * byte-0 form wrote. It is the float-to-integer conversion in the three-source class with the 16-bit result,
+ * laid out as literal_prefix() followed by a common-store C:
+ *   A        a short literal, the conversion's target format: G5P_SMALL_UN8, the format code of
+ *            g5p_usc_convert_small() (g5p_usc_f2u16_half() puts G5P_SMALL_U16 in the same place);
+ *   B        byte 0: unused (selector 0); byte 1: dst_half, group 1;
+ *   C        the common-store dword (shared_src(), group 1);
+ *   opcode   the float-to-integer conversion (convert_code[], as g5p_usc_f2u16_half());
+ *   control  bit 0 the continuation into the last parcel; bit 1 the 16-bit result; bit 2 set by every
+ *            conversion form (g5p_usc_convert2(), g5p_usc_f2u16_half(), g5p_usc_convert_small()); the byte-1
+ *            form adds bits 4 and 6, which were only observed together (bit 6 also selects the source's high
+ *            byte in g5p_usc_convert_small());
+ *   routing  the low byte of the last parcel, observed per byte; its high byte, the source control, is 0.
+ * The form was recovered from controlled probes; the clear was tested on the A9 at 5, 6, 7 and 8 targets. */
+#define G5P_CONVERT_CTL 0x04
+#define G5P_UNORM8_CTL_BYTE1 0x50
+#define G5P_UNORM8_ROUTING_BYTE0 0x10
+#define G5P_UNORM8_ROUTING_BYTE1 0x1c
+#define G5P_SOURCE_CONTROL_NONE 0x00
+
+unsigned g5p_usc_unorm8_byte(uint8_t *out, unsigned dst_half, unsigned byte, unsigned src_dword)
+{
+   CHECK(byte <= 1, "a half has bytes 0 and 1");
+   const unsigned dst_bank = 0, c_group = 1;
+   const unsigned b_half = byte ? dst_half : 0, b_group = byte ? 1 : 0;
+   uint8_t raw[G5P_USC_MAX];
+   unsigned n = literal_prefix(raw, G5P_CLASS_TERNARY_RESULT_HALF, dst_half, dst_bank, G5P_SMALL_UN8, b_half,
+                               b_group, G5P_HEADER_FRAGMENT, 0);
+   if (!n)
+      return 0;
+   if (!shared_src(raw + n, src_dword, c_group))
+      return 0;
+   n += 4;
+   raw[n++] = convert_code[G5P_F2U32];
+   raw[n++] = G5P_TERNARY_CTL_RESULT_HALF | G5P_CONVERT_CTL | (byte ? G5P_UNORM8_CTL_BYTE1 : 0) |
+              G5P_PARCEL_CONTINUES;
+   raw[n++] = byte ? G5P_UNORM8_ROUTING_BYTE1 : G5P_UNORM8_ROUTING_BYTE0;
+   raw[n++] = G5P_SOURCE_CONTROL_NONE;
+   return finish(out, raw, n);
+}
+
+/* A move of a common-store dword into a 16-bit half of bank 0 (the end-of-tile program's state moves,
+ * g5p_mrt_programs.h): alu_header() with the 16-bit move class (G5P_CLASS_MOVE_HALF, as g5p_usc_half_immediate())
+ * and the fragment header, A = the common-store dword (shared_src(), group 1), then the half move's opcode and
+ * control (G5P_HALF_MOVE_OP, G5P_HALF_MOVE_CTL: the bytes of g5p_usc_half_immediate()'s last parcel, named by
+ * that observed role) and no source control. */
+#define G5P_CLASS_MOVE_HALF 0x88
+#define G5P_HALF_MOVE_OP 0x28
+#define G5P_HALF_MOVE_CTL 0x39
+unsigned g5p_usc_mov_shared_half(uint8_t *out, unsigned dst_half, unsigned src_dword)
+{
+   uint8_t raw[12];
+   if (!alu_header(raw, G5P_CLASS_MOVE_HALF, dst_half, 0, G5P_HEADER_FRAGMENT, 0, 0) ||
+       !shared_src(raw + 4, src_dword, 1))
+      return 0;
+   raw[8] = G5P_HALF_MOVE_OP;
+   raw[9] = G5P_PARCEL_CONTINUES;
+   raw[10] = G5P_HALF_MOVE_CTL;
+   raw[11] = G5P_SOURCE_CONTROL_NONE;
+   return finish(out, raw, 12);
+}
+
 unsigned g5p_usc_alu_shared(uint8_t *out, enum g5p_binop op, unsigned dst_half, unsigned a_dword,
                             unsigned b_half, unsigned bank, unsigned b_group, unsigned header,
                             unsigned source_extension, unsigned dst_control, bool negate_b,

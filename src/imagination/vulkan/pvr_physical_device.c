@@ -730,9 +730,9 @@ static bool pvr_physical_device_get_properties(
 
       /* Fragment Shader Limits */
       .maxFragmentInputComponents = PVR_HAS_FEATURE(dev_info, apple_g9p) ? 120U : 64U,
-      .maxFragmentOutputAttachments = 4U,
+      .maxFragmentOutputAttachments = PVR_HAS_FEATURE(dev_info, apple_g5p) ? 8U : 4U, /* G5P: 5..8 compact UNORM8 targets */
       .maxFragmentDualSrcAttachments = 0U, /* Requires dualSrcBlend */
-      .maxFragmentCombinedOutputResources = 4U,
+      .maxFragmentCombinedOutputResources = PVR_HAS_FEATURE(dev_info, apple_g5p) ? 8U : 4U,
 
       /* Compute Shader Limits */
       .maxComputeSharedMemorySize = 16U * 1024U,
@@ -795,7 +795,7 @@ static bool pvr_physical_device_get_properties(
       .framebufferDepthSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT,
       .framebufferStencilSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT,
       .framebufferNoAttachmentsSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT,
-      .maxColorAttachments = 4U,
+      .maxColorAttachments = PVR_HAS_FEATURE(dev_info, apple_g5p) ? 8U : 4U, /* G5P: 5..8 compact UNORM8 targets (pvr_g5p_mrt.h) */
       .sampledImageColorSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT,
       .sampledImageIntegerSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT,
       .sampledImageDepthSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT,

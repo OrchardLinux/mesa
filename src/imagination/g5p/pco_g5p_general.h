@@ -82,6 +82,10 @@ enum pco_g5p_color_output {
    PCO_G5P_COLOR_F16 = 0,
    PCO_G5P_COLOR_UINT32,
    PCO_G5P_COLOR_SINT32,
+   /* 5..8 UNORM8 targets: each target's RGBA packed into one dword (BGRA8:
+    * bytes B,G,R,A), stored through a physical R32UI PBE */
+   PCO_G5P_COLOR_PACKED_BGRA8,
+   PCO_G5P_COLOR_PACKED_RGBA8,
 };
 
 struct pco_g5p_rt_blend {
