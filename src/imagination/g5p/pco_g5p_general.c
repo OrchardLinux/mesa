@@ -92,6 +92,7 @@ struct tex_bind {
    unsigned element, selement; /* array elements of the texture / sampler binding */
    unsigned image, sampler; /* common dwords */
    bool needs_sampler, needs_fetch_sampler;
+   unsigned image_flags; /* PCO_G5P_UPLOAD_IMAGE_AS_2D / _ARRAY: how its samples read the state */
 };
 
 struct range {
@@ -102,6 +103,8 @@ struct range {
 };
 
 enum { BLEND_NONE, BLEND_PREMULT, BLEND_STRAIGHT_OVER, BLEND_REPLACE, BLEND_GENERAL };
+/* nir_tex_instr.backend_flags: an array sample of layer 0 drawn as 2D (layer0_as_2d()) */
+#define G5P_TEX_LAYER0_AS_2D (1u << 30)
 
 /* The general blend epilogue (g5p_blend.c, hyprland-gpu.md §11.2) for
  * settings without a measured epilogue. Premultiplied, straight-over and
@@ -2013,6 +2016,8 @@ static void tex_bindings(struct gctx *c, nir_tex_instr *t, struct tex_bind *b)
                           sv->data.binding, element, selement};
    b->needs_sampler = t->op != nir_texop_txf;
    b->needs_fetch_sampler = t->op == nir_texop_txf;
+   b->image_flags = (t->backend_flags & G5P_TEX_LAYER0_AS_2D) ? PCO_G5P_UPLOAD_IMAGE_AS_2D :
+                    t->is_array ? PCO_G5P_UPLOAD_IMAGE_ARRAY : 0;
 }
 
 static struct tex_bind *tex_for(struct gctx *c, nir_tex_instr *t)
@@ -2021,7 +2026,8 @@ static struct tex_bind *tex_for(struct gctx *c, nir_tex_instr *t)
    tex_bindings(c, t, &b);
    for (unsigned i = 0; i < c->ntex; i++)
       if (c->tex[i].set == b.set && c->tex[i].binding == b.binding && c->tex[i].sset == b.sset &&
-          c->tex[i].sbinding == b.sbinding && c->tex[i].element == b.element && c->tex[i].selement == b.selement)
+          c->tex[i].sbinding == b.sbinding && c->tex[i].element == b.element && c->tex[i].selement == b.selement &&
+          c->tex[i].image_flags == b.image_flags)
          { c->tex[i].needs_sampler |= b.needs_sampler;
            c->tex[i].needs_fetch_sampler |= b.needs_fetch_sampler;
            return &c->tex[i]; }
@@ -2223,7 +2229,7 @@ static void plan_common(struct gctx *c)
       next = compact ? c->fetch_sampler_common + 2 * (qualified && fetch_sampler) : t->image + 10;
       if (t->image / 2 > (compact ? 120 : 28) || t->sampler / 2 > (compact ? 124 : 32))
          refuse(c, "texture descriptors beyond the bounded qualified selectors");
-      add_upload(c, PCO_G5P_UPLOAD_IMAGE, t->set, t->binding, t->element, 0, 8, t->image);
+      add_upload(c, PCO_G5P_UPLOAD_IMAGE, t->set, t->binding, t->element, t->image_flags, 8, t->image);
       if (!qualified || t->needs_sampler)
          add_upload(c, PCO_G5P_UPLOAD_SAMPLER, t->sset, t->sbinding, t->selement, 32, 2, t->sampler);
    }
@@ -6145,6 +6151,36 @@ static bool hoist_branch_derivatives(nir_shader *nir)
    return nir_progress(progress, impl, nir_metadata_control_flow);
 }
 
+/* An array sample at a constant layer that clamps to 0 reads the view's
+ * base layer: Vulkan's layer is clamp(RNE(z), 0, layers - 1). It is drawn
+ * as a 2D sample of that layer (the upload's PCO_G5P_UPLOAD_IMAGE_AS_2D),
+ * which also samples a single-layer array view of a linear image: the A9 has
+ * no array state for a linear image, and its array sample needs one even
+ * for one layer (pvr_arch_g5p_tex.c). PPSSPP binds every texture and
+ * framebuffer as a 2D_ARRAY view and samples layer 0.0. */
+static bool layer0_as_2d(nir_builder *b, nir_tex_instr *t, void *data)
+{
+   if (!t->is_array || t->sampler_dim != GLSL_SAMPLER_DIM_2D || t->coord_components != 3 ||
+       (t->op != nir_texop_tex && t->op != nir_texop_txb && t->op != nir_texop_txl &&
+        t->op != nir_texop_txd && t->op != nir_texop_txf && t->op != nir_texop_tg4))
+      return false;
+   const int ci = nir_tex_instr_src_index(t, nir_tex_src_coord);
+   if (ci < 0)
+      return false;
+   nir_scalar z = nir_scalar_chase_movs(nir_get_scalar(t->src[ci].src.ssa, 2));
+   if (!nir_scalar_is_const(z))
+      return false;
+   if (t->op == nir_texop_txf ? nir_scalar_as_int(z) != 0 : !(nir_scalar_as_float(z) <= 0.5))
+      return false;
+   b->cursor = nir_before_instr(&t->instr);
+   nir_def *c = t->src[ci].src.ssa;
+   nir_src_rewrite(&t->src[ci].src, nir_channels(b, c, 0x3));
+   t->coord_components = 2;
+   t->is_array = false;
+   t->backend_flags |= G5P_TEX_LAYER0_AS_2D;
+   return true;
+}
+
 static bool lower(nir_shader *nir, bool preserve_cf)
 {
    bool progress;
@@ -6168,6 +6204,7 @@ static bool lower(nir_shader *nir, bool preserve_cf)
                        (nir->info.stage == MESA_SHADER_VERTEX && g5p_vtex_size_lod_probe()),
    };
    NIR_PASS(_, nir, nir_lower_tex, &txp);
+   NIR_PASS(_, nir, nir_shader_tex_pass, layer0_as_2d, nir_metadata_control_flow, NULL);
    pvr_g5p_tbo_lower(nir);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const, nir_address_format_32bit_offset);
    NIR_PASS(_, nir, nir_lower_flrp, 32, false);

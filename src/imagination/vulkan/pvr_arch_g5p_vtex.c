@@ -122,6 +122,9 @@ vtex_descriptor(struct pvr_cmd_buffer *cmd, const struct pco_g5p_upload *u, uint
       if (!image || u->dwords != 8 || !pvr_g5p_tex_state_valid(desc))
          return VTEX_REFUSE(cmd, "set %u binding %u has no A9 image state", u->set, u->binding);
       memcpy(out, desc, 32);
+      const char *why = pvr_g5p_tex_state_for(out, u->offset);
+      if (why)
+         return VTEX_REFUSE(cmd, "set %u binding %u: %s", u->set, u->binding, why);
    } else if (u->kind == PCO_G5P_UPLOAD_SAMPLER) {
       if (lb->type != VK_DESCRIPTOR_TYPE_SAMPLER && lb->type != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
          return VTEX_REFUSE(cmd, "set %u binding %u is not a sampler", u->set, u->binding);

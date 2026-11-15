@@ -138,6 +138,15 @@ enum pco_g5p_upload_kind {
    PCO_G5P_UPLOAD_BLEND_CONSTANTS, /* 4 dwords: the dynamic blend constants (f32) */
    PCO_G5P_UPLOAD_FETCH_SAMPLER, /* two generated samplerless-read policy words */
 };
+/* PCO_G5P_UPLOAD_IMAGE's offset (the state is always descriptor +0): how the
+ * program samples it. AS_2D: an array sample at the constant layer 0, drawn
+ * as a 2D sample, so the driver uploads the view's base layer as a 2D state
+ * (a 2D_ARRAY state converted, pvr_g5p_tex_state_as_2d()); ARRAY: an array
+ * sample, which needs a 2D_ARRAY state (the A9's array sample reads its
+ * layer through the array descriptor even for one layer). */
+#define PCO_G5P_UPLOAD_IMAGE_AS_2D 1u
+#define PCO_G5P_UPLOAD_IMAGE_ARRAY 2u
+
 
 /* Varyings (docs/gpu/experiments/varyings.md). Apple's A9 compiler takes at
  * most 60 interpolated components ("Number of varying components(64)

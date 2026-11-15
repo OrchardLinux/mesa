@@ -81,7 +81,13 @@ g5p_view_state(const struct pvr_image_view *iview, uint64_t q[3])
          pvr_g5p_tex_twiddled(q, &v);
          return NULL;
       }
-      if (view_type != VK_IMAGE_VIEW_TYPE_2D || iview->vk.base_mip_level)
+      /* A single-layer array view (PPSSPP binds every texture so) gets the
+       * image's 2D state: the compiler draws its layer-0 samples as 2D
+       * (PCO_G5P_UPLOAD_IMAGE_AS_2D); an array sample at another layer is
+       * refused at its draw, which is skipped (pvr_g5p_tex_state_for()). */
+      const bool one_layer_array = view_type == VK_IMAGE_VIEW_TYPE_2D_ARRAY &&
+                                   image->vk.image_type == VK_IMAGE_TYPE_2D && iview->vk.layer_count == 1;
+      if ((view_type != VK_IMAGE_VIEW_TYPE_2D && !one_layer_array) || iview->vk.base_mip_level)
          return "array/3D/cube or mip view of a linear image (Apple samples those twiddled only)";
       if (va % 16 || level->pitch % 16)
          return "linear texture off a 16-byte base or 16-byte rows";

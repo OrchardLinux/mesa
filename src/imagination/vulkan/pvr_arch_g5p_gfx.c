@@ -1530,12 +1530,16 @@ fs_uploads(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_pipeline *g, 
          continue;
       }
       switch (u->kind) {
-      case PCO_G5P_UPLOAD_IMAGE:
+      case PCO_G5P_UPLOAD_IMAGE: {
          if (!pvr_g5p_tex_state_valid(desc))
             return G5P_REFUSE(cmd_buffer, "set %u binding %u: a view without A9 texture state", u->set,
                               u->binding);
          memcpy(out, desc, 4 * u->dwords);
+         const char *why = u->dwords == 8 ? pvr_g5p_tex_state_for(out, u->offset) : NULL;
+         if (why)
+            return G5P_REFUSE(cmd_buffer, "set %u binding %u: %s", u->set, u->binding, why);
          break;
+      }
       case PCO_G5P_UPLOAD_SAMPLER:
          /* a combined descriptor's sampler is at +32 (the upload's offset),
           * a standalone sampler's at +0 */
