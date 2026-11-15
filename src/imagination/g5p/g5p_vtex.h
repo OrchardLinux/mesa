@@ -15,6 +15,6 @@ static inline bool g5p_vtex_fetch_offset_probe(void) { return true; }
 static inline bool g5p_vtex_gradient_probe(void) { return false; }
 static inline bool g5p_vtex_integer_probe(void) { return false; }
 static inline bool g5p_vtex_xyz_offset_probe(void) { return false; }
-static inline bool g5p_vtex_size_lod_probe(void) { return false; }
+static inline bool g5p_vtex_size_lod_probe(void) { return true; }
 static inline bool g5p_vtex_shadow_probe(void) { return false; }
 #endif
