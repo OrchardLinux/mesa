@@ -58,7 +58,6 @@
 #include "pvr_g5p_xfb.h"
 #include "pvr_g5p_shader_dump.h"
 #include "pvr_g9p.h"
-#include "winsys/apple_g5p/pvr_g5p_winsys.h"
 #include "pvr_g5p_ds.h"
 #include "pvr_g5p_msaa.h"
 #include "pvr_g5p_vertex.h"
@@ -1721,7 +1720,7 @@ g5p_cpu_addr(struct pvr_device *device, uint64_t addr, uint64_t *available)
 
 static VkResult
 g5p_realign_binding(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_vertex_binding *vb, uint32_t stride,
-                    uint64_t *addr)
+                    uint32_t extra, uint64_t *addr)
 {
    uint64_t available;
    const uint8_t *src = g5p_cpu_addr(cmd_buffer->device, vb->buffer->dev_addr.addr + vb->offset, &available);
@@ -1734,13 +1733,14 @@ g5p_realign_binding(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_vertex_b
    /* the sub-command's draws from the same binding share one copy (all are copied at submission) */
    if (cmd_buffer->vk.level != VK_COMMAND_BUFFER_LEVEL_SECONDARY) {
       util_dynarray_foreach (&cmd_buffer->state.current_sub_cmd->gfx.g9p_realigns, struct g9p_realign, e) {
-         if (e->src == src && e->size == size && e->stride == stride && e->dst_addr) {
+         if (e->src == src && e->size == size && e->stride == stride && e->extra >= extra && e->dst_addr) {
             *addr = e->dst_addr;
             return VK_SUCCESS;
          }
       }
    }
-   const uint64_t copy_size = (uint64_t)MAX2(new_stride, 16) * count;
+   /* the elements, then zeros for the fetches' reads past the last one (extra: its fetch extent) */
+   const uint64_t copy_size = (uint64_t)MAX2(new_stride, 16) * count + extra;
    if (copy_size > 64u << 20)
       return G5P_REFUSE(cmd_buffer, "an unaligned vertex binding of %" PRIu64 " bytes to copy", copy_size);
    uint8_t *zero = calloc(1, copy_size);
@@ -1754,7 +1754,7 @@ g5p_realign_binding(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_vertex_b
    *addr = bo->dev_addr.addr;
    const struct g9p_realign r = {
       .src = src, .dst = pvr_bo_suballoc_get_map_addr(bo), .size = size, .count = count, .stride = stride,
-      .new_stride = new_stride, .dst_addr = bo->dev_addr.addr,
+      .new_stride = new_stride, .dst_addr = bo->dev_addr.addr, .extra = extra,
       .gpu_written = vb->buffer->g9p_gpu_written ||
                      (vb->buffer->vk.usage & (VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                               VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT |
@@ -1982,17 +1982,37 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
       u_foreach_bit (i, g->vs_id_mask)
          fdata[fetch_ids(g->fetch_count) + k++] = doutw_control(g->vs_id_reg[i], i == 1, i == last_id);
       uint64_t realigned[PVR_MAX_VERTEX_INPUT_BINDINGS] = { 0 };
+      /* A binding draws from a dword-aligned, zero-padded copy (g5p_realign_binding()) when its address or stride
+       * is off dwords, or when a fetch's whole-dword overread past the bound range could leave the buffer's GPU
+       * mapping (a sub-dword attribute at the very end of its BO) */
+      bool copy[PVR_MAX_VERTEX_INPUT_BINDINGS] = { false };
+      uint32_t extent[PVR_MAX_VERTEX_INPUT_BINDINGS] = { 0 };
       for (unsigned f = 0; f < g->fetch_count; f++) {
          const struct pvr_g5p_fetch *fe = &g->fetch_list[f];
          const struct pvr_vertex_binding *vb = &cs->vertex_bindings[fe->binding];
          if (!vb->buffer)
             return G5P_REFUSE(cmd_buffer, "no vertex buffer bound at binding %u", fe->binding);
+         const uint32_t stride = dyn->vi_binding_strides[fe->binding];
+         const uint64_t binding_base = vb->buffer->dev_addr.addr + vb->offset;
+         extent[fe->binding] = MAX2(extent[fe->binding], fe->offset + 4 * fe->dwords);
+         if ((binding_base | stride) & 3) {
+            copy[fe->binding] = true;
+         } else if (fe->overread) {
+            const uint64_t range = vb->size == VK_WHOLE_SIZE ? vb->buffer->vk.size - vb->offset : vb->size;
+            const struct pvr_winsys_vma *vma = vb->buffer->vma;
+            const uint64_t gpu_end = vma && vma->bo ? vma->dev_addr.addr + vma->mapped_size : 0;
+            if (gpu_end && binding_base + range + fe->overread > gpu_end)
+               copy[fe->binding] = true;
+         }
+      }
+      for (unsigned f = 0; f < g->fetch_count; f++) {
+         const struct pvr_g5p_fetch *fe = &g->fetch_list[f];
+         const struct pvr_vertex_binding *vb = &cs->vertex_bindings[fe->binding];
          uint32_t stride = dyn->vi_binding_strides[fe->binding];
          uint64_t binding_base = vb->buffer->dev_addr.addr + vb->offset;
-         /* an address or stride off dwords: the copy's (g5p_realign_binding()) */
-         if ((binding_base | stride) & 3) {
+         if (copy[fe->binding]) {
             if (!realigned[fe->binding]) {
-               result = g5p_realign_binding(cmd_buffer, vb, stride, &realigned[fe->binding]);
+               result = g5p_realign_binding(cmd_buffer, vb, stride, extent[fe->binding], &realigned[fe->binding]);
                if (result != VK_SUCCESS)
                   return result;
             }

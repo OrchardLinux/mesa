@@ -211,6 +211,9 @@ enum pvr_g5p_fetch_rate {
 struct pvr_g5p_fetch {
    uint8_t binding, dwords, ao, rate;
    uint32_t offset, divisor;
+   /* bytes the fetch reads past the end of its binding's last attribute in the element (the fetch reads whole
+    * dwords, the ICD layout 16 bytes a location): the draw keeps that inside the buffer's GPU mapping */
+   uint16_t overread;
 };
 
 /* One common-store upload of the fragment program (the backend's

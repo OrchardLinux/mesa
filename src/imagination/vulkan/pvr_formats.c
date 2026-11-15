@@ -453,15 +453,17 @@ pvr_get_format_swizzle_for_tpu(const struct util_format_description *desc)
 }
 
 /* G5P fetches the vertex formats of pvr_g5p_vertex_format_info() (32-bit
- * float and integer, 8/16-bit normalized and scaled, 16-bit float) with
- * dword strides. Of those, it advertises the ones a whole number of dwords
- * in size, whose tightly packed strides are dword multiples too (Zink passes
- * GL's strides through), and no other, so that Zink converts the rest. */
+ * float and integer, 8/16-bit normalized, scaled and pure integer, 16-bit
+ * float) as whole dwords and advertises all of them: a binding whose address
+ * or stride is off dwords (a tightly packed R8 or RGB16 array) draws from a
+ * dword-aligned copy, as does one whose last element sits at the end of the
+ * buffer's GPU mapping (pvr_arch_g5p_gfx.c). */
 static bool
 pvr_g5p_vertex_buffer_format(VkFormat vk_format)
 {
-   return pvr_g5p_vertex_format_info(vk_format, &(struct pvr_g5p_vertex_format){ 0 }) &&
-          vk_format_get_blocksize(vk_format) % 4 == 0;
+   /* Any size: the fetch reads whole dwords, and a read that could pass the end of the buffer's GPU mapping
+    * draws from a padded copy instead (pvr_arch_g5p_gfx.c, pvr_g5p_fetch.overread) */
+   return pvr_g5p_vertex_format_info(vk_format, &(struct pvr_g5p_vertex_format){ 0 });
 }
 
 static VkFormatFeatureFlags2

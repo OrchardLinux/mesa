@@ -276,6 +276,22 @@ packed_fetches(struct pvr_g5p_vertex_layout *l, struct attrib *a, unsigned n, un
    return true;
 }
 
+/* Each fetch's overread: how far it reads past the end of the last attribute of its binding's element. Vulkan
+ * keeps every fetched vertex's attributes inside the bound range, so the draw's reads end at most that many bytes
+ * past it (pvr_arch_g5p_gfx.c keeps them inside the buffer's GPU mapping, or draws from a padded copy). */
+static void
+fetch_overreads(struct pvr_g5p_vertex_layout *l, const struct attrib *a, unsigned n)
+{
+   uint32_t end[MESA_VK_MAX_VERTEX_BINDINGS] = { 0 };
+   for (unsigned i = 0; i < n; i++)
+      end[a[i].binding] = MAX2(end[a[i].binding], a[i].offset + a[i].lead + a[i].f.bytes * a[i].f.components);
+   for (unsigned f = 0; f < l->fetch_count; f++) {
+      struct pvr_g5p_fetch *fe = &l->fetch_list[f];
+      const uint32_t fetch_end = fe->offset + 4 * fe->dwords;
+      fe->overread = fetch_end > end[fe->binding] ? MIN2(fetch_end - end[fe->binding], UINT16_MAX) : 0;
+   }
+}
+
 struct rewrite {
    const struct pvr_g5p_vertex_layout *l;
    const unsigned *base;
@@ -462,12 +478,14 @@ pvr_g5p_vertex_lower(nir_shader *vs, struct pvr_g5p_vertex_layout *l)
    l->packed = converted || l->read >= BITFIELD_BIT(ICD_LOCATIONS);
    if (!l->packed) {
       icd_fetches(l, a, n);
+      fetch_overreads(l, a, n);
       return fetch_divisors(l);
    }
 
    unsigned base[PCO_G5P_MAX_ATTRIBS] = { 0 };
    if (!packed_fetches(l, a, n, base) || !fetch_divisors(l))
       return false;
+   fetch_overreads(l, a, n);
    const struct rewrite rw = { l, base };
    nir_shader_intrinsics_pass(vs, rewrite_load, nir_metadata_control_flow, (void *)&rw);
    nir_opt_constant_folding(vs);

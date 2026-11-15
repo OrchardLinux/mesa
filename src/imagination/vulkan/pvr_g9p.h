@@ -33,6 +33,7 @@ struct g9p_realign {
    uint32_t stride, new_stride;
    bool gpu_written; /* the source may be written by an earlier GPU job */
    uint64_t dst_addr; /* the copy's device address (G5P reuses a copy across the sub-command's draws) */
+   uint32_t extra;    /* G5P: zero bytes after the copy's last element, for its fetches' overread */
 };
 
 struct pvr_sub_cmd_gfx;
