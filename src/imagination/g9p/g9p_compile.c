@@ -69,9 +69,7 @@ g9p_fail(struct g9p_shader *out, const char *fmt, ...)
          snprintf(out->a9_refusal, sizeof(out->a9_refusal), "%s", why);
       snprintf(a9_last_refusal, sizeof(a9_last_refusal), "%s", out->a9_refusal);
    }
-   if (out->a9) {
-      mesa_logw("G5P refuses: %s", why);
-   } else {
+   if (!out->a9) {
       /* Preserve main's non-A9 diagnostics. */
       if (!strcmp(why, "shader has no entry point"))
          return false;
