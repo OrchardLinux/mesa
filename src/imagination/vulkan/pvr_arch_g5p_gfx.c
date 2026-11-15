@@ -625,6 +625,7 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
    link.point_size = s->ia && s->ia->primitive_topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
    g->vs_point_size = link.point_size;
    g->polygon_mode = s->rs ? s->rs->polygon_mode : VK_POLYGON_MODE_FILL;
+   link.clip_distance = pvr_g5p_clip_distance_probe();
    for (unsigned i = 0; i < fs->num_varyings; i++)
       link.interp[fs->vary[i].location] = fs->vary[i].interp;
    /* the transform feedback variant (pvr_g5p_xfb.h): the capturing vertex program */
@@ -753,6 +754,7 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
    g->vs_written_temps = vs->written_temps;
    g->fs_temps = fs->temps;
    g->vs_outputs = vs->outputs;
+   g->vs_clip_count = vs->clip_count;
    g->vs_id_mask = vs->id_mask;
    memcpy(g->vs_id_reg, vs->id_reg, sizeof(g->vs_id_reg));
    g->fs_discard = (fs->evidence & PCO_G5P_EV_DISCARD) != 0;
@@ -1889,6 +1891,17 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
       os.rhw_pres = true;
       /* points: the size follows the position (g3b-points) */
       os.psprite_size_pres = g->vs_point_size;
+      /* user planes 0..n-1 from the declared clip distances, the vertex's
+       * last dwords (AGXMetalA9 VertexProgramVariant 0x207d28594:
+       * ~(-1 << count) into TA_OUTPUT_SEL; no cull plane) */
+      os.plane0 = g->vs_clip_count > 0;
+      os.plane1 = g->vs_clip_count > 1;
+      os.plane2 = g->vs_clip_count > 2;
+      os.plane3 = g->vs_clip_count > 3;
+      os.plane4 = g->vs_clip_count > 4;
+      os.plane5 = g->vs_clip_count > 5;
+      os.plane6 = g->vs_clip_count > 6;
+      os.plane7 = g->vs_clip_count > 7;
    }
    PPP_BLOCK(w, 2);
    /* 6. ISP: the colour-only form (no depth/stencil attachment); Apple's

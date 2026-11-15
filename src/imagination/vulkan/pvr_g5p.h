@@ -46,6 +46,13 @@ static inline VkResult pvr_refusal_to_api(VkResult result)
 
 #include "pvr_common.h"
 #include "pvr_limits.h"
+
+/* User clip distances are written to the A9 TA user planes. */
+static inline bool
+pvr_g5p_clip_distance_probe(void)
+{
+   return true;
+}
 #include "pvr_macros.h"
 #include "util/simple_mtx.h"
 #include "vk_meta.h"
@@ -276,6 +283,7 @@ struct pvr_g5p_pipeline {
     * ISP object type, as AGXMetalA9 encodeISPPrimitiveType picks it from
     * its triangle fill mode (desktop-gl-polygon-mode.md) */
    VkPolygonMode polygon_mode;
+   unsigned vs_clip_count; /* user clip distances: TA user planes 0..n-1 (Apple's VertexProgramVariant) */
    /* the fragment program's tile read (pco_g5p_program::blend_mode: 0 none)
     * and colour write mask, for the ISP pass type (pvr_g5p_blend.h) */
    unsigned fs_blend_mode;

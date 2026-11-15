@@ -236,6 +236,7 @@ struct gctx {
    unsigned nvout;
    const struct pco_g5p_vs_link *link;
    unsigned psize_dword; /* a point pipeline's point size: the last output dword */
+   unsigned clip_dword;  /* the first user clip distance (Apple's A9 vertex: they follow the point size) */
    bool eager_vout; /* VS temps retry: each output written as soon as its value is final */
    bool compact_vs; /* last retry: compact movable bank1 values between instructions */
    bool vs_bank0;   /* VS pressure retry: temps in bank 0, outputs in bank 1 (vs-two-bank-allocator.md) */
@@ -1409,6 +1410,19 @@ static bool smooth_centre(nir_intrinsic_instr *in)
           interp == PCO_G5P_INTERP_SMOOTH && !centroid;
 }
 
+/* A vertex output store's location, its constant slot offset included (a
+ * compact gl_ClipDistance[4..7] store is CLIP_DIST0 at offset 1); other
+ * offsets are refused by collect_vs_outputs(). */
+static unsigned
+out_location(nir_intrinsic_instr *in)
+{
+   unsigned loc = nir_intrinsic_io_semantics(in).location;
+   nir_src *off = nir_get_io_offset_src(in);
+   if ((loc == VARYING_SLOT_CLIP_DIST0 || loc == VARYING_SLOT_CLIP_DIST1) && off && nir_src_is_const(*off))
+      loc += nir_src_as_uint(*off);
+   return loc;
+}
+
 /* First output dword of a vertex output location: 0 for the position, -1
  * when the location is not written (its fragment program does not read it),
  * -2 for a location without an output slot. */
@@ -1418,6 +1432,8 @@ static int vs_base(struct gctx *c, unsigned loc)
       return 0;
    if (loc == VARYING_SLOT_PSIZ && c->link && c->link->point_size)
       return c->psize_dword;
+   if ((loc == VARYING_SLOT_CLIP_DIST0 || loc == VARYING_SLOT_CLIP_DIST1) && c->p->clip_count)
+      return c->clip_dword + 4 * (loc - VARYING_SLOT_CLIP_DIST0);
    if (loc < VARYING_SLOT_VAR0 || loc > VARYING_SLOT_VAR31)
       return -2;
    unsigned d = c->p->vout_dword[loc - VARYING_SLOT_VAR0];
@@ -1478,6 +1494,21 @@ static void plan_vs_layout(struct gctx *c)
     * alpha for the size) */
    if (c->link && c->link->point_size)
       c->psize_dword = c->p->outputs++;
+   /* User clip distances: the vertex's last dwords, after the point size,
+    * one per declared distance (Apple's applegpu_g5p layout, LD_MD +164; the
+    * TA's user planes 0..n-1, TA_OUTPUT_SEL plane0..7). Disabled GL planes
+    * are the program's business (Zink's nir_lower_clip_disable, Apple's
+    * clipDistanceEnableMask in the program key). */
+   const unsigned clips = c->nir->info.clip_distance_array_size;
+   if (c->nir->info.cull_distance_array_size)
+      refuse(c, "cull distances (A9's TA user planes are clip planes; Apple's A9 driver sets no cull plane)");
+   if (clips && !(c->link && c->link->clip_distance))
+      refuse(c, "user clip distances");
+   if (clips > 8)
+      refuse(c, "%u clip distances (the TA has 8 user planes)", clips);
+   c->clip_dword = c->p->outputs;
+   c->p->clip_count = clips;
+   c->p->outputs += clips;
    /* The A9 TA vertex holds 128 dwords, the position included
     * (varyings-capacity-1: 124 varying components exact, 128 wrong as a
     * whole with no GPU event); refuse past it by name, never draw it. */
@@ -1490,7 +1521,7 @@ static void plan_vs_layout(struct gctx *c)
       if (ins->type != nir_instr_type_intrinsic)
          continue;
       nir_intrinsic_instr *in = nir_instr_as_intrinsic(ins);
-      if (in->intrinsic != nir_intrinsic_store_output || vs_base(c, nir_intrinsic_io_semantics(in).location) < 0)
+      if (in->intrinsic != nir_intrinsic_store_output || vs_base(c, out_location(in)) < 0)
          continue;
       last = in;
       last_comp = util_last_bit(nir_intrinsic_write_mask(in)) - 1;
@@ -1773,7 +1804,7 @@ static void liveness(struct gctx *c)
             continue;
          if (in->instr.block->cf_node.parent->type != nir_cf_node_function)
             refuse(c, "store_output inside control flow");
-         unsigned loc = nir_intrinsic_io_semantics(in).location;
+         unsigned loc = c->vs ? out_location(in) : nir_intrinsic_io_semantics(in).location;
          unsigned comp = nir_intrinsic_component(in);
          u_foreach_bit(k, nir_intrinsic_write_mask(in)) {
             if (c->vs) {
@@ -5732,13 +5763,18 @@ static void collect_vs_outputs(struct gctx *c)
       nir_intrinsic_instr *in = nir_instr_as_intrinsic(ins);
       if (in->intrinsic != nir_intrinsic_store_output)
          continue;
-      unsigned loc = nir_intrinsic_io_semantics(in).location;
+      const unsigned sem_loc = nir_intrinsic_io_semantics(in).location;
+      const unsigned loc = out_location(in);
       int base = vs_base(c, loc);
       if (base == -2)
-         refuse(c, "store_output to %s (only position and generic varyings have output slots)",
+         refuse(c, "store_output to %s (only position, generic varyings and clip distances have output slots)",
                 gl_varying_slot_name_for_stage(loc, MESA_SHADER_VERTEX));
-      if (!nir_src_is_const(in->src[1]) || nir_src_as_uint(in->src[1]))
+      if (!nir_src_is_const(in->src[1]) || (loc == sem_loc && nir_src_as_uint(in->src[1])))
          refuse(c, "indirect store_output");
+      if (base >= 0 && (loc == VARYING_SLOT_CLIP_DIST0 || loc == VARYING_SLOT_CLIP_DIST1) &&
+          4 * (loc - VARYING_SLOT_CLIP_DIST0) + nir_intrinsic_component(in) +
+                util_last_bit(nir_intrinsic_write_mask(in)) > c->p->clip_count)
+         refuse(c, "a clip distance past the %u declared", c->p->clip_count);
       if (base == -1)
          continue; /* not read by the fragment program */
       u_foreach_bit(k, nir_intrinsic_write_mask(in)) {

@@ -21,6 +21,7 @@
 #include "compiler/spirv/spirv_info.h"
 #include "util/u_call_once.h"
 #include "util/u_math.h"
+#include "vk_nir.h"
 #include "vk_shader_module.h"
 #include "vk_util.h"
 
@@ -391,6 +392,14 @@ g5p_nir_prepare(nir_shader *nir)
     * as its location (glslang's gl_PointSize became slot 1, COL0) */
    nir_split_var_copies(nir);
    nir_split_per_member_structs(nir);
+   /* gl_ClipDistance/gl_CullDistance sizes, before IO lowering, after the
+    * dead outputs are gone (vk_nir.c: glslang declares an unwritten
+    * gl_ClipDistance[1] and gl_CullDistance[1] in every gl_PerVertex) */
+   if (stage == MESA_SHADER_VERTEX) {
+      const nir_remove_dead_variables_options dead = { .can_remove_var = nir_vk_is_not_xfb_output };
+      nir_remove_dead_variables(nir, nir_var_shader_out, &dead);
+      nir_gather_clip_cull_distance_sizes_from_vars(nir);
+   }
    nir_lower_vars_to_ssa(nir);
    nir_opt_deref(nir);
    nir_lower_system_values(nir);
@@ -538,6 +547,50 @@ pad_color_slots(nir_shader *nir, unsigned color_targets)
    nir_index_ssa_defs(impl);
 }
 
+/* The clip distance components a vertex program stores (a bit per
+ * distance; compact CLIP_DIST0/1, constant offsets) */
+static bool
+clip_written(nir_builder *b, nir_intrinsic_instr *in, void *data)
+{
+   if (in->intrinsic != nir_intrinsic_store_output)
+      return false;
+   const unsigned loc = nir_intrinsic_io_semantics(in).location;
+   if (loc != VARYING_SLOT_CLIP_DIST0 && loc != VARYING_SLOT_CLIP_DIST1)
+      return false;
+   nir_src *off = nir_get_io_offset_src(in);
+   const unsigned first = 4 * (loc - VARYING_SLOT_CLIP_DIST0 + (nir_src_is_const(*off) ? nir_src_as_uint(*off) : 0)) +
+                          nir_intrinsic_component(in);
+   *(unsigned *)data |= nir_intrinsic_write_mask(in) << first;
+   return false;
+}
+
+/* A declared clip distance the program never stores is 0 (on the plane,
+ * not clipped): the TA reads every declared one (plane0..n-1), and an
+ * unwritten output dword would clip by a stale register. GL's disabled
+ * planes are already stored as 0 (Zink's nir_lower_clip_disable). */
+static void
+fill_clip_distances(nir_shader *nir)
+{
+   const unsigned n = nir->info.clip_distance_array_size;
+   unsigned written = 0;
+   if (!n)
+      return;
+   nir_shader_intrinsics_pass(nir, clip_written, nir_metadata_all, &written);
+   const unsigned missing = BITFIELD_MASK(n) & ~written;
+   if (!missing)
+      return;
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_builder b = nir_builder_at(nir_after_impl(impl));
+   u_foreach_bit(i, missing) {
+      const gl_varying_slot loc = i < 4 ? VARYING_SLOT_CLIP_DIST0 : VARYING_SLOT_CLIP_DIST1;
+      nir_store_output(&b, nir_imm_float(&b, 0.0f), nir_imm_int(&b, 0), .base = 0, .component = i % 4,
+                       .write_mask = 1, .src_type = nir_type_float32,
+                       .io_semantics = (nir_io_semantics){ .location = loc, .num_slots = 1 });
+      nir->info.outputs_written |= BITFIELD64_BIT(loc);
+   }
+   nir_index_ssa_defs(impl);
+}
+
 /* G5P renders layer 0 of single-layer views only (no layered rendering is
  * exposed): a vertex shader's gl_Layer is dropped and a fragment shader's
  * gl_Layer reads 0. vk_meta's rectangle and blit shaders use both. */
@@ -622,6 +675,8 @@ graphics_lower(nir_shader *nir, unsigned color_targets, bool *sample_mask, bool 
       nir_opt_dce(nir);
       nir_index_ssa_defs(nir_shader_get_entrypoint(nir));
    }
+   if (nir && stage == MESA_SHADER_VERTEX)
+      fill_clip_distances(nir);
    bool writes_psize = false;
    if (nir && stage == MESA_SHADER_VERTEX && point_size)
       nir_shader_intrinsics_pass(nir, find_point_size, nir_metadata_all, &writes_psize);
@@ -734,6 +789,10 @@ xfb_lower(nir_shader *nir, struct g5p_xfb_layout *layout, char *refusal, size_t 
       const nir_xfb_output_info *o = &x->outputs[i];
       if (o->data_is_16bit) {
          snprintf(refusal, refusal_size, "transform feedback of 16-bit data");
+         return false;
+      }
+      if (o->location == VARYING_SLOT_CLIP_DIST0 || o->location == VARYING_SLOT_CLIP_DIST1) {
+         snprintf(refusal, refusal_size, "transform feedback of gl_ClipDistance (capture not qualified)");
          return false;
       }
       const unsigned r = layout->nranges++;

@@ -187,6 +187,9 @@ struct pco_g5p_vs_link {
    /* a point pipeline: gl_PointSize is the last output dword, after the
     * varyings (TA_OUTPUT_SEL psprite_size_pres; Apple's g3b-points) */
    bool point_size;
+   /* user clip distances admitted (the enabled user-plane path): their
+    * dwords follow the point size, the vertex's last (Apple's applegpu_g5p) */
+   bool clip_distance;
 };
 
 /* Per-draw transform feedback block (PCO_G5P_UPLOAD_XFB): the VA each
@@ -249,6 +252,7 @@ struct pco_g5p_program {
    /* VS of a non-point pipeline: it wrote gl_PointSize, which was dropped
     * (set by pvr_g5p_nir.c after compilation; polygon mode POINT refuses it) */
    bool psize_dropped;
+   uint8_t clip_count;  /* VS: user clip distances, the last output dwords (TA user planes 0..n-1) */
    char refusal[512];
 };
 
