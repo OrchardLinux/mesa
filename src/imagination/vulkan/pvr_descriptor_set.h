@@ -18,6 +18,7 @@
 #include "util/vma.h"
 
 #include "vk_descriptor_set_layout.h"
+#include "vk_util.h"
 
 #include "pvr_common.h"
 #include "pvr_macros.h"
@@ -84,6 +85,79 @@ struct pvr_descriptor_set {
 
    struct pvr_buffer_descriptor dynamic_buffers[];
 };
+
+/* Dynamic uniform and storage buffers have no descriptor memory in the set:
+ * their binding offset is ~0, and the buffer lives in set->dynamic_buffers[]
+ * with the offset vkCmdBindDescriptorSets gave it. A path that reads buffer
+ * descriptors from the set's device memory (a DMA from set->dev_addr) must
+ * take these from here instead.
+ */
+static inline bool
+pvr_descriptor_set_binding_is_dynamic(
+   const struct pvr_descriptor_set_layout_binding *binding)
+{
+   return vk_descriptor_type_is_dynamic(binding->type);
+}
+
+/* The bound buffer of a dynamic binding's element: its address with the
+ * dynamic offset applied, and its range from there. Returns false when the
+ * element was never written (no buffer).
+ */
+static inline bool
+pvr_descriptor_set_dynamic_buffer(
+   const struct pvr_descriptor_set *set,
+   const struct pvr_descriptor_set_layout_binding *binding,
+   unsigned element,
+   uint64_t *addr,
+   uint32_t *range)
+{
+   const struct pvr_buffer_descriptor *d =
+      &set->dynamic_buffers[binding->dynamic_buffer_idx + element];
+
+   if (!d->addr)
+      return false;
+
+   *addr = d->addr + d->offset;
+   *range = d->size;
+   return true;
+}
+
+/* For a dispatch that DMAs a buffer slot's two dwords from descriptor
+ * memory (the A9 and A10 compute bind tasks): when the slot's binding is
+ * dynamic, the dwords it would read (the address, or the size word and the
+ * zero after it), to be uploaded instead. *dynamic is false for a binding
+ * that has descriptor memory. Fails for an unbound set, an element past the
+ * binding or an unwritten dynamic buffer.
+ */
+static inline bool
+pvr_descriptor_set_dynamic_slot(const struct pvr_descriptor_set *set,
+                                unsigned binding,
+                                unsigned element,
+                                bool size,
+                                uint32_t out[static 2],
+                                bool *dynamic)
+{
+   *dynamic = false;
+   if (!set || !set->layout || binding >= set->layout->binding_count)
+      return false;
+
+   const struct pvr_descriptor_set_layout_binding *lb =
+      &set->layout->bindings[binding];
+   if (!pvr_descriptor_set_binding_is_dynamic(lb))
+      return true;
+   if (element >= MAX2(lb->descriptor_count, 1))
+      return false;
+
+   uint64_t addr;
+   uint32_t range;
+   if (!pvr_descriptor_set_dynamic_buffer(set, lb, element, &addr, &range))
+      return false;
+
+   out[0] = size ? range : addr;
+   out[1] = size ? 0 : addr >> 32;
+   *dynamic = true;
+   return true;
+}
 
 struct pvr_push_descriptor_set {
    struct pvr_descriptor_set_layout *layout;

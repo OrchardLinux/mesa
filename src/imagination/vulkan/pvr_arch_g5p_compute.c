@@ -198,12 +198,14 @@ g5p_record_dispatch(struct pvr_cmd_buffer *cmd, struct pvr_sub_cmd_compute *sub,
    const char *sep = "";
    for (unsigned si = 0; si < PVR_MAX_DESCRIPTOR_SETS; si++) {
       const struct pvr_descriptor_set *set = desc->sets[si];
-      if (!set || !set->layout || !set->mapping) continue;
+      /* a set of dynamic buffers only has no descriptor memory (no mapping) */
+      if (!set || !set->layout) continue;
       for (unsigned bi = 0; bi < set->layout->binding_count; bi++) {
          const struct pvr_descriptor_set_layout_binding *b = &set->layout->bindings[bi];
          if (!(b->stage_flags & VK_SHADER_STAGE_COMPUTE_BIT)) continue;
+         if (!set->mapping && !pvr_descriptor_set_binding_is_dynamic(b)) continue;
          for (unsigned e = 0; e < b->descriptor_count; e++) {
-            const uint8_t *d = (uint8_t *)set->mapping + b->offset + e * b->stride;
+            const uint8_t *d = set->mapping ? (uint8_t *)set->mapping + b->offset + e * b->stride : NULL;
             switch (b->type) {
             case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
             case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
@@ -293,6 +295,7 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
    uint32_t bind_data[4 * (G9P_MAX_BUFFERS + 1) + 4 + 3 * G9P_A9_MAX_UPLOADS] = { 0 };
    uint32_t bind_code[G9P_MAX_BUFFERS + 5 + G9P_A9_MAX_UPLOADS];
    uint32_t kernel_data[12] = { 0 }, kernel_code[8];
+   bool from_uniforms[G9P_MAX_BUFFERS] = { false };
    struct pvr_pds_upload bind, kernel;
    unsigned bind_dwords, ctrl0, nc = 0;
    VkResult result;
@@ -394,6 +397,21 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
          uniforms[2 * k] = pc->dev_addr.addr;
          uniforms[2 * k + 1] = pc->dev_addr.addr >> 32;
       }
+      if (state->buffers[k].set < PVR_MAX_DESCRIPTOR_SETS) {
+         /* A dynamic buffer has no descriptor in set memory (its binding
+          * offset is ~0: a DMA from there reads set->dev_addr + 0xffffffff).
+          * Its address with the bound dynamic offset, or its range for
+          * arrayLength(), goes through this upload. */
+         const unsigned element = (state->buffers[k].binding & ~G9P_BINDING_SIZE) >> G9P_BINDING_ELEMENT_SHIFT;
+         const unsigned b = state->buffers[k].binding & BITFIELD_MASK(G9P_BINDING_ELEMENT_SHIFT);
+
+         if (!pvr_descriptor_set_dynamic_slot(desc->sets[state->buffers[k].set], b, element,
+                                              state->buffers[k].binding & G9P_BINDING_SIZE,
+                                              &uniforms[2 * k], &from_uniforms[k]))
+            return vk_errorf(cmd_buffer, VK_ERROR_UNKNOWN,
+                             "G5P compute: set %u binding %u element %u holds no bound buffer",
+                             state->buffers[k].set, b, element);
+      }
    }
    unsigned images=state->a9_num_images;
    if(images && n>15)return vk_errorf(cmd_buffer,VK_ERROR_OUT_OF_HOST_MEMORY,"G5P image LOD common31 overlaps the16th buffer pointer");
@@ -480,7 +498,7 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
          src = uniforms_bo->dev_addr.addr + 4 * (tex0 + 8 * i);
          dest = state->a9_uploads[i].common;
          dwords = state->a9_uploads[i].dwords;
-      } else if (k < n && state->buffers[k].set != G9P_PUSH_CONSTANTS &&
+      } else if (k < n && !from_uniforms[k] && state->buffers[k].set != G9P_PUSH_CONSTANTS &&
                  state->buffers[k].set != G9P_NUM_WORKGROUPS &&
                  state->buffers[k].set != G9P_SHARED_SPILL) {
          const struct pvr_descriptor_set *set = desc->sets[state->buffers[k].set];
