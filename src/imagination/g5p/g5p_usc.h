@@ -202,6 +202,9 @@ struct g5p_tex_ext {
    enum g5p_tex_tuple tuple;
    bool lod_shared; /* prefix level source: common store instead of register */
 };
+/* A9 compute's register-level array or cube sample and fetch: the coupled temporary-level tuple, the fetch's
+ * coordinate kept live (fields at the encoder). */
+unsigned g5p_usc_sample_register_lod(uint8_t *out, const struct g5p_tex_ext *t);
 unsigned g5p_usc_sample_ext(uint8_t *out, const struct g5p_tex_ext *t);
 /* 16-bit immediate into one half (class 0x88, the 32-bit move's split map;
  * Apple's texel-offset probes witness bits 0-9). */

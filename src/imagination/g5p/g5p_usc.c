@@ -1180,6 +1180,22 @@ unsigned g5p_usc_sample_ext(uint8_t *out, const struct g5p_tex_ext *t)
    return finish(out, raw, 10);
 }
 
+/* A9 compute's array or cube sample with the level in a register (Apple's A9 compiler's form): the coupled
+ * temporary-level tuple of g5p_usc_sample_ext(). Its fetch form (read) keeps the coordinate operand live: it
+ * clears the coordinate's last-read bit, which every other sample form sets (texture_base()'s coordinate byte). */
+#define G5P_TEX_COORD_BYTE 5
+#define G5P_TEX_COORD_LAST_READ 0x80
+unsigned g5p_usc_sample_register_lod(uint8_t *out, const struct g5p_tex_ext *t)
+{
+   CHECK(t->tuple == G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL && t->lod == G5P_TEX_LOD_LEVEL && !t->lod_shared &&
+         (t->dim == G5P_TEX_2D_ARRAY || t->dim == G5P_TEX_CUBE),
+         "the register-LOD form is an array or cube sample at a level");
+   const unsigned n = g5p_usc_sample_ext(out, t);
+   if (n && t->read)
+      out[G5P_TEX_COORD_BYTE] &= ~G5P_TEX_COORD_LAST_READ;
+   return n;
+}
+
 unsigned g5p_usc_half_immediate(uint8_t *out, unsigned dst_half, uint16_t value)
 {
    CHECK(dst_half <= 63, "dst_half beyond r31");

@@ -74,10 +74,7 @@ static int
 a9_tex_shared_lod(struct g9p_ctx *ctx, nir_tex_instr *tex, bool read)
 {
    int li = nir_tex_instr_src_index(tex, nir_tex_src_lod);
-   if (li >= 0 && !nir_src_is_const(tex->src[li].src)) {
-      a9_tex_refuse(ctx, "dynamic LOD on a compute 2D array or cube (no A9 witness yet)");
-      return -1;
-   }
+   assert(li < 0 || nir_src_is_const(tex->src[li].src));
    uint32_t value = li < 0 ? 0 : read ? nir_src_as_uint(tex->src[li].src) :
                                        _mesa_float_to_half(nir_src_as_float(tex->src[li].src));
    unsigned used = 0;
@@ -256,7 +253,28 @@ a9_tex(struct g9p_ctx *ctx, nir_tex_instr *tex)
 
    /* level (f16 for samples, u32 for reads) or gradients */
    int lod;
-   if (layered) {
+   const int li = nir_tex_instr_src_index(tex, nir_tex_src_lod);
+   const bool register_lod = layered && li >= 0 && !nir_src_is_const(tex->src[li].src);
+   if (register_lod) {
+      /* Apple's A9 witnesses sla_d/slc_d convert the level to the low f16 of
+       * a register with the source in slot A, its last read marked; the
+       * older plain-2D g9p_f16_of() reads slot B; leave that proven path
+       * alone. Copy into a private low temporary: the witness marks the
+       * source's last read, so it cannot be a still-live NIR value. */
+      int src = src_reg(ctx, nir_get_scalar(tex->src[li].src.ssa, 0));
+      if (src < 0) return false;
+      int copy = alloc_low_temp(ctx);
+      if (copy < 0) return false;
+      g9p_alu2(ctx->c, G9P_OR, copy, src, src, false);
+      lod = read ? copy : alloc_low_temp(ctx);
+      if (lod < 0) return false;
+      if (!read) {
+         const unsigned at = ctx->c->n;
+         g9p_f16_of(ctx->c, lod, 0);
+         ctx->c->w[at + 2] |= copy << G9P_SRC_A_SHIFT | G9P_SRC_A_LAST_READ;
+      }
+      /* ra_d loads its uint LOD directly into r0: no f16 conversion. */
+   } else if (layered) {
       lod = a9_tex_shared_lod(ctx, tex, read);
       if (lod < 0) return false;
    } else if (grad) {
@@ -301,6 +319,25 @@ a9_tex(struct g9p_ctx *ctx, nir_tex_instr *tex)
    if (dst < 0 || dst > 28)
       return false;
 
+   if (register_lod) {
+      /* Apple's A9 register-LOD array or cube sample (slc_d/sla_d) and fetch
+       * (ra_d, coordinate r3; its preceding ops produce x,y,layer in r3,r4,r5):
+       * g5p_usc_sample_register_lod(), the coupled temporary-level tuple
+       * with the LOD register. Keep this local to these witnessed compute
+       * cases; g5p_usc_sample_ext() and all graphics encodings are unchanged. */
+      const struct g5p_tex_ext x = {
+         .dst_half = 2 * dst, .image_qword = image / 2, .sampler_qword = sampler / 2, .coord_dword = block,
+         .dim = cube ? G5P_TEX_CUBE : G5P_TEX_2D_ARRAY, .mask = 0xf, .read = read,
+         .lod = G5P_TEX_LOD_LEVEL, .lod_dword = lod, .tuple = G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL,
+      };
+      uint8_t raw[G5P_USC_MAX];
+      const unsigned n = g5p_usc_sample_register_lod(raw, &x);
+      if (!n) {
+         a9_tex_refuse(ctx, "the register-LOD sample was refused by the encoder");
+         return false;
+      }
+      a9_tex_emit_raw(ctx, raw, n);
+   } else {
    struct g5p_tex_ext x = {
       .dst_half = 2 * dst, .image_qword = image / 2, .sampler_qword = sampler / 2,
       .coord_dword = block, .dim = cube ? G5P_TEX_CUBE : array ? G5P_TEX_2D_ARRAY : G5P_TEX_2D, .mask = 0xf, .read = read,
@@ -316,6 +353,7 @@ a9_tex(struct g9p_ctx *ctx, nir_tex_instr *tex)
       return false;
    }
    a9_tex_emit_raw(ctx, raw, n);
+   }
    g9p_wait(ctx->c);
    for (unsigned c = 0; c < 4; c++) {
       ctx->reg[key(&tex->def, c)] = dst + c;
