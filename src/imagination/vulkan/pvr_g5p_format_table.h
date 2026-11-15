@@ -76,6 +76,7 @@ enum pvr_g5p_fmt_evidence {
    PVR_G5P_FMT_EV_ICD,     /* captured key, device-proven by our ICD (gles3tex, textypes) */
    PVR_G5P_FMT_EV_RULE,    /* derived from the decoded code rule, not captured */
    PVR_G5P_FMT_EV_CAPTURE, /* captured key, never run on the device */
+   PVR_G5P_FMT_EV_AGX,     /* AGXMetalA9's own texFormat row (code and swizzle words), never run on the device */
 };
 
 struct pvr_g5p_format {
@@ -161,6 +162,23 @@ static const struct pvr_g5p_format pvr_g5p_format_table[] = {
     * with alpha low). */
    G5P_FMT(R5G6B5_UNORM_PACK16, 2, false, G5P_SF, G5P1B, 0x0b, 2, 1, 0, G5P_ONE),
    G5P_FMT(B4G4R4A4_UNORM_PACK16, 2, false, G5P_SF, G5P1B, 0x0c, 1, 2, 3, 0),
+   /* The other 16-bit packed forms (PPSSPP's A1R5G5B5 among them), sampled and filtered, from AGXMetalA9's
+    * texFormat rows (word 0 the code, word 16 the sampling swizzle,
+    * 3-bit selectors from bit 6: 2 + component, 0 zero, 1 one) and chooseTextureFormatOBJC's MTLPixelFormat map:
+    *   B5G6R5Unorm (40) -> RGB565 0x0b [c2 c1 c0 1]   A1BGR5Unorm (41) -> RGB5A1 0x0d [c3 c2 c1 c0]
+    *   ABGR4Unorm (42)  -> RGBA4  0x0c [c3 c2 c1 c0]  BGR5A1Unorm (43) -> A1RGB5 0x0e [c2 c1 c0 c3]
+    *   (no MTLPixelFormat)  BGRA4 0x0c [c2 c1 c0 c3]
+    * Component 0 is the lowest field: the 565 and 4444 rows above, which assume it, are exact on the device. So
+    * 0x0d is 1_5_5_5 (alpha bit 0) and 0x0e 5_5_5_1 (alpha bit 15); the Vulkan forms below are those rows' own
+    * swizzles or a reordering of them. Advertised by default since the tex16 cases (packed-texture format checks) were exact
+    * on the device (2026-11-14); these formats are always enabled. */
+   G5P_FMT(A1R5G5B5_UNORM_PACK16, 2, false, G5P_SF | G5P_PS, AGX, 0x0e, 2, 1, 0, 3),
+   G5P_FMT(R5G5B5A1_UNORM_PACK16, 2, false, G5P_SF | G5P_PS, AGX, 0x0d, 3, 2, 1, 0),
+   G5P_FMT(B5G5R5A1_UNORM_PACK16, 2, false, G5P_SF | G5P_PS, AGX, 0x0d, 1, 2, 3, 0),
+   G5P_FMT(B5G6R5_UNORM_PACK16, 2, false, G5P_SF | G5P_PS, AGX, 0x0b, 0, 1, 2, G5P_ONE),
+   G5P_FMT(R4G4B4A4_UNORM_PACK16, 2, false, G5P_SF | G5P_PS, AGX, 0x0c, 3, 2, 1, 0),
+   G5P_FMT(A4R4G4B4_UNORM_PACK16, 2, false, G5P_SF | G5P_PS, AGX, 0x0c, 2, 1, 0, 3),
+   G5P_FMT(A4B4G4R4_UNORM_PACK16, 2, false, G5P_SF | G5P_PS, AGX, 0x0c, 0, 1, 2, 3),
    /* integer (g3b-sample-b t5-t18, fmt-rgba8ui; textypes int-fetch and
     * int-sample on the device). RGBA32 UINT/SINT clear/draw/LOAD/masks
     * passed the integer-r4 core/compat device cases. Narrow integer render

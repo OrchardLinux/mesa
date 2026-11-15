@@ -240,11 +240,13 @@ pvr_get_format(struct pvr_physical_device *pdevice, VkFormat vk_format)
        pdevice->formats.formats[format].bind != 0) {
       return &pdevice->formats.formats[format];
    }
-   /* G5P: ASTC LDR exists only in the A9's own table (Rogue's table, which
-    * G9P shares, has none); the G5P hooks take its features and texture
-    * state from that row (pvr_g5p_format_table.h) */
+   /* G5P: ASTC LDR and the 16-bit packed forms Rogue lacks (A1R5G5B5,
+    * B5G6R5, R4G4B4A4, ...) exist only in the A9's own table (Rogue's table,
+    * which G9P shares, has none); the G5P hooks take their features and
+    * texture state from that row (pvr_g5p_format_table.h) */
    if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g5p) &&
-       vk_format_description(vk_format)->layout == UTIL_FORMAT_LAYOUT_ASTC &&
+       (vk_format_description(vk_format)->layout == UTIL_FORMAT_LAYOUT_ASTC ||
+        vk_format_get_blocksize(vk_format) == 2) &&
        pvr_g5p_format_find(vk_format)) {
       static const struct pvr_format g5p_astc = {
          /* Rogue's texture-format codes are not used on G5P (its own key is) */

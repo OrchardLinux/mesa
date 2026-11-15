@@ -32,13 +32,26 @@ pvr_g5p_formats_probe(void)
    return false;
 }
 
+/* Qualified 16-bit packed texture formats are always enabled. */
+static bool
+tex16_row(VkFormat format)
+{
+   const struct pvr_g5p_format *f = pvr_g5p_format_find(format);
+   return f && f->evidence == PVR_G5P_FMT_EV_AGX && f->cpp == 2;
+}
+
+static bool
+row_probe(VkFormat format)
+{
+   return pvr_g5p_formats_probe() || tex16_row(format);
+}
 
 bool
 pvr_g5p_format_tex(VkFormat format, uint32_t *key, bool *srgb)
 {
    const struct pvr_g5p_format *f = pvr_g5p_format_find(format);
 
-   if (!f || !(pvr_g5p_format_flags(f, pvr_g5p_formats_probe()) & PVR_G5P_FMT_SAMPLED))
+   if (!f || !(pvr_g5p_format_flags(f, row_probe(format)) & PVR_G5P_FMT_SAMPLED))
       return false;
    *key = f->key;
    *srgb = f->srgb;
@@ -56,7 +69,7 @@ pvr_g5p_packed_word_pbe_key(void)
 bool
 pvr_g5p_format_pbe(VkFormat format, uint32_t *key, bool *srgb)
 {
-   return pvr_g5p_format_pbe_key(format, pvr_g5p_formats_probe(), key, srgb);
+   return pvr_g5p_format_pbe_key(format, row_probe(format), key, srgb);
 }
 
 VkFormatFeatureFlags2
@@ -66,7 +79,7 @@ pvr_g5p_color_format_features(VkFormat format, VkImageTiling tiling, VkFormatFea
 
    /* the A9's own answer; upstream's flags only say the format exists */
    (void)flags;
-   return pvr_g5p_format_features(f, tiling == VK_IMAGE_TILING_LINEAR, pvr_g5p_formats_probe());
+   return pvr_g5p_format_features(f, tiling == VK_IMAGE_TILING_LINEAR, row_probe(format));
 }
 
 VkResult
