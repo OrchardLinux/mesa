@@ -4812,6 +4812,7 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
    ctx.c = rzalloc(mem_ctx, struct g9p_code);
    ctx.c->fragment = stage == MESA_SHADER_FRAGMENT;
    ctx.c->high_bank0 = stage == MESA_SHADER_COMPUTE && out->a9;
+   ctx.c->a9_stack = stage == MESA_SHADER_COMPUTE && out->a9;
    ctx.reg = ralloc_array(mem_ctx, int8_t, impl->ssa_alloc * 4);
    ctx.uni = ralloc_array(mem_ctx, int16_t, impl->ssa_alloc * 4);
    memset(ctx.uni, -1, impl->ssa_alloc * 4 * sizeof(*ctx.uni));

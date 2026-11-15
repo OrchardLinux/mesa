@@ -27,6 +27,9 @@ struct g9p_code {
    /* registers above r31 ("homes") in the fragment bank (bank 0) while the code's own stay in bank 1: A9 compute
     * (g9p_mov_to_high()) */
    bool high_bank0;
+   /* A9 compute: Apple's A9 mask-stack rule, the stack register's last-read bit only on the program's
+    * last stack operation (g9p_pop()), not on every pop (g9p_pop_levels()) */
+   bool a9_stack;
    /* the code pushes onto the mask stack (needs g9p_push_init()) */
    bool uses_stack;
 };
@@ -462,10 +465,27 @@ g9p_else(struct g9p_code *c, unsigned st)
    G9P_EMIT(c, g9p_w0(c, 0x21c8), g9p_st_dst(c, st), g9p_st_src(c, st), 0x46d4);
 }
 
+/*
+ * Pop @levels. Bit 7 of the source word is the stack register's last-read bit. G9P (A10) sets it on every
+ * pop; Apple's A9 compiler sets it only on the program's last stack operation (G5P's fragment port
+ * g5p_usc_stack() does the same, and so does Apple's captured divergent loop: the loop's pop leaves
+ * the bit clear, the last pop sets it). An intermediate pop that marks the register read for the last time
+ * lets the counter go while lanes still wait on it: on A9 compute a loop whose lanes leave at different
+ * iterations ((g & 3) + 2 rounds) lost the GPU before any store, while uniform loops ran.
+ */
+#define G9P_SRC_A_LAST_READ    0x0080
+#define G9P_CLASS_STACK        0xc8 /* the mask stack: its register as destination and as source A */
+#define G9P_W0_STACK           (G9P_CLASS_STACK | G9P_CONT | G9P_W0_SRC_A_BANK1)
+#define G9P_STACK_PUSH         0xd1
+#define G9P_STACK_POP          0xd2
+#define G9P_STACK_CTL          0x0600 /* set in every stack operation's last word (observed role) */
+#define G9P_STACK_LEVELS_SHIFT 14
 static inline void
 g9p_pop_levels(struct g9p_code *c, unsigned st, unsigned levels)
 {
-   G9P_EMIT(c, g9p_w0(c, 0x21c8), g9p_st_dst(c, st), 0x0080 | g9p_st_src(c, st), 0x06d2 | levels << 14);
+   G9P_EMIT(c, g9p_w0(c, G9P_W0_STACK), g9p_st_dst(c, st),
+            (c->a9_stack ? 0 : G9P_SRC_A_LAST_READ) | g9p_st_src(c, st),
+            G9P_STACK_CTL | G9P_STACK_POP | levels << G9P_STACK_LEVELS_SHIFT);
 }
 
 /* Loops: start (two levels), break the lanes whose compare passed/failed */
