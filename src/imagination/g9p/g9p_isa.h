@@ -24,6 +24,9 @@ struct g9p_code {
    unsigned n;
    /* a fragment shader: registers in the other bank, see g9p_w0() */
    bool fragment;
+   /* registers above r31 ("homes") in the fragment bank (bank 0) while the code's own stay in bank 1: A9 compute
+    * (g9p_mov_to_high()) */
+   bool high_bank0;
    /* the code pushes onto the mask stack (needs g9p_push_init()) */
    bool uses_stack;
 };
@@ -158,6 +161,25 @@ g9p_mov_imm(struct g9p_code *c, unsigned dst, uint32_t imm)
    }
 }
 
+/*
+ * Word fields, named for the encoders below: W0 holds the class byte, the continuation bit 8 and, outside fragment
+ * code (g9p_w0()), the register-bank bits of sources B (bit 12) and A (bit 13); a destination word (g9p_dst())
+ * the half index, the continuation and the bank bit 9; a source word (g9p_srcs()) source A's register at bit 2
+ * and B's at bit 10, each with its last-read bit (7 and 15). A register source above r31 sets the source word's
+ * bit 0 and puts r >> 5 in an extension word (A at bit 1, B at bit 9).
+ */
+#define G9P_CONT           0x0100
+#define G9P_W0_SRC_B_BANK1 0x1000
+#define G9P_W0_SRC_A_BANK1 0x2000
+#define G9P_W1_BANK1       0x0200
+#define G9P_CLASS_ALU2     0x99 /* g9p_alu2()'s class: two register sources */
+#define G9P_W0_ALU2        (G9P_CLASS_ALU2 | G9P_CONT | G9P_W0_SRC_A_BANK1 | G9P_W0_SRC_B_BANK1)
+#define G9P_SRC_A_SHIFT    2
+#define G9P_SRC_B_SHIFT    10
+#define G9P_SRCS_EXT       0x0001
+#define G9P_EXT_A_SHIFT    1
+#define G9P_EXT_B_SHIFT    9
+
 /* Two register sources; @kill marks both as last use */
 static inline uint16_t
 g9p_srcs(unsigned a, unsigned b, bool kill)
@@ -182,19 +204,34 @@ g9p_alu2(struct g9p_code *c, unsigned op, unsigned dst, unsigned a, unsigned b,
  * r31"). The compiler parks NIR registers there ("homes") and moves them
  * with OR, which copies any bit pattern.
  */
+/*
+ * A9 compute (c->high_bank0): its registers r0-r31 are in bank 1 (W0 bits 11-13, W1 bit 9), but the
+ * registers above r31 are bank 0's, as in Apple's A9 kernels:
+ * examined kernels write bank 0 up to r60 and bank 1 up to r2 or r7, and declare 64
+ * registers (__GPU_METADATA r.0.0), so the count covers bank 0. The kernel's register allocation comes
+ * from it (CDM K0 bits 12+ = ceil(regs / 4), AGXMetalA9 ComputeProgramVariant 0x207d2c4b0 -> +0x9b8;
+ * DOUTU temps (regs & ~3) << 1, EncodeComputePDSProgram 0x207d1ea4c). Homes in bank 1 above r31
+ * read wrong values on every lane of a 69-register kernel and lost the GPU; that bank 1
+ * holds only 32, as in vertex code, is inferred. A home move keeps its low side in the code's bank and
+ * its high side in bank 0, the fragment form above (validated at r40/r77/r100 on the A9): an operand's
+ * header bit and the destination's W1 bit 9 name each side's bank.
+ */
 static inline void
 g9p_mov_to_high(struct g9p_code *c, unsigned hi, unsigned src)
 {
    assert(src < 32 && hi < 128);
-   G9P_EMIT(c, g9p_w0(c, 0x3199), g9p_dst(c, hi), 0x0100 | src << 2 | src << 10, 0x00ce);
+   G9P_EMIT(c, g9p_w0(c, G9P_W0_ALU2), c->high_bank0 ? G9P_CONT | 2 * hi : g9p_dst(c, hi),
+            g9p_srcs(src, src, false), G9P_OR);
 }
 
 static inline void
 g9p_mov_from_high(struct g9p_code *c, unsigned dst, unsigned hi)
 {
    assert(dst < 32 && hi < 128);
-   G9P_EMIT(c, g9p_w0(c, 0x3199), g9p_dst(c, dst), 0x0101 | (hi & 31) << 2 | (hi & 31) << 10,
-            0x0100 | (hi >> 5) << 1 | (hi >> 5) << 9, 0x00ce);
+   /* on A9 compute (high_bank0) both sources are bank 0's */
+   G9P_EMIT(c, g9p_w0(c, G9P_W0_ALU2) & ~(c->high_bank0 ? G9P_W0_SRC_A_BANK1 | G9P_W0_SRC_B_BANK1 : 0),
+            g9p_dst(c, dst), g9p_srcs(hi & 31, hi & 31, false) | G9P_SRCS_EXT,
+            G9P_CONT | (hi >> 5) << G9P_EXT_A_SHIFT | (hi >> 5) << G9P_EXT_B_SHIFT, G9P_OR);
 }
 
 /* dst = src + imm, 0 <= imm < 64 */

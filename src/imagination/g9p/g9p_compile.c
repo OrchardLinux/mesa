@@ -4811,6 +4811,7 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
    ctx.frag_coord_slot = frag_coord_slot;
    ctx.c = rzalloc(mem_ctx, struct g9p_code);
    ctx.c->fragment = stage == MESA_SHADER_FRAGMENT;
+   ctx.c->high_bank0 = stage == MESA_SHADER_COMPUTE && out->a9;
    ctx.reg = ralloc_array(mem_ctx, int8_t, impl->ssa_alloc * 4);
    ctx.uni = ralloc_array(mem_ctx, int16_t, impl->ssa_alloc * 4);
    memset(ctx.uni, -1, impl->ssa_alloc * 4 * sizeof(*ctx.uni));
@@ -4907,7 +4908,9 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
          ctx.reserve_st_low = true;
          continue;
       }
-      if (!ctx.oom || stage == MESA_SHADER_COMPUTE || num_homed >= 1024 || g9p_no_homes)
+      /* A9 compute parks values above its bank-1 limit in bank 0. */
+      if (!ctx.oom || (stage == MESA_SHADER_COMPUTE && !(out->a9)) || num_homed >= 1024 ||
+          g9p_no_homes)
          return false;
       stuck = ctx.oom_ip == last_oom_ip ? stuck + 1 : 0;
       last_oom_ip = ctx.oom_ip;
@@ -4957,7 +4960,8 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
          const unsigned start = victim_decl ? ctx.reg_first[victim / 4] : ctx.def_ip[victim / 4];
          /* a NIR register's range takes in the loops it is used in (use_scalar()) */
          const unsigned end = ctx.last_use[victim];
-         const unsigned max_homes = g9p_max_homes;
+         /* compute: at most 96 registers per lane (G9P_CDM_KERNEL_REGS' field; residency) */
+         const unsigned max_homes = stage == MESA_SHADER_COMPUTE ? MIN2(g9p_max_homes, 64) : g9p_max_homes;
          int home = -1;
 
          for (unsigned h = 0; home < 0 && h < max_homes; h++) {
