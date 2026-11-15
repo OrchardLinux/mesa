@@ -15,7 +15,7 @@ const char *const g5p_binop_name[G5P_BIN_COUNT] = {"fadd", "fmul", "iadd", "imul
 const char *const g5p_minmax_name[G5P_MINMAX_COUNT] = {"umin", "umax", "imin", "imax"};
 const char *const g5p_convert_name[G5P_CONVERT_COUNT] = {"f2i32", "f2u32", "i2f32", "u2f32", "f2i32_rte"};
 const char *const g5p_unary_name[G5P_UNARY_COUNT] = {"floor", "log2", "exp2", "not", "popcount", "bitreverse"};
-const char *const g5p_tex_dim_name[G5P_TEX_DIM_COUNT] = {"2d", "2d_array", "3d", "cube"};
+const char *const g5p_tex_dim_name[G5P_TEX_DIM_COUNT] = {"2d", "2d_array", "3d", "cube", "2d_ms"};
 const char *const g5p_cmp_name[G5P_CMP_COUNT] = {"flt", "fgt", "feq", "ilt", "igt", "ult", "ugt", "ieq"};
 const char *const g5p_sfu_name[G5P_SFU_COUNT] = {"rcp_approx", "rsqrt_approx", "sin_core", "cos_core"};
 
@@ -26,7 +26,7 @@ static const uint8_t convert_code[G5P_CONVERT_COUNT] = {0x60, 0x60, 0x68, 0x68, 
 static const uint8_t cmp_code[G5P_CMP_COUNT] = {0x59, 0x5d, 0x55, 0xbe, 0xbf, 0xb6, 0xb7, 0xbd};
 static const uint8_t sfu_code[G5P_SFU_COUNT] = {0x80, 0x81, 0x82, 0x86};
 static const uint8_t unary_code[G5P_UNARY_COUNT] = {0x40, 0x84, 0x85, 0xc5, 0xe8, 0xe4};
-static const uint8_t dim_code[G5P_TEX_DIM_COUNT] = {0xf5, 0xf7, 0xfb, 0xfd};
+static const uint8_t dim_code[G5P_TEX_DIM_COUNT] = {0xf5, 0xf7, 0xfb, 0xfd, 0xf9};
 static const uint8_t mov_trailer[4] = {0x54, 0x01, 0x38, 0x00};
 
 /* Split immediate map (g5p_isa.IMM_MAP): bit -> (byte, bit). */
@@ -988,6 +988,8 @@ static unsigned texture_base(uint8_t *raw, const struct g5p_tex *t)
    CHECK(t->class_variant <= 1, "class_variant must be an integer in [0,1]");
    CHECK(t->dim < G5P_TEX_DIM_COUNT, "unmeasured texture dimension");
    CHECK(!t->read || t->dim == G5P_TEX_2D, "only 2d read has been isolated");
+   CHECK(t->dim != G5P_TEX_2D_MS || (!t->read && !t->class_variant),
+         "the 2D-multisample fetch is witnessed only as the narrow class0 sample");
    raw[0] = 0x1a | t->class_variant;
    raw[1] = dim_code[t->dim];
    raw[2] = t->dst_half | (t->read ? 0x40 : 0);
@@ -1003,11 +1005,51 @@ unsigned g5p_usc_sample(uint8_t *out, const struct g5p_tex *t)
    uint8_t raw[G5P_USC_MAX];
    if (!texture_base(raw, t))
       return 0;
+   CHECK(t->dim != G5P_TEX_2D_MS || (t->narrow && t->coord_control),
+         "the 2D-multisample sample is witnessed only narrow with coordinate control");
    if (t->narrow) {
-      CHECK(!t->class_variant && t->dim == G5P_TEX_2D, "narrow sample witnessed only as 2d class0");
+      CHECK(!t->class_variant && (t->dim == G5P_TEX_2D || t->dim == G5P_TEX_2D_MS),
+            "narrow sample witnessed only as 2d and 2d-multisample class0");
       raw[0] &= ~2;
    }
    return finish(out, raw, 6);
+}
+
+/* A move of a special value: the layout of g5p_usc_immediate()'s short move, with the source kind "special
+ * value" where the immediate sets "literal". Fields, by byte:
+ *   0  the single-source class of g5p_usc_move() and g5p_usc_immediate();
+ *   1  the header: only the continuation into the destination parcel;
+ *   2  the destination half, 3 its bank (destination());
+ *   4  bit 0: slot A is not a register; bits 1..6: the special value's index (where the immediate keeps its
+ *      bits 0..5); bit 7: zero (the register form's group bit);
+ *   5  slot B unused (selector 0) with the continuation;
+ *   6  the source kind (G5P_MOV_SOURCE_*); the immediate's long-form bit 0 and literal bits stay zero;
+ *   7  the continuation, the immediate's literal bits zero;
+ *   8  the move's trailer (mov_trailer, as g5p_usc_move()).
+ * The A9 compiler emits this form for two indices: G5P_SPECIAL_OWN_SAMPLE, and 24 for the primitive's facing,
+ * which no encoder here takes. */
+#define G5P_CLASS_MOVE 0x98
+#define G5P_SRC_A_NOT_REGISTER 0x01
+#define G5P_SRC_B_UNUSED 0x00
+#define G5P_MOV_SOURCE_SPECIAL 0x10 /* observed with the two indices above; the immediate sets 0x20 */
+#define G5P_SPECIAL_OWN_SAMPLE 12   /* the sample the task shades */
+
+unsigned g5p_usc_ms_own_sample(uint8_t *out, unsigned dst_half)
+{
+   CHECK(half_register(dst_half, "the sample operand's destination must be a 32-bit aligned half index"),
+         g5p_usc_error);
+   const unsigned dst_bank = 0;
+   uint8_t raw[12];
+   raw[0] = G5P_CLASS_MOVE;
+   raw[1] = G5P_HEADER_FRAGMENT;
+   if (!destination(raw + 2, dst_half, dst_bank))
+      return 0;
+   raw[4] = G5P_SRC_A_NOT_REGISTER | G5P_SPECIAL_OWN_SAMPLE << 1;
+   raw[5] = G5P_SRC_B_UNUSED | G5P_PARCEL_CONTINUES;
+   raw[6] = G5P_MOV_SOURCE_SPECIAL;
+   raw[7] = G5P_PARCEL_CONTINUES;
+   memcpy(raw + 8, mov_trailer, sizeof(mov_trailer));
+   return finish(out, raw, 12);
 }
 
 unsigned g5p_usc_texture_lod(uint8_t *out, const struct g5p_tex *t)
@@ -1062,7 +1104,7 @@ unsigned g5p_usc_sample_ext(uint8_t *out, const struct g5p_tex_ext *t)
    CHECK((unsigned)t->tuple <= G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL_COMPARE_OFFSET, "unqualified texture recipe");
    CHECK(!coupled || t->lod_shared == (t->tuple == G5P_TEX_TUPLE_COUPLED_SHARED_LEVEL),
          "unqualified independent texture continuation choices");
-   static const uint8_t dim_low[G5P_TEX_DIM_COUNT] = {0x5, 0x7, 0xb, 0xd};
+   static const uint8_t dim_low[G5P_TEX_DIM_COUNT] = {0x5, 0x7, 0xb, 0xd, 0x9};
    static const uint8_t lod_mode[] = {0, 0x40, 0x20, 0x60};
    CHECK(half_register(t->dst_half, "dst_half requires a measured 32-bit aligned half index"), g5p_usc_error);
    /* A9 Metal v_images31 and v_units16_sample witness the complete 7-bit
@@ -1071,6 +1113,7 @@ unsigned g5p_usc_sample_ext(uint8_t *out, const struct g5p_tex_ext *t)
    CHECK(t->sampler_qword <= 124, "sampler_qword must be an integer in [0,124]");
    CHECK(t->coord_dword <= 31 && t->lod_dword <= 31 && t->extras_half <= 63, "operand beyond r31");
    CHECK(t->dim < G5P_TEX_DIM_COUNT, "unmeasured texture dimension");
+   CHECK(t->dim != G5P_TEX_2D_MS, "no general-form 2D-multisample fetch is witnessed");
    CHECK(t->mask == 0xf || (t->mask == 1 && t->compare), "only rgba and compare results are measured");
    CHECK(!t->read || (!t->compare && !t->offset && t->lod == G5P_TEX_LOD_LEVEL && t->dim != G5P_TEX_CUBE),
          "read takes a level and no compare/offset (cube reads are refused by Apple)");
@@ -1443,6 +1486,50 @@ unsigned g5p_usc_discard_test(uint8_t *out, enum g5p_cmp op, unsigned dst_half, 
       raw[n++] = 0;
       raw[n++] = relation_control;
    }
+   return finish(out, raw, n);
+}
+
+/* The 4x discard test is a packed ternary of g5p_usc_literal_ternary()'s layout: the 16-bit-result class,
+ * A a long literal (literal_prefix()), B the tested value, C a short literal, then the opcode, the operation
+ * control and a last parcel of routing and relation. Its values:
+ *   A  -0.0f, the literal Apple's compiler compares against zero with (as the rsqrt and sign recipes);
+ *   C  the kill's sample mask, all four samples;
+ *   opcode  the float-equality compare of g5p_usc_compare_write();
+ *   control  bit 1 the 16-bit result (as g5p_usc_binary()'s result_half flag); bit 4 observed with a short C
+ *            literal (set in this form and in the cos-scale and bool-to-half recipes, clear in the rsqrt and
+ *            sign recipes' long C literals; the rcp-refine recipe also sets it, with a register C); bit 0 the
+ *            continuation into the last parcel;
+ *   routing  the low byte, the routing of the literal forms (g5p_usc_binary_literal2());
+ *   relation  the high byte, as relation_control in g5p_usc_discard_test() and g5p_usc_compare_write(): 0, so
+ *             with this opcode the test is A != B, as Apple's compiler emits it for (v != 0.0f) discard. The ==
+ *             relation (0x10) killed the samples a discard should keep on the device. Its continuation bit is
+ *             clear: the parcel ends the instruction. */
+#define G5P_F32_NEG_ZERO 0x80000000u
+#define G5P_MS4_ALL_SAMPLES 0xfu
+#define G5P_TERNARY_CTL_C_SHORT 0x10
+#define G5P_ROUTING_LITERAL 0x70
+#define G5P_RELATION_NE 0x00
+
+unsigned g5p_usc_discard_test_ms4(uint8_t *out, unsigned dst_half, struct g5p_src a)
+{
+   CHECK(!a.neg && !a.abs, "the 4x discard test is witnessed without source modifiers");
+   const unsigned dst_bank = 0;
+   const int a_long = 1, c_long = 0;
+   uint8_t raw[G5P_USC_MAX], c[G5P_USC_MAX];
+   unsigned n = literal_prefix(raw, G5P_CLASS_TERNARY_RESULT_HALF, dst_half, dst_bank, G5P_F32_NEG_ZERO, a.half,
+                               a.group, G5P_HEADER_FRAGMENT, a_long);
+   if (!n)
+      return 0;
+   /* C's literal: its parcels from byte 4 on of a literal prefix (as g5p_usc_literal_ternary()). */
+   unsigned m = literal_prefix(c, 0, 0, 0, G5P_MS4_ALL_SAMPLES, 0, 0, G5P_HEADER_FRAGMENT, c_long);
+   if (!m)
+      return 0;
+   memcpy(raw + n, c + 4, m - 4);
+   n += m - 4;
+   raw[n++] = cmp_code[G5P_FEQ];
+   raw[n++] = G5P_TERNARY_CTL_RESULT_HALF | G5P_TERNARY_CTL_C_SHORT | G5P_PARCEL_CONTINUES;
+   raw[n++] = G5P_ROUTING_LITERAL;
+   raw[n++] = G5P_RELATION_NE;
    return finish(out, raw, n);
 }
 

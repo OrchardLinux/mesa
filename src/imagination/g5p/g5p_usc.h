@@ -38,7 +38,10 @@ enum g5p_small_format {
    G5P_SMALL_FORMAT_COUNT
 };
 enum g5p_unary { G5P_FLOOR, G5P_LOG2, G5P_EXP2, G5P_NOT, G5P_POPCOUNT, G5P_BITREVERSE, G5P_UNARY_COUNT };
-enum g5p_tex_dim { G5P_TEX_2D, G5P_TEX_2D_ARRAY, G5P_TEX_3D, G5P_TEX_CUBE, G5P_TEX_DIM_COUNT };
+/* G5P_TEX_2D_MS (code 0xf9): the 2D-multisample fetch, its sample operand in the register after the
+ * coordinates (Apple's 4x LOAD background and Metal texture2d_ms probes); only the narrow
+ * sample (g5p_usc_sample()) takes it. */
+enum g5p_tex_dim { G5P_TEX_2D, G5P_TEX_2D_ARRAY, G5P_TEX_3D, G5P_TEX_CUBE, G5P_TEX_2D_MS, G5P_TEX_DIM_COUNT };
 /* ISA round 2 (isa-g5p.md "ISA round 2"): compare/write relations, SFU
  * cores and the literal kinds of encode_binary_literal. */
 enum g5p_cmp { G5P_FLT, G5P_FGT, G5P_FEQ, G5P_ILT, G5P_IGT, G5P_ULT, G5P_UGT, G5P_IEQ, G5P_CMP_COUNT };
@@ -157,6 +160,12 @@ struct g5p_tex {
    unsigned length; /* 0 = minimum */
 };
 unsigned g5p_usc_sample(uint8_t *out, const struct g5p_tex *t);
+/* The 2D-multisample fetch's sample operand "the task's own sample" (a sample-rate program reads the
+ * sample it shades): a 12-byte move of the special value with that index into dst_half, bank 0 (the fields
+ * are listed at the encoder). It is not g5p_usc_immediate()'s move: its source kind is "special value" where
+ * the immediate's is "literal". Witnesses: the 4x LOAD background (an iOS capture of a 4x colour load, half
+ * 4) and texture2d_ms::read(c, sample_id) (a Metal probe, half 12, which the fetch reads unchanged). */
+unsigned g5p_usc_ms_own_sample(uint8_t *out, unsigned dst_half);
 unsigned g5p_usc_texture_lod(uint8_t *out, const struct g5p_tex *t);
 unsigned g5p_usc_gather(uint8_t *out, const struct g5p_tex *t);
 
@@ -300,6 +309,15 @@ unsigned g5p_usc_sfu_core(uint8_t *out, enum g5p_sfu op, unsigned dst_half, stru
 unsigned g5p_usc_square(uint8_t *out, unsigned dst_half, struct g5p_src s, struct g5p_ctl k);
 unsigned g5p_usc_discard_test(uint8_t *out, enum g5p_cmp op, unsigned dst_half, struct g5p_src a,
                               struct g5p_src b, unsigned relation_control);
+/* The discard test at 4 raster samples: A != 0.0 writes the kill's sample mask 15 (all four samples) into the
+ * destination, where the one-sample test writes 1 (our one-sample g5p_usc_discard_test() kills where A != 0.0
+ * too). Apple's compiler, the same fragment program under raster_sample_count 4 (if (v != 0.0f)
+ * discard_fragment(), v in h0 and, read again, h4): a packed ternary with the 16-bit result, -0.0f as a long
+ * literal A, v as B and the mask 15 as a short literal C, the float-equality opcode and the != relation (the
+ * fields are listed at the encoder). At one sample the same compiler writes the mask 1 with a two-source form.
+ * With the == relation the form killed the samples it should keep on the device. The kill that follows is
+ * g5p_usc_discard() of the destination; an unconditional discard is g5p_usc_discard(-1) at 4 samples as at one. */
+unsigned g5p_usc_discard_test_ms4(uint8_t *out, unsigned dst_half, struct g5p_src a);
 unsigned g5p_usc_discard(uint8_t *out, int src_half);
 /* Fragment depth replacement (A9 depth(any) compiler witnesses). */
 unsigned g5p_usc_depth_feedback(uint8_t *out, unsigned src_half);
@@ -457,7 +475,7 @@ unsigned g5p_usc_address_add(uint8_t *out, unsigned dst_half, unsigned ptr_dword
  * `10 (0x23+8(n-1)) (0x80|data_half) (addr_half<<1|1) OO 88`.
  * Vertex tasks commit only the 4-byte form (xfb.md, device run 2). */
 /* Host fragment store predicate and class70/71 memory side effect;
- * helper-lane interpretation is inferred, pending graphics-storage rungs. */
+ * helper-lane interpretation is inferred, pending graphics-storage cases. */
 unsigned g5p_usc_fs_store_predicate(uint8_t *out);
 unsigned g5p_usc_fs_store(uint8_t *out,unsigned bytes,unsigned data_half,unsigned addr_half,unsigned slot);
 unsigned g5p_usc_global_store(uint8_t *out, unsigned bytes, unsigned data_half, unsigned addr_half,
