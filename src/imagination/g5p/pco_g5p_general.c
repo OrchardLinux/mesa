@@ -4190,13 +4190,24 @@ bool pco_g5p_fuse_ffma(void)
    return true;
 }
 
-/* The index is clamp_dyn_ubo's umin(i, last), a constant bound inside the block. */
+/* The index is clamp_dyn_ubo's umin(i, last), a constant bound inside the
+ * block; or nir_opt_algebraic removed that umin because the index is
+ * already proven to be at most `last` (x & 3 into uvec4[4]). The second form
+ * is accepted only with a proven bound inside the largest UBO
+ * (maxUniformBufferRange 64 KiB = 4096 elements of 16 bytes), never a
+ * wild 32-bit index. */
 static bool clamped_index(struct ref ix)
 {
    nir_alu_instr *a = alu_of(ix.def);
-   if (!a || a->op != nir_op_umin)
-      return false;
-   return nir_src_is_const(a->src[0].src) || nir_src_is_const(a->src[1].src);
+   if (a && a->op == nir_op_umin &&
+       (nir_src_is_const(a->src[0].src) || nir_src_is_const(a->src[1].src)))
+      return true;
+   nir_instr *ins = nir_def_instr(ix.def);
+   nir_shader *shader = nir_cf_node_get_function(&ins->block->cf_node)->function->shader;
+   struct hash_table *ht = _mesa_pointer_hash_table_create(NULL);
+   uint32_t bound = nir_unsigned_upper_bound(shader, ht, nir_get_scalar(ix.def, ix.comp));
+   _mesa_hash_table_destroy(ht, NULL);
+   return bound < 4096;
 }
 
 static void emit_dyn_ubo(struct gctx *c, nir_intrinsic_instr *in)
