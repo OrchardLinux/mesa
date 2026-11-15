@@ -249,6 +249,17 @@ PVR_PER_ARCH(g5p_vs_uploads_draw)(struct pvr_cmd_buffer *cmd_buffer, const struc
          result = g5p_up_buffer(cmd_buffer, u, &addr, &size);
          if (result != VK_SUCCESS)
             return result;
+         if (u->kind == PCO_G5P_UPLOAD_SSBO_ADDR && u->offset == PCO_G5P_SSBO_SIZE_OFFSET) {
+            /* get_ssbo_size: the bound size in bytes */
+            const uint32_t sz[2] = { (uint32_t)MIN2(size, UINT32_MAX), 0 };
+            if (u->dwords > 2)
+               return G5P_REFUSE(cmd_buffer, "vertex storage buffer size: %u dwords", u->dwords);
+            result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, sz, sizeof(sz), &bo);
+            if (result != VK_SUCCESS)
+               return result;
+            src[i] = bo->dev_addr.addr;
+            break;
+         }
          if (u->dwords != 2 || (u->kind == PCO_G5P_UPLOAD_UBO_ADDR && u->offset >= size))
             return G5P_REFUSE(cmd_buffer, "vertex %s: %u dwords at offset %u of %" PRIu64 " bytes",
                                  g5p_up_kind_str(u->kind), u->dwords, u->offset, size);

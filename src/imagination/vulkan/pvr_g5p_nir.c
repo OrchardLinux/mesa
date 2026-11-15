@@ -63,6 +63,10 @@ g5p_init_options(void)
     * shifts, masks and selects. Keep PCO's BFE/BFI capabilities disabled. */
    g5p_options.lower_bitfield_extract = true;
    g5p_options.lower_bitfield_insert = true;
+   /* saturating integer add/subtract (naga's bounds clamps: usub_sat(arrayLength, 1)): compare and select */
+   g5p_options.lower_usub_sat = true;
+   g5p_options.lower_uadd_sat = true;
+   g5p_options.lower_iadd_sat = true;
    g5p_vertex_options = g5p_options;
    g5p_vertex_options.max_unroll_iterations = 16;
    /* The isolated Apple iv_reg_pop/reverse witnesses qualify native VS

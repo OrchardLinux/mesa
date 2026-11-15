@@ -144,6 +144,9 @@ enum pco_g5p_upload_kind {
  * (a 2D_ARRAY state converted, pvr_g5p_tex_state_as_2d()); ARRAY: an array
  * sample, which needs a 2D_ARRAY state (the A9's array sample reads its
  * layer through the array descriptor even for one layer). */
+/* PCO_G5P_UPLOAD_SSBO_ADDR at this offset: not the buffer's address but its
+ * bound size in bytes (one dword; get_ssbo_size, WGSL arrayLength) */
+#define PCO_G5P_SSBO_SIZE_OFFSET 0xfffcu
 #define PCO_G5P_UPLOAD_IMAGE_AS_2D 1u
 #define PCO_G5P_UPLOAD_IMAGE_ARRAY 2u
 

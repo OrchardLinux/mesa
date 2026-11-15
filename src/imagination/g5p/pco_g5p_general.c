@@ -401,6 +401,8 @@ static void vs_bank1_only(struct gctx *c, const char *what, int r0, int r1, int 
          refuse(c, "%s with a register in vertex bank 0 (no witnessed mixed-bank form)", what);
 }
 
+static unsigned vs_bank1_index(struct gctx *c, unsigned reg);
+
 /* ---- registers (dwords) ---- */
 /* A vertex bank-0 register: the first free one, else -1. */
 static int alloc_bank0(struct gctx *c)
@@ -1184,6 +1186,9 @@ static void scan_cf(struct gctx *c, struct exec_list *list, struct unsupported *
             case nir_intrinsic_load_push_constant:
             case nir_intrinsic_load_ubo:
                ok = true;
+               break;
+            case nir_intrinsic_get_ssbo_size:
+               ok = in->def.bit_size == 32 && in->def.num_components == 1;
                break;
             case nir_intrinsic_store_ssbo:
                ok = in->src[0].ssa->bit_size==32 && in->num_components==1 && nir_intrinsic_write_mask(in)==1;
@@ -2156,6 +2161,13 @@ static void plan_common(struct gctx *c)
             c->uptr[c->nuptr].element = element;
             c->uptr[c->nuptr++].base = base;
          }
+      } else if (in->intrinsic == nir_intrinsic_get_ssbo_size) {
+         /* the bound size, a CPU-written dword (PCO_G5P_SSBO_SIZE_OFFSET) */
+         if (!block_binding_element(in->src[0].ssa, &set, &binding, &element))
+            refuse(c, "get_ssbo_size: block index is not a constant descriptor binding");
+         struct range *r = range_for(c, PCO_G5P_UPLOAD_SSBO_ADDR, set, binding, element);
+         r->lo = PCO_G5P_SSBO_SIZE_OFFSET;
+         r->hi = PCO_G5P_SSBO_SIZE_OFFSET + 4;
       } else if (in->intrinsic == nir_intrinsic_load_ubo) {
          if (!block_binding_element(in->src[0].ssa, &set, &binding, &element))
             refuse(c, "load_ubo: block index is not a constant descriptor binding");
@@ -4285,8 +4297,10 @@ static void emit_dyn_ubo(struct gctx *c, nir_intrinsic_instr *in)
           c->uptr[i].element == element && c->uptr[i].base == base)
          common = c->uptr[i].common;
    unsigned index = reg_of(c, ix, "register-indexed UBO load index");
+   /* a bank-0 index is copied into bank 1 first (the witnessed mixed-bank move), as a storage
+    * buffer's offset is (vs_bank1_index()): nfsu2's vertex pulling indexes its uniforms so */
    if (c->vs)
-      vs_bank1_only(c, "vertex register-indexed UBO load", index, -1, -1, -1);
+      index = vs_bank1_index(c, index);
    bool kill = dies(c, ix);
    /* Registers are read at issue: like Apple's v_cexpr (index r0 -> pair
     * r0:r1 -> data r0..r3), the pair may take a dying index's register and
@@ -4512,7 +4526,9 @@ static void emit_address_ssbo_load(struct gctx *c, nir_intrinsic_instr *in, unsi
    c->max_written = MAX2(c->max_written, pair + 2);
    put(c, raw, g5p_usc_address_add_shift(raw, 2 * pair, base, H(c, index), 0, kill, c->vs),
        "storage-buffer address");
-   const unsigned dst = alloc_run(c, n, "load_ssbo");
+   /* a vertex load writes bank 1 (the witnessed form), also when the program allocates in
+    * bank 0: its results are ordinary bank-1 registers, as a vertex sample's are */
+   const unsigned dst = c->vs ? alloc_bank1_run(c, n, "load_ssbo") : alloc_run(c, n, "load_ssbo");
    if (c->vs) {
       vs_bank1_only(c, "vertex storage-buffer load", dst, -1, -1, -1);
       put(c, raw, g5p_usc_vertex_address_load(raw, 2 * dst, bytes, 2 * pair), "vertex storage-buffer load");
@@ -4614,6 +4630,16 @@ static void emit_intrinsic(struct gctx *c, nir_intrinsic_instr *in)
          v->state = VAL_SHARED;
          v->imm = r->common + (off - r->lo) / 4 + k;
       }
+      break;
+   }
+   case nir_intrinsic_get_ssbo_size: {
+      unsigned set, binding, element;
+      if (!block_binding_element(in->src[0].ssa, &set, &binding, &element))
+         refuse(c, "get_ssbo_size: block index is not a constant descriptor binding");
+      struct range *r = range_for(c, PCO_G5P_UPLOAD_SSBO_ADDR, set, binding, element);
+      struct val *v = V(c, &in->def, 0);
+      v->state = VAL_SHARED;
+      v->imm = r->common;
       break;
    }
    case nir_intrinsic_load_ssbo: {
