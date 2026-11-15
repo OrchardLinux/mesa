@@ -775,8 +775,16 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
 
    g->fetch_count = vertex.fetch_count;
    memcpy(g->fetch_list, vertex.fetch_list, sizeof(g->fetch_list));
-   if (!g->fetch_count && !(g->vs_id_mask & 1))
-      return G5P_REFUSE(device, "a vertex shader without attributes or vertex index (no fetch-less PDS form)");
+   /* A vertex program that reads no attribute and no vertex index (WGSL vertex pulling from a
+    * storage buffer by instance only, or constants: nfsu2) still runs once per vertex: it is
+    * launched with the vertex-index PDS form that a gl_VertexIndex-only program uses (proven:
+    * a fullscreen vertex shader), the index written to an input register the program never
+    * reads (r0, or the one after the instance index). Apple's vertex task always receives the
+    * vertex id the same way. */
+   if (!g->fetch_count && !(g->vs_id_mask & 1)) {
+      g->vs_id_reg[0] = (g->vs_id_mask & 2) ? g->vs_id_reg[1] + 1 : 0;
+      g->vs_id_mask |= 1;
+   }
 
    /* The unified store holds every input dword: Apple's sizes fit 4 units
     * per 8 input dwords; above 8 temps or 8 input dwords it grows with the
@@ -1501,6 +1509,17 @@ fs_uploads(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_pipeline *g, 
          result = pvr_arch_g5p_upload_buffer(cmd_buffer, u->set, u->binding, u->element, &addr, &size);
          if (result != VK_SUCCESS)
             return result;
+         if (u->kind == PCO_G5P_UPLOAD_SSBO_ADDR && u->offset == PCO_G5P_SSBO_SIZE_OFFSET) {
+            /* get_ssbo_size: the bound size in bytes */
+            const uint32_t sz[2] = { (uint32_t)MIN2(size, UINT32_MAX), 0 };
+            if (u->dwords > 2)
+               return G5P_REFUSE(cmd_buffer, "fragment storage buffer size: %u dwords", u->dwords);
+            result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, sz, sizeof(sz), &bo);
+            if (result != VK_SUCCESS)
+               return result;
+            src[i] = bo->dev_addr.addr;
+            continue;
+         }
          if (u->dwords != 2 || (u->kind == PCO_G5P_UPLOAD_UBO_ADDR && u->offset >= size))
             return G5P_REFUSE(cmd_buffer, "fragment buffer address: %u dwords at offset %u of %" PRIu64 " bytes",
                               u->dwords, u->offset, size);
