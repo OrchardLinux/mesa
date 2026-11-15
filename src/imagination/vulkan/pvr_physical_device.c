@@ -286,7 +286,10 @@ static void pvr_physical_device_get_supported_features(
       .shaderStorageBufferArrayDynamicIndexing = true,
       .shaderStorageImageArrayDynamicIndexing = true,
       .shaderClipDistance = true,
-      .shaderCullDistance = true,
+      /* G5P: the A9 TA's user planes clip; Apple's A9 driver sets no cull plane, and a cull
+       * distance is no clip distance (it drops whole primitives): not supported, so applications
+       * (PPSSPP) do not write gl_CullDistance */
+      .shaderCullDistance = !PVR_HAS_FEATURE(dev_info, apple_g5p),
       .shaderFloat64 = false,
       .shaderInt64 = false,
       .shaderInt16 = false,
@@ -810,7 +813,7 @@ static bool pvr_physical_device_get_properties(
       .timestampPeriod = 0.0f,
 
       .maxClipDistances = PVR_MAX_USER_PLANES,
-      .maxCullDistances = PVR_MAX_USER_PLANES,
+      .maxCullDistances = PVR_HAS_FEATURE(dev_info, apple_g5p) ? 0U : PVR_MAX_USER_PLANES, /* no shaderCullDistance */
       .maxCombinedClipAndCullDistances = PVR_MAX_USER_PLANES,
 
       .discreteQueuePriorities = 2U,
