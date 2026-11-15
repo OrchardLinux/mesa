@@ -26,7 +26,9 @@
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_builder.h"
 #include "compiler/shader_enums.h"
+#include "util/log.h"
 #include "util/macros.h"
+#include "util/u_debug.h"
 #include "util/format/u_format.h"
 #include "util/u_math.h"
 #include "vk_format.h"
@@ -366,17 +368,22 @@ rewrite_load(nir_builder *b, nir_intrinsic_instr *in, void *data)
    return true;
 }
 
-/* A load of a location the pipeline gives no attribute: (0, 0, 0, 1) (G9P's 4a8c71666d9 ("pvr/g9p: Qt Quick on Zink: packed vertex formats, texelFetch"); the
- * refusal "reads location %u, which has no vertex attribute" before) */
+/* A load of a location the pipeline gives no attribute: (0, 0, 0, 1), GL's generic-attribute default that Zink's GL
+ * relies on (G9P's 4a8c71666d9 ("pvr/g9p: Qt Quick on Zink: packed vertex formats, texelFetch")). Diagnostic: each pipeline logs the locations it substitutes. */
+struct unbound_state {
+   uint32_t valid, substituted;
+};
+
 static bool
 unbound_input(nir_builder *b, nir_intrinsic_instr *in, void *data)
 {
-   const uint32_t valid = *(const uint32_t *)data;
+   struct unbound_state *u = data;
    if (in->intrinsic != nir_intrinsic_load_input)
       return false;
    const int loc = generic_location(in);
-   if (loc < 0 || (valid & BITFIELD_BIT(loc)) || in->def.bit_size != 32)
+   if (loc < 0 || (u->valid & BITFIELD_BIT(loc)) || in->def.bit_size != 32)
       return false;
+   u->substituted |= BITFIELD_BIT(loc);
    const bool is_float = nir_alu_type_get_base_type(nir_intrinsic_dest_type(in)) == nir_type_float;
    b->cursor = nir_before_instr(&in->instr);
    nir_def *c[4];
@@ -393,8 +400,10 @@ pvr_g5p_vertex_lower(nir_shader *vs, struct pvr_g5p_vertex_layout *l)
    const struct vk_vertex_input_state *vi = l->vi;
 
    {
-      uint32_t valid = vi ? vi->attributes_valid : 0;
-      nir_shader_intrinsics_pass(vs, unbound_input, nir_metadata_control_flow, &valid);
+      struct unbound_state u = { .valid = vi ? vi->attributes_valid : 0 };
+      nir_shader_intrinsics_pass(vs, unbound_input, nir_metadata_control_flow, &u);
+      u_foreach_bit (loc, u.substituted)
+         mesa_logw("G5P vertex input %u has no attribute: reading (0,0,0,1)", loc);
    }
 
    /* the locations the program reads */
