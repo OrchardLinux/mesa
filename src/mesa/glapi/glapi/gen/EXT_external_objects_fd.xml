@@ -10,14 +10,14 @@
 
     <enum name="HANDLE_TYPE_OPAQUE_FD_EXT"              value="0x9586"/>
 
-    <function name="ImportMemoryFdEXT" es2="3.2">
+    <function name="ImportMemoryFdEXT" es2="3.0">
         <param name="memory" type="GLuint"/>
         <param name="size" type="GLuint64"/>
         <param name="handleType" type="GLenum"/>
         <param name="fd" type="GLint"/>
     </function>
 
-    <function name="ImportSemaphoreFdEXT" es2="3.2">
+    <function name="ImportSemaphoreFdEXT" es2="2.0">
         <param name="semaphore" type="GLuint"/>
         <param name="handleType" type="GLenum"/>
         <param name="fd" type="GLint"/>
