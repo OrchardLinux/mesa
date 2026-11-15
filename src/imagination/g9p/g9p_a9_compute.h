@@ -254,12 +254,28 @@ bool g9p_a9_compile_compute(nir_shader *nir, struct g9p_shader *out, void *mem_c
     * (g9p_compile.c "pressure"). Clone before compile_back mutates nir. */
    nir_shader *again = nir_shader_clone(mem_ctx, nir);
    const struct g9p_shader saved = *out;
-   if (!compile_back(nir, out, MESA_SHADER_COMPUTE, NULL, 0, false, false, mem_ctx, false)) {
-      if (!again || strncmp(out->a9_refusal, "out of registers", 16))
+   const bool compiled = compile_back(nir, out, MESA_SHADER_COMPUTE, NULL, 0,
+                                      false, false, mem_ctx, false, false);
+   if (!compiled) {
+      if (!again || strncmp(out->a9_refusal, "out of registers", 16)) {
          return false;
+      }
+      /* Preserve the existing pressure retry and its 64-home ceiling. Only a second
+       * register refusal gets Apple's larger budget, using the same pressure
+       * mode on a fresh clone of the prepared NIR. */
+      nir_shader *budget = nir_shader_clone(mem_ctx, again);
       *out = saved;
-      if (!compile_back(again, out, MESA_SHADER_COMPUTE, NULL, 0, false, false, mem_ctx, true))
-         return false;
+         const bool retried = compile_back(again, out, MESA_SHADER_COMPUTE, NULL, 0,
+                                        false, false, mem_ctx, true, false);
+         if (!retried) {
+         if (strncmp(out->a9_refusal, "out of registers", 16)) {
+               return false;
+         }
+         *out = saved;
+         if (!compile_back(budget, out, MESA_SHADER_COMPUTE, NULL, 0,
+                           false, false, mem_ctx, true, true))
+            return false;
+      }
    }
    /* the fixed common-store places of texture words (g9p_a9_tex.h) */
    bool sizes = false, lods = false;

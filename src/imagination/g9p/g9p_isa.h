@@ -272,19 +272,25 @@ g9p_alu2(struct g9p_code *c, unsigned op, unsigned dst, unsigned a, unsigned b,
  * its high side in bank 0, the fragment form above (validated at r40/r77/r100 on the A9): an operand's
  * header bit and the destination's W1 bit 9 name each side's bank.
  */
+/* A9 compute (high_bank0): bank-0 homes up to r239. Above r127 the destination's half-index bit 8 is W0 bit 9
+ * (header bit 1), as in Apple's A9 code (moves to r127 and r128 differ in that bit and the half index; a
+ * move to r218 with bank-1 sources sets it too). */
+#define G9P_W0_DST_HALF_BIT8 0x0200 /* the destination half index's bit 8 */
 static inline void
 g9p_mov_to_high(struct g9p_code *c, unsigned hi, unsigned src)
 {
-   assert(src < 32 && hi < 128);
-   G9P_EMIT(c, g9p_w0(c, G9P_W0_ALU2), c->high_bank0 ? G9P_CONT | 2 * hi : g9p_dst(c, hi),
+   assert(src < 32 && hi < (c->high_bank0 ? 240u : 128u));
+   G9P_EMIT(c, g9p_w0(c, G9P_W0_ALU2) | (c->high_bank0 && hi >= 128 ? G9P_W0_DST_HALF_BIT8 : 0),
+            c->high_bank0 ? G9P_CONT | ((2 * hi) & 0xff) : g9p_dst(c, hi),
             g9p_srcs(src, src, false), G9P_OR);
 }
 
 static inline void
 g9p_mov_from_high(struct g9p_code *c, unsigned dst, unsigned hi)
 {
-   assert(dst < 32 && hi < 128);
-   /* on A9 compute (high_bank0) both sources are bank 0's */
+   assert(dst < 32 && hi < (c->high_bank0 ? 240u : 128u));
+   /* Three-bit source extensions (hi >> 5 in the fourth word), as Apple's A9 compute reads r182;
+    * on A9 compute (high_bank0) both sources are bank 0's. */
    G9P_EMIT(c, g9p_w0(c, G9P_W0_ALU2) & ~(c->high_bank0 ? G9P_W0_SRC_A_BANK1 | G9P_W0_SRC_B_BANK1 : 0),
             g9p_dst(c, dst), g9p_srcs(hi & 31, hi & 31, false) | G9P_SRCS_EXT,
             G9P_CONT | (hi >> 5) << G9P_EXT_A_SHIFT | (hi >> 5) << G9P_EXT_B_SHIFT, G9P_OR);

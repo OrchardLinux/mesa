@@ -108,13 +108,14 @@ g9p_num_regs(void)
 /*
  * A9 compute: the homes (bank-0 registers above r31) a workgroup of @threads lanes may use. Apple's bank-0
  * limit for t DOUTU temps is 32 * floor((3329 - a) / a) lanes, a = (4t + 28) & ~31 (the same +0xb08 value);
- * the temps are 32 + homes rounded up to 8. 256 lanes allow 88 temps (56 homes); at most 64 homes as before.
+ * the temps are 32 + homes rounded up to 8. Apple's A9 allocator declares up to 240 temps at 64 lanes without
+ * spilling (loop144 240, p120 reads r238). Homes run r32..r239, fewer as the workgroup grows (256 lanes: 56).
  * A kernel that needs more is refused by name here, instead of at pipeline creation.
  */
 static unsigned
 g9p_a9_max_homes(unsigned threads)
 {
-   unsigned homes = 64;
+   unsigned homes = 208;
    while (homes > 0) {
       const unsigned t = 8 * DIV_ROUND_UP(32 + homes, 8), a = (4 * t + 28) & ~31u;
       if (32 * ((3329 - a) / a) >= threads)
@@ -323,7 +324,7 @@ struct g9p_ctx {
     * Fragment NIR registers parked above r31 (per decl_reg key, -1: none),
     * chosen across generate() attempts when registers run out
     */
-   int8_t *home;
+   int16_t *home;
    unsigned num_homes;
    bool oom_low;      /* the failed allocation needs r0-r15 */
    bool oom;          /* the last generate() ran out of registers */
@@ -5117,10 +5118,11 @@ size_of_sampled_level(nir_builder *b, nir_tex_instr *tex, void *data)
 static bool
 compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
              const struct g9p_vertex_attrib *attribs, unsigned frag_coord_slot,
-             bool repeat_loads, bool point_size, void *mem_ctx, bool pressure)
+             bool repeat_loads, bool point_size, void *mem_ctx, bool pressure, bool apple_budget)
 {
    /* G9P_LATE_OUTPUTS: outputs held to the end unless out of registers, as before */
    /* not with transform feedback: its capture reads the outputs at the end */
+   apple_budget &= stage == MESA_SHADER_COMPUTE && out->a9;
    const bool xfb = nir->xfb_info && nir->xfb_info->buffers_written;
    struct g9p_ctx ctx = { .pressure = pressure && stage == MESA_SHADER_COMPUTE && out->a9,
                           .point_size = point_size, .repeat_loads = repeat_loads,
@@ -5345,15 +5347,15 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
     * Fragment shaders that run out of registers park the NIR register live
     * at that point with the furthest last use above r31 and try again.
     */
-   ctx.home = ralloc_array(mem_ctx, int8_t, impl->ssa_alloc * 4);
-   memset(ctx.home, -1, impl->ssa_alloc * 4);
+   ctx.home = ralloc_array(mem_ctx, int16_t, impl->ssa_alloc * 4);
+   memset(ctx.home, -1, impl->ssa_alloc * 4 * sizeof(*ctx.home));
    /*
     * Homes are shared: a value parks in the first one no other parked value is live in.
     * One home each ran out at 96 in Firefox's shaders.
     */
    struct {
       unsigned start, end;
-      int8_t home;
+      int16_t home;
    } *homed = NULL;
    unsigned num_homed = 0, homed_capacity = 1024;
    homed = ralloc_array(mem_ctx, __typeof__(*homed), homed_capacity);
@@ -5387,7 +5389,7 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
       stuck = ctx.oom_ip == last_oom_ip ? stuck + 1 : 0;
       last_oom_ip = ctx.oom_ip;
       /* each retry parks one more value; 40 live scalars need more than 16 (drawbench fs 2) */
-      if (stuck >= 64) {
+      if (stuck >= (apple_budget ? 208 : 64)) {
          g9p_fail(out, "out of registers at instruction %u (parking does not help)", ctx.oom_ip);
          return backend_failure(out, &ctx);
       }
@@ -5465,17 +5467,18 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
             const unsigned start = victim_decl ? ctx.reg_first[victim / 4] : ctx.def_ip[victim / 4];
             /* a NIR register's range takes in the loops it is used in (use_scalar()) */
             const unsigned end = ctx.last_use[victim];
-            /* compute: at most 64 homes, bank 0 up to r95 (the DOUTU temps; residency) */
+            /* Only the third A9 compute attempt gets Apple's full per-lane budget. */
             const unsigned max_homes =
                stage != MESA_SHADER_COMPUTE ? g9p_max_homes
-               : out->a9 ? MIN2(g9p_max_homes, g9p_a9_max_homes(MAX2(out->local_size[0], 1) *
-                                                                MAX2(out->local_size[1], 1) *
-                                                                MAX2(out->local_size[2], 1)))
+               : out->a9 ? MIN2(apple_budget ? 208 : 64,
+                                g9p_a9_max_homes(MAX2(out->local_size[0], 1) *
+                                                 MAX2(out->local_size[1], 1) *
+                                                 MAX2(out->local_size[2], 1)))
                          : MIN2(g9p_max_homes, 64);
             int home = -1;
 
             for (unsigned h = 0; home < 0 && h < max_homes; h++) {
-               bool free = true;
+               bool free = !(out->a9 && 32 + (int)h > 239);
 
                for (unsigned i = 0; free && i < num_homed; i++)
                   free = homed[i].home != 32 + (int)h || homed[i].end < start || end < homed[i].start;
@@ -5497,7 +5500,7 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
                homed = ranges;
                homed_capacity = capacity;
             }
-            homed[num_homed++] = (__typeof__(*homed)){ start, end, (int8_t)home };
+            homed[num_homed++] = (__typeof__(*homed)){ start, end, (int16_t)home };
             ctx.home[victim] = home;
             ctx.num_homes = MAX2(ctx.num_homes, (unsigned)home - 31);
          }
@@ -5658,7 +5661,7 @@ g9p_compile_compute(nir_shader *nir, struct g9p_shader *out, void *mem_ctx)
    memset(out, 0, sizeof(*out));
    lower_front(nir);
    NIR_PASS(_, nir, nir_lower_compute_system_values, &csv);
-   return compile_back(nir, out, MESA_SHADER_COMPUTE, NULL, 0, false, false, mem_ctx, false);
+   return compile_back(nir, out, MESA_SHADER_COMPUTE, NULL, 0, false, false, mem_ctx, false, false);
 }
 #include "g9p_a9_compute.h"
 /*
@@ -6047,7 +6050,7 @@ g9p_compile_vertex_attempts(nir_shader *nir, const struct g9p_vertex_attrib *att
          nir_shader *n = nir_shader_clone(mem_ctx, attempt[i]);
 
          g9p_no_schedule = i == 2;
-         if (compile_back(n, out, MESA_SHADER_VERTEX, attribs, 0, i > 0, point_size, mem_ctx, false)) {
+         if (compile_back(n, out, MESA_SHADER_VERTEX, attribs, 0, i > 0, point_size, mem_ctx, false, false)) {
             g9p_no_schedule = g9p_no_homes = false;
             g9p_max_homes = 92;
             return true;
@@ -6439,7 +6442,7 @@ g9p_compile_fragment(nir_shader *nir, unsigned frag_coord_slot,
          nir_shader *n = nir_shader_clone(mem_ctx, attempt[i]);
 
          g9p_no_schedule = i == 2;
-         if (compile_back(n, out, MESA_SHADER_FRAGMENT, NULL, frag_coord_slot, i > 0, false, mem_ctx, false)) {
+         if (compile_back(n, out, MESA_SHADER_FRAGMENT, NULL, frag_coord_slot, i > 0, false, mem_ctx, false, false)) {
             g9p_no_schedule = g9p_no_homes = false;
             g9p_max_homes = 92;
             return true;
