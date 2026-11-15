@@ -63,6 +63,16 @@ g5p_init_options(void)
     * shifts, masks and selects. Keep PCO's BFE/BFI capabilities disabled. */
    g5p_options.lower_bitfield_extract = true;
    g5p_options.lower_bitfield_insert = true;
+   /* GLSL's norm packings (packUnorm2x16() ...) lower to the measured float clamps, rounds, conversions and
+    * shifts (G9P's 26b4dcbc83d ("pvr/g9p: packing built-ins"); the half packings: pco_g5p_general.c lower_half_packing()) */
+   g5p_options.lower_pack_snorm_2x16 = true;
+   g5p_options.lower_unpack_snorm_2x16 = true;
+   g5p_options.lower_pack_unorm_2x16 = true;
+   g5p_options.lower_unpack_unorm_2x16 = true;
+   g5p_options.lower_pack_snorm_4x8 = true;
+   g5p_options.lower_unpack_snorm_4x8 = true;
+   g5p_options.lower_pack_unorm_4x8 = true;
+   g5p_options.lower_unpack_unorm_4x8 = true;
    /* saturating integer add/subtract (naga's bounds clamps: usub_sat(arrayLength, 1)): compare and select */
    g5p_options.lower_usub_sat = true;
    g5p_options.lower_uadd_sat = true;

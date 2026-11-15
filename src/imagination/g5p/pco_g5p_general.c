@@ -6280,9 +6280,67 @@ static bool ms_as_2d(nir_builder *b, nir_tex_instr *t, void *data)
    return true;
 }
 
+/* A half float's bits (in a 32-bit value) as a 32-bit float, in integer code (G9P's 26b4dcbc83d ("pvr/g9p: packing built-ins")) */
+static nir_def *
+half_to_f32(nir_builder *b, nir_def *h)
+{
+   nir_def *magnitude = nir_iand_imm(b, h, 0x7fff);
+   nir_def *shifted = nir_ishl_imm(b, magnitude, 13);
+   /* exponent 31: inf and NaN; exponent 0: zero and subnormals */
+   nir_def *bits = nir_bcsel(b, nir_uge_imm(b, magnitude, 0x7c00), nir_ior_imm(b, shifted, 0x7f800000),
+                             nir_iadd_imm(b, shifted, 0x38000000));
+
+   bits = nir_bcsel(b, nir_ult_imm(b, magnitude, 0x400),
+                    nir_fmul_imm(b, nir_u2f32(b, magnitude), 1.0f / (1 << 24)), bits);
+   return nir_ior(b, bits, nir_ishl_imm(b, nir_iand_imm(b, h, 0x8000), 16));
+}
+
+/* A 32-bit float as a half float's bits, rounded to nearest, in integer code */
+static nir_def *
+f32_to_half(nir_builder *b, nir_def *f)
+{
+   nir_def *sign = nir_iand_imm(b, nir_ushr_imm(b, f, 16), 0x8000);
+   nir_def *abs = nir_iand_imm(b, f, 0x7fffffff);
+   nir_def *normal = nir_ushr_imm(b, nir_iadd_imm(b, abs, 0x1000 - 0x38000000), 13);
+   nir_def *shift = nir_isub(b, nir_imm_int(b, 126), nir_ushr_imm(b, abs, 23));
+   nir_def *mantissa = nir_ior_imm(b, nir_iand_imm(b, abs, 0x7fffff), 0x800000);
+   nir_def *rounded = nir_iadd(b, mantissa, nir_ishl(b, nir_imm_int(b, 1), nir_iadd_imm(b, shift, -1)));
+   nir_def *subnormal = nir_ushr(b, rounded, shift);
+   nir_def *v = nir_bcsel(b, nir_uge_imm(b, abs, 0x38800000), normal,
+                          nir_bcsel(b, nir_uge_imm(b, abs, 0x33000000), subnormal, nir_imm_int(b, 0)));
+
+   v = nir_bcsel(b, nir_uge_imm(b, abs, 0x47800000), nir_imm_int(b, 0x7c00), v);
+   v = nir_bcsel(b, nir_ult(b, nir_imm_int(b, 0x7f800000), abs), nir_imm_int(b, 0x7e00), v);
+   return nir_ior(b, sign, nir_iand_imm(b, v, 0x7fff));
+}
+
+/* packHalf2x16(), unpackHalf2x16(): no 16-bit values in G5P programs (g9p 26b4dcbc83d) */
+static bool
+lower_half_packing(nir_builder *b, nir_instr *instr, void *data)
+{
+   if (instr->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+
+   if (alu->op != nir_op_pack_half_2x16 && alu->op != nir_op_unpack_half_2x16)
+      return false;
+   b->cursor = nir_before_instr(instr);
+   nir_def *src = nir_ssa_for_alu_src(b, alu, 0);
+
+   if (alu->op == nir_op_pack_half_2x16) {
+      nir_def_replace(&alu->def, nir_ior(b, f32_to_half(b, nir_channel(b, src, 0)),
+                                         nir_ishl_imm(b, f32_to_half(b, nir_channel(b, src, 1)), 16)));
+   } else {
+      nir_def_replace(&alu->def, nir_vec2(b, half_to_f32(b, nir_iand_imm(b, src, 0xffff)),
+                                          half_to_f32(b, nir_ushr_imm(b, src, 16))));
+   }
+   return true;
+}
+
 static bool lower(nir_shader *nir, bool preserve_cf)
 {
    bool progress;
+   NIR_PASS(_, nir, nir_shader_instructions_pass, lower_half_packing, nir_metadata_control_flow, NULL);
    /* Projective sampling (GLSL textureProj/texture2DProj, Mesa's fixed-function
     * fragment program; Zink passes 2D projectors on as OpImageSampleProj*):
     * Apple's GPU has no projected sample, Metal divides in the program, so
