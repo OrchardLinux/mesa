@@ -38,6 +38,7 @@ static const struct debug_named_value debug_control[] = {
      "Dump descriptor set and pipeline layouts." },
    { "info", PVR_DEBUG_INFO,
      "Display information about the driver and device." },
+   { "errors", PVR_DEBUG_ERRORS, "Log every Vulkan error the driver returns, with its origin." },
    DEBUG_NAMED_VALUE_END
 };
 /* clang-format on */
