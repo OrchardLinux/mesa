@@ -215,7 +215,7 @@ zink_check_valid_buffer_src_access(struct zink_context *ctx, struct zink_resourc
 void
 zink_resource_image_transfer_dst_barrier(struct zink_context *ctx, struct zink_resource *res, unsigned level, const struct pipe_box *box, bool unsync);
 bool
-zink_resource_buffer_transfer_dst_barrier(struct zink_context *ctx, struct zink_resource *res, unsigned offset, unsigned size);
+zink_resource_buffer_transfer_dst_barrier(struct zink_context *ctx, struct zink_resource *res, unsigned offset, unsigned size, bool unsync);
 void
 zink_synchronization_init(struct zink_screen *screen);
 void
