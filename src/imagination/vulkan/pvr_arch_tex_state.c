@@ -121,6 +121,10 @@ VkResult pvr_arch_pack_tex_state(struct pvr_device *device,
    enum pvr_memlayout mem_layout;
    VkImageViewType iview_type;
    PVR_G5P_HOOK(texel_state, device, info, state)
+   if (info->skip_rogue_words) {
+      memset(state->words, 0, sizeof(state->words));
+      goto metadata;
+   }
    if (info->type == VK_IMAGE_VIEW_TYPE_1D &&
        info->mem_layout == PVR_MEMLAYOUT_LINEAR) {
       /* Change the memory layout to twiddled as there isn't a TEXSTATE_TEXTYPE
@@ -315,6 +319,7 @@ VkResult pvr_arch_pack_tex_state(struct pvr_device *device,
       }
    }
 
+metadata:
    state->meta[PCO_IMAGE_META_LAYER_SIZE] = info->layer_size;
    state->meta[PCO_IMAGE_META_BUFFER_ELEMS] = info->buffer_elems;
    state->meta[PCO_IMAGE_META_Z_SLICE] = info->z_slice;

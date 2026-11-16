@@ -48,6 +48,7 @@
 
 /** Parameters for #pvr_pack_tex_state(). */
 struct pvr_texture_state_info {
+   bool skip_rogue_words;
    VkFormat format;
    enum pvr_memlayout mem_layout;
    uint32_t flags;
