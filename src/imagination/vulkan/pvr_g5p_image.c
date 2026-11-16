@@ -227,21 +227,23 @@ pvr_g5p_msaa_limits(struct pvr_physical_device *pdevice, struct vk_properties *p
 /*
  * An image format's sample counts: 4 as well only for what a 4x pass
  * renders (our ICD's rule): a 2D optimal colour attachment of 4-byte
- * samples, or one of the depth/stencil formats the ZLS keeps on chip, used
- * neither as a sampled, storage nor input attachment image. Upstream's Rogue answer is every count up to 8.
+ * samples, or one of the depth/stencil formats the ZLS keeps on chip, not
+ * used as a storage image, nor as a sampled depth/stencil image. Upstream's Rogue answer is every count up to 8.
  */
 void
 pvr_g5p_msaa_image_samples(struct pvr_physical_device *pdevice, const VkPhysicalDeviceImageFormatInfo2 *info,
                            VkImageTiling tiling, VkImageFormatProperties *props)
 {
    const VkImageUsageFlags attach = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
-   const VkImageUsageFlags read = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
-                                  VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
+   /* Vulkan bounds sampleCounts by the framebuffer, sampled and storage limits of the usage; input
+    * attachments have no limit of their own and do not change the 4x layout. Multisample subpass
+    * reads stay refused by the compiler (tex_shape_refusal()). */
+   const VkImageUsageFlags read = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
    const bool format_ok = pvr_g5p_ds_format(info->format) ||
                           (vk_format_is_color(info->format) && !vk_format_is_compressed(info->format) &&
                            !vk_format_is_int(info->format) && vk_format_get_blocksize(info->format) == 4);
    /* a 4-sample colour attachment may also be sampled (its view is the 2Wx2H twiddled texture of
-    * its samples, pvr_arch_g5p_tex.c); depth/stencil, storage and input attachments stay 1x */
+    * its samples, pvr_arch_g5p_tex.c); sampled depth/stencil and storage images stay 1x */
    const VkImageUsageFlags colour_read = vk_format_is_color(info->format) ? VK_IMAGE_USAGE_SAMPLED_BIT : 0;
    const bool four = tiling == VK_IMAGE_TILING_OPTIMAL &&
                      info->type == VK_IMAGE_TYPE_2D && !(info->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) &&
