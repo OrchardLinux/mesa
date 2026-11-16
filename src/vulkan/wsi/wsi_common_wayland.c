@@ -38,6 +38,7 @@
 
 #include "vk_instance.h"
 #include "vk_device.h"
+#include "vk_format.h"
 #include "vk_physical_device.h"
 #include "vk_util.h"
 #include "wsi_common_entrypoints.h"
@@ -1894,20 +1895,6 @@ wsi_wl_display_init(struct wsi_wayland *wsi_wl,
       goto fail;
    }
 
-   if (wsi_wl->wsi->force_bgra8_unorm_first) {
-      /* Find BGRA8_UNORM in the list and swap it to the first position if we
-       * can find it.  Some apps get confused if SRGB is first in the list.
-       */
-      struct wsi_wl_format *first_fmt = u_vector_tail(&display->formats);
-      struct wsi_wl_format *f, tmp_fmt;
-      f = find_format(&display->formats, VK_FORMAT_B8G8R8A8_UNORM);
-      if (f) {
-         tmp_fmt = *f;
-         *f = *first_fmt;
-         *first_fmt = tmp_fmt;
-      }
-   }
-
 out:
    /* Keep the registry alive to track output additions and removals. */
 
@@ -2387,6 +2374,43 @@ wsi_wl_surface_get_capabilities2(VkIcdSurfaceBase *surface,
    return result;
 }
 
+static void
+wsi_wl_surface_sort_formats(struct wsi_wl_display *display,
+                            const struct wsi_device *wsi_device,
+                            struct wsi_wl_format **sorted_formats)
+{
+   unsigned count = 0;
+
+   /* Prefer 8-bit color channels, preserving the compositor's order within
+    * each group.  Higher precision formats can cost more memory and may not
+    * be supported by display planes.
+    */
+   for (unsigned pass = 0; pass < 2; pass++) {
+      struct wsi_wl_format *disp_fmt;
+      u_vector_foreach(disp_fmt, &display->formats) {
+         VkFormat format = disp_fmt->vk_format;
+         bool is_8bit =
+            vk_format_get_component_bits(format, UTIL_FORMAT_COLORSPACE_RGB, 0) == 8 &&
+            vk_format_get_component_bits(format, UTIL_FORMAT_COLORSPACE_RGB, 1) == 8 &&
+            vk_format_get_component_bits(format, UTIL_FORMAT_COLORSPACE_RGB, 2) == 8;
+         if (is_8bit == (pass == 0))
+            sorted_formats[count++] = disp_fmt;
+      }
+   }
+
+   if (wsi_device->force_bgra8_unorm_first) {
+      for (unsigned i = 0; i < count; i++) {
+         if (sorted_formats[i]->vk_format == VK_FORMAT_B8G8R8A8_UNORM) {
+            struct wsi_wl_format *format = sorted_formats[i];
+            memmove(&sorted_formats[1], &sorted_formats[0],
+                    i * sizeof(*sorted_formats));
+            sorted_formats[0] = format;
+            break;
+         }
+      }
+   }
+}
+
 static VkResult
 wsi_wl_surface_get_formats(VkIcdSurfaceBase *icd_surface,
                            struct wsi_device *wsi_device,
@@ -2404,13 +2428,21 @@ wsi_wl_surface_get_formats(VkIcdSurfaceBase *icd_surface,
                            wsi_device->sw, "mesa formats query"))
       return VK_ERROR_SURFACE_LOST_KHR;
 
+   unsigned format_count = u_vector_length(&display.formats);
+   STACK_ARRAY(struct wsi_wl_format *, sorted_formats, format_count);
+   if (!sorted_formats) {
+      wsi_wl_display_finish(&display);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+   wsi_wl_surface_sort_formats(&display, wsi_device, sorted_formats);
+
    VK_OUTARRAY_MAKE_TYPED(VkSurfaceFormatKHR, out,
                           pSurfaceFormats, pSurfaceFormatCount);
 
    VkColorSpaceKHR *cs;
    u_vector_foreach(cs, &display.colorspaces) {
-      struct wsi_wl_format *disp_fmt;
-      u_vector_foreach(disp_fmt, &display.formats) {
+      for (unsigned i = 0; i < format_count; i++) {
+         struct wsi_wl_format *disp_fmt = sorted_formats[i];
          /* Skip formats for which we can't support both alpha & opaque
           * formats.
           */
@@ -2426,6 +2458,7 @@ wsi_wl_surface_get_formats(VkIcdSurfaceBase *icd_surface,
       }
    }
 
+   STACK_ARRAY_FINISH(sorted_formats);
    wsi_wl_display_finish(&display);
 
    return vk_outarray_status(&out);
@@ -2449,13 +2482,21 @@ wsi_wl_surface_get_formats2(VkIcdSurfaceBase *icd_surface,
                            wsi_device->sw, "mesa formats2 query"))
       return VK_ERROR_SURFACE_LOST_KHR;
 
+   unsigned format_count = u_vector_length(&display.formats);
+   STACK_ARRAY(struct wsi_wl_format *, sorted_formats, format_count);
+   if (!sorted_formats) {
+      wsi_wl_display_finish(&display);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+   wsi_wl_surface_sort_formats(&display, wsi_device, sorted_formats);
+
    VK_OUTARRAY_MAKE_TYPED(VkSurfaceFormat2KHR, out,
                           pSurfaceFormats, pSurfaceFormatCount);
 
    VkColorSpaceKHR *cs;
    u_vector_foreach(cs, &display.colorspaces) {
-      struct wsi_wl_format *disp_fmt;
-      u_vector_foreach(disp_fmt, &display.formats) {
+      for (unsigned i = 0; i < format_count; i++) {
+         struct wsi_wl_format *disp_fmt = sorted_formats[i];
          /* Skip formats for which we can't support both alpha & opaque
           * formats.
           */
@@ -2471,6 +2512,7 @@ wsi_wl_surface_get_formats2(VkIcdSurfaceBase *icd_surface,
       }
    }
 
+   STACK_ARRAY_FINISH(sorted_formats);
    wsi_wl_display_finish(&display);
 
    return vk_outarray_status(&out);
