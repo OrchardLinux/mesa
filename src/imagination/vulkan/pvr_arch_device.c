@@ -35,6 +35,7 @@
 #include "pvr_g9p.h"
 #   include "pvr_g5p.h"
 #include "pvr_utrace.h"
+#include "pvr_errlog.h"
 #include "util/os_misc.h"
 
 #define PVR_GLOBAL_FREE_LIST_INITIAL_SIZE (2U * 1024U * 1024U)
@@ -829,6 +830,10 @@ VkResult PVR_PER_ARCH(create_device)(struct pvr_physical_device *pdevice,
    if (result != VK_SUCCESS)
       goto err_free_device;
 
+   result = pvr_errlog_install(device);
+   if (result != VK_SUCCESS)
+      goto err_vk_device_finish;
+
    device->instance = instance;
    device->pdevice = pdevice;
    device->ws = ws;
@@ -1061,6 +1066,7 @@ err_dec_device_count:
    pvr_bo_store_destroy(device);
 
 err_vk_device_finish:
+   vk_free(&device->vk.alloc, device->errlog_orig);
    vk_device_finish(&device->vk);
 
 err_free_device:
@@ -1131,6 +1137,7 @@ void PVR_PER_ARCH(destroy_device)(struct pvr_device *device,
    pvr_bo_store_destroy(device);
    pvr_winsys_destroy(device->ws);
    p_atomic_dec(&device->instance->active_device_count);
+   vk_free(&device->vk.alloc, device->errlog_orig);
    vk_device_finish(&device->vk);
    vk_free(&device->vk.alloc, device);
 }

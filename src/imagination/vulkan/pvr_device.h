@@ -70,6 +70,7 @@ struct pvr_compute_query_shader {
 
 struct pvr_device {
    struct vk_device vk;
+   struct vk_device_dispatch_table *errlog_orig;
    struct pvr_instance *instance;
    struct pvr_physical_device *pdevice;
 
