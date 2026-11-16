@@ -2490,6 +2490,18 @@ static unsigned scratch_imm(struct gctx *c, uint32_t value)
    return reg;
 }
 
+/* A scratch immediate in vertex bank 1, also when the program allocates its
+ * temps in bank 0 (alloc_bank1_run()). */
+static unsigned scratch_imm_bank1(struct gctx *c, uint32_t value)
+{
+   bool bank0 = c->vs_bank0, tex_bank0 = c->tex_bank0;
+   c->vs_bank0 = c->tex_bank0 = false;
+   unsigned reg = scratch_imm(c, value);
+   c->vs_bank0 = bank0;
+   c->tex_bank0 = tex_bank0;
+   return reg;
+}
+
 static unsigned one_reg(struct gctx *c)
 {
    if (c->remat || c->cf_depth > 0)
@@ -4362,7 +4374,10 @@ static void emit_memory_ubo(struct gctx *c, nir_intrinsic_instr *in,
    if (in->def.bit_size != 32 || !n || n > 4)
       refuse(c, "memory UBO load: only 1..4 aligned 32-bit components");
 
-   const unsigned dst = alloc_run(c, n, "memory UBO load");
+   /* A vertex load writes bank 1, the witnessed form, also when the program
+    * allocates its temps in bank 0 (control flow, or the bank-0 pressure
+    * retry), as a vertex storage-buffer load does (emit_address_ssbo_load). */
+   const unsigned dst = c->vs ? alloc_bank1_run(c, n, "memory UBO load") : alloc_run(c, n, "memory UBO load");
    if (c->vs)
       vs_bank1_only(c, "vertex memory UBO load", dst, -1, -1, -1);
    const unsigned first = off - r->lo;
@@ -4373,7 +4388,10 @@ static void emit_memory_ubo(struct gctx *c, nir_intrinsic_instr *in,
    for (unsigned i = 0; i < loads; i++) {
       const unsigned bytes = vector ? 16 : 4;
       const unsigned at = first + (vector ? 0 : 4 * i);
-      const unsigned index = scratch_imm(c, at);
+      /* the vertex addr.add_shift reads its offset from bank 1 only (vs_bank1_index()) */
+      const unsigned index = c->vs ? scratch_imm_bank1(c, at) : scratch_imm(c, at);
+      if (c->vs)
+         vs_bank1_only(c, "vertex constant UBO address offset", index, -1, -1, -1);
       unsigned pair;
 
       for (pair = 0; pair + 2 <= NUM_DWORDS; pair += 2)
