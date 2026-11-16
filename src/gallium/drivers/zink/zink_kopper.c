@@ -320,7 +320,10 @@ kopper_CreateSwapchain(struct zink_screen *screen, struct kopper_displaytarget *
    }
    cswap->scci.presentMode = cdt->present_mode;
    cswap->scci.minImageCount = cdt->caps.minImageCount;
-   cswap->scci.preTransform = cdt->caps.currentTransform;
+   /* GL rendering is not pre-rotated. */
+   cswap->scci.preTransform = cdt->caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR
+                            ? VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR
+                            : cdt->caps.currentTransform;
    if (cdt->formats[1])
       cswap->scci.pNext = &cdt->format_list;
 
