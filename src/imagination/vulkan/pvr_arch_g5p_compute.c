@@ -115,7 +115,7 @@ PVR_PER_ARCH(g5p_compute_pipeline_compile)(
    state->num_regs = shader.num_regs;
    state->a9_bank1_regs = shader.a9_bank1_regs;
    state->a9_bodyless = shader.a9_bodyless;
-   state->a9_unit_z = shader.a9_unit_z;
+   state->a9_wgid_z = shader.a9_wgid_z;
    state->a9_local_dwords = shader.a9_local_dwords;
    state->a9_has_barriers = shader.a9_has_barriers;
    state->a9_device_fence = shader.a9_device_fence;
@@ -198,13 +198,6 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
     * empty program does not retire under our CDM launch contract, so do not
     * launch it: the sub-command's ordinary completion tail still establishes
     * command-buffer ordering and signals the submit fence. */
-   /* The compiler's unit-Z specialization is valid only for these actual
-    * dispatch dimensions. Indirect dimensions cannot be checked here. */
-   if (state->a9_unit_z && (indirect_va || group_count[2] != 1)) {
-      return vk_errorf(cmd_buffer, VK_ERROR_OUT_OF_HOST_MEMORY,
-                       "compute workgroup Z specialization requires a direct dispatch with one Z group");
-   }
-
    if (state->a9_bodyless) {
       /* An indirect bodyless dispatch has no consumer of its dimensions,
        * so its argument read is unobservable and is omitted like the kernel
@@ -375,7 +368,8 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
    /*
     * Kernel task: DOUTU source (USC offset, 0x10), the local-ID control
     * word (temps q0 -> r0) and the workgroup-ID one (temps q0, 64 bits ->
-    * threadgroup words 0-1) in the coefficient task.
+    * threadgroup words 0-1, and z from q1's upper half -> word 3 when the
+    * kernel reads it) in the coefficient task.
     */
    g9p_pds_kick_data(kernel_data, usc_offset(device, state->shader_bo));
    /* the DOUTU temps allocate bank 0 (homes up to r(num_regs - 1)); the record's register field below
@@ -405,6 +399,22 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
       kernel_code[3] = kernel_code[4] = g9p_pds_halt();
       kernel_code[5] = g9p_pds_dout(G9P_DOUTW, 0, G9P_PDS_TEMPS, 2, 0);
       kernel_code[6] = g9p_pds_dout(G9P_DOUTU, 0, G9P_PDS_DATA, 0, G9P_PDS_END | G9P_PDS_CC);
+   }
+   if (state->a9_wgid_z) {
+      /* Workgroup ID z, only for a kernel that reads it: AGXMetalA9's EncodeComputePDSProgram (0x207d1ea4c, flags
+       * bit 2) adds a DOUTW of temps q1's upper half (g9p_pds_dout(G9P_DOUTW, 1, G9P_PDS_TEMPS, ...); its source-1
+       * word below: last, the common store, the destination word, the upper 32 bits) after the x/y one (all 64
+       * bits), which then drops its last bit; G9P's 496e44739dc uses the same form on the A10.
+       * Our word is G9P_A9_TG_WGID_Z (3): word 2 is the barrier counter, whose zero pair is written first. */
+      const unsigned at = state->a9_has_barriers ? 2 : 1;
+      kernel_data[4] = PVR_ROGUE_PDSINST_DOUT_FIELDS_DOUTW_SRC1_DEST_COMMON_STORE |
+                       PVR_ROGUE_PDSINST_DOUT_FIELDS_DOUTW_SRC1_BSIZE_ALL64;
+      kernel_data[5] = PVR_ROGUE_PDSINST_DOUT_FIELDS_DOUTW_SRC1_LAST_EN |
+                       PVR_ROGUE_PDSINST_DOUT_FIELDS_DOUTW_SRC1_DEST_COMMON_STORE |
+                       G9P_A9_TG_WGID_Z << PVR_ROGUE_PDSINST_DOUT_FIELDS_DOUTW_SRC1_AO_SHIFT |
+                       PVR_ROGUE_PDSINST_DOUT_FIELDS_DOUTW_SRC1_BSIZE_UPPER;
+      kernel_code[at] = g9p_pds_dout(G9P_DOUTW, 0, G9P_PDS_TEMPS, 4, 0);
+      kernel_code[at + 1] = g9p_pds_dout(G9P_DOUTW, 1, G9P_PDS_TEMPS, 5, G9P_PDS_END);
    }
    result = pvr_arch_cmd_buffer_upload_pds(cmd_buffer, kernel_data,
                                            kernel_dwords,

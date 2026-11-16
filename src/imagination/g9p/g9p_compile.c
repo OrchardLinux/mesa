@@ -2977,7 +2977,11 @@ emit_intrinsic(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
          r = alloc_reg(ctx);
          if (r < 0)
             return false;
-         g9p_tg_load(ctx->c, r, c);
+         /* A9: z is in its own word after the barrier counter (g9p_a9.h G9P_A9_TG_WGID_Z) */
+         const bool a9_z = ctx->out->a9 && c == 2;
+         g9p_tg_load(ctx->c, r, a9_z ? G9P_A9_TG_WGID_Z : c);
+         if (a9_z)
+            ctx->out->a9_wgid_z = true;
          ctx->reg[key(&intr->def, c)] = r;
       }
       g9p_wait(ctx->c);

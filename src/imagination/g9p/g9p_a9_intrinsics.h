@@ -3,7 +3,7 @@
 #include "../g5p/g5p_atomic.h"
 #include "../g5p/g5p_image.h"
 /* Static threadgroup operands: A9 host-compiler forms (compute.md §4).
- * Reserve TG0/1 for IDs and TG2/3 for the future software-barrier counters.
+ * TG0/1 hold the workgroup IDs x/y, TG2 the software-barrier counter, TG3 the ID z (G9P_A9_TG_WGID_Z).
  * CDM allocation covers system words plus the native shared block. */
 /* S and RI address forms from compute-isa-shared-atomic.md §1.3.
  * RI reads a temporary half index for the last time (short parcel8800).
