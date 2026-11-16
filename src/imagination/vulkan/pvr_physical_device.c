@@ -1174,11 +1174,23 @@ static bool pvr_device_is_conformant(const struct pvr_device_info *info)
 
 
 
-static inline uint64_t pvr_compute_heap_size(struct pvr_instance *instance)
+static inline uint64_t
+pvr_compute_heap_size(const struct pvr_physical_device *pdevice,
+                      struct pvr_instance *instance)
 {
-   uint64_t available_ram =
-      os_get_gpu_heap_size(instance->drirc.misc.heap_memory_percent, NULL);
-   return available_ram;
+   uint64_t total;
+   if (!os_get_total_physical_memory(&total))
+      return PVR_MAX_MEMORY_ALLOCATION_SIZE;
+   const float percent = instance->drirc.misc.heap_memory_percent;
+   if (percent == OS_GPU_HEAP_SIZE_HEURISTIC &&
+       PVR_HAS_FEATURE(&pdevice->dev_info, apple_g5p)) {
+      uint64_t page_size;
+      if (!os_get_page_size(&page_size))
+         return PVR_MAX_MEMORY_ALLOCATION_SIZE;
+      /* This device class limits the GPU working set to two thirds of RAM. */
+      return ALIGN_POT(total * 2 / 3, page_size);
+   }
+   return os_gpu_heap_size_calculate(total, percent, NULL);
 }
 
 static void
@@ -1271,7 +1283,7 @@ VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
 
    /* Setup available memory heaps and types */
    pdevice->memory.memoryHeapCount = 1;
-   pdevice->memory.memoryHeaps[0].size = pvr_compute_heap_size(instance);
+   pdevice->memory.memoryHeaps[0].size = pvr_compute_heap_size(pdevice, instance);
    pdevice->memory.memoryHeaps[0].flags = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
 
    pdevice->memory.memoryTypeCount = 1;
