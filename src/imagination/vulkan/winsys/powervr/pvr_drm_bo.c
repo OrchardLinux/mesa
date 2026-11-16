@@ -526,12 +526,14 @@ VkResult pvr_drm_winsys_vma_map(struct pvr_winsys_vma *vma,
       return vk_error(NULL, VK_ERROR_MEMORY_MAP_FAILED);
    }
 
-   result = pvr_ioctl(drm_ws->base.render_fd,
-                      DRM_IOCTL_PVR_VM_MAP,
-                      &args,
-                      VK_ERROR_MEMORY_MAP_FAILED);
-   if (result != VK_SUCCESS)
-      return result;
+   if (drmIoctl(drm_ws->base.render_fd, DRM_IOCTL_PVR_VM_MAP, &args)) {
+      const int err = errno;
+      const char *message = strerror(err);
+      return vk_errorf(NULL,
+                       err == EIO ? VK_ERROR_OUT_OF_HOST_MEMORY
+                                  : VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                       "DRM_IOCTL_PVR_VM_MAP failed (errno %d: %s)", err, message);
+   }
 
    pvr_drm_buffer_acquire(drm_bo);
 
