@@ -1197,6 +1197,19 @@ zink_init_screen_caps(struct zink_screen *screen)
       assert(screen->info.feats.features.tessellationShader == VK_FALSE);
       caps->max_varyings = 16;
    }
+   /* Between 64 and 120 output components, halving for streamout falls below
+    * the ES 3.0 minimum of 15 varyings. Zink inlines every transform-feedback
+    * output into an existing output (update_so_info()), and the GLSL linker
+    * limits the vertex stage's outputs to maxVertexOutputComponents
+    * (check_against_output_limit()), so 16 varyings cannot push the vertex
+    * shader past the device limit: such a program fails to link instead.
+    */
+   else if (zink_driverid(screen) == VK_DRIVER_ID_IMAGINATION_OPEN_SOURCE_MESA &&
+            !screen->info.feats.features.geometryShader &&
+            !screen->info.feats.features.tessellationShader &&
+            screen->info.props.limits.maxVertexOutputComponents > 64 &&
+            screen->info.props.limits.maxVertexOutputComponents < 120)
+      caps->max_varyings = 16;
 
    caps->dmabuf =
 #if defined(HAVE_LIBDRM) && (DETECT_OS_LINUX || DETECT_OS_BSD)
