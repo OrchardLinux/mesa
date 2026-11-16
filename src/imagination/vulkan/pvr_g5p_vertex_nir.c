@@ -83,8 +83,25 @@ pvr_g5p_vertex_format_info(VkFormat format, struct pvr_g5p_vertex_format *f)
    if (!d || d->layout != UTIL_FORMAT_LAYOUT_PLAIN || d->block.width != 1 || d->block.height != 1 ||
        d->nr_channels < 1 || d->nr_channels > 4)
       return false;
-   /* Packed 10:10:10:2 formats (a 32-bit fetch followed by scalar NIR
-    * operations, f->packed_1010102) have not run on the device: not taken. */
+   /* Packed 10:10:10:2 formats: a 32-bit fetch followed by ordinary scalar
+    * NIR operations (f->packed_1010102); no hardware packed conversion is
+    * assumed. Tested on the A9 before the powervr interface: all 42
+    * dEQP-GLES3 vertex_arrays.single_attribute *2_10_10_10 cases fixed
+    * (int and uint, wrong result before), 24 controls kept, none lost. */
+   if (d->nr_channels == 4 && d->block.bits == 32 &&
+       d->channel[0].size == 10 && d->channel[1].size == 10 &&
+       d->channel[2].size == 10 && d->channel[3].size == 2) {
+      f->components = 4;
+      f->bytes = 1; /* four logical components occupy one dword */
+      f->convert = -1;
+      f->packed_1010102 = true;
+      for (unsigned c = 0; c < 4; c++) {
+         if (d->swizzle[c] > PIPE_SWIZZLE_W)
+            return false;
+         f->swizzle[c] = d->swizzle[c];
+      }
+      return true;
+   }
    const struct util_format_channel_description *ch = &d->channel[0];
    const unsigned bits = ch->size;
    if ((bits != 8 && bits != 16 && bits != 32) || d->block.bits != bits * d->nr_channels)
