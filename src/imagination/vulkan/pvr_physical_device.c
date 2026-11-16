@@ -609,6 +609,9 @@ static uint32_t get_api_version(void)
 static unsigned
 get_custom_border_color_samplers(const struct pvr_device_info *dev_info);
 
+/* Minimum required by the Vulkan spec Limits (maxMemoryAllocationSize) */
+#define PVR_MAX_MEMORY_ALLOCATION_SIZE (1ull << 30)
+
 static bool pvr_physical_device_get_properties(
    const struct pvr_physical_device *const pdevice,
    struct vk_properties *const properties)
@@ -660,7 +663,7 @@ static bool pvr_physical_device_get_properties(
 
    assert(pdevice->memory.memoryHeapCount == 1);
    const VkDeviceSize max_memory_alloc_size =
-      pdevice->memory.memoryHeaps[0].size;
+      MAX2(pdevice->memory.memoryHeaps[0].size, PVR_MAX_MEMORY_ALLOCATION_SIZE);
 
    const uint32_t line_sub_pixel_precision_bits =
       PVR_HAS_FEATURE(dev_info, simple_internal_parameter_format) ? 4U : 8U;
@@ -1169,14 +1172,13 @@ static bool pvr_device_is_conformant(const struct pvr_device_info *info)
    return false;
 }
 
-/* Minimum required by the Vulkan spec Limits (maxMemoryAllocationSize) */
-#define PVR_MAX_MEMORY_ALLOCATION_SIZE (1ull << 30)
+
 
 static inline uint64_t pvr_compute_heap_size(struct pvr_instance *instance)
 {
    uint64_t available_ram =
       os_get_gpu_heap_size(instance->drirc.misc.heap_memory_percent, NULL);
-   return MAX2(available_ram, PVR_MAX_MEMORY_ALLOCATION_SIZE);
+   return available_ram;
 }
 
 static void

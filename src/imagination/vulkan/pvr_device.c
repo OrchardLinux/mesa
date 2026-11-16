@@ -233,13 +233,11 @@ VkResult pvr_AllocateMemory(VkDevice _device,
 
    const VkMemoryType *mem_type =
       &device->pdevice->memory.memoryTypes[pAllocateInfo->memoryTypeIndex];
-   const VkMemoryHeap *mem_heap =
-      &device->pdevice->memory.memoryHeaps[mem_type->heapIndex];
 
    VkDeviceSize aligned_alloc_size =
       ALIGN_POT(pAllocateInfo->allocationSize, device->ws->page_size);
 
-   if (aligned_alloc_size > mem_heap->size) {
+   if (aligned_alloc_size > device->pdevice->vk.properties.maxMemoryAllocationSize) {
       if (unlikely(device->bo_log))
          pvr_bo_log_memory_alloc(device,
                                  pAllocateInfo,
