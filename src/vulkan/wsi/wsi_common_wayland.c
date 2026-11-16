@@ -99,12 +99,78 @@ struct dmabuf_feedback {
    struct dmabuf_feedback_tranche pending_tranche;
 };
 
+struct wsi_wl_output {
+   struct wl_list link;
+   struct wl_output *output;
+   uint32_t name;
+   enum wl_output_transform transform;
+};
+
+/* Vulkan VkSurfaceTransformFlagBitsKHR defines clockwise rotations, while
+ * wayland.xml wl_output.transform defines counter-clockwise rotations. Both
+ * VkSwapchainCreateInfoKHR.preTransform and wl_surface.set_buffer_transform
+ * describe the transform already applied to the image content.
+ * https://docs.vulkan.org/refpages/latest/refpages/source/VkSurfaceTransformFlagBitsKHR.html
+ * https://gitlab.freedesktop.org/wayland/wayland/-/blob/main/protocol/wayland.xml
+ */
+static VkSurfaceTransformFlagBitsKHR
+wl_transform_to_vk(enum wl_output_transform transform)
+{
+   switch (transform) {
+   case WL_OUTPUT_TRANSFORM_NORMAL:
+      return VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+   case WL_OUTPUT_TRANSFORM_90:
+      return VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR;
+   case WL_OUTPUT_TRANSFORM_180:
+      return VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR;
+   case WL_OUTPUT_TRANSFORM_270:
+      return VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR;
+   case WL_OUTPUT_TRANSFORM_FLIPPED:
+      return VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_BIT_KHR;
+   case WL_OUTPUT_TRANSFORM_FLIPPED_90:
+      return VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_270_BIT_KHR;
+   case WL_OUTPUT_TRANSFORM_FLIPPED_180:
+      return VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_180_BIT_KHR;
+   case WL_OUTPUT_TRANSFORM_FLIPPED_270:
+      return VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_90_BIT_KHR;
+   default:
+      UNREACHABLE("Invalid Wayland transform");
+   }
+}
+
+static enum wl_output_transform
+vk_transform_to_wl(VkSurfaceTransformFlagBitsKHR transform)
+{
+   switch (transform) {
+   case VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR:
+      return WL_OUTPUT_TRANSFORM_NORMAL;
+   case VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR:
+      return WL_OUTPUT_TRANSFORM_90;
+   case VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR:
+      return WL_OUTPUT_TRANSFORM_180;
+   case VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR:
+      return WL_OUTPUT_TRANSFORM_270;
+   case VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_BIT_KHR:
+      return WL_OUTPUT_TRANSFORM_FLIPPED;
+   case VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_270_BIT_KHR:
+      return WL_OUTPUT_TRANSFORM_FLIPPED_90;
+   case VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_180_BIT_KHR:
+      return WL_OUTPUT_TRANSFORM_FLIPPED_180;
+   case VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_90_BIT_KHR:
+      return WL_OUTPUT_TRANSFORM_FLIPPED_270;
+   default:
+      UNREACHABLE("Invalid Vulkan surface transform");
+   }
+}
+
 struct wsi_wl_display {
    /* The real wl_display */
    struct wl_display *wl_display;
    /* Actually a proxy wrapper around the event queue */
    struct wl_display *wl_display_wrapper;
    struct wl_event_queue *queue;
+   struct wl_registry *registry;
+   struct wl_list outputs;
    struct wl_fixes *wl_fixes;
 
    struct wl_shm *wl_shm;
@@ -179,6 +245,7 @@ struct wsi_wl_surface {
    VkIcdSurfaceWayland base;
 
    unsigned int chain_count;
+   enum wl_output_transform buffer_transform;
 
    struct wsi_wl_swapchain *chain;
    struct loader_wayland_surface wayland_surface;
@@ -201,6 +268,7 @@ struct wsi_wl_swapchain {
    struct wl_callback *frame;
 
    VkExtent2D extent;
+   enum wl_output_transform buffer_transform;
    VkFormat vk_format;
    enum wsi_wl_buffer_type buffer_type;
    uint32_t drm_format;
@@ -1498,10 +1566,78 @@ static const struct wp_presentation_listener presentation_listener = {
 #endif
 
 static void
+output_handle_geometry(void *data, struct wl_output *output,
+                       int32_t x, int32_t y, int32_t physical_width,
+                       int32_t physical_height, int32_t subpixel,
+                       const char *make, const char *model, int32_t transform)
+{
+   struct wsi_wl_output *wl_output = data;
+   wl_output->transform = transform;
+}
+
+static void
+output_handle_mode(void *data, struct wl_output *output, uint32_t flags,
+                   int32_t width, int32_t height, int32_t refresh)
+{
+}
+
+static void
+output_handle_done(void *data, struct wl_output *output)
+{
+}
+
+static void
+output_handle_scale(void *data, struct wl_output *output, int32_t factor)
+{
+}
+
+static void
+output_handle_name(void *data, struct wl_output *output, const char *name)
+{
+}
+
+static void
+output_handle_description(void *data, struct wl_output *output,
+                          const char *description)
+{
+}
+
+static const struct wl_output_listener output_listener = {
+   .geometry = output_handle_geometry,
+   .mode = output_handle_mode,
+   .done = output_handle_done,
+   .scale = output_handle_scale,
+   .name = output_handle_name,
+   .description = output_handle_description,
+};
+
+static void
+wsi_wl_output_destroy(struct wsi_wl_output *output)
+{
+   wl_list_remove(&output->link);
+   if (wl_output_get_version(output->output) >= WL_OUTPUT_RELEASE_SINCE_VERSION)
+      wl_output_release(output->output);
+   else
+      wl_output_destroy(output->output);
+   free(output);
+}
+
+static void
 registry_handle_global(void *data, struct wl_registry *registry,
                        uint32_t name, const char *interface, uint32_t version)
 {
    struct wsi_wl_display *display = data;
+
+   if (strcmp(interface, wl_output_interface.name) == 0 && version >= 2) {
+      struct wsi_wl_output *output = calloc(1, sizeof(*output));
+      if (!output)
+         return;
+      output->name = name;
+      output->output = wl_registry_bind(registry, name, &wl_output_interface,
+                                        MIN2(version, 4));
+      wl_output_add_listener(output->output, &output_listener, output);
+      wl_list_insert(&display->outputs, &output->link);
+   }
 
    if (display->sw) {
       if (strcmp(interface, wl_shm_interface.name) == 0) {
@@ -1564,9 +1700,14 @@ static void
 registry_handle_global_remove(void *data, struct wl_registry *registry,
                               uint32_t name)
 {
-#ifdef WL_FIXES_ACK_GLOBAL_REMOVE
    struct wsi_wl_display *display = data;
+   struct wsi_wl_output *output, *tmp;
+   wl_list_for_each_safe(output, tmp, &display->outputs, link) {
+      if (output->name == name)
+         wsi_wl_output_destroy(output);
+   }
 
+#ifdef WL_FIXES_ACK_GLOBAL_REMOVE
    if (display->wl_fixes && wl_fixes_get_version(display->wl_fixes) >= WL_FIXES_ACK_GLOBAL_REMOVE_SINCE_VERSION) {
       wl_fixes_ack_global_remove(display->wl_fixes, registry, name);
    }
@@ -1581,6 +1722,18 @@ static const struct wl_registry_listener registry_listener = {
 static void
 wsi_wl_display_finish(struct wsi_wl_display *display)
 {
+   struct wsi_wl_output *output, *tmp;
+   wl_list_for_each_safe(output, tmp, &display->outputs, link)
+      wsi_wl_output_destroy(output);
+
+   if (display->registry) {
+#ifdef WL_FIXES_INTERFACE
+      if (display->wl_fixes)
+         wl_fixes_destroy_registry(display->wl_fixes, display->registry);
+#endif
+      wl_registry_destroy(display->registry);
+   }
+
    struct wsi_wl_format *f;
    u_vector_foreach(f, &display->formats)
       u_vector_finish(&f->modifiers);
@@ -1624,6 +1777,7 @@ wsi_wl_display_init(struct wsi_wayland *wsi_wl,
 {
    VkResult result = VK_SUCCESS;
    memset(display, 0, sizeof(*display));
+   wl_list_init(&display->outputs);
 
    if (!u_vector_init(&display->formats, 8, sizeof(struct wsi_wl_format)))
       return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -1657,6 +1811,7 @@ wsi_wl_display_init(struct wsi_wayland *wsi_wl,
       goto fail;
    }
 
+   display->registry = registry;
    wl_registry_add_listener(registry, &registry_listener, display);
 
    /* Round-trip to get wl_shm and zwp_linux_dmabuf_v1 globals */
@@ -1754,12 +1909,7 @@ wsi_wl_display_init(struct wsi_wayland *wsi_wl,
    }
 
 out:
-   /* We don't need this anymore */
-#ifdef WL_FIXES_INTERFACE
-   if (display->wl_fixes)
-      wl_fixes_destroy_registry(display->wl_fixes, registry);
-#endif
-   wl_registry_destroy(registry);
+   /* Keep the registry alive to track output additions and removals. */
 
    /* Destroy default dma-buf feedback object and format table */
    if (display->wl_dmabuf_feedback) {
@@ -1771,14 +1921,6 @@ out:
    return VK_SUCCESS;
 
 fail_registry:
-   if (registry) {
-#ifdef WL_FIXES_INTERFACE
-      if (display->wl_fixes)
-         wl_fixes_destroy_registry(display->wl_fixes, registry);
-#endif
-      wl_registry_destroy(registry);
-   }
-
 fail:
    wsi_wl_display_finish(display);
    return result;
@@ -1921,6 +2063,30 @@ wsi_wl_surface_get_capabilities(VkIcdSurfaceBase *icd_surface,
 
    caps->surfaceCapabilities.minImageCount = wsi_wl_surface_get_min_image_count(display, present_mode);
 
+   caps->surfaceCapabilities.supportedTransforms = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+   caps->surfaceCapabilities.currentTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+   if (wl_surface_get_version(surface->surface) >=
+       WL_SURFACE_SET_BUFFER_TRANSFORM_SINCE_VERSION) {
+      caps->surfaceCapabilities.supportedTransforms |=
+         VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR |
+         VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR |
+         VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR |
+         VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_BIT_KHR |
+         VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_90_BIT_KHR |
+         VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_180_BIT_KHR |
+         VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_270_BIT_KHR;
+
+      /* Without the application's surface enter/leave events, only a single
+       * output tells us which transform applies. Otherwise prefer identity.
+       */
+      if (wl_list_length(&display->outputs) == 1) {
+         struct wsi_wl_output *output =
+            wl_container_of(display->outputs.next, output, link);
+         caps->surfaceCapabilities.currentTransform =
+            wl_transform_to_vk(output->transform);
+      }
+   }
+
    if (!wsi_wl_surface->display)
       wsi_wl_display_finish(&temp_display);
 
@@ -1934,8 +2100,6 @@ wsi_wl_surface_get_capabilities(VkIcdSurfaceBase *icd_surface,
       wsi_device->maxImageDimension2D,
    };
 
-   caps->surfaceCapabilities.supportedTransforms = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
-   caps->surfaceCapabilities.currentTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
    caps->surfaceCapabilities.maxImageArrayLayers = 1;
 
    caps->surfaceCapabilities.supportedCompositeAlpha =
@@ -3570,6 +3734,11 @@ wsi_wl_swapchain_queue_present(struct wsi_swapchain *wsi_chain,
       wp_fifo_v1_wait_barrier(chain->fifo);
       chain->next_present_force_wait_barrier = false;
    }
+   if (chain->buffer_transform != wsi_wl_surface->buffer_transform) {
+      wl_surface_set_buffer_transform(wsi_wl_surface->wayland_surface.wrapper,
+                                      chain->buffer_transform);
+      wsi_wl_surface->buffer_transform = chain->buffer_transform;
+   }
    wl_surface_commit(wsi_wl_surface->wayland_surface.wrapper);
    wl_display_flush(wsi_wl_surface->display->wl_display);
 
@@ -4023,6 +4192,7 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
    chain->base.image_count = num_images;
    chain->base.set_hdr_metadata = wsi_wl_swapchain_set_hdr_metadata;
    chain->extent = pCreateInfo->imageExtent;
+   chain->buffer_transform = vk_transform_to_wl(pCreateInfo->preTransform);
    chain->vk_format = pCreateInfo->imageFormat;
    chain->buffer_type = buffer_type;
    if (buffer_type == WSI_WL_BUFFER_NATIVE) {
