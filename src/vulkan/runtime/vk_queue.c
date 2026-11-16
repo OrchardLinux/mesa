@@ -828,7 +828,11 @@ vk_queue_stop_submit_thread(struct vk_queue *queue)
 
    thrd_join(queue->submit.thread, NULL);
 
-   assert(list_is_empty(&queue->submit.submits));
+   /* A failed submit may remain after queue loss. vk_queue_finish destroys
+    * pending submits after the worker has exited.
+    */
+   assert(list_is_empty(&queue->submit.submits) ||
+          vk_device_is_lost_no_report(queue->base.device));
    queue->submit.mode = VK_QUEUE_SUBMIT_MODE_IMMEDIATE;
 }
 
