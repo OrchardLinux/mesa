@@ -1,0 +1,91 @@
+name: Build
+# Compiles the drivers OrchardLinux ships from this fork, the way its package
+# builds them: the build() and package() of OrchardLinux/packages'
+# packages/mesa/pacman/PKGBUILD, run on this checkout instead of the commit the
+# package pins, in the same Arch Linux ARM container the package is built in.
+# That is the Imagination PowerVR Vulkan driver (Wayland) and OpenGL through
+# Zink, llvmpipe and softpipe (X11 and Wayland), with exactly the package's
+# meson options; package() then checks that the drivers the image needs are
+# there. Build only: nothing is tested on a GPU or published.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  aarch64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    # The image OrchardLinux/packages pins for aarch64 (ci/containers.json).
+    container: docker.io/arch4edu/archlinuxarm@sha256:1db43d1af9917db5fd34af3dab64e2b229a21240e81bb765e3d2d3c34739d587
+    env:
+      ORCHARD_ARCH: aarch64
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_MAXSIZE: 2G
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # The package's recipe and the packages repository's container setup. The
+      # image has no git yet, so this comes as an archive: the whole small repository.
+      - uses: actions/checkout@v4
+        with:
+          repository: OrchardLinux/packages
+          path: packages
+          persist-credentials: false
+      # pacman made usable in a container and the system brought up to date, as
+      # for every package build there; then the recipe's dependencies.
+      - name: Prepare the build system
+        run: |
+          bash packages/ci/prepare-pacman
+          pacman -S --noconfirm --needed git ccache
+          # shellcheck disable=SC1091
+          source packages/packages/mesa/pacman/PKGBUILD
+          pacman -S --noconfirm --needed --asdeps "${depends[@]}" "${makedepends[@]}"
+      - uses: actions/checkout@v4
+        with:
+          path: mesa
+          persist-credentials: false
+      # main keeps the compiler cache of its last build; a pull request only reads it.
+      - uses: actions/cache@v4
+        if: github.event_name != 'pull_request'
+        with:
+          path: .ccache
+          key: mesa-ccache-v1-aarch64-${{ github.sha }}
+          restore-keys: mesa-ccache-v1-aarch64-
+      - uses: actions/cache/restore@v4
+        if: github.event_name == 'pull_request'
+        with:
+          path: .ccache
+          key: mesa-ccache-v1-aarch64-${{ github.sha }}
+          restore-keys: mesa-ccache-v1-aarch64-
+      - name: Build as the package does
+        run: |
+          # makepkg's compiler flags; the recipe's options leave out LTO and debug.
+          # shellcheck disable=SC1091
+          source /etc/makepkg.conf
+          export CFLAGS CXXFLAGS LDFLAGS
+          # shellcheck disable=SC1091
+          source packages/packages/mesa/pacman/PKGBUILD
+          # The recipe builds the source directory mesa-$_commit: this checkout.
+          work=$PWD/work
+          mkdir -p "$work"
+          ln -s "$GITHUB_WORKSPACE/mesa" "$work/mesa-${_commit}"
+          cp packages/packages/mesa/gpu-probe.c "$work/"
+          mkdir -p "$CCACHE_DIR"
+          ccache --zero-stats >/dev/null
+          started=$(date +%s)
+          # meson compiles through ccache when it finds it.
+          (cd "$work" && build)
+          export srcdir=$work pkgdir=$work/pkg
+          (cd "$work" && package)
+          # Keep only what this build used, so the saved cache stays one build large.
+          ccache --evict-older-than "$(( $(date +%s) - started + 60 ))s" >/dev/null
+          { echo 'Compiler cache:'; echo '```'; ccache --show-stats; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          ls -l "$work/pkg/usr/lib/libvulkan_powervr_mesa.so" "$work"/pkg/usr/lib/libgallium-*.so
