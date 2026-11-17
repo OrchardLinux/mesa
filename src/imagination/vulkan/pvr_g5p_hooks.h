@@ -47,6 +47,13 @@
       pvr_arch_g5p_pack_image_view(                                         \
          iview, &(iview)->image_state[PVR_TEXTURE_STATE_SAMPLE]);
 
+/* Only storage descriptors reinterpret cube faces as a 2D array. */
+#define PVR_G5P_HOOK_storage_image(dev_info, iview, desc) \
+   if (PVR_HAS_FEATURE(dev_info, apple_g5p) && \
+       ((iview)->vk.view_type == VK_IMAGE_VIEW_TYPE_CUBE || \
+        (iview)->vk.view_type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY)) \
+      pvr_arch_g5p_pack_storage_image_view(iview, desc);
+
 /* Release integration of the vertex-store capability, preserving shared lines. */
 /* Also the polygon-mode and indirect lanes' feature lines (their
  * pvr_g5p_publish_hooks.h, which this base no longer has): line and point
@@ -142,7 +149,9 @@
       (surface)->g5p_aspect = (aspect);                                    \
    }                                                                      \
    if (PVR_G5P_IMAGE_IS_SLICED_3D(image)) {                                  \
-      (surface)->dev_addr.addr += (info)->depthPitch * (uint32_t)(fdepth);   \
+      /* the slice's offset, info->depthPitch * z, is added once after this \
+       * hook by pvr_setup_transfer_surface() itself, as for any non-3D     \
+       * surface: adding it here too put slice z at 2z (observed in 3D transfers) */ \
       (surface)->mem_layout = PVR_MEMLAYOUT_TWIDDLED;                        \
       (surface)->depth = 1;                                                  \
    }
@@ -292,7 +301,7 @@
    if (PVR_HAS_FEATURE(&(cmd_buffer)->device->pdevice->dev_info, apple_g5p)) {                        \
       VkResult r_ = pvr_arch_g5p_clear_attachments(cmd_buffer, count, attachments, rect_count, rects); \
       if (r_ != VK_SUCCESS)                                                                           \
-         pvr_cmd_buffer_set_error_unwarned(cmd_buffer, r_);                                           \
+         pvr_cmd_buffer_set_error_unwarned(cmd_buffer, pvr_refusal_to_api(r_));                                           \
       return;                                                                                         \
    }
 

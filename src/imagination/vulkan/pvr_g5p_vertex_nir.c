@@ -26,7 +26,9 @@
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_builder.h"
 #include "compiler/shader_enums.h"
+#include "util/log.h"
 #include "util/macros.h"
+#include "util/u_debug.h"
 #include "util/format/u_format.h"
 #include "util/u_math.h"
 #include "vk_format.h"
@@ -81,8 +83,25 @@ pvr_g5p_vertex_format_info(VkFormat format, struct pvr_g5p_vertex_format *f)
    if (!d || d->layout != UTIL_FORMAT_LAYOUT_PLAIN || d->block.width != 1 || d->block.height != 1 ||
        d->nr_channels < 1 || d->nr_channels > 4)
       return false;
-   /* Packed 10:10:10:2 formats (a 32-bit fetch followed by scalar NIR
-    * operations, f->packed_1010102) have not run on the device: not taken. */
+   /* Packed 10:10:10:2 formats: a 32-bit fetch followed by ordinary scalar
+    * NIR operations (f->packed_1010102); no hardware packed conversion is
+    * assumed. Tested on the A9 before the powervr interface: all 42
+    * dEQP-GLES3 vertex_arrays.single_attribute *2_10_10_10 cases fixed
+    * (int and uint, wrong result before), 24 controls kept, none lost. */
+   if (d->nr_channels == 4 && d->block.bits == 32 &&
+       d->channel[0].size == 10 && d->channel[1].size == 10 &&
+       d->channel[2].size == 10 && d->channel[3].size == 2) {
+      f->components = 4;
+      f->bytes = 1; /* four logical components occupy one dword */
+      f->convert = -1;
+      f->packed_1010102 = true;
+      for (unsigned c = 0; c < 4; c++) {
+         if (d->swizzle[c] > PIPE_SWIZZLE_W)
+            return false;
+         f->swizzle[c] = d->swizzle[c];
+      }
+      return true;
+   }
    const struct util_format_channel_description *ch = &d->channel[0];
    const unsigned bits = ch->size;
    if ((bits != 8 && bits != 16 && bits != 32) || d->block.bits != bits * d->nr_channels)
@@ -118,9 +137,16 @@ pvr_g5p_vertex_format_info(VkFormat format, struct pvr_g5p_vertex_format *f)
       f->convert = PCO_G5P_VSF_F16;
       return true;
    }
-   /* to float: normalized or scaled; 8- and 16-bit integer inputs are not
-    * converted yet */
-   if (!(is_signed || is_unsigned) || ch->pure_integer)
+   /* 8- and 16-bit pure integers (glVertexAttribIPointer with GL_BYTE ... GL_UNSIGNED_SHORT): the dwords
+    * that hold them fetched raw, each component shifted out (and sign-extended) in NIR, no conversion
+    * (G9P's 4a8c71666d9 ("pvr/g9p: Qt Quick on Zink: packed vertex formats, texelFetch") for the A10) */
+   if ((is_signed || is_unsigned) && ch->pure_integer) {
+      f->convert = -1;
+      f->raw_int = true;
+      return true;
+   }
+   /* to float: normalized or scaled */
+   if (!(is_signed || is_unsigned))
       return false;
    f->convert = (bits == 16 ? PCO_G5P_VSF_U16 : PCO_G5P_VSF_U8) + (ch->normalized ? 2 : 0) + is_signed;
    return true;
@@ -259,12 +285,27 @@ packed_fetches(struct pvr_g5p_vertex_layout *l, struct attrib *a, unsigned n, un
       }
       slot += a[i].dwords;
    }
-   if (slot > PVR_G5P_VERTEX_INPUT_DWORDS)
-      return REFUSE(l, "vertex attributes of %u dwords (the unified store holds %u)", slot,
-                    PVR_G5P_VERTEX_INPUT_DWORDS);
+   if (slot > PVR_G5P_VERTEX_INPUT_MAX_DWORDS)
+      return REFUSE(l, "vertex attributes of %u dwords (%u are built)", slot, PVR_G5P_VERTEX_INPUT_MAX_DWORDS);
    for (unsigned v = 0; 4 * v < slot; v++)
       l->components[v] = MIN2(4, slot - 4 * v);
    return true;
+}
+
+/* Each fetch's overread: how far it reads past the end of the last attribute of its binding's element. Vulkan
+ * keeps every fetched vertex's attributes inside the bound range, so the draw's reads end at most that many bytes
+ * past it (pvr_arch_g5p_gfx.c keeps them inside the buffer's GPU mapping, or draws from a padded copy). */
+static void
+fetch_overreads(struct pvr_g5p_vertex_layout *l, const struct attrib *a, unsigned n)
+{
+   uint32_t end[MESA_VK_MAX_VERTEX_BINDINGS] = { 0 };
+   for (unsigned i = 0; i < n; i++)
+      end[a[i].binding] = MAX2(end[a[i].binding], a[i].offset + a[i].lead + a[i].f.bytes * a[i].f.components);
+   for (unsigned f = 0; f < l->fetch_count; f++) {
+      struct pvr_g5p_fetch *fe = &l->fetch_list[f];
+      const uint32_t fetch_end = fe->offset + 4 * fe->dwords;
+      fe->overread = fetch_end > end[fe->binding] ? MIN2(fetch_end - end[fe->binding], UINT16_MAX) : 0;
+   }
 }
 
 struct rewrite {
@@ -295,6 +336,20 @@ rewrite_load(nir_builder *b, nir_intrinsic_instr *in, void *data)
          c[k] = comp != 3 ? nir_imm_int(b, 0) : is_float ? nir_imm_float(b, 1.0f) : nir_imm_int(b, 1);
          continue;
       }
+      if (f.raw_int) {
+         /* the component's bytes in the attribute's fetched dwords */
+         const unsigned at = lead + f.bytes * f.swizzle[comp], reg = rw->base[loc] + at / 4;
+         const unsigned shift = 8 * (at % 4), bits = 8 * f.bytes;
+         nir_def *word = nir_load_input(b, 1, 32, nir_imm_int(b, 0), .base = reg / 4,
+                                       .component = reg % 4, .dest_type = nir_type_uint32,
+                                       .io_semantics = (nir_io_semantics){
+                                          .location = VERT_ATTRIB_GENERIC0 + reg / 4, .num_slots = 1 });
+         const bool is_signed = vk_format_description(rw->l->vi->attributes[loc].format)->channel[0].type ==
+                                UTIL_FORMAT_TYPE_SIGNED;
+         c[k] = is_signed ? nir_ishr_imm(b, nir_ishl_imm(b, word, 32 - shift - bits), 32 - bits)
+                          : nir_iand_imm(b, nir_ushr_imm(b, word, shift), BITFIELD_MASK(bits));
+         continue;
+      }
       if (f.packed_1010102) {
          unsigned reg = rw->base[loc];
          nir_def *word = nir_load_input(b, 1, 32, nir_imm_int(b, 0), .base = reg / 4,
@@ -323,6 +378,19 @@ rewrite_load(nir_builder *b, nir_intrinsic_instr *in, void *data)
       /* the component's byte in the fetched dwords; a converted one names
        * its format and byte in the load's base */
       const unsigned at = lead + f.bytes * f.swizzle[comp], reg = rw->base[loc] + at / 4;
+      /* a 32-bit component off dwords (an attribute at an unaligned offset): the two dwords it straddles,
+       * funnel-shifted (the binding itself is dword-aligned, pvr_arch_g5p_gfx.c g5p_realign_binding()) */
+      if (f.convert < 0 && at % 4) {
+         nir_def *w[2];
+         for (unsigned i = 0; i < 2; i++)
+            w[i] = nir_load_input(b, 1, 32, nir_imm_int(b, 0), .base = (reg + i) / 4, .component = (reg + i) % 4,
+                                  .dest_type = nir_type_uint32,
+                                  .io_semantics = (nir_io_semantics){ .location = VERT_ATTRIB_GENERIC0 + (reg + i) / 4,
+                                                                      .num_slots = 1 });
+         const unsigned sh = 8 * (at % 4);
+         c[k] = nir_ior(b, nir_ushr_imm(b, w[0], sh), nir_ishl_imm(b, w[1], 32 - sh));
+         continue;
+      }
       const unsigned base = f.convert < 0 ? reg / 4 : PCO_G5P_VS_CONVERT_BASE + 4 * f.convert + at % 4;
       c[k] = nir_load_input(b, 1, 32, nir_imm_int(b, 0), .base = base, .component = reg % 4, .dest_type = type,
                             .io_semantics = (nir_io_semantics){ .location = VERT_ATTRIB_GENERIC0 + reg / 4,
@@ -332,10 +400,43 @@ rewrite_load(nir_builder *b, nir_intrinsic_instr *in, void *data)
    return true;
 }
 
+/* A load of a location the pipeline gives no attribute: (0, 0, 0, 1), GL's generic-attribute default that Zink's GL
+ * relies on (G9P's 4a8c71666d9 ("pvr/g9p: Qt Quick on Zink: packed vertex formats, texelFetch")). Diagnostic: each pipeline logs the locations it substitutes. */
+struct unbound_state {
+   uint32_t valid, substituted;
+};
+
+static bool
+unbound_input(nir_builder *b, nir_intrinsic_instr *in, void *data)
+{
+   struct unbound_state *u = data;
+   if (in->intrinsic != nir_intrinsic_load_input)
+      return false;
+   const int loc = generic_location(in);
+   if (loc < 0 || (u->valid & BITFIELD_BIT(loc)) || in->def.bit_size != 32)
+      return false;
+   u->substituted |= BITFIELD_BIT(loc);
+   const bool is_float = nir_alu_type_get_base_type(nir_intrinsic_dest_type(in)) == nir_type_float;
+   b->cursor = nir_before_instr(&in->instr);
+   nir_def *c[4];
+   for (unsigned k = 0; k < in->def.num_components; k++)
+      c[k] = nir_intrinsic_component(in) + k != 3 ? nir_imm_int(b, 0) : is_float ? nir_imm_float(b, 1.0f)
+                                                                                 : nir_imm_int(b, 1);
+   nir_def_replace(&in->def, nir_vec(b, c, in->def.num_components));
+   return true;
+}
+
 bool
 pvr_g5p_vertex_lower(nir_shader *vs, struct pvr_g5p_vertex_layout *l)
 {
    const struct vk_vertex_input_state *vi = l->vi;
+
+   {
+      struct unbound_state u = { .valid = vi ? vi->attributes_valid : 0 };
+      nir_shader_intrinsics_pass(vs, unbound_input, nir_metadata_control_flow, &u);
+      u_foreach_bit (loc, u.substituted)
+         mesa_logw("G5P vertex input %u has no attribute: reading (0,0,0,1)", loc);
+   }
 
    /* the locations the program reads */
    l->read = 0;
@@ -378,14 +479,12 @@ pvr_g5p_vertex_lower(nir_shader *vs, struct pvr_g5p_vertex_layout *l)
       /* the fetch is dword-granular: a 32-bit attribute starts on a dword,
        * a converted one is read from the dwords that hold its bytes */
       const unsigned lead = at->offset % 4;
-      if (f.convert < 0 && lead)
-         return REFUSE(l, "vertex attribute %u at offset %u (the fetch is dword-granular)", loc, at->offset);
-      if (lead % f.bytes)
+      /* a 32-bit attribute at an offset off dwords: read from the two dwords it straddles (rewrite_load()) */
+      const bool straddle = f.convert < 0 && !f.raw_int && !f.packed_1010102 && lead;
+      if (!straddle && lead % f.bytes)
          return REFUSE(l, "vertex attribute %u: %u-byte components at offset %u", loc, f.bytes, at->offset);
-      if (!l->dynamic_strides && vi->bindings[at->binding].stride % 4)
-         return REFUSE(l, "vertex binding %u: stride %u (the fetch is dword-granular)", at->binding,
-                       vi->bindings[at->binding].stride);
-      converted |= f.convert >= 0 || f.packed_1010102;
+      /* a stride off dwords: the draw's copy (pvr_arch_g5p_gfx.c g5p_realign_binding()) */
+      converted |= f.convert >= 0 || f.packed_1010102 || f.raw_int || straddle;
       a[n++] = (struct attrib){ loc, at->binding, DIV_ROUND_UP(lead + f.bytes * f.components, 4), at->offset - lead,
                                 lead, f };
    }
@@ -395,12 +494,14 @@ pvr_g5p_vertex_lower(nir_shader *vs, struct pvr_g5p_vertex_layout *l)
    l->packed = converted || l->read >= BITFIELD_BIT(ICD_LOCATIONS);
    if (!l->packed) {
       icd_fetches(l, a, n);
+      fetch_overreads(l, a, n);
       return fetch_divisors(l);
    }
 
    unsigned base[PCO_G5P_MAX_ATTRIBS] = { 0 };
    if (!packed_fetches(l, a, n, base) || !fetch_divisors(l))
       return false;
+   fetch_overreads(l, a, n);
    const struct rewrite rw = { l, base };
    nir_shader_intrinsics_pass(vs, rewrite_load, nir_metadata_control_flow, (void *)&rw);
    nir_opt_constant_folding(vs);

@@ -59,10 +59,12 @@
 #include "pvr_bo.h"
 #include "pvr_pipeline.h"
 
+#include "util/log.h"
 #include "util/macros.h"
 #include "util/u_atomic.h"
 #include "vk_alloc.h"
 #include "vk_common_entrypoints.h"
+#include "vk_enum_to_str.h"
 #include "vk_fence.h"
 #include "vk_log.h"
 #include "vk_object.h"
@@ -281,7 +283,7 @@ g5p_merge_syncs(struct pvr_device *device, struct vk_sync *a, struct vk_sync *b,
       waits[n++] = (struct vk_sync_wait){ .sync = a, .stage_mask = ~(VkPipelineStageFlags2)0 };
    if (b)
       waits[n++] = (struct vk_sync_wait){ .sync = b, .stage_mask = ~(VkPipelineStageFlags2)0 };
-   result = vk_sync_create(&device->vk, &device->pdevice->ws->syncobj_type, 0U, 0UL, out);
+   result = vk_sync_create(&device->vk, &device->pdevice->sync_type, 0U, 0UL, out);
    if (result != VK_SUCCESS)
       return result;
    const struct vk_sync_signal signal = { .sync = *out, .stage_mask = ~(VkPipelineStageFlags2)0 };
@@ -311,7 +313,7 @@ pvr_process_graphics_cmd_for_view(struct pvr_device *device,
    job->view_state.view_index = view_index;
 
    result = vk_sync_create(&device->vk,
-                           &device->pdevice->ws->syncobj_type,
+                           &device->pdevice->sync_type,
                            0U,
                            0UL,
                            &geom_signal_sync);
@@ -320,7 +322,7 @@ pvr_process_graphics_cmd_for_view(struct pvr_device *device,
 
    if (job->run_frag) {
       result = vk_sync_create(&device->vk,
-                              &device->pdevice->ws->syncobj_type,
+                              &device->pdevice->sync_type,
                               0U,
                               0UL,
                               &frag_signal_sync);
@@ -683,7 +685,7 @@ static VkResult pvr_process_compute_cmd(struct pvr_device *device,
    VkResult result;
 
    result = vk_sync_create(&device->vk,
-                           &device->pdevice->ws->syncobj_type,
+                           &device->pdevice->sync_type,
                            0U,
                            0UL,
                            &sync);
@@ -721,7 +723,7 @@ static VkResult pvr_process_transfer_cmds(struct pvr_device *device,
    VkResult result;
 
    result = vk_sync_create(&device->vk,
-                           &device->pdevice->ws->syncobj_type,
+                           &device->pdevice->sync_type,
                            0U,
                            0UL,
                            &sync);
@@ -868,7 +870,7 @@ static VkResult pvr_process_query_cmd(struct pvr_device *device,
     */
 
    result = vk_sync_create(&device->vk,
-                           &device->pdevice->ws->syncobj_type,
+                           &device->pdevice->sync_type,
                            0U,
                            0UL,
                            &sync);
@@ -939,7 +941,7 @@ pvr_process_event_cmd_barrier(struct pvr_device *device,
       struct vk_sync *signal_sync;
 
       result = vk_sync_create(&device->vk,
-                              &device->pdevice->ws->syncobj_type,
+                              &device->pdevice->sync_type,
                               0U,
                               0UL,
                               &signal_sync);
@@ -1008,7 +1010,7 @@ pvr_process_event_cmd_set_or_reset(struct pvr_device *device,
    }
 
    result = vk_sync_create(&device->vk,
-                           &device->pdevice->ws->syncobj_type,
+                           &device->pdevice->sync_type,
                            0U,
                            0UL,
                            &signal_sync);
@@ -1119,7 +1121,7 @@ pvr_process_event_cmd_wait(struct pvr_device *device,
       assert(wait_count <= (sub_cmd->count + 1));
 
       result = vk_sync_create(&device->vk,
-                              &device->pdevice->ws->syncobj_type,
+                              &device->pdevice->sync_type,
                               0U,
                               0UL,
                               &signal_sync);
@@ -1197,6 +1199,16 @@ static VkResult pvr_process_cmd_buffer(struct pvr_device *device,
       const int64_t g9p_t0 = getenv("G9P_TIME") ? os_time_get_nano() : 0;
       switch (sub_cmd->type) {
       case PVR_SUB_CMD_TYPE_GRAPHICS: {
+         /* a refused render pass (pvr_arch_cmd_buffer.c): nothing to submit */
+         if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p) &&
+             sub_cmd->gfx.g5p_refused) {
+            if (!sub_cmd->is_resume) {
+               suspended_data->rts = NULL;
+               suspended_data->query_pool = NULL;
+            }
+            result = VK_SUCCESS;
+            break;
+         }
          /* If the fragment job utilizes queries, for data integrity
           * it needs to wait for the query to be processed.
           */
@@ -1591,7 +1603,7 @@ static VkResult pvr_process_queue_waits(struct pvr_queue *queue,
       }
 
       result = vk_sync_create(&device->vk,
-                              &device->pdevice->ws->syncobj_type,
+                              &device->pdevice->sync_type,
                               0U,
                               0UL,
                               &queue->next_job_wait_sync[i]);
@@ -1708,6 +1720,18 @@ static void pvr_signal_unsubmitted(struct vk_device *device,
 static VkResult pvr_driver_queue_submit(struct vk_queue *queue,
                                         struct vk_queue_submit *submit)
 {
+   struct pvr_queue *driver_queue = container_of(queue, struct pvr_queue, vk);
+   const bool is_g5p =
+      PVR_HAS_FEATURE(&driver_queue->device->pdevice->dev_info, apple_g5p);
+
+   if (is_g5p && vk_queue_is_lost(queue)) {
+      for (uint32_t i = 0; i < submit->signal_count; i++)
+         pvr_signal_unsubmitted(&driver_queue->device->vk,
+                                submit->signals[i].sync,
+                                submit->signals[i].signal_value);
+      return VK_SUCCESS;
+   }
+
    const int64_t g9p_t0 = os_time_get_nano();
    VkResult result = pvr_driver_queue_submit_jobs(queue, submit);
 
@@ -1721,8 +1745,6 @@ static VkResult pvr_driver_queue_submit(struct vk_queue *queue,
     * reset, freezing the desktop; signalled, it sees the device lost and can recover
     */
    if (result != VK_SUCCESS) {
-      struct pvr_queue *driver_queue = container_of(queue, struct pvr_queue, vk);
-
       for (uint32_t i = 0; i < submit->signal_count; i++) {
          if (PVR_HAS_FEATURE(&driver_queue->device->pdevice->dev_info, apple_g5p))
             pvr_signal_unsubmitted(&driver_queue->device->vk,
@@ -1732,6 +1754,7 @@ static VkResult pvr_driver_queue_submit(struct vk_queue *queue,
             vk_sync_signal(&driver_queue->device->vk, submit->signals[i].sync,
                            submit->signals[i].signal_value);
       }
+
    }
    if (result == VK_ERROR_DEVICE_LOST)
       return vk_queue_set_lost(queue, "GPU context lost");

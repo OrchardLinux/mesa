@@ -1,9 +1,10 @@
 /* SPDX-License-Identifier: MIT */
 #include "../g5p/g5p_barrier.h"
 #include "../g5p/g5p_atomic.h"
+#include "../g5p/g5p_shared_atomic.h"
 #include "../g5p/g5p_image.h"
 /* Static threadgroup operands: A9 host-compiler forms (compute.md §4).
- * Reserve TG0/1 for IDs and TG2/3 for the future software-barrier counters.
+ * TG0/1 hold the workgroup IDs x/y, TG2 the software-barrier counter, TG3 the ID z (G9P_A9_TG_WGID_Z).
  * CDM allocation covers system words plus the native shared block. */
 /* S and RI address forms from compute-isa-shared-atomic.md §1.3.
  * RI reads a temporary half index for the last time (short parcel8800).
@@ -14,37 +15,50 @@ static bool a9_shared(struct g9p_ctx *ctx, nir_intrinsic_instr *in)
    nir_src offset = in->src[load ? 0 : 1];
    unsigned bits = load ? in->def.bit_size : nir_src_bit_size(in->src[0]);
    unsigned comps = load ? in->def.num_components : nir_src_num_components(in->src[0]);
-   if (!ctx->out->a9 || bits != 32 || comps != 1 || (nir_intrinsic_base(in) & 3))
+   unsigned base = 16 + nir_intrinsic_base(in);
+   unsigned unit = 4 * comps, shift_bits = util_logbase2(unit);
+   unsigned size = comps == 1 ? G9P_SIZE_U32 : comps == 2 ? G9P_SIZE_2X32 : G9P_SIZE_4X32;
+   if (!ctx->out->a9 || bits != 32 || (comps != 1 && comps != 2 && comps != 4) ||
+       base % unit || (!load && nir_intrinsic_write_mask(in) != BITFIELD_MASK(comps)))
       return false;
-   unsigned word = 4 + nir_intrinsic_base(in) / 4;
+   unsigned word = base / unit;
    bool constant = nir_src_is_const(offset);
    int index = -1;
    if (constant) {
       unsigned byte = nir_src_as_uint(offset);
-      if (byte & 3) return false;
-      word += byte / 4;
+      if (byte % unit) return false;
+      word += byte / unit;
    } else {
       int src = src_reg(ctx, nir_get_scalar(offset.ssa, 0));
-      int shift = const_reg(ctx, 2);
+      int shift = const_reg(ctx, shift_bits);
       index = alloc_temp(ctx);
       if (src < 0 || shift < 0 || index < 0) return false;
       g9p_shift(ctx->c, index, src, shift, true);
-      G9P_EMIT(ctx->c, 0x1189, 0x0300 | 2 * index,
-               0x0101 | index << 10, 0x0120, 0x0fa1, 0x4000);
+      g9p_shared_index(ctx->c, index, index, shift_bits);
    }
-   int reg = load ? alloc_reg(ctx) : src_reg(ctx, nir_get_scalar(in->src[0].ssa, 0));
-   if (reg < 0 || word >= 65536) return false;
-   unsigned w1 = 0x0100 | (!load ? 0x80 : 0) | 2 * reg;
-   if (constant) {
-      G9P_EMIT(ctx->c, 0x2314, w1, 0x8100 | (word & 255), 0x0200 | (word >> 8));
+   int reg;
+   if (load) {
+      reg = comps == 1 ? alloc_reg(ctx) : alloc_range(ctx, comps);
+   } else if (comps == 1) {
+      reg = src_reg(ctx, nir_get_scalar(in->src[0].ssa, 0));
    } else {
-      w1 |= (2 * index) << 9;
-      if (word < 256) G9P_EMIT(ctx->c, 0x2314, w1, 0x8800 | word);
-      else G9P_EMIT(ctx->c, 0x2314, w1, 0x8900 | (word & 255), word >> 8);
+      reg = alloc_range(ctx, comps);
+      if (reg < 0) return false;
+      ctx->temps |= BITFIELD64_RANGE(reg, comps);
+      for (unsigned j = 0; j < comps; j++) {
+         int r = src_reg(ctx, nir_get_scalar(in->src[0].ssa, j));
+         if (r < 0) return false;
+         g9p_alu2(ctx->c, G9P_OR, reg + j, r, r, false);
+      }
    }
+   if (reg < 0 || 2 * reg + 2 * comps - 1 >= 128 || word >= 4096) return false;
+   g9p_shared_access(ctx->c, size, !load, reg, word, constant ? -1 : 2 * index);
    g9p_wait(ctx->c);
    release(ctx, &in->instr);
-   if (load) ctx->reg[key(&in->def, 0)] = reg;
+   if (load) for (unsigned j = 0; j < comps; j++) {
+      ctx->reg[key(&in->def, j)] = reg + j;
+      if (!ctx->last_use[key(&in->def, j)]) ctx->busy &= ~BITFIELD64_BIT(reg + j);
+   }
    return true;
 }
 /* Keep the election's local-index source live for every task barrier. */
@@ -80,7 +94,7 @@ static bool a9_barrier(struct g9p_ctx *ctx, nir_intrinsic_instr *in)
    bool device=modes & (nir_var_mem_ssbo | nir_var_mem_global | nir_var_image);
    if ((modes & ~(nir_var_mem_shared | nir_var_mem_ssbo | nir_var_mem_global | nir_var_image)) ||
        (scope != SCOPE_NONE && scope != SCOPE_INVOCATION && scope != SCOPE_WORKGROUP)) {
-      fprintf(stderr, "g5p: unsupported barrier memory mode or execution scope\n");
+      mesa_logw("g5p: unsupported barrier memory mode or execution scope");
       return false;
    }
    int fence_pair=-1;
@@ -94,8 +108,10 @@ static bool a9_barrier(struct g9p_ctx *ctx, nir_intrinsic_instr *in)
       g9p_mov_uniform(ctx->c,fence_pair+1,57,zero);
    }
    if (scope == SCOPE_WORKGROUP) {
-      unsigned N = ctx->a9_barriers_remaining--;
-      if (!N || N > 31) return false;
+      /* Apple's A9 b30/b32/b40/b70 (disassembled barrier kernels): both
+       * X2f and X0f count down and wrap in 1..15, not 1..31. */
+      unsigned rem = ctx->a9_barriers_remaining--;
+      unsigned N = ((rem - 1) % 15) + 1;
       if (n > 32) {
          int r = alloc_temp(ctx), t = alloc_temp(ctx);
          if (r < 0 || t < 0) return false;
@@ -114,6 +130,51 @@ static bool a9_barrier(struct g9p_ctx *ctx, nir_intrinsic_instr *in)
    g9p_wait(ctx->c);
    return true;
 }
+static bool a9_shared_atomic(struct g9p_ctx *ctx, nir_intrinsic_instr *in)
+{
+   if (!ctx->out->a9 || ctx->stage != MESA_SHADER_COMPUTE ||
+       in->def.bit_size != 32 || in->def.num_components != 1 ||
+       (nir_intrinsic_base(in) & 3)) return false;
+   nir_atomic_op op = nir_intrinsic_atomic_op(in);
+   bool cas = in->intrinsic == nir_intrinsic_shared_atomic_swap;
+   if (cas && op != nir_atomic_op_cmpxchg) return false;
+   switch (op) {
+   case nir_atomic_op_iadd:
+   case nir_atomic_op_imin: case nir_atomic_op_umin:
+   case nir_atomic_op_imax: case nir_atomic_op_umax:
+   case nir_atomic_op_iand: case nir_atomic_op_ior: case nir_atomic_op_ixor:
+   case nir_atomic_op_xchg: break;
+   case nir_atomic_op_cmpxchg: if (!cas) return false; break;
+   default:
+      mesa_logw("g5p: unsupported shared atomic op %u", op);
+      return false;
+   }
+   unsigned word = 4 + nir_intrinsic_base(in) / 4;
+   int index = -1;
+   if (nir_src_is_const(in->src[0])) {
+      unsigned byte = nir_src_as_uint(in->src[0]);
+      if (byte & 3) return false;
+      word += byte / 4;
+   } else {
+      int src = src_reg(ctx, nir_get_scalar(in->src[0].ssa, 0));
+      int shift = const_reg(ctx, 2);
+      index = alloc_temp(ctx);
+      if (src < 0 || shift < 0 || index < 0) return false;
+      g9p_shift(ctx->c, index, src, shift, true);
+      g9p_shared_index(ctx->c, index, index, 2); /* a dword index */
+   }
+   int val = src_reg(ctx, nir_get_scalar(in->src[cas ? 2 : 1].ssa, 0));
+   int cmp = cas ? src_reg(ctx, nir_get_scalar(in->src[1].ssa, 0)) : 0;
+   int old = alloc_reg(ctx), next = alloc_temp(ctx);
+   if (val < 0 || cmp < 0 || old < 0 || next < 0 || word >= 4096) return false;
+   g5p_shared_atomic(ctx->c, op, old, val, cmp, next, word,
+                     index < 0 ? -1 : 2 * index, ctx->st);
+   release(ctx, &in->instr);
+   ctx->reg[key(&in->def, 0)] = old;
+   if (!ctx->last_use[key(&in->def, 0)]) ctx->busy &= ~BITFIELD64_BIT(old);
+   return true;
+}
+
 static bool a9_ssbo_atomic(struct g9p_ctx *ctx, nir_intrinsic_instr *in)
 {
    if (!ctx->out->a9 || ctx->stage != MESA_SHADER_COMPUTE ||
@@ -167,48 +228,95 @@ static bool a9_ssbo_cas(struct g9p_ctx *ctx, nir_intrinsic_instr *in)
 }
 static bool a9_image(struct g9p_ctx *ctx, nir_intrinsic_instr *in)
 {
-   bool store=in->intrinsic==nir_intrinsic_image_deref_store;
-   if(!ctx->out->a9 || ctx->stage!=MESA_SHADER_COMPUTE ||
-      nir_intrinsic_image_dim(in)!=GLSL_SAMPLER_DIM_2D || nir_intrinsic_image_array(in))return false;
-   nir_deref_instr *deref=nir_src_as_deref(in->src[0]);
-   nir_variable *v=nir_deref_instr_get_variable(deref);
-   if(!v || deref->deref_type!=nir_deref_type_var || v->data.image.format!=PIPE_FORMAT_R32_UINT ||
-      !nir_src_is_const(in->src[store?4:3]) || nir_src_as_uint(in->src[store?4:3])!=0)return false;
-   if(ctx->out->num_textures && (ctx->out->textures[0].set!=v->data.descriptor_set ||
-      ctx->out->textures[0].binding!=v->data.binding))return false;
-   ctx->out->num_textures=1;
-   ctx->out->textures[0].set=v->data.descriptor_set;
-   ctx->out->textures[0].binding=v->data.binding;
-   int co=alloc_pair(ctx);
-   if(co<0 || co>30)return false;
-   ctx->temps |= BITFIELD64_RANGE(co,2);
-   for(unsigned j=0;j<2;j++) {
-      int r=src_reg(ctx,nir_get_scalar(in->src[1].ssa,j));
-      if(r<0)return false;
-      g9p_alu2(ctx->c,G9P_OR,co+j,r,r,false);
+   bool store = in->intrinsic == nir_intrinsic_image_deref_store;
+   enum glsl_sampler_dim dim = nir_intrinsic_image_dim(in);
+   bool array = nir_intrinsic_image_array(in);
+   if (!ctx->out->a9 || ctx->stage != MESA_SHADER_COMPUTE)
+      return false;
+   if ((dim != GLSL_SAMPLER_DIM_2D && !(store && dim == GLSL_SAMPLER_DIM_CUBE)) ||
+       (!store && array)) {
+      char why[128];
+      snprintf(why, sizeof(why), "image %s dimension %s is_array=%u unsupported",
+               store ? "store" : "load", (dim == GLSL_SAMPLER_DIM_CUBE ? "cube" : dim == GLSL_SAMPLER_DIM_3D ? "3D" :
+               dim == GLSL_SAMPLER_DIM_2D ? "2D" : "other"), array);
+      a9_tex_refuse(ctx, why);
+      return false;
    }
-   int data=alloc_range(ctx,4);
-   if(data<0 || data>28)return false;
-   if(store) {
-      if(nir_src_bit_size(in->src[3])!=32 || nir_src_num_components(in->src[3])!=4)return false;
-      ctx->temps |= BITFIELD64_RANGE(data,4);
-      for(unsigned j=0;j<4;j++) {
-         int r=src_reg(ctx,nir_get_scalar(in->src[3].ssa,j));
-         if(r<0)return false;
-         g9p_alu2(ctx->c,G9P_OR,data+j,r,r,false);
+   nir_deref_instr *deref = nir_src_as_deref(in->src[0]);
+   nir_variable *v = nir_deref_instr_get_variable(deref);
+   if (!v || deref->deref_type != nir_deref_type_var) {
+      a9_tex_refuse(ctx, "image access without a constant storage binding");
+      return false;
+   }
+   enum pipe_format format = v->data.image.format;
+   bool packed = false, supported = format == PIPE_FORMAT_R32_UINT;
+   if (store) switch (format) {
+   case PIPE_FORMAT_R32_UINT: case PIPE_FORMAT_R32_SINT: case PIPE_FORMAT_R32_FLOAT:
+   case PIPE_FORMAT_R32G32B32A32_UINT: case PIPE_FORMAT_R32G32B32A32_SINT:
+   case PIPE_FORMAT_R32G32B32A32_FLOAT:
+      supported = true; break;
+   case PIPE_FORMAT_R8G8B8A8_UNORM: case PIPE_FORMAT_R16G16B16A16_FLOAT:
+   case PIPE_FORMAT_R16G16_FLOAT: case PIPE_FORMAT_R16_FLOAT:
+      supported = packed = true; break;
+   default: break;
+   }
+   if (!supported) {
+      char why[160];
+      snprintf(why, sizeof(why), "image %s format %s (%s)", store ? "store" : "load",
+               util_format_short_name(format), store ? "no A9 pack path yet" : "R32_UINT only");
+      a9_tex_refuse(ctx, why);
+      return false;
+   }
+   if (!nir_src_is_const(in->src[store ? 4 : 3]) ||
+       nir_src_as_uint(in->src[store ? 4 : 3]) != 0) {
+      a9_tex_refuse(ctx, "image access at a nonzero or dynamic level");
+      return false;
+   }
+   if (ctx->out->num_textures && (ctx->out->textures[0].set != v->data.descriptor_set ||
+       ctx->out->textures[0].binding != v->data.binding)) {
+      a9_tex_refuse(ctx, "more than one storage image binding");
+      return false;
+   }
+   ctx->out->num_textures = 1;
+   ctx->out->textures[0].set = v->data.descriptor_set;
+   ctx->out->textures[0].binding = v->data.binding;
+   unsigned coords = array || dim == GLSL_SAMPLER_DIM_CUBE ? 3 : 2;
+   int co = alloc_range(ctx, coords);
+   if (co < 0 || co + coords > 32) return false;
+   ctx->temps |= BITFIELD64_RANGE(co, coords);
+   for (unsigned j = 0; j < coords; j++) {
+      int r = src_reg(ctx, nir_get_scalar(in->src[1].ssa, j));
+      if (r < 0) return false;
+      g9p_alu2(ctx->c, G9P_OR, co + j, r, r, false);
+   }
+   unsigned words = packed ? 2 : 4;
+   int data = alloc_range(ctx, words);
+   if (data < 0 || data + words > 32) return false;
+   if (store) {
+      if (nir_src_bit_size(in->src[3]) != 32 || nir_src_num_components(in->src[3]) != words)
+         return false;
+      ctx->temps |= BITFIELD64_RANGE(data, words);
+      for (unsigned j = 0; j < words; j++) {
+         int r = src_reg(ctx, nir_get_scalar(in->src[3].ssa, j));
+         if (r < 0) return false;
+         g9p_alu2(ctx->c, G9P_OR, data + j, r, r, false);
       }
-   } else if(in->def.bit_size!=32 || in->def.num_components>4)return false;
-   g5p_image_raw32(ctx->c,store,data,co,40,31);
-   release(ctx,&in->instr);
-   if(!store) for(unsigned j=0;j<4;j++) {
-      ctx->reg[key(&in->def,j)]=data+j;
-      if(j>=in->def.num_components || !ctx->last_use[key(&in->def,j)])ctx->busy &= ~BITFIELD64_BIT(data+j);
+   } else if (in->def.bit_size != 32 || in->def.num_components > 4) return false;
+   g5p_image_access(ctx->c, store, packed, coords == 3, data, co, 40, 31);
+   release(ctx, &in->instr);
+   if (!store) for (unsigned j = 0; j < 4; j++) {
+      ctx->reg[key(&in->def, j)] = data + j;
+      if (j >= in->def.num_components || !ctx->last_use[key(&in->def, j)])
+         ctx->busy &= ~BITFIELD64_BIT(data + j);
    }
    return true;
 }
 #define G9P_A9_INTRINSICS \
    if (ctx->out->a9) { switch (intr->intrinsic) { \
+   case nir_intrinsic_image_deref_atomic: case nir_intrinsic_image_deref_atomic_swap: \
+      a9_tex_refuse(ctx, "image atomics unsupported on A9"); return false; \
    case nir_intrinsic_image_deref_store: case nir_intrinsic_image_deref_load: return a9_image(ctx, intr); \
+   case nir_intrinsic_shared_atomic: case nir_intrinsic_shared_atomic_swap: return a9_shared_atomic(ctx, intr); \
    case nir_intrinsic_ssbo_atomic_swap: return a9_ssbo_cas(ctx, intr); \
    case nir_intrinsic_ssbo_atomic: return a9_ssbo_atomic(ctx, intr); \
    case nir_intrinsic_load_shared: case nir_intrinsic_store_shared: return a9_shared(ctx, intr); \

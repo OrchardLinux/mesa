@@ -26,10 +26,6 @@
 #include "pvr_pipeline.h"
 #include "pvr_g5p_vertex.h"
 
-/* A refusal, by name, on stderr too (vk_errorf() is silent in release builds) */
-#define G5P_REFUSE(obj, ...)                                                                                       \
-   (mesa_logw("G5P refuses: " __VA_ARGS__),                                                              \
-    vk_errorf((obj), VK_ERROR_FEATURE_NOT_PRESENT, "G5P: " __VA_ARGS__))
 
 VkResult
 PVR_PER_ARCH(g5p_vertex_draw_check)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_pipeline *g,
@@ -45,15 +41,13 @@ PVR_PER_ARCH(g5p_vertex_draw_check)(struct pvr_cmd_buffer *cmd_buffer, const str
       if (t != VK_INDEX_TYPE_UINT16 && t != VK_INDEX_TYPE_UINT32 && t != VK_INDEX_TYPE_UINT8_KHR)
          return G5P_REFUSE(cmd_buffer, "index type %d", t);
    }
-   /* the DDMAD reads dwords: every fetch's base and stride are dword-aligned */
+   /* the DDMAD reads dwords: a binding whose address or stride is off dwords draws from a dword-aligned copy
+    * (pvr_arch_g5p_gfx.c g5p_realign_binding()) */
    for (unsigned f = 0; f < g->fetch_count; f++) {
       const struct pvr_g5p_fetch *fe = &g->fetch_list[f];
       const struct pvr_vertex_binding *vb = &cs->vertex_bindings[fe->binding];
       if (!vb->buffer)
          return G5P_REFUSE(cmd_buffer, "no vertex buffer bound at binding %u", fe->binding);
-      if ((vb->offset + fe->offset) % 4 || dyn->vi_binding_strides[fe->binding] % 4)
-         return G5P_REFUSE(cmd_buffer, "vertex binding %u at offset %" PRIu64 ", stride %u (the fetch is dword-granular)",
-                           fe->binding, (uint64_t)(vb->offset + fe->offset), dyn->vi_binding_strides[fe->binding]);
    }
    return VK_SUCCESS;
 }
@@ -85,6 +79,7 @@ PVR_PER_ARCH(g5p_vertex_index_list)(struct pvr_cmd_buffer *cmd_buffer, const str
          v0.cut_index_present = true;
          v0.cut_index_enable = true;
          v0.cam_size = vector <= 32 ? 95 : vector <= 48 ? 63 : vector <= 64 ? 31 : 15;
+         v0.flatshade_control = PVR_G5P_FLATSHADE_CONTROL(&cmd_buffer->vk.dynamic_graphics_state);
       }
       pvr_csb_pack (&w[(*n)++], VDMCTRL_VDM_STATE1, v1) {
          v1.cut_index = isize == 1 ? 0xff : isize == 2 ? 0xffff : 0xffffffff;
@@ -192,6 +187,7 @@ PVR_PER_ARCH(g5p_vertex_indirect)(struct pvr_cmd_buffer *cmd_buffer, const struc
          state.cut_index_present = true;
          state.cut_index_enable = true;
          state.cam_size = vector <= 32 ? 95 : vector <= 48 ? 63 : vector <= 64 ? 31 : 15;
+         state.flatshade_control = PVR_G5P_FLATSHADE_CONTROL(&cmd_buffer->vk.dynamic_graphics_state);
       }
       pvr_csb_emit (csb, VDMCTRL_VDM_STATE1, state) {
          state.cut_index = isize == 1 ? 0xff : isize == 2 ? 0xffff : 0xffffffff;

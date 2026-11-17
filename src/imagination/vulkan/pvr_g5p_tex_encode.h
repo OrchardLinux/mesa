@@ -326,6 +326,37 @@ pvr_g5p_tex_size(const uint32_t state[4], unsigned level, uint32_t out[4])
 
 /* A descriptor's state as the draw path uploads it: a valid image state
  * never has q0 = 0 (its layout bits), a valid sampler word is never 0. */
+/*
+ * The texture state an upload's sample reads (PCO_G5P_UPLOAD_IMAGE's offset
+ * flags), in place over the 8 copied dwords; NULL, or the reason there is none.
+ *  - AS_2D (an array sample at layer 0 drawn as 2D): a 2D_ARRAY state becomes
+ *    its base layer's 2D state (layout 2, no layer count, no big-layer bit;
+ *    the address is already the base layer's, as a 2D view of that layer
+ *    gets); a 2D or linear state is used as it is; 3D/cube have no 2D form.
+ *  - ARRAY: the state must be an array's (a single-layer array view of a
+ *    linear image has only its 2D state: sampled at a non-constant layer).
+ */
+static inline const char *
+pvr_g5p_tex_state_for(uint32_t dw[8], unsigned flags)
+{
+   const unsigned layout = dw[0] & 7;
+   if (flags & 1u /* PCO_G5P_UPLOAD_IMAGE_AS_2D */) {
+      if (layout == PVR_G5P_TEX_LAYOUT_2D_ARRAY) {
+         uint64_t q0 = dw[0] | (uint64_t)dw[1] << 32, q1 = dw[2] | (uint64_t)dw[3] << 32;
+         q0 = (q0 & ~UINT64_C(7)) | PVR_G5P_TEX_LAYOUT_2D;
+         q1 &= ~(UINT64_C(0x3fff) << PVR_G5P_TEX_DEPTH_SHIFT);
+         q1 &= ~(UINT64_C(1) << PVR_G5P_TEX_BIG_LAYER_BIT);
+         dw[0] = (uint32_t)q0, dw[1] = (uint32_t)(q0 >> 32), dw[2] = (uint32_t)q1, dw[3] = (uint32_t)(q1 >> 32);
+      } else if (layout != PVR_G5P_TEX_LAYOUT_2D) {
+         return "a layer-0 array sample of a 3D or cube view";
+      }
+   } else if ((flags & 2u /* PCO_G5P_UPLOAD_IMAGE_ARRAY */) && layout != PVR_G5P_TEX_LAYOUT_2D_ARRAY) {
+      return "an array sample at a non-constant layer of a view without array state (a single-layer view of a "
+             "linear image: Apple samples arrays twiddled only)";
+   }
+   return NULL;
+}
+
 static inline bool
 pvr_g5p_tex_state_valid(const uint32_t dwords[2])
 {

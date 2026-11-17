@@ -62,6 +62,7 @@ pvr_g5p_image_layout(struct pvr_image *image, unsigned stride_align)
       return;
 
    const bool twiddled = is3d || image->vk.mip_levels > 1 ||
+                         (image->vk.usage & VK_IMAGE_USAGE_STORAGE_BIT) ||
                          (image->vk.create_flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) ||
                          (image->vk.array_layers > 1 && (image->vk.usage & VK_IMAGE_USAGE_SAMPLED_BIT)) ||
                          vk_format_is_compressed(image->vk.format);
@@ -89,10 +90,31 @@ pvr_g5p_image_layout(struct pvr_image *image, unsigned stride_align)
       const uint32_t chain = image->vk.mip_levels > 1 ? util_logbase2(MAX2(pw, ph)) + 1 : 1;
       VkDeviceSize size = 0, own = 0;
 
+      /* Blocks other than 4x4 (ASTC 5x4..12x12): each level's block grid is a
+       * power of two per side, pow2(ceil(level / block)), as AGXMetalA9's
+       * TextureGen2 lays them out (0x207dbfe4c: ceil(width / bw), then the
+       * next power of two, per plane level) and as the Morton order needs (a
+       * 7-block side is addressed as 8: g5p_twiddle2d()). Upstream's level
+       * offsets minify the block count instead, so these images take their
+       * offsets from here. 4x4 grids are already powers of two (or one block):
+       * ETC2/EAC and ASTC 4x4 keep upstream's offsets, which are the same. */
+      const bool pow2_blocks = !is3d && vk_format_is_compressed(image->vk.format) && (bw != 4 || bh != 4);
       for (uint32_t l = 0; l < MAX2(chain, image->vk.mip_levels); l++) {
-         const uint32_t ew = DIV_ROUND_UP(u_minify(pw, l), bw), eh = DIV_ROUND_UP(u_minify(ph, l), bh);
+         uint32_t ew = DIV_ROUND_UP(u_minify(pw, l), bw), eh = DIV_ROUND_UP(u_minify(ph, l), bh);
+         if (pow2_blocks) {
+            ew = util_next_power_of_two(ew);
+            eh = util_next_power_of_two(eh);
+         }
          const VkDeviceSize level_size = (VkDeviceSize)cpp * ew * eh;
 
+         if (pow2_blocks && l < image->vk.mip_levels) {
+            struct pvr_mip_level *level = &plane->mip_levels[l];
+
+            level->pitch = cpp * ew;
+            level->height_pitch = eh;
+            level->size = level_size;
+            level->offset = own;
+         }
          if (is3d && l < image->vk.mip_levels) {
             /* a 3D image's levels are one slice's: upstream's 3DTWIDDLED levels hold every slice */
             struct pvr_mip_level *level = &plane->mip_levels[l];
@@ -193,7 +215,9 @@ pvr_g5p_msaa_limits(struct pvr_physical_device *pdevice, struct vk_properties *p
    p->framebufferStencilSampleCounts = fb;
    p->framebufferNoAttachmentsSampleCounts = fb;
    p->framebufferIntegerColorSampleCounts = VK_SAMPLE_COUNT_1_BIT;
-   p->sampledImageColorSampleCounts = VK_SAMPLE_COUNT_1_BIT;
+   /* 4-sample colour images are sampled (texelFetch of a 2D multisample texture,
+    * pvr_arch_g5p_tex.c's 2Wx2H view state and the compiler's txf_ms lowering) */
+   p->sampledImageColorSampleCounts = fb;
    p->sampledImageIntegerSampleCounts = VK_SAMPLE_COUNT_1_BIT;
    p->sampledImageDepthSampleCounts = VK_SAMPLE_COUNT_1_BIT;
    p->sampledImageStencilSampleCounts = VK_SAMPLE_COUNT_1_BIT;
@@ -203,22 +227,27 @@ pvr_g5p_msaa_limits(struct pvr_physical_device *pdevice, struct vk_properties *p
 /*
  * An image format's sample counts: 4 as well only for what a 4x pass
  * renders (our ICD's rule): a 2D optimal colour attachment of 4-byte
- * samples, or one of the depth/stencil formats the ZLS keeps on chip, used
- * neither as a sampled, storage nor input attachment image. Upstream's Rogue answer is every count up to 8.
+ * samples, or one of the depth/stencil formats the ZLS keeps on chip, not
+ * used as a storage image, nor as a sampled depth/stencil image. Upstream's Rogue answer is every count up to 8.
  */
 void
 pvr_g5p_msaa_image_samples(struct pvr_physical_device *pdevice, const VkPhysicalDeviceImageFormatInfo2 *info,
                            VkImageTiling tiling, VkImageFormatProperties *props)
 {
    const VkImageUsageFlags attach = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
-   const VkImageUsageFlags read = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
-                                  VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
+   /* Vulkan bounds sampleCounts by the framebuffer, sampled and storage limits of the usage; input
+    * attachments have no limit of their own and do not change the 4x layout. Multisample subpass
+    * reads stay refused by the compiler (tex_shape_refusal()). */
+   const VkImageUsageFlags read = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
    const bool format_ok = pvr_g5p_ds_format(info->format) ||
                           (vk_format_is_color(info->format) && !vk_format_is_compressed(info->format) &&
                            !vk_format_is_int(info->format) && vk_format_get_blocksize(info->format) == 4);
+   /* a 4-sample colour attachment may also be sampled (its view is the 2Wx2H twiddled texture of
+    * its samples, pvr_arch_g5p_tex.c); sampled depth/stencil and storage images stay 1x */
+   const VkImageUsageFlags colour_read = vk_format_is_color(info->format) ? VK_IMAGE_USAGE_SAMPLED_BIT : 0;
    const bool four = tiling == VK_IMAGE_TILING_OPTIMAL &&
                      info->type == VK_IMAGE_TYPE_2D && !(info->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) &&
-                     (info->usage & attach) && !(info->usage & read) && format_ok;
+                     (info->usage & attach) && !(info->usage & read & ~colour_read) && format_ok;
 
    props->sampleCounts &= four ? VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT : VK_SAMPLE_COUNT_1_BIT;
 }

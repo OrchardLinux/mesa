@@ -18,6 +18,7 @@
 #include <string.h>
 
 #include "util/log.h"
+#include "util/u_debug.h"
 #include "vk_enum_to_str.h"
 #include "vk_format.h"
 
@@ -31,22 +32,44 @@ pvr_g5p_formats_probe(void)
    return false;
 }
 
+/* Qualified 16-bit packed texture formats are always enabled. */
+static bool
+tex16_row(VkFormat format)
+{
+   const struct pvr_g5p_format *f = pvr_g5p_format_find(format);
+   return f && f->evidence == PVR_G5P_FMT_EV_AGX && f->cpp == 2;
+}
+
+static bool
+row_probe(VkFormat format)
+{
+   return pvr_g5p_formats_probe() || tex16_row(format);
+}
+
 bool
 pvr_g5p_format_tex(VkFormat format, uint32_t *key, bool *srgb)
 {
    const struct pvr_g5p_format *f = pvr_g5p_format_find(format);
 
-   if (!f || !(pvr_g5p_format_flags(f, pvr_g5p_formats_probe()) & PVR_G5P_FMT_SAMPLED))
+   if (!f || !(pvr_g5p_format_flags(f, row_probe(format)) & PVR_G5P_FMT_SAMPLED))
       return false;
    *key = f->key;
    *srgb = f->srgb;
    return true;
 }
 
+/* The physical one-dword store of already packed bytes (5..8 compact
+ * targets): R32UI's PBE key, no format admission of its own. */
+uint32_t
+pvr_g5p_packed_word_pbe_key(void)
+{
+   return pvr_g5p_format_find(VK_FORMAT_R32_UINT)->key;
+}
+
 bool
 pvr_g5p_format_pbe(VkFormat format, uint32_t *key, bool *srgb)
 {
-   return pvr_g5p_format_pbe_key(format, pvr_g5p_formats_probe(), key, srgb);
+   return pvr_g5p_format_pbe_key(format, row_probe(format), key, srgb);
 }
 
 VkFormatFeatureFlags2
@@ -56,7 +79,7 @@ pvr_g5p_color_format_features(VkFormat format, VkImageTiling tiling, VkFormatFea
 
    /* the A9's own answer; upstream's flags only say the format exists */
    (void)flags;
-   return pvr_g5p_format_features(f, tiling == VK_IMAGE_TILING_LINEAR, pvr_g5p_formats_probe());
+   return pvr_g5p_format_features(f, tiling == VK_IMAGE_TILING_LINEAR, row_probe(format));
 }
 
 VkResult
@@ -74,6 +97,13 @@ pvr_g5p_image_format_check(const VkPhysicalDeviceImageFormatInfo2 *info, VkImage
       why = "3D block-compressed images (the A9's 3D order is built for texels only)";
    else if (info->type == VK_IMAGE_TYPE_3D && tiling != VK_IMAGE_TILING_OPTIMAL)
       why = "linear 3D images (Apple samples 3D twiddled only)";
+   if (!why && (info->usage & VK_IMAGE_USAGE_STORAGE_BIT)) {
+      const struct pvr_g5p_format *f = pvr_g5p_format_find(info->format);
+      if (!(f->flags & PVR_G5P_FMT_STORAGE))
+         why = "no A9 storage pack path for this format";
+      else if (info->type != VK_IMAGE_TYPE_2D || tiling != VK_IMAGE_TILING_OPTIMAL)
+         why = "A9 storage images require optimal 2D images (including arrays/cube faces)";
+   }
    if (!why)
       return VK_SUCCESS;
    mesa_logd("G5P: no %s image of %s, tiling %s, usage %#x, flags %#x: %s", vk_ImageType_to_str(info->type),

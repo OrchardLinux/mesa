@@ -336,6 +336,18 @@ changing the descriptor manager may improve performance:
 ``db``
    Use EXT_descriptor_buffer when possible.
 
+The ``zink_frames_in_flight`` driconf option controls the swap throttle depth.
+It accepts integers from 0 to 3. The default, 0, selects two frames for
+``VK_DRIVER_ID_IMAGINATION_OPEN_SOURCE_MESA`` and one frame for other drivers.
+Values 1 through 3 explicitly select that many frames. Mesa also accepts the
+same-named environment variable, for example ``zink_frames_in_flight=1`` to
+restore the previous-frame throttle.
+
+Two frames allow a tile-based GPU to overlap geometry and fragment work from
+successive frames. When GPU-bound, this can add one frame of input latency
+and requires one more swapchain image per window (12 MiB at 2048x1536 RGBA8),
+subject to the surface's maximum image count.
+
 Debugging
 ---------
 

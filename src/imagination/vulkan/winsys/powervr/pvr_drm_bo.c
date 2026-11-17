@@ -36,6 +36,7 @@
 
 #include "drm-uapi/pvr_drm.h"
 #include "pvr_drm.h"
+#include "pvr_debug.h"
 #include "pvr_drm_bo.h"
 #include "pvr_macros.h"
 #include "pvr_winsys_helper.h"
@@ -43,6 +44,7 @@
 #include "util/macros.h"
 #include "vk_alloc.h"
 #include "vk_log.h"
+#include "util/log.h"
 
 static VkResult pvr_drm_create_gem_bo(struct pvr_drm_winsys *drm_ws,
                                       uint32_t drm_flags,
@@ -149,6 +151,9 @@ static void pvr_drm_buffer_release(struct pvr_drm_winsys_bo *drm_bo)
    if (p_atomic_dec_return(&drm_bo->ref_count) == 0) {
       uint32_t handle = drm_bo->handle;
 
+      if (PVR_IS_DEBUG_SET(BO_LOG) && drm_bo->count_kind < 2)
+         pvr_winsys_count_bo(drm_bo->count_kind, -(int64_t)drm_bo->base.size);
+
       /* Our BO structs are stored in a sparse array in the winsys structure,
        * so we don't want to free the BO pointer, instead we want to reset it
        * to 0, to signal that array entry as being free.
@@ -192,6 +197,10 @@ pvr_drm_display_buffer_create(struct pvr_drm_winsys *drm_ws,
       return result;
 
    assert((*bo_out)->size >= size);
+
+   to_pvr_drm_winsys_bo(*bo_out)->count_kind = 1;
+   if (PVR_IS_DEBUG_SET(BO_LOG))
+      pvr_winsys_count_bo(1, (*bo_out)->size);
 
    return VK_SUCCESS;
 }
@@ -250,6 +259,9 @@ VkResult pvr_drm_winsys_buffer_create(struct pvr_winsys *ws,
    drm_bo->base.ws = ws;
    drm_bo->handle = handle;
    drm_bo->flags = drm_flags;
+   drm_bo->count_kind = 0;
+   if (PVR_IS_DEBUG_SET(BO_LOG))
+      pvr_winsys_count_bo(0, size);
 
    p_atomic_set(&drm_bo->ref_count, 1);
    g9p_bolog('+', handle, size);
@@ -294,6 +306,7 @@ pvr_drm_winsys_buffer_create_from_fd(struct pvr_winsys *ws,
       drm_bo->base.ws = ws;
       drm_bo->base.size = (uint64_t)size;
       drm_bo->base.is_imported = true;
+      drm_bo->count_kind = 2;
       drm_bo->handle = handle;
 
       p_atomic_set(&drm_bo->ref_count, 1);
@@ -525,12 +538,14 @@ VkResult pvr_drm_winsys_vma_map(struct pvr_winsys_vma *vma,
       return vk_error(NULL, VK_ERROR_MEMORY_MAP_FAILED);
    }
 
-   result = pvr_ioctl(drm_ws->base.render_fd,
-                      DRM_IOCTL_PVR_VM_MAP,
-                      &args,
-                      VK_ERROR_MEMORY_MAP_FAILED);
-   if (result != VK_SUCCESS)
-      return result;
+   if (drmIoctl(drm_ws->base.render_fd, DRM_IOCTL_PVR_VM_MAP, &args)) {
+      const int err = errno;
+      const char *message = strerror(err);
+      return vk_errorf(NULL,
+                       err == EIO ? VK_ERROR_OUT_OF_HOST_MEMORY
+                                  : VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                       "DRM_IOCTL_PVR_VM_MAP failed (errno %d: %s)", err, message);
+   }
 
    pvr_drm_buffer_acquire(drm_bo);
 
@@ -558,11 +573,21 @@ void pvr_drm_winsys_vma_unmap(struct pvr_winsys_vma *vma)
    /* Address should be mapped. */
    assert(vma->bo);
 
-   pvr_ioctlf(drm_ws->base.render_fd,
-              DRM_IOCTL_PVR_VM_UNMAP,
-              &args,
-              VK_ERROR_UNKNOWN,
-              "Unmap failed");
+   if (p_atomic_read(&drm_ws->lost)) {
+      if (drmIoctl(drm_ws->base.render_fd, DRM_IOCTL_PVR_VM_UNMAP, &args) &&
+          p_atomic_cmpxchg(&drm_ws->unmap_loss_reported, 0, 1) == 0) {
+         const int err = errno;
+         const char *message = strerror(err);
+         mesa_logw("%s: VM_UNMAP after loss ignored (errno %d: %s)",
+                   drm_ws->is_g5p ? "G5P" : "pvr", err, message);
+      }
+   } else {
+      pvr_ioctlf(drm_ws->base.render_fd,
+                 DRM_IOCTL_PVR_VM_UNMAP,
+                 &args,
+                 VK_ERROR_UNKNOWN,
+                 "Unmap failed");
+   }
 
    pvr_drm_buffer_release(drm_bo);
 

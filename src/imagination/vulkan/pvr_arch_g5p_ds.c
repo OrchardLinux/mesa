@@ -12,6 +12,7 @@
 #include <string.h>
 
 #include "util/log.h"
+#include "pvr_g5p.h"
 #include "vk_format.h"
 #include "vk_graphics_state.h"
 #include "vk_log.h"
@@ -22,15 +23,12 @@
 #include "pvr_cmd_buffer.h"
 #include "pvr_csb.h"
 #include "pvr_g5p_ds.h"
+#include "pvr_g5p_shader_dump.h"
 #include "pvr_g5p_tex_encode.h"
 #include "pvr_hw_pass.h"
 #include "pvr_image.h"
 #include "pvr_job_render.h"
 
-/* A refusal, by name, on stderr too (vk_errorf() is silent in release builds) */
-#define G5P_DS_REFUSE(cmd_buffer, ...)                                                                             \
-   (mesa_logw("G5P refuses: " __VA_ARGS__),                                                              \
-    vk_errorf((cmd_buffer), VK_ERROR_FEATURE_NOT_PRESENT, "G5P: " __VA_ARGS__))
 
 VkResult
 PVR_PER_ARCH(g5p_ds_admit)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_renderpass_hwsetup_render *hw_render)
@@ -45,38 +43,35 @@ PVR_PER_ARCH(g5p_ds_admit)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_r
    struct pvr_g5p_ds_plane plane;
 
    if (!f)
-      return G5P_DS_REFUSE(cmd_buffer, "depth/stencil format %s (the ZLS stores D16, D32F, S8, D32F_S8)",
+      return G5P_REFUSE(cmd_buffer, "depth/stencil format %s (the ZLS stores D16, D32F, S8, D32F_S8)",
                            vk_Format_to_str(iview->vk.format));
    struct pvr_g5p_ds_chain chain;
    const bool sampled_chain = pvr_g5p_ds_sampled_chain(image, &chain);
    if (sampled_chain && f->stencil && (iview->vk.extent.width < 32 || iview->vk.extent.height < 32))
-      return G5P_DS_REFUSE(cmd_buffer, "small combined depth/stencil chain attachment needs Apple's temporary ZLS plane");
+      return G5P_REFUSE(cmd_buffer, "small combined depth/stencil chain attachment needs Apple's temporary ZLS plane");
    if (iview->vk.base_mip_level || iview->vk.base_array_layer)
-      return G5P_DS_REFUSE(cmd_buffer, "a depth/stencil view of level %u layer %u (level 0 layer 0 are built)",
+      return G5P_REFUSE(cmd_buffer, "a depth/stencil view of level %u layer %u (level 0 layer 0 are built)",
                            iview->vk.base_mip_level, iview->vk.base_array_layer);
    /* upstream's own test (pvr_arch_hw_pass.c): a resolve mode; the index is set only with one */
    if (hw_render->depth_resolve_mode || hw_render->stencil_resolve_mode)
-      return G5P_DS_REFUSE(cmd_buffer, "a depth/stencil resolve (no capture)");
+      return G5P_REFUSE(cmd_buffer, "a depth/stencil resolve (no capture)");
    if (hw_render->eot_surface_count > 1)
-      return G5P_DS_REFUSE(cmd_buffer, "depth/stencil beside %u colour targets (no capture of the combination)",
+      return G5P_REFUSE(cmd_buffer, "depth/stencil beside %u colour targets (no capture of the combination)",
                            hw_render->eot_surface_count);
    if (hw_render->eot_surface_count) {
       const struct pvr_image_view *c = info->attachments[hw_render->eot_surfaces[0].attachment_idx];
       if (c->vk.extent.width != iview->vk.extent.width || c->vk.extent.height != iview->vk.extent.height)
-         return G5P_DS_REFUSE(cmd_buffer, "a depth/stencil attachment of %ux%u beside a %ux%u colour target "
+         return G5P_REFUSE(cmd_buffer, "a depth/stencil attachment of %ux%u beside a %ux%u colour target "
                               "(ZLS_PIXELS describe one surface)", iview->vk.extent.width,
                               iview->vk.extent.height, c->vk.extent.width, c->vk.extent.height);
    }
    if (!pvr_g5p_ds_layout(iview->vk.format, image->vk.extent.width, image->vk.extent.height,
                           image->vk.samples, &plane) ||
        image->total_size < (sampled_chain ? chain.size : plane.size))
-      return G5P_DS_REFUSE(cmd_buffer, "a depth/stencil image of %" PRIu64 " bytes, the ZLS planes take %" PRIu64
+      return G5P_REFUSE(cmd_buffer, "a depth/stencil image of %" PRIu64 " bytes, the ZLS planes take %" PRIu64
                            " (pvr_g5p_ds_layout())", (uint64_t)image->total_size, plane.size);
-   if (image->vk.samples == VK_SAMPLE_COUNT_4_BIT &&
-       (hw_render->depth_init == VK_ATTACHMENT_LOAD_OP_LOAD || hw_render->stencil_init == VK_ATTACHMENT_LOAD_OP_LOAD ||
-        hw_render->depth_store || hw_render->stencil_store))
-      return G5P_DS_REFUSE(cmd_buffer, "a load or store of a 4-sample depth/stencil attachment "
-                           "(no multisample ZLS capture: it stays on chip)");
+   /* 4 samples: loaded and stored as at one sample over the 4x plane (pvr_g5p_ds_zls(), iOS
+    * captures of 4x depth store and load, and of 4x stencil) */
    return VK_SUCCESS;
 }
 

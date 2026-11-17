@@ -227,6 +227,11 @@ static void pvr_cmd_buffer_free_sub_cmd(struct pvr_cmd_buffer *cmd_buffer,
       case PVR_SUB_CMD_TYPE_COMPUTE:
       case PVR_SUB_CMD_TYPE_QUERY:
          vk_free(&cmd_buffer->vk.pool->alloc, sub_cmd->compute.g9p_query);
+         for (struct pvr_g5p_dispatch_log *l = sub_cmd->compute.g5p_log_first, *next; l; l = next) {
+            next = l->next;
+            free(l->line);
+            free(l);
+         }
          pvr_csb_finish(&sub_cmd->compute.control_stream);
          break;
 
@@ -2696,8 +2701,13 @@ VkResult pvr_arch_cmd_buffer_end_sub_cmd(struct pvr_cmd_buffer *cmd_buffer)
          result = pvr_sub_cmd_gfx_job_init(&device->pdevice->dev_info,
                                            cmd_buffer,
                                            gfx_sub_cmd);
+         if (result == VK_ERROR_FEATURE_NOT_PRESENT &&
+             device->pdevice->skip_refused_work) {
+            gfx_sub_cmd->g5p_refused = true;
+            break;
+         }
          if (result != VK_SUCCESS)
-            return pvr_cmd_buffer_set_error_unwarned(cmd_buffer, result);
+            return pvr_cmd_buffer_set_error_unwarned(cmd_buffer, pvr_refusal_to_api(result));
       }
 
       if (pvr_sub_cmd_gfx_requires_split_submit(gfx_sub_cmd)) {
@@ -4334,6 +4344,13 @@ void PVR_PER_ARCH(CmdBeginRenderPass2)(
 
    assert(!state->render_pass_info.pass);
    assert(cmd_buffer->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY);
+
+   /* G5P: the pass's EXTERNAL -> subpass dependencies, before it begins (pvr_render_pass::ext_begin) */
+   if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g5p) && pass->ext_begin) {
+      const VkDependencyInfo ext = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1,
+                                     .pMemoryBarriers = &pass->ext_begin_barrier };
+      PVR_PER_ARCH(CmdPipelineBarrier2)(commandBuffer, &ext);
+   }
 
    /* FIXME: Create a separate function for everything using pass->subpasses,
     * look at cmd_buffer_begin_subpass() for example. */
@@ -7135,6 +7152,7 @@ static VkResult pvr_cmd_upload_push_consts(struct pvr_cmd_buffer *cmd_buffer,
 static void pvr_cmd_dispatch(
    struct pvr_cmd_buffer *const cmd_buffer,
    const pvr_dev_addr_t indirect_addr,
+   const uint64_t indirect_offset,
    const uint32_t base_group[static const PVR_WORKGROUP_DIMENSIONS],
    const uint32_t workgroup_size[static const PVR_WORKGROUP_DIMENSIONS])
 {
@@ -7212,7 +7230,7 @@ void PVR_PER_ARCH(CmdDispatchBase)(VkCommandBuffer commandBuffer,
       return;
 
    pvr_cmd_dispatch(cmd_buffer,
-                    PVR_DEV_ADDR_INVALID,
+                    PVR_DEV_ADDR_INVALID, 0,
                     (uint32_t[]){ baseGroupX, baseGroupY, baseGroupZ },
                     (uint32_t[]){ groupCountX, groupCountY, groupCountZ });
 }
@@ -7227,7 +7245,7 @@ void PVR_PER_ARCH(CmdDispatchIndirect)(VkCommandBuffer commandBuffer,
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
 
    pvr_cmd_dispatch(cmd_buffer,
-                    PVR_DEV_ADDR_OFFSET(buffer->dev_addr, offset),
+                    PVR_DEV_ADDR_OFFSET(buffer->dev_addr, offset), offset,
                     (uint32_t[]){ 0, 0, 0 },
                     (uint32_t[]){ 1, 1, 1 });
 }
@@ -9679,6 +9697,18 @@ static void pvr_emit_vdm_index_list(struct pvr_cmd_buffer *cmd_buffer,
    pvr_csb_clear_relocation_mark(csb);
 }
 
+/* Refusal reasons are logged by G5P_REFUSE before this boundary. */
+static void
+g5p_draw_result(struct pvr_cmd_buffer *cmd_buffer, VkResult result)
+{
+   if (result == VK_SUCCESS)
+      return;
+   if (result == VK_ERROR_FEATURE_NOT_PRESENT &&
+       cmd_buffer->device->pdevice->skip_refused_work)
+      return;
+   vk_command_buffer_set_error(&cmd_buffer->vk, pvr_refusal_to_api(result));
+}
+
 void PVR_PER_ARCH(CmdDraw)(VkCommandBuffer commandBuffer,
                            uint32_t vertexCount,
                            uint32_t instanceCount,
@@ -9714,8 +9744,7 @@ void PVR_PER_ARCH(CmdDraw)(VkCommandBuffer commandBuffer,
       result = pvr_flush_push_descriptors(cmd_buffer, &cmd_buffer->state.gfx_desc_state);
       if (result == VK_SUCCESS)
          result = pvr_arch_g5p_cmd_draw(cmd_buffer, &g5p_draw);
-      if (result != VK_SUCCESS)
-         vk_command_buffer_set_error(&cmd_buffer->vk, result);
+      g5p_draw_result(cmd_buffer, result);
       goto end_cmd_draw;
    }
    if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g9p)) {
@@ -9796,8 +9825,7 @@ void PVR_PER_ARCH(CmdDrawIndexed)(VkCommandBuffer commandBuffer,
       if (result == VK_SUCCESS)
          result = pvr_arch_g5p_cmd_draw_indexed(cmd_buffer, indexCount, instanceCount, firstIndex,
                                                 vertexOffset, firstInstance);
-      if (result != VK_SUCCESS)
-         vk_command_buffer_set_error(&cmd_buffer->vk, result);
+      g5p_draw_result(cmd_buffer, result);
       goto end_cmd_draw_indexed;
    }
    if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g9p)) {
@@ -10166,6 +10194,7 @@ void PVR_PER_ARCH(CmdEndRenderPass2)(VkCommandBuffer commandBuffer,
 
    assert(state->render_pass_info.pass);
    assert(state->render_pass_info.framebuffer);
+   const struct pvr_render_pass *ended_pass = state->render_pass_info.pass;
 
    result = pvr_arch_cmd_buffer_end_sub_cmd(cmd_buffer);
    if (result != VK_SUCCESS)
@@ -10184,6 +10213,14 @@ void PVR_PER_ARCH(CmdEndRenderPass2)(VkCommandBuffer commandBuffer,
 
    state->render_pass_info.attachments = attachments;
    state->render_pass_info.clear_values = clear_values;
+   /* G5P: the pass's subpass -> EXTERNAL dependencies, after it ended: a transfer or
+    * draw after the pass that the pass declares it must precede (xapi-present V4, arr0:
+    * a copy of the pass's colour read the memory before the render wrote it) */
+   if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g5p) && ended_pass->ext_end) {
+      const VkDependencyInfo ext = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1,
+                                     .pMemoryBarriers = &ended_pass->ext_end_barrier };
+      PVR_PER_ARCH(CmdPipelineBarrier2)(commandBuffer, &ext);
+   }
 }
 
 static VkResult

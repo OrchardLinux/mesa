@@ -78,6 +78,13 @@ static inline uint32_t g9p_pds_bra_not_if1(uint32_t target)
  * COMPUTE.md "Register allocation"): field 2n holds 8n registers (field 1-2
  * covers r0-r8, 3-4 r0-r16, 5-6 r0-r24, 8 r0-r32). Bit 8 observed set on
  * every iPadOS kernel record, meaning open. iPadOS's 0x2100 is field 2.
+ *
+ * On A9 this field allocates register bank 1 only (destination W1 bit 9 set: the bank G9P's compute code
+ * uses), and the DOUTU temps allocate bank 0. AGXMetalA9's ComputeProgramVariant (0x207d2c4b0) builds the
+ * record's word 0 (+0x9b8) from __GPU_METADATA r.3.0, which is 8 in all 164 examined A9 kernels
+ * (field 2, iPadOS's 0x2100), while EncodeComputePDSProgram (0x207d1ea4c) takes
+ * the DOUTU temps from r.0.0 (8..64, bank-0 values to r60). Fields 12 and 18 (48 and
+ * 72 registers, tested with bank-0 register parking) lost the GPU before any store (no CDM completion), so an A9 kernel passes its bank-1 count (at most 32: field 8, the largest measured).
  */
 #define G9P_CDM_KERNEL_REGS(n)	(0x100u | (2u * (((n) + 7) / 8)) << 12)
 #define G9P_CDM_KERNEL_SIZES	G9P_CDM_KERNEL_REGS(8)

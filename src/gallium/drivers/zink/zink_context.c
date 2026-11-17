@@ -5446,7 +5446,7 @@ zink_copy_buffer(struct zink_context *ctx, struct zink_resource *dst, struct zin
    /* unsync should only occur during subdata with staging resource */
    if (!unsync)
       zink_screen(ctx->base.screen)->buffer_barrier(ctx, src, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-   bool unordered_dst = zink_resource_buffer_transfer_dst_barrier(ctx, dst, dst_offset, size);
+   bool unordered_dst = zink_resource_buffer_transfer_dst_barrier(ctx, dst, dst_offset, size, unsync);
    bool can_unorder = unordered_dst && unordered_src && !ctx->no_reorder;
    VkCommandBuffer cmdbuf = unsync ? ctx->bs->unsynchronized_cmdbuf : 
                                      can_unorder ? ctx->bs->reordered_cmdbuf : zink_get_cmdbuf(ctx, src, dst);
@@ -5524,7 +5524,7 @@ zink_copy_image_buffer(struct zink_context *ctx, struct zink_resource *dst, stru
          ctx->no_reorder++;
       VkImageLayout layout = screen->driver_workarounds.general_layout ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
       screen->image_barrier(ctx, use_img, layout, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-      zink_resource_buffer_transfer_dst_barrier(ctx, buf, box->x, box->width);
+      zink_resource_buffer_transfer_dst_barrier(ctx, buf, box->x, box->width, false);
    }
 
    VkBufferImageCopy region = {0};

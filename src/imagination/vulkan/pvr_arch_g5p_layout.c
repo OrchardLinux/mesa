@@ -16,6 +16,8 @@
  */
 
 #include <assert.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <pthread.h>
 #include <inttypes.h>
 #include <stdlib.h>
@@ -24,10 +26,12 @@
 
 #include "vk_format.h"
 #include "vk_sync.h"
+#include "vk_enum_to_str.h"
 
 #include "util/format/u_format.h"
 #include "util/log.h"
 #include "util/texcompress_etc.h"
+#include "util/texcompress_astc.h"
 #include "util/u_math.h"
 #include "util/os_time.h"
 #include <unistd.h>
@@ -38,6 +42,9 @@
 #include "pvr_g5p_ds.h"
 #include "pvr_g9p.h"
 #include "pvr_image.h"
+
+/* the most texels one compressed block holds: ASTC 12x12 (ETC2/EAC 16) */
+#define G5P_BLOCK_TEXELS 144
 #include "pvr_job_transfer.h"
 
 
@@ -52,6 +59,18 @@ struct g5p_surface {
    VkImageAspectFlags aspects;
    uint64_t image_offset;
 };
+
+/* Why the CPU transfer refused (the last refusal on this thread, for the error line) */
+static thread_local char g5p_why[192];
+static bool PRINTFLIKE(1, 2)
+G5P_WHY(const char *fmt, ...)
+{
+   va_list ap;
+   va_start(ap, fmt);
+   vsnprintf(g5p_why, sizeof(g5p_why), fmt, ap);
+   va_end(ap);
+   return false;
+}
 
 static bool
 g5p_surface_init(struct pvr_device *device, const struct pvr_transfer_cmd_surface *s, struct g5p_surface *out)
@@ -89,8 +108,8 @@ g5p_surface_init(struct pvr_device *device, const struct pvr_transfer_cmd_surfac
    out->aspects = s->g5p_aspect;
    out->image_offset = s->g5p_image ? s->dev_addr.addr - s->g5p_image->dev_addr.addr - pvr_single_plane_const(s->g5p_image)->offset : 0;
    if (!out->base)
-      mesa_loge("G5P transfer: no CPU mapping for %#" PRIx64, s->dev_addr.addr);
-   return out->base != NULL;
+      return G5P_WHY("no CPU mapping of a tracked memory binding covers %#" PRIx64, s->dev_addr.addr);
+   return true;
 }
 
 /* Spread the low 16 coordinate bits into even bit positions. G5P uses
@@ -126,13 +145,18 @@ g5p_offset(const struct g5p_surface *s, unsigned x, unsigned y)
 static uint8_t *
 g5p_element(struct g5p_surface *s, unsigned x, unsigned y)
 {
-   if (x >= s->width || y >= s->height)
+   if (x >= s->width || y >= s->height) {
+      G5P_WHY("element (%u,%u) outside the %ux%u surface", x, y, s->width, s->height);
       return NULL;
+   }
 
    const size_t offset = g5p_offset(s, x, y);
 
-   if (offset > s->available || s->bpp > s->available - offset)
+   if (offset > s->available || s->bpp > s->available - offset) {
+      G5P_WHY("element (%u,%u) at byte %zu + %u past the %" PRIu64 " bytes bound from its address",
+              x, y, offset, s->bpp, (uint64_t)s->available);
       return NULL;
+   }
    return s->base + offset + s->component_offset;
 }
 
@@ -158,7 +182,8 @@ g5p_ds_plane(const struct g5p_surface *s, VkImageAspectFlagBits aspect,
    const struct pvr_image *image = s->image;
    const struct pvr_g5p_ds_format *own = pvr_g5p_ds_format(image->vk.format);
    if (!own || (stencil ? !own->stencil : !own->depth) || image->vk.samples != 1)
-      return false;
+      return G5P_WHY("depth/stencil plane of %s, %u samples (one-sample depth/stencil images only)",
+                     vk_Format_to_str(image->vk.format), image->vk.samples);
    p->format = stencil ? PIPE_FORMAT_S8_UINT :
                own->depth_bytes == 2 ? PIPE_FORMAT_Z16_UNORM : PIPE_FORMAT_Z32_FLOAT;
    p->cpp = stencil ? 1 : own->depth_bytes;
@@ -267,9 +292,22 @@ g5p_etc2_decoded(enum pipe_format p)
 }
 
 /* A 4x4 block as 16 RGBA floats, row by row */
+/* The most texels of one block: ASTC 12x12 */
 static void
-g5p_decode_block(enum pipe_format format, const uint8_t *p, unsigned bpp, float block[16][4])
+g5p_decode_block(enum pipe_format format, const uint8_t *p, unsigned bpp, float block[G5P_BLOCK_TEXELS][4])
 {
+   if (util_format_description(format)->layout == UTIL_FORMAT_LAYOUT_ASTC) {
+      /* util's ASTC LDR decoder: RGBA8 (sRGB-encoded for the sRGB formats),
+       * one block of bw x bh texels, then the 8-bit format's unpack as for
+       * ETC2 below */
+      const unsigned bw = util_format_get_blockwidth(format), bh = util_format_get_blockheight(format);
+      uint8_t texels[G5P_BLOCK_TEXELS * 4];
+
+      _mesa_unpack_astc_2d_ldr(texels, 4 * bw, p, bpp, bw, bh, format);
+      util_format_unpack_rgba(util_format_is_srgb(format) ? PIPE_FORMAT_R8G8B8A8_SRGB : PIPE_FORMAT_R8G8B8A8_UNORM,
+                              block, texels, bw * bh);
+      return;
+   }
    const enum pipe_format dec = g5p_etc2_decoded(format);
 
    if (dec != PIPE_FORMAT_NONE) {
@@ -290,7 +328,7 @@ g5p_decode_block(enum pipe_format format, const uint8_t *p, unsigned bpp, float 
  * the last block decoded is kept */
 static bool
 g5p_block_texel(const struct g5p_surface *s, unsigned x, unsigned y, float out[4], const uint8_t **last,
-                float block[16][4])
+                float block[G5P_BLOCK_TEXELS][4])
 {
    const unsigned bw = util_format_get_blockwidth(s->format), bh = util_format_get_blockheight(s->format);
    struct g5p_surface b = *s;
@@ -304,7 +342,7 @@ g5p_block_texel(const struct g5p_surface *s, unsigned x, unsigned y, float out[4
 
    const uint8_t *p = g5p_element(&b, x / bw, y / bh);
 
-   assert(bw == 4 && bh == 4);
+   assert(bw * bh <= G5P_BLOCK_TEXELS);
    if (!p)
       return false;
    if (p != *last) {
@@ -335,7 +373,7 @@ g5p_normalize_axis(int32_t *offset, uint32_t *extent, bool *flip)
  * util_format_unpack_rgba() looks it up (a call_once) on every call. */
 static bool
 g5p_texel(struct g5p_surface *s, const struct util_format_unpack_description *unpack, unsigned x, unsigned y,
-          float out[4], const uint8_t **last, float block[16][4])
+          float out[4], const uint8_t **last, float block[G5P_BLOCK_TEXELS][4])
 {
    if (s->blocks)
       return g5p_block_texel(s, x, y, out, last, block);
@@ -356,7 +394,7 @@ g5p_texel(struct g5p_surface *s, const struct util_format_unpack_description *un
 static bool
 g5p_linear_sample(struct g5p_surface *src, const struct util_format_unpack_description *unpack,
                   const struct pvr_rect_mapping *m, unsigned x, unsigned y, float out[4],
-                  const uint8_t **last, float block[16][4])
+                  const uint8_t **last, float block[G5P_BLOCK_TEXELS][4])
 {
    const double sw = m->src_rect.extent.width, sh = m->src_rect.extent.height;
    const double dw = m->dst_rect.extent.width, dh = m->dst_rect.extent.height;
@@ -570,7 +608,7 @@ g5p_copy(const struct pvr_rect_mapping *mapping, struct g5p_surface *src, struct
    const unsigned dw = m->dst_rect.extent.width, dh = m->dst_rect.extent.height;
    const unsigned sw = m->src_rect.extent.width, sh = m->src_rect.extent.height;
    const uint8_t *last = NULL;
-   float block[16][4];
+   float block[G5P_BLOCK_TEXELS][4];
 
    if (!dw || !dh || !sw || !sh)
       return true;
@@ -686,8 +724,8 @@ g5p_copy(const struct pvr_rect_mapping *mapping, struct g5p_surface *src, struct
                util_format_unpack_s_8uint(src->format, &stencil, from, 1);
                util_format_pack_s_8uint(dst->format, to, &stencil, 1);
             } else {
-               mesa_loge("G5P transfer: unsupported depth/stencil conversion %u -> %u", src->format, dst->format);
-               return false;
+               return G5P_WHY("depth/stencil conversion %s -> %s", util_format_short_name(src->format),
+                              util_format_short_name(dst->format));
             }
          } else if (integer) {
             uint32_t v[4];
@@ -714,7 +752,7 @@ g5p_copy_aspects(const struct pvr_rect_mapping *mapping, struct g5p_surface *src
    VkImageAspectFlags aspects = src->image ? src->aspects : dst->aspects;
    if (src->image && dst->image) aspects &= dst->aspects;
    const struct pvr_g5p_ds_format *f = pvr_g5p_ds_format(image->vk.format);
-   if (!f) return false;
+   if (!f) return G5P_WHY("no G5P depth/stencil layout for %s", vk_Format_to_str(image->vk.format));
    for (unsigned i = 0; i < 2; i++) {
       VkImageAspectFlagBits aspect = i ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
       if (!(aspects & aspect)) continue;
@@ -736,7 +774,7 @@ g5p_run(struct pvr_device *device, const struct pvr_transfer_cmd *cmd)
    if (cmd->flags & PVR_TRANSFER_CMD_FLAGS_FILL) {
       if (dst.image && vk_format_is_depth_or_stencil(dst.image->vk.format)) {
          const struct pvr_g5p_ds_format *f = pvr_g5p_ds_format(dst.image->vk.format);
-         if (!f) return false;
+         if (!f) return G5P_WHY("no G5P depth/stencil layout for %s", vk_Format_to_str(dst.image->vk.format));
          for (unsigned i = 0; i < 2; i++) {
             VkImageAspectFlagBits aspect = i ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
             struct g5p_surface p;
@@ -767,6 +805,51 @@ g5p_run(struct pvr_device *device, const struct pvr_transfer_cmd *cmd)
    return true;
 }
 
+/* One surface of a refused transfer, for the error line */
+static int
+g5p_describe_surface(char *out, size_t n, const char *what, const struct pvr_transfer_cmd_surface *s)
+{
+   const struct pvr_image *im = s->g5p_image;
+   int k = snprintf(out, n, " %s{%s %ux%ux%u stride %u %s samples %u z %.1f va %#" PRIx64, what,
+                    vk_Format_to_str(s->vk_format), s->width, s->height, s->depth, s->stride,
+                    s->mem_layout == PVR_MEMLAYOUT_TWIDDLED ? "twiddled" :
+                    s->mem_layout == PVR_MEMLAYOUT_LINEAR ? "linear" : "3d-twiddled",
+                    s->sample_count, s->z_position, s->dev_addr.addr);
+   if (im && k >= 0 && (size_t)k < n)
+      k += snprintf(out + k, n - k, " image %s %ux%ux%u levels %u layers %u samples %u size %" PRIu64 " at +%" PRIu64,
+                    vk_Format_to_str(im->vk.format), im->vk.extent.width, im->vk.extent.height, im->vk.extent.depth,
+                    im->vk.mip_levels, im->vk.array_layers, im->vk.samples, (uint64_t)im->total_size,
+                    s->dev_addr.addr - im->dev_addr.addr);
+   if (k >= 0 && (size_t)k < n)
+      k += snprintf(out + k, n - k, "}");
+   return k;
+}
+
+/* A CPU transfer G5P refuses (g5p_run() false): which surface and why */
+static void
+g5p_transfer_refused(const struct pvr_transfer_cmd *cmd)
+{
+   char line[1024];
+   int k = snprintf(line, sizeof(line), "G5P transfer refused: %s; %s scissor %ux%u+%d+%d",
+                    g5p_why[0] ? g5p_why : "?", (cmd->flags & PVR_TRANSFER_CMD_FLAGS_FILL) ? "fill" : "copy",
+                    cmd->scissor.extent.width, cmd->scissor.extent.height, cmd->scissor.offset.x,
+                    cmd->scissor.offset.y);
+   if (k >= 0 && (size_t)k < sizeof(line))
+      k += g5p_describe_surface(line + k, sizeof(line) - k, "dst", &cmd->dst);
+   for (unsigned i = 0; i < cmd->source_count && k >= 0 && (size_t)k < sizeof(line); i++) {
+      const struct pvr_transfer_cmd_source *src = &cmd->sources[i];
+      k += g5p_describe_surface(line + k, sizeof(line) - k, "src", &src->surface);
+      if (src->mapping_count && k >= 0 && (size_t)k < sizeof(line)) {
+         const struct pvr_rect_mapping *m = &src->mappings[0];
+         k += snprintf(line + k, sizeof(line) - k, " map[%u] %ux%u+%d+%d -> %ux%u+%d+%d", src->mapping_count,
+                       m->src_rect.extent.width, m->src_rect.extent.height, m->src_rect.offset.x,
+                       m->src_rect.offset.y, m->dst_rect.extent.width, m->dst_rect.extent.height,
+                       m->dst_rect.offset.x, m->dst_rect.offset.y);
+      }
+   }
+   mesa_logw("%s", line);
+}
+
 VkResult
 PVR_PER_ARCH(g5p_transfer_submit)(struct pvr_device *device, struct pvr_sub_cmd_transfer *sub_cmd,
                                   const struct vk_sync_wait *waits, uint32_t wait_count,
@@ -780,9 +863,13 @@ PVR_PER_ARCH(g5p_transfer_submit)(struct pvr_device *device, struct pvr_sub_cmd_
          return result;
    }
    list_for_each_entry (struct pvr_transfer_cmd, cmd, sub_cmd->transfer_cmds, link) {
-      if (!g5p_run(device, cmd))
-         return vk_errorf(device, VK_ERROR_DEVICE_LOST,
-                          "G5P transfer surface exceeds its memory's mapping");
+      g5p_why[0] = 0;
+      if (!g5p_run(device, cmd)) {
+         /* A transfer the CPU path cannot do is named (surface, size, format, layout and why) and skipped:
+          * its destination keeps what it held and the queue goes on (the game workload previously returned
+          * DEVICE_LOST). Decide unsupported copies at recording time in a future change. */
+         g5p_transfer_refused(cmd);
+      }
    }
    return vk_sync_signal(&device->vk, signal_sync, 0);
 }

@@ -857,6 +857,23 @@ add_2d_view_flag(struct zink_screen *screen, const struct pipe_resource *templ, 
    }
 }
 
+/* The sampled-image sample counts of a format, as zink_is_format_supported() checks them. */
+static VkSampleCountFlags
+sampled_sample_counts(struct zink_screen *screen, enum pipe_format format)
+{
+   const VkPhysicalDeviceLimits *l = &screen->info.props.limits;
+   const struct util_format_description *desc = util_format_description(format);
+   if (util_format_is_depth_or_stencil(format)) {
+      VkSampleCountFlags s = ~0u;
+      if (util_format_has_depth(desc))
+         s &= l->sampledImageDepthSampleCounts;
+      if (util_format_has_stencil(desc))
+         s &= l->sampledImageStencilSampleCounts;
+      return s;
+   }
+   return util_format_is_pure_integer(format) ? l->sampledImageIntegerSampleCounts : l->sampledImageColorSampleCounts;
+}
+
 static unsigned
 build_usage_candidates(struct zink_screen *screen, const struct pipe_resource *templ, unsigned bind,
                        VkImageTiling tiling, VkImageCreateFlags base_flags, bool extended, bool have_fmtlist,
@@ -901,6 +918,17 @@ build_usage_candidates(struct zink_screen *screen, const struct pipe_resource *t
    } else {
       n = emit_usage_candidates(c, n, tiling, usage, flags, false, have_fmtlist, always_mutable, max);
    }
+
+   /* Vulkan allows sampledImage*SampleCounts to be a subset of framebuffer*SampleCounts. GL
+    * renderbuffers carry PIPE_BIND_SAMPLER_VIEW, but their format and GL_MAX_SAMPLES are chosen
+    * without it, so a multisampled attachment the device cannot sample at this count would get no
+    * storage. Retry without SAMPLED: zink_is_format_supported() reports SAMPLER_VIEW unsupported for
+    * this sample count, so nothing samples the image.
+    */
+   if (templ->nr_samples > 1 && (usage & VK_IMAGE_USAGE_SAMPLED_BIT) &&
+       !(sampled_sample_counts(screen, templ->format) & (VkSampleCountFlags)templ->nr_samples))
+      n = emit_usage_candidates(c, n, tiling, usage & ~VK_IMAGE_USAGE_SAMPLED_BIT, flags, false, have_fmtlist,
+                                always_mutable, max);
 
    return n;
 }

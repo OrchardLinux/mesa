@@ -197,6 +197,7 @@ PVR_PER_ARCH(g9p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
    uint32_t bind_data[4 * (G9P_MAX_BUFFERS + 1) + 4] = { 0 };
    uint32_t bind_code[G9P_MAX_BUFFERS + 2];
    uint32_t kernel_data[G9P_KERNEL_DATA_DWORDS] = { 0 }, kernel_code[8];
+   bool from_uniforms[G9P_MAX_BUFFERS] = { false };
    struct pvr_pds_upload bind, kernel;
    unsigned bind_dwords, ctrl0, nc = 0;
    VkResult result;
@@ -218,6 +219,17 @@ PVR_PER_ARCH(g9p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
          uniforms[2 * k] = pc->dev_addr.addr;
          uniforms[2 * k + 1] = pc->dev_addr.addr >> 32;
       }
+      if (state->buffers[k].set < PVR_MAX_DESCRIPTOR_SETS) {
+         /* a dynamic buffer has no descriptor in set memory (binding offset ~0) */
+         const unsigned element =
+            (state->buffers[k].binding & ~G9P_BINDING_SIZE) >> G9P_BINDING_ELEMENT_SHIFT;
+         const unsigned b = state->buffers[k].binding & BITFIELD_MASK(G9P_BINDING_ELEMENT_SHIFT);
+
+         if (!pvr_descriptor_set_dynamic_slot(desc->sets[state->buffers[k].set], b, element,
+                                              state->buffers[k].binding & G9P_BINDING_SIZE,
+                                              &uniforms[2 * k], &from_uniforms[k]))
+            return vk_error(cmd_buffer, VK_ERROR_UNKNOWN);
+      }
    }
    uniforms[2 * n] = count;
    result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, uniforms,
@@ -236,7 +248,7 @@ PVR_PER_ARCH(g9p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
       uint64_t src;
       uint32_t dest = 2 * k, dwords = 2;
 
-      if (k < n && state->buffers[k].set != G9P_PUSH_CONSTANTS &&
+      if (k < n && !from_uniforms[k] && state->buffers[k].set != G9P_PUSH_CONSTANTS &&
           state->buffers[k].set != G9P_NUM_WORKGROUPS) {
          const struct pvr_descriptor_set *set = desc->sets[state->buffers[k].set];
          /* an array's element (Zink keeps all storage buffers in one array) */

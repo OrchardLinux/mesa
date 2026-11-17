@@ -268,7 +268,8 @@ static void pvr_physical_device_get_supported_features(
       .multiViewport = false,
       .samplerAnisotropy = true,
       .textureCompressionETC2 = true,
-      .textureCompressionASTC_LDR = false,
+      /* G5P: all 28 ASTC LDR formats sampled, filtered and blit sources (pvr_g5p_format_table.h) */
+      .textureCompressionASTC_LDR = PVR_HAS_FEATURE(dev_info, apple_g5p),
       .textureCompressionBC = false,
       .occlusionQueryPrecise = true,
       .pipelineStatisticsQuery = false,
@@ -285,7 +286,10 @@ static void pvr_physical_device_get_supported_features(
       .shaderStorageBufferArrayDynamicIndexing = true,
       .shaderStorageImageArrayDynamicIndexing = true,
       .shaderClipDistance = true,
-      .shaderCullDistance = true,
+      /* G5P: the A9 TA's user planes clip; Apple's A9 driver sets no cull plane, and a cull
+       * distance is no clip distance (it drops whole primitives): not supported, so applications
+       * (PPSSPP) do not write gl_CullDistance */
+      .shaderCullDistance = !PVR_HAS_FEATURE(dev_info, apple_g5p),
       .shaderFloat64 = false,
       .shaderInt64 = false,
       .shaderInt16 = false,
@@ -605,6 +609,9 @@ static uint32_t get_api_version(void)
 static unsigned
 get_custom_border_color_samplers(const struct pvr_device_info *dev_info);
 
+/* Minimum required by the Vulkan spec Limits (maxMemoryAllocationSize) */
+#define PVR_MAX_MEMORY_ALLOCATION_SIZE (1ull << 30)
+
 static bool pvr_physical_device_get_properties(
    const struct pvr_physical_device *const pdevice,
    struct vk_properties *const properties)
@@ -656,7 +663,7 @@ static bool pvr_physical_device_get_properties(
 
    assert(pdevice->memory.memoryHeapCount == 1);
    const VkDeviceSize max_memory_alloc_size =
-      pdevice->memory.memoryHeaps[0].size;
+      MAX2(pdevice->memory.memoryHeaps[0].size, PVR_MAX_MEMORY_ALLOCATION_SIZE);
 
    const uint32_t line_sub_pixel_precision_bits =
       PVR_HAS_FEATURE(dev_info, simple_internal_parameter_format) ? 4U : 8U;
@@ -671,13 +678,15 @@ static bool pvr_physical_device_get_properties(
       .deviceType = VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU,
       /* deviceName and pipelineCacheUUID are filled below .*/
 
-      .maxImageDimension1D = 4096U,
-      .maxImageDimension2D = 4096U,
+      /* G5P: 8192, the Orchard kernel's render-target bound (G5P_RU_MAX_DIM) and inside the A9's
+       * 14-bit width/height fields of the texture and PBE states (pvr_g5p_tex_encode.h, g5p_pbe.h) */
+      .maxImageDimension1D = PVR_HAS_FEATURE(dev_info, apple_g5p) ? 8192U : 4096U,
+      .maxImageDimension2D = PVR_HAS_FEATURE(dev_info, apple_g5p) ? 8192U : 4096U,
       .maxImageDimension3D = pvr_get_texture_extent_max_z(dev_info),
-      .maxImageDimensionCube = 4096U,
+      .maxImageDimensionCube = PVR_HAS_FEATURE(dev_info, apple_g5p) ? 8192U : 4096U,
       .maxImageArrayLayers = rogue_get_render_size_max_z(dev_info),
       .maxTexelBufferElements = 64U * 1024U,
-      .maxUniformBufferRange = 16U * 1024U,
+      .maxUniformBufferRange = PVR_HAS_FEATURE(dev_info, apple_g5p) ? 64U * 1024U : 16U * 1024U,
       .maxStorageBufferRange = 128U * 1024U * 1024U,
       .maxPushConstantsSize = 128U,
       .maxMemoryAllocationCount = 4096U,
@@ -695,7 +704,7 @@ static bool pvr_physical_device_get_properties(
       .maxDescriptorSetSamplers = 3U * 16U,
       .maxDescriptorSetUniformBuffers = 3U * 12U,
       .maxDescriptorSetUniformBuffersDynamic = 8U,
-      .maxDescriptorSetStorageBuffers = 3U * 4U,
+      .maxDescriptorSetStorageBuffers = PVR_HAS_FEATURE(dev_info, apple_g5p) ? 16U : 3U * 4U,
       .maxDescriptorSetStorageBuffersDynamic = 4U,
       .maxDescriptorSetSampledImages = 3U * 16U,
       .maxDescriptorSetStorageImages = 3U * 4U,
@@ -707,7 +716,8 @@ static bool pvr_physical_device_get_properties(
       .maxVertexInputAttributeOffset = 2048U - 1U,
       .maxVertexInputBindingStride = 2048U,
       /* G9P: its 30 varyings (Zink exposes an eighth of this as GL varyings) */
-      .maxVertexOutputComponents = PVR_HAS_FEATURE(dev_info, apple_g9p) ? 120U : 64U,
+      .maxVertexOutputComponents = PVR_HAS_FEATURE(dev_info, apple_g9p) ? 120U :
+         PVR_HAS_FEATURE(dev_info, apple_g5p) ? 112U : 64U, /* G5P: 4 * PCO_G5P_MAX_FS_VARYINGS */
 
       /* Tessellation Limits */
       /* Requires tessellationShader */
@@ -729,10 +739,11 @@ static bool pvr_physical_device_get_properties(
       .maxGeometryTotalOutputComponents = 0U,
 
       /* Fragment Shader Limits */
-      .maxFragmentInputComponents = PVR_HAS_FEATURE(dev_info, apple_g9p) ? 120U : 64U,
-      .maxFragmentOutputAttachments = 4U,
+      .maxFragmentInputComponents = PVR_HAS_FEATURE(dev_info, apple_g9p) ? 120U :
+         PVR_HAS_FEATURE(dev_info, apple_g5p) ? 112U : 64U, /* G5P: 4 * PCO_G5P_MAX_FS_VARYINGS */
+      .maxFragmentOutputAttachments = PVR_HAS_FEATURE(dev_info, apple_g5p) ? 8U : 4U, /* G5P: 5..8 compact UNORM8 targets */
       .maxFragmentDualSrcAttachments = 0U, /* Requires dualSrcBlend */
-      .maxFragmentCombinedOutputResources = 4U,
+      .maxFragmentCombinedOutputResources = PVR_HAS_FEATURE(dev_info, apple_g5p) ? 8U : 4U,
 
       /* Compute Shader Limits */
       .maxComputeSharedMemorySize = 16U * 1024U,
@@ -741,10 +752,14 @@ static bool pvr_physical_device_get_properties(
          [1] = (64U * 1024U) - 1,
          [2] = (64U * 1024U) - 1,
       },
-      .maxComputeWorkGroupInvocations = 128U,
+      /* G5P: 256 (AGXMetalA9: 512 per threadgroup, maxThreadsPerThreadgroup; Rogue's CDM: 32 lanes x 16
+       * tasks per USC). Barriers above 32 lanes are Apple's software barrier (g5p_barrier.h); a pipeline whose
+       * temporaries cannot keep every task of a barriered workgroup resident is refused at creation
+       * (pvr_arch_g5p_compute.c). */
+      .maxComputeWorkGroupInvocations = PVR_HAS_FEATURE(dev_info, apple_g5p) ? 256U : 128U,
       .maxComputeWorkGroupSize = {
-        [0] = 128U,
-        [1] = 128U,
+        [0] = PVR_HAS_FEATURE(dev_info, apple_g5p) ? 256U : 128U,
+        [1] = PVR_HAS_FEATURE(dev_info, apple_g5p) ? 256U : 128U,
         [2] = 64U,
       },
 
@@ -759,10 +774,11 @@ static bool pvr_physical_device_get_properties(
       .maxSamplerAnisotropy = 16.0f, /* Requires samplerAnisotropy */
       .maxViewports = 1U, /* Requires multiViewport */
 
-      .maxViewportDimensions[0] = 4096U,
-      .maxViewportDimensions[1] = 4096U,
-      .viewportBoundsRange[0] = -8192.0f,
-      .viewportBoundsRange[1] = 8191.0f,
+      .maxViewportDimensions[0] = PVR_HAS_FEATURE(dev_info, apple_g5p) ? 8192U : 4096U,
+      .maxViewportDimensions[1] = PVR_HAS_FEATURE(dev_info, apple_g5p) ? 8192U : 4096U,
+      /* at least [-2 * maxViewportDimensions, 2 * maxViewportDimensions - 1] */
+      .viewportBoundsRange[0] = PVR_HAS_FEATURE(dev_info, apple_g5p) ? -16384.0f : -8192.0f,
+      .viewportBoundsRange[1] = PVR_HAS_FEATURE(dev_info, apple_g5p) ? 16383.0f : 8191.0f,
 
       .viewportSubPixelBits = 0U,
       .minMemoryMapAlignment = pdevice->ws->page_size,
@@ -782,8 +798,8 @@ static bool pvr_physical_device_get_properties(
       .maxInterpolationOffset = 0.5f,
       .subPixelInterpolationOffsetBits = 4U,
 
-      .maxFramebufferWidth = 4096U,
-      .maxFramebufferHeight = 4096U,
+      .maxFramebufferWidth = PVR_HAS_FEATURE(dev_info, apple_g5p) ? 8192U : 4096U,
+      .maxFramebufferHeight = PVR_HAS_FEATURE(dev_info, apple_g5p) ? 8192U : 4096U,
       .maxFramebufferLayers = 256U,
 
       /* Note: update nir_shader_compiler_options.max_samples when changing this. */
@@ -791,7 +807,7 @@ static bool pvr_physical_device_get_properties(
       .framebufferDepthSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT,
       .framebufferStencilSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT,
       .framebufferNoAttachmentsSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT,
-      .maxColorAttachments = 4U,
+      .maxColorAttachments = PVR_HAS_FEATURE(dev_info, apple_g5p) ? 8U : 4U, /* G5P: 5..8 compact UNORM8 targets (pvr_g5p_mrt.h) */
       .sampledImageColorSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT,
       .sampledImageIntegerSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT,
       .sampledImageDepthSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT,
@@ -802,7 +818,7 @@ static bool pvr_physical_device_get_properties(
       .timestampPeriod = 0.0f,
 
       .maxClipDistances = PVR_MAX_USER_PLANES,
-      .maxCullDistances = PVR_MAX_USER_PLANES,
+      .maxCullDistances = PVR_HAS_FEATURE(dev_info, apple_g5p) ? 0U : PVR_MAX_USER_PLANES, /* no shaderCullDistance */
       .maxCombinedClipAndCullDistances = PVR_MAX_USER_PLANES,
 
       .discreteQueuePriorities = 2U,
@@ -822,7 +838,7 @@ static bool pvr_physical_device_get_properties(
       .nonCoherentAtomSize = 1U,
 
       /* Vulkan 1.1 */
-      .subgroupSize = ROGUE_MAX_INSTANCES_PER_TASK,
+      .subgroupSize = PVR_HAS_FEATURE(dev_info, apple_g5p) ? 1U : ROGUE_MAX_INSTANCES_PER_TASK,
       .subgroupSupportedStages = VK_SHADER_STAGE_COMPUTE_BIT,
       .subgroupSupportedOperations = VK_SUBGROUP_FEATURE_BASIC_BIT |
                                      VK_SUBGROUP_FEATURE_VOTE_BIT |
@@ -962,9 +978,10 @@ static bool pvr_physical_device_get_properties(
       .integerDotProductAccumulatingSaturating64BitMixedSignednessAccelerated = false,
 
       /* Vulkan 1.3 / VK_EXT_subgroup_size_control */
-      .minSubgroupSize = ROGUE_MAX_INSTANCES_PER_TASK,
-      .maxSubgroupSize = ROGUE_MAX_INSTANCES_PER_TASK,
-      .maxComputeWorkgroupSubgroups = 128U / ROGUE_MAX_INSTANCES_PER_TASK,
+      .minSubgroupSize = PVR_HAS_FEATURE(dev_info, apple_g5p) ? 1U : ROGUE_MAX_INSTANCES_PER_TASK,
+      .maxSubgroupSize = PVR_HAS_FEATURE(dev_info, apple_g5p) ? 1U : ROGUE_MAX_INSTANCES_PER_TASK,
+      .maxComputeWorkgroupSubgroups = PVR_HAS_FEATURE(dev_info, apple_g5p) ?
+                                       256U : 128U / ROGUE_MAX_INSTANCES_PER_TASK,
       .requiredSubgroupSizeStages = VK_SHADER_STAGE_COMPUTE_BIT,
 
       /* Vulkan 1.2 / VK_KHR_timeline_semaphore */
@@ -1157,14 +1174,25 @@ static bool pvr_device_is_conformant(const struct pvr_device_info *info)
    return false;
 }
 
-/* Minimum required by the Vulkan spec Limits (maxMemoryAllocationSize) */
-#define PVR_MAX_MEMORY_ALLOCATION_SIZE (1ull << 30)
 
-static inline uint64_t pvr_compute_heap_size(struct pvr_instance *instance)
+
+static inline uint64_t
+pvr_compute_heap_size(const struct pvr_physical_device *pdevice,
+                      struct pvr_instance *instance)
 {
-   uint64_t available_ram =
-      os_get_gpu_heap_size(instance->drirc.misc.heap_memory_percent, NULL);
-   return MAX2(available_ram, PVR_MAX_MEMORY_ALLOCATION_SIZE);
+   uint64_t total;
+   if (!os_get_total_physical_memory(&total))
+      return PVR_MAX_MEMORY_ALLOCATION_SIZE;
+   const float percent = instance->drirc.misc.heap_memory_percent;
+   if (percent == OS_GPU_HEAP_SIZE_HEURISTIC &&
+       PVR_HAS_FEATURE(&pdevice->dev_info, apple_g5p)) {
+      uint64_t page_size;
+      if (!os_get_page_size(&page_size))
+         return PVR_MAX_MEMORY_ALLOCATION_SIZE;
+      /* This device class limits the GPU working set to two thirds of RAM. */
+      return ALIGN_POT(total * 2 / 3, page_size);
+   }
+   return os_gpu_heap_size_calculate(total, percent, NULL);
 }
 
 static void
@@ -1257,7 +1285,7 @@ VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
 
    /* Setup available memory heaps and types */
    pdevice->memory.memoryHeapCount = 1;
-   pdevice->memory.memoryHeaps[0].size = pvr_compute_heap_size(instance);
+   pdevice->memory.memoryHeaps[0].size = pvr_compute_heap_size(pdevice, instance);
    pdevice->memory.memoryHeaps[0].flags = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
 
    pdevice->memory.memoryTypeCount = 1;
@@ -1294,6 +1322,11 @@ VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
       supported_properties.transformFeedbackDraw = false;
       supported_properties.transformFeedbackQueries = true;
       supported_extensions.EXT_color_write_enable = false;
+      /* G5P samples every cube seamlessly and ignores VkSamplerCreateFlags' non-seamless bit; not advertising
+       * the extension leaves GL's non-seamless cubes to Zink (G9P's 82abaf9be98 ("pvr/g9p: non-seamless cube maps") builds them natively
+       * on the A10) */
+      supported_extensions.EXT_non_seamless_cube_map = false;
+      supported_features.nonSeamlessCubeMap = false;
       supported_features.dualSrcBlend = true;
       supported_properties.maxFragmentDualSrcAttachments = 1;
       supported_features.colorWriteEnable = false; PVR_G5P_HOOK(release9_features, supported_features)
@@ -1356,7 +1389,23 @@ VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
       goto err_vk_physical_device_finish;
    }
 
-   pdevice->vk.supported_sync_types = ws->sync_types;
+   pdevice->skip_refused_work = PVR_HAS_FEATURE(&pdevice->dev_info, apple_g5p) &&
+                                 instance->drirc.misc.pvr_skip_refused_work;
+
+   pdevice->sync_type = ws->syncobj_type;
+   if (ws->job_sync_size) {
+      pdevice->sync_type.size = MAX2(pdevice->sync_type.size, ws->job_sync_size);
+      pdevice->native_wait_many = pdevice->sync_type.wait_many;
+      pdevice->sync_type.wait_many = pvr_sync_wait_many;
+   }
+   pdevice->sync_types[0] = &pdevice->sync_type;
+   pdevice->sync_types[1] = NULL;
+   pdevice->sync_types[2] = NULL;
+   if (ws->sync_types[1]) {
+      pdevice->timeline_sync_type = vk_sync_timeline_get_type(&pdevice->sync_type);
+      pdevice->sync_types[1] = &pdevice->timeline_sync_type.sync;
+   }
+   pdevice->vk.supported_sync_types = pdevice->sync_types;
 
    pdevice->pco_ctx =
       pco_ctx_create(&pdevice->dev_info, &pdevice->dev_runtime_info, NULL);

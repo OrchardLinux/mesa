@@ -26,8 +26,9 @@ struct pvr_cmd_buffer;
 struct pvr_device;
 struct pvr_renderpass_hwsetup_render;
 
-/* the most colour targets a G5P pipeline or pass has (Apple's 4-target pass) */
-#define PVR_G5P_MRT_MAX_COLORS 4
+/* the most colour targets a G5P pipeline or pass has: Apple's 4-target pass, then 5..8 compact UNORM8
+ * targets (one format, full write mask, no blending) */
+#define PVR_G5P_MRT_MAX_COLORS 8
 
 /* The formats of Apple's 2- and 4-target pass */
 static inline bool

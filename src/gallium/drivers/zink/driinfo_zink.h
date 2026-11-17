@@ -6,6 +6,7 @@ DRI_CONF_SECTION_DEBUG
 DRI_CONF_SECTION_END
 
 DRI_CONF_SECTION_PERFORMANCE
+DRI_CONF_OPT_I(zink_frames_in_flight, 0, 0, 3, "Frames in flight (0 = driver default)")
 DRI_CONF_MESA_GLTHREAD_DRIVER(true)
 DRI_CONF_OPT_B(zink_shader_object_enable, false, "Enable support for EXT_shader_object")
 DRI_CONF_SECTION_END

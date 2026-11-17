@@ -14,6 +14,7 @@
 
 #include "vk_enum_to_str.h"
 #include "vk_format.h"
+#include "pvr_g5p_shader_dump.h"
 #include "vk_internal_exts.h"
 #include "vk_log.h"
 #include "vk_util.h"
@@ -38,7 +39,7 @@ g5p_tex_format(VkFormat format, struct pvr_g5p_tex_format *out)
 
 /* The three qwords of a view, or the reason it has none */
 static const char *
-g5p_view_state(const struct pvr_image_view *iview, uint64_t q[3])
+g5p_view_state(const struct pvr_image_view *iview, bool storage, uint64_t q[3])
 {
    const struct pvr_image *image = pvr_image_view_get_image(iview);
    const struct pvr_image_plane *plane = pvr_single_plane_const(image);
@@ -57,7 +58,10 @@ g5p_view_state(const struct pvr_image_view *iview, uint64_t q[3])
    const bool meta_2d = (iview->vk.create_flags & VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA) &&
                         iview->vk.view_type == VK_IMAGE_VIEW_TYPE_2D_ARRAY && iview->vk.layer_count == 1 &&
                         image->vk.image_type == VK_IMAGE_TYPE_2D;
-   const VkImageViewType view_type = meta_2d ? VK_IMAGE_VIEW_TYPE_2D : iview->vk.view_type;
+   const bool storage_cube = storage && (iview->vk.view_type == VK_IMAGE_VIEW_TYPE_CUBE ||
+                                          iview->vk.view_type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY);
+   const VkImageViewType view_type = storage_cube ? VK_IMAGE_VIEW_TYPE_2D_ARRAY :
+                                       meta_2d ? VK_IMAGE_VIEW_TYPE_2D : iview->vk.view_type;
 
    if (image->memlayout == PVR_MEMLAYOUT_LINEAR) {
       const struct pvr_mip_level *level = &plane->mip_levels[0];
@@ -81,7 +85,13 @@ g5p_view_state(const struct pvr_image_view *iview, uint64_t q[3])
          pvr_g5p_tex_twiddled(q, &v);
          return NULL;
       }
-      if (view_type != VK_IMAGE_VIEW_TYPE_2D || iview->vk.base_mip_level)
+      /* A single-layer array view (PPSSPP binds every texture so) gets the
+       * image's 2D state: the compiler draws its layer-0 samples as 2D
+       * (PCO_G5P_UPLOAD_IMAGE_AS_2D); an array sample at another layer is
+       * refused at its draw, which is skipped (pvr_g5p_tex_state_for()). */
+      const bool one_layer_array = view_type == VK_IMAGE_VIEW_TYPE_2D_ARRAY &&
+                                   image->vk.image_type == VK_IMAGE_TYPE_2D && iview->vk.layer_count == 1;
+      if ((view_type != VK_IMAGE_VIEW_TYPE_2D && !one_layer_array) || iview->vk.base_mip_level)
          return "array/3D/cube or mip view of a linear image (Apple samples those twiddled only)";
       if (va % 16 || level->pitch % 16)
          return "linear texture off a 16-byte base or 16-byte rows";
@@ -90,6 +100,27 @@ g5p_view_state(const struct pvr_image_view *iview, uint64_t q[3])
       return NULL;
    }
 
+   /* A 4-sample colour image: each pixel's four samples are 16 consecutive bytes over the
+    * twiddled power-of-two surface (pvr_g5p_msaa_layout(), the PBE's multisample store), which is
+    * the 2W x 2H twiddled 2D texture whose texel (2x + (s >> 1), 2y + (s & 1)) is sample s of
+    * pixel (x, y) (Morton order, y in bit 0). The compiler reads sample s there (txf_ms lowered
+    * to txf, layer0/txs halved: pco_g5p_general.c ms_as_2d()). */
+   if (image->vk.samples == VK_SAMPLE_COUNT_4_BIT) {
+      if (image->vk.image_type != VK_IMAGE_TYPE_2D || iview->vk.base_mip_level || iview->vk.layer_count != 1 ||
+          (view_type != VK_IMAGE_VIEW_TYPE_2D && view_type != VK_IMAGE_VIEW_TYPE_2D_ARRAY) ||
+          vk_format_get_blocksize(iview->vk.format) != 4)
+         return "a 4-sample view other than one layer of a 2D 4-byte colour image";
+      const struct pvr_g5p_tex_twiddled_view v = {
+         .key = key, .layout = PVR_G5P_TEX_LAYOUT_2D,
+         .width = 2 * image->vk.extent.width, .height = 2 * image->vk.extent.height, .depth = 1,
+         .level_count = 1, .srgb = f->srgb,
+         .va = image->dev_addr.addr + plane->offset + iview->vk.base_array_layer * plane->layer_size,
+      };
+      if (v.va % 64)
+         return "a 4-sample view off a 64-byte base";
+      pvr_g5p_tex_twiddled(q, &v);
+      return NULL;
+   }
    if (image->vk.image_type == VK_IMAGE_TYPE_3D && iview->vk.view_type != VK_IMAGE_VIEW_TYPE_3D)
       return "2D view of a 3D image (a slice of the A9's 3D bricks is no 2D texture)";
 
@@ -135,13 +166,13 @@ g5p_view_state(const struct pvr_image_view *iview, uint64_t q[3])
 
 /*
  * The sampled state of a view: q0, q1 in words[], q2 in meta[0..1],
- * meta[2..3] zero, the 32 bytes the backend's image upload reads.
+ * meta[2..3] diagnostic view pointer when logging, otherwise zero.
  */
-const char *
-PVR_PER_ARCH(g5p_pack_image_view)(const struct pvr_image_view *iview, struct pvr_image_descriptor *desc)
+static const char *
+g5p_pack_view(const struct pvr_image_view *iview, bool storage, struct pvr_image_descriptor *desc)
 {
    uint64_t q[3];
-   const char *why = g5p_view_state(iview, q);
+   const char *why = g5p_view_state(iview, storage, q);
 
    static_assert(sizeof(desc->words) + sizeof(desc->meta) == 32, "G5P image state is 32 bytes");
    memset(desc, 0, sizeof(*desc));
@@ -161,7 +192,30 @@ PVR_PER_ARCH(g5p_pack_image_view)(const struct pvr_image_view *iview, struct pvr
    desc->words[1] = q[1];
    desc->meta[0] = (uint32_t)q[2];
    desc->meta[1] = (uint32_t)(q[2] >> 32);
+   /* q3 is CPU metadata, not one of the three A9 texture-state qwords.
+    * Descriptor copies/templates preserve it. Dispatch logging snapshots the
+    * view immediately, never retaining this pointer in a recorded command. */
+   if (pvr_g5p_compute_log()) {
+      const uintptr_t ptr = (uintptr_t)iview;
+      static_assert(sizeof(ptr) == 8, "A9 userspace pointers");
+      memcpy(&desc->meta[2], &ptr, sizeof(ptr));
+   }
    return NULL;
+}
+
+const char *
+PVR_PER_ARCH(g5p_pack_image_view)(const struct pvr_image_view *iview, struct pvr_image_descriptor *desc)
+{
+   return g5p_pack_view(iview, false, desc);
+}
+
+/* Vulkan layer_count already counts faces (six for each cube). Storage
+ * descriptors use that same face order as a 2D array; sampled state stays cube. */
+const char *
+PVR_PER_ARCH(g5p_pack_storage_image_view)(const struct pvr_image_view *iview,
+                                        struct pvr_image_descriptor *desc)
+{
+   return g5p_pack_view(iview, true, desc);
 }
 
 /*

@@ -42,6 +42,77 @@
 #include "vk_alloc.h"
 #include "vk_drm_syncobj.h"
 #include "vk_log.h"
+#include "util/log.h"
+#include "util/u_atomic.h"
+#include "util/os_time.h"
+#include <linux/sync_file.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+
+/* Terminal loss diagnostics keep the first failing job's errno. */
+void pvr_drm_report_loss(struct pvr_drm_winsys *ws, const char *job_type,
+                         const char *source, int status)
+{
+   if (p_atomic_cmpxchg(&ws->loss_reported, 0, 1) == 0) {
+      ws->base.loss_source = source;
+      p_atomic_set(&ws->lost, 1);
+      const char *message = strerror(status < 0 ? -status : status);
+      mesa_loge("%s: device lost: job=%s %s=%d (%s)",
+                ws->is_g5p ? "G5P" : "pvr", job_type, source,
+                status, message);
+   }
+}
+
+VkResult pvr_drm_submit_jobs(struct pvr_drm_winsys *ws,
+                             struct drm_pvr_ioctl_submit_jobs_args *args,
+                             const char *job_type)
+{
+   if (drmIoctl(ws->base.render_fd, DRM_IOCTL_PVR_SUBMIT_JOBS, args) == 0)
+      return VK_SUCCESS;
+   const int err = errno;
+   if (err == EIO)
+      pvr_drm_report_loss(ws, job_type, "SUBMIT_JOBS errno", err);
+   const char *message = strerror(err);
+   return vk_errorf(NULL, err == EIO ? VK_ERROR_DEVICE_LOST : VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                    "Failed to submit %s job (errno %d: %s)", job_type, err, message);
+}
+
+static bool pvr_drm_winsys_is_lost(struct pvr_winsys *ws)
+{
+   struct pvr_drm_winsys *drm_ws = to_pvr_drm_winsys(ws);
+   return p_atomic_read(&drm_ws->lost);
+}
+
+static VkResult pvr_drm_check_job_fences(struct pvr_winsys *base,
+                                          uint32_t count,
+                                          const struct vk_sync_wait *waits)
+{
+   struct pvr_drm_winsys *ws = to_pvr_drm_winsys(base);
+   for (uint32_t i = 0; i < count; i++) {
+      /* Job out-syncobjs are binary.  A timeline export would not name the
+       * specific point that was waited, so leave those to the runtime.
+       */
+      if ((waits[i].sync->flags & VK_SYNC_IS_TIMELINE) ||
+          !ws->base.job_sync_size ||
+          waits[i].sync->type->size != ws->base.job_sync_size)
+         continue;
+      const char *job_type = ((struct pvr_drm_job_sync *)waits[i].sync)->job_type;
+      if (!job_type)
+         continue;
+      struct vk_drm_syncobj *sync = vk_sync_as_drm_syncobj(waits[i].sync);
+      int fd = -1;
+      if (!sync || drmSyncobjExportSyncFile(ws->base.render_fd, sync->syncobj, &fd))
+         continue;
+      struct sync_file_info info = { 0 };
+      const int ret = ioctl(fd, SYNC_IOC_FILE_INFO, &info);
+      close(fd);
+      if (!ret && info.status < 0) {
+         pvr_drm_report_loss(ws, job_type, "fence status", info.status);
+         return VK_ERROR_DEVICE_LOST;
+      }
+   }
+   return VK_SUCCESS;
+}
 
 static void pvr_drm_finish_heaps(struct pvr_drm_winsys *const drm_ws)
 {
@@ -391,6 +462,8 @@ static void pvr_drm_winsys_get_heaps_info(struct pvr_winsys *ws,
 
 static const struct pvr_winsys_ops drm_winsys_ops = {
    .destroy = pvr_drm_winsys_destroy,
+   .is_lost = pvr_drm_winsys_is_lost,
+   .check_job_fences = pvr_drm_check_job_fences,
    .device_info_init = pvr_drm_winsys_device_info_init,
    .get_heaps_info = pvr_drm_winsys_get_heaps_info,
    .buffer_create = pvr_drm_winsys_buffer_create,
@@ -722,6 +795,15 @@ VkResult pvr_drm_winsys_create(const int render_fd,
       goto err_util_sparse_array_finish_bo_map;
 
    drm_ws->bvnc = gpu_info.gpu_id;
+
+   struct pvr_device_info info;
+   if (!pvr_device_info_init(&info, drm_ws->bvnc)) {
+      drm_ws->is_g5p = PVR_HAS_FEATURE(&info, apple_g5p);
+      drm_ws->job_fence_errors = drm_ws->is_g5p ||
+                                 PVR_HAS_FEATURE(&info, apple_g9p);
+      drm_ws->base.job_sync_size = drm_ws->job_fence_errors
+                                    ? sizeof(struct pvr_drm_job_sync) : 0;
+   }
 
    result = pvr_ioctl(render_fd,
                       DRM_IOCTL_PVR_CREATE_VM_CONTEXT,

@@ -791,7 +791,7 @@ copy_pool_results_to_buffer(struct zink_context *ctx, struct zink_query *query, 
    /* if it's a single query that doesn't need special handling, we can copy it and be done */
    zink_batch_reference_resource_rw(ctx, res, true);
    zink_resource_disable_unordered(res, true);
-   zink_resource_buffer_transfer_dst_barrier(ctx, res, offset, result_size);
+   zink_resource_buffer_transfer_dst_barrier(ctx, res, offset, result_size, false);
    util_range_add(&res->base.b, &res->valid_buffer_range, offset, offset + result_size);
    assert(query_id < NUM_QUERIES);
    ctx->bs->has_work = true;

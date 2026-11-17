@@ -37,6 +37,7 @@
 #endif
 
 #include "hwdef/rogue_hw_utils.h"
+#include "pvr_bo_log.h"
 #include "pvr_bo.h"
 #include "pvr_debug.h"
 #include "pvr_device.h"
@@ -338,12 +339,13 @@ static inline void pvr_bo_free_bo(const struct pvr_device *const device,
  *
  * \sa #pvr_bo_free()
  */
-VkResult pvr_bo_alloc(struct pvr_device *device,
-                      struct pvr_winsys_heap *heap,
-                      uint64_t size,
-                      uint64_t alignment,
-                      uint64_t flags,
-                      struct pvr_bo **const pvr_bo_out)
+VkResult pvr_bo_alloc_tagged(const char *tag,
+                             struct pvr_device *device,
+                             struct pvr_winsys_heap *heap,
+                             uint64_t size,
+                             uint64_t alignment,
+                             uint64_t flags,
+                             struct pvr_bo **const pvr_bo_out)
 {
    struct pvr_bo *pvr_bo;
    VkResult result;
@@ -383,6 +385,14 @@ VkResult pvr_bo_alloc(struct pvr_device *device,
 
    pvr_bo_store_insert(device->bo_store, pvr_bo);
    *pvr_bo_out = pvr_bo;
+   if (unlikely(device->bo_log))
+      pvr_bo_log_driver_alloc(device,
+                              tag,
+                              heap,
+                              size,
+                              flags,
+                              pvr_bo,
+                              VK_SUCCESS);
 
    return VK_SUCCESS;
 
@@ -400,6 +410,8 @@ err_free_bo:
    pvr_bo_free_bo(device, pvr_bo);
 
 err_out:
+   if (unlikely(device->bo_log))
+      pvr_bo_log_driver_alloc(device, tag, heap, size, flags, NULL, result);
    return result;
 }
 
@@ -479,6 +491,9 @@ void pvr_bo_free(struct pvr_device *device, struct pvr_bo *pvr_bo)
    vk_free(&device->vk.alloc, pvr_bo->bo->vbits);
 #endif /* defined(HAVE_VALGRIND) */
 
+   if (unlikely(device->bo_log))
+      pvr_bo_log_free(device, pvr_bo);
+
    pvr_bo_store_remove(device->bo_store, pvr_bo);
 
    device->ws->ops->vma_unmap(pvr_bo->vma);
@@ -538,6 +553,11 @@ static inline struct pvr_bo *pvr_bo_get_ref(struct pvr_bo *bo)
    return bo;
 }
 
+static inline uint64_t pvr_suballoc_cache_max(const struct pvr_suballocator *a)
+{
+   return 2 * (uint64_t)a->default_size;
+}
+
 /**
  * \brief Interface to sub-allocate buffer objects.
  *
@@ -581,6 +601,37 @@ VkResult pvr_bo_suballoc(struct pvr_suballocator *allocator,
    aligned_size = ALIGN_POT(size, align);
 
    simple_mtx_lock(&allocator->mtx);
+
+   /* Large allocations must not replace the current BO or enter the cache. */
+   if (aligned_size > pvr_suballoc_cache_max(allocator)) {
+      struct pvr_bo *bo;
+
+      result = pvr_bo_alloc(allocator->device,
+                            allocator->heap,
+                            aligned_size,
+                            align,
+                            PVR_BO_ALLOC_FLAG_CPU_MAPPED,
+                            &bo);
+      if (result != VK_SUCCESS) {
+         vk_free(&allocator->device->vk.alloc, suballoc_bo);
+         simple_mtx_unlock(&allocator->mtx);
+         return result;
+      }
+
+      suballoc_bo->allocator = allocator;
+      suballoc_bo->bo = bo;
+      suballoc_bo->dev_addr = bo->vma->dev_addr;
+      suballoc_bo->offset = 0;
+      suballoc_bo->size = aligned_size;
+
+      if (zero_on_alloc)
+         memset(pvr_bo_suballoc_get_map_addr(suballoc_bo), 0, aligned_size);
+
+      *suballoc_bo_out = suballoc_bo;
+      simple_mtx_unlock(&allocator->mtx);
+      return VK_SUCCESS;
+   }
+
 
    if (allocator->bo) {
       uint32_t aligned_offset = ALIGN_POT(allocator->next_offset, align);
@@ -667,7 +718,8 @@ void pvr_bo_suballoc_free(struct pvr_suballoc_bo *suballoc_bo)
    simple_mtx_lock(&suballoc_bo->allocator->mtx);
 
    if (p_atomic_read(&suballoc_bo->bo->ref_count) == 1 &&
-       !suballoc_bo->allocator->bo_cached) {
+       !suballoc_bo->allocator->bo_cached &&
+       suballoc_bo->bo->bo->size <= pvr_suballoc_cache_max(suballoc_bo->allocator)) {
       suballoc_bo->allocator->bo_cached = suballoc_bo->bo;
    } else {
       pvr_bo_free(suballoc_bo->allocator->device, suballoc_bo->bo);

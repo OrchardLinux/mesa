@@ -70,6 +70,7 @@ struct pvr_compute_query_shader {
 
 struct pvr_device {
    struct vk_device vk;
+   struct vk_device_dispatch_table *errlog_orig;
    struct pvr_instance *instance;
    struct pvr_physical_device *pdevice;
 
@@ -216,6 +217,7 @@ struct pvr_device {
    struct pvr_spm_scratch_buffer_store spm_scratch_buffer_store;
 
    struct pvr_bo_store *bo_store;
+   struct pvr_bo_log *bo_log;
 
    struct pvr_bo *robustness_buffer;
 
@@ -281,6 +283,10 @@ static inline struct pvr_device *vk_to_pvr_device(struct vk_device *device)
 {
    return container_of(device, struct pvr_device, vk);
 }
+
+VkResult pvr_sync_wait_many(struct vk_device *vk, uint32_t count,
+                            const struct vk_sync_wait *waits,
+                            enum vk_sync_wait_flags flags, uint64_t timeout);
 
 VkResult pvr_device_tile_buffer_ensure_cap(struct pvr_device *device,
                                            uint32_t capacity);

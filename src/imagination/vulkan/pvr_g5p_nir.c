@@ -21,6 +21,7 @@
 #include "compiler/spirv/spirv_info.h"
 #include "util/u_call_once.h"
 #include "util/u_math.h"
+#include "vk_nir.h"
 #include "vk_shader_module.h"
 #include "vk_util.h"
 
@@ -62,6 +63,20 @@ g5p_init_options(void)
     * shifts, masks and selects. Keep PCO's BFE/BFI capabilities disabled. */
    g5p_options.lower_bitfield_extract = true;
    g5p_options.lower_bitfield_insert = true;
+   /* GLSL's norm packings (packUnorm2x16() ...) lower to the measured float clamps, rounds, conversions and
+    * shifts (G9P's 26b4dcbc83d ("pvr/g9p: packing built-ins"); the half packings: pco_g5p_general.c lower_half_packing()) */
+   g5p_options.lower_pack_snorm_2x16 = true;
+   g5p_options.lower_unpack_snorm_2x16 = true;
+   g5p_options.lower_pack_unorm_2x16 = true;
+   g5p_options.lower_unpack_unorm_2x16 = true;
+   g5p_options.lower_pack_snorm_4x8 = true;
+   g5p_options.lower_unpack_snorm_4x8 = true;
+   g5p_options.lower_pack_unorm_4x8 = true;
+   g5p_options.lower_unpack_unorm_4x8 = true;
+   /* saturating integer add/subtract (naga's bounds clamps: usub_sat(arrayLength, 1)): compare and select */
+   g5p_options.lower_usub_sat = true;
+   g5p_options.lower_uadd_sat = true;
+   g5p_options.lower_iadd_sat = true;
    g5p_vertex_options = g5p_options;
    g5p_vertex_options.max_unroll_iterations = 16;
    /* The isolated Apple iv_reg_pop/reverse witnesses qualify native VS
@@ -289,6 +304,67 @@ clamp_dyn_ubo(nir_shader *nir)
 
 static nir_shader *g5p_nir_prepare(nir_shader *nir);
 
+/* Storage-buffer accesses the backend encodes: a 32-bit scalar, or a vec4
+ * load at a 16-byte-aligned offset (one 16-byte addressed load). Wider or
+ * misaligned vectors become scalars at offset + 4k (WGSL's vec2/vec3 and
+ * struct members), and stores become one scalar store per written
+ * component. A constant offset keeps a vec4 that the fixed load already
+ * encodes, so earlier programs are unchanged. */
+static bool
+split_ssbo_access(nir_builder *b, nir_intrinsic_instr *in, void *data)
+{
+   if (in->intrinsic == nir_intrinsic_load_ssbo) {
+      const unsigned n = in->def.num_components;
+      if (in->def.bit_size != 32 || n == 1)
+         return false;
+      if (n == 4 && (nir_intrinsic_align(in) >= 16 ||
+                     (nir_src_is_const(in->src[1]) && !(nir_src_as_uint(in->src[1]) % 16))))
+         return false;
+      b->cursor = nir_before_instr(&in->instr);
+      nir_def *comp[NIR_MAX_VEC_COMPONENTS];
+      for (unsigned k = 0; k < n; k++)
+         comp[k] = nir_load_ssbo(b, 1, 32, in->src[0].ssa, nir_iadd_imm(b, in->src[1].ssa, 4 * k),
+                                 .access = nir_intrinsic_access(in), .align_mul = 4, .align_offset = 0);
+      nir_def_replace(&in->def, nir_vec(b, comp, n));
+      return true;
+   }
+   if (in->intrinsic == nir_intrinsic_store_ssbo) {
+      const unsigned n = in->src[0].ssa->num_components;
+      const unsigned mask = nir_intrinsic_write_mask(in);
+      if (in->src[0].ssa->bit_size != 32 || (n == 1 && mask == 1))
+         return false;
+      b->cursor = nir_before_instr(&in->instr);
+      u_foreach_bit(k, mask)
+         nir_store_ssbo(b, nir_channel(b, in->src[0].ssa, k), in->src[1].ssa,
+                        nir_iadd_imm(b, in->src[2].ssa, 4 * k), .write_mask = 1,
+                        .access = nir_intrinsic_access(in), .align_mul = 4, .align_offset = 0);
+      nir_instr_remove(&in->instr);
+      return true;
+   }
+   return false;
+}
+
+/* After constant folding: a register-indexed vec2/vec3 UBO load becomes
+ * scalars at offset + 4k (the backend encodes scalar and vec4 forms;
+ * vec4_dyn_ubo() then merges complete quads). Constant-offset loads are
+ * preloaded and stay as they are. */
+static bool
+split_dyn_ubo(nir_builder *b, nir_intrinsic_instr *in, void *data)
+{
+   const unsigned n = in->def.num_components;
+   if (in->intrinsic != nir_intrinsic_load_ubo || in->def.bit_size != 32 || (n != 2 && n != 3) ||
+       nir_src_is_const(in->src[1]))
+      return false;
+   b->cursor = nir_before_instr(&in->instr);
+   nir_def *comp[NIR_MAX_VEC_COMPONENTS];
+   for (unsigned k = 0; k < n; k++)
+      comp[k] = nir_load_ubo(b, 1, 32, in->src[0].ssa, nir_iadd_imm(b, in->src[1].ssa, 4 * k),
+                             .access = nir_intrinsic_access(in), .align_mul = 4, .align_offset = 0,
+                             .range_base = 0, .range = ~0u);
+   nir_def_replace(&in->def, nir_vec(b, comp, n));
+   return true;
+}
+
 /* SPIR-V -> optimised NIR (the ICD's g5p_nir()) */
 static nir_shader *
 g5p_nir(const uint32_t *spv, size_t words, mesa_shader_stage stage, const char *entry)
@@ -330,6 +406,14 @@ g5p_nir_prepare(nir_shader *nir)
     * as its location (glslang's gl_PointSize became slot 1, COL0) */
    nir_split_var_copies(nir);
    nir_split_per_member_structs(nir);
+   /* gl_ClipDistance/gl_CullDistance sizes, before IO lowering, after the
+    * dead outputs are gone (vk_nir.c: glslang declares an unwritten
+    * gl_ClipDistance[1] and gl_CullDistance[1] in every gl_PerVertex) */
+   if (stage == MESA_SHADER_VERTEX) {
+      const nir_remove_dead_variables_options dead = { .can_remove_var = nir_vk_is_not_xfb_output };
+      nir_remove_dead_variables(nir, nir_var_shader_out, &dead);
+      nir_gather_clip_cull_distance_sizes_from_vars(nir);
+   }
    nir_lower_vars_to_ssa(nir);
    nir_opt_deref(nir);
    nir_lower_system_values(nir);
@@ -339,6 +423,7 @@ g5p_nir_prepare(nir_shader *nir)
       nir_shader_gather_xfb_info(nir);
    nir_lower_io_passes(nir, false);
    nir_lower_explicit_io(nir, nir_var_mem_ssbo | nir_var_mem_ubo, nir_address_format_32bit_index_offset);
+   nir_shader_intrinsics_pass(nir, split_ssbo_access, nir_metadata_control_flow, NULL);
    bool progress;
    do {
       progress = false;
@@ -351,6 +436,11 @@ g5p_nir_prepare(nir_shader *nir)
       NIR_PASS(progress, nir, nir_opt_dead_cf);
    } while (progress);
    progress = false;
+   if (nir_shader_intrinsics_pass(nir, split_dyn_ubo, nir_metadata_control_flow, NULL)) {
+      NIR_PASS(_, nir, nir_opt_constant_folding);
+      NIR_PASS(_, nir, nir_opt_algebraic);
+      NIR_PASS(_, nir, nir_opt_cse);
+   }
    NIR_PASS(progress, nir, vec4_dyn_ubo);
    if (stage == MESA_SHADER_FRAGMENT && pco_g5p_fs_dyn_ubo())
       NIR_PASS(progress, nir, clamp_dyn_ubo);
@@ -471,6 +561,50 @@ pad_color_slots(nir_shader *nir, unsigned color_targets)
    nir_index_ssa_defs(impl);
 }
 
+/* The clip distance components a vertex program stores (a bit per
+ * distance; compact CLIP_DIST0/1, constant offsets) */
+static bool
+clip_written(nir_builder *b, nir_intrinsic_instr *in, void *data)
+{
+   if (in->intrinsic != nir_intrinsic_store_output)
+      return false;
+   const unsigned loc = nir_intrinsic_io_semantics(in).location;
+   if (loc != VARYING_SLOT_CLIP_DIST0 && loc != VARYING_SLOT_CLIP_DIST1)
+      return false;
+   nir_src *off = nir_get_io_offset_src(in);
+   const unsigned first = 4 * (loc - VARYING_SLOT_CLIP_DIST0 + (nir_src_is_const(*off) ? nir_src_as_uint(*off) : 0)) +
+                          nir_intrinsic_component(in);
+   *(unsigned *)data |= nir_intrinsic_write_mask(in) << first;
+   return false;
+}
+
+/* A declared clip distance the program never stores is 0 (on the plane,
+ * not clipped): the TA reads every declared one (plane0..n-1), and an
+ * unwritten output dword would clip by a stale register. GL's disabled
+ * planes are already stored as 0 (Zink's nir_lower_clip_disable). */
+static void
+fill_clip_distances(nir_shader *nir)
+{
+   const unsigned n = nir->info.clip_distance_array_size;
+   unsigned written = 0;
+   if (!n)
+      return;
+   nir_shader_intrinsics_pass(nir, clip_written, nir_metadata_all, &written);
+   const unsigned missing = BITFIELD_MASK(n) & ~written;
+   if (!missing)
+      return;
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_builder b = nir_builder_at(nir_after_impl(impl));
+   u_foreach_bit(i, missing) {
+      const gl_varying_slot loc = i < 4 ? VARYING_SLOT_CLIP_DIST0 : VARYING_SLOT_CLIP_DIST1;
+      nir_store_output(&b, nir_imm_float(&b, 0.0f), nir_imm_int(&b, 0), .base = 0, .component = i % 4,
+                       .write_mask = 1, .src_type = nir_type_float32,
+                       .io_semantics = (nir_io_semantics){ .location = loc, .num_slots = 1 });
+      nir->info.outputs_written |= BITFIELD64_BIT(loc);
+   }
+   nir_index_ssa_defs(impl);
+}
+
 /* G5P renders layer 0 of single-layer views only (no layered rendering is
  * exposed): a vertex shader's gl_Layer is dropped and a fragment shader's
  * gl_Layer reads 0. vk_meta's rectangle and blit shaders use both. */
@@ -555,6 +689,8 @@ graphics_lower(nir_shader *nir, unsigned color_targets, bool *sample_mask, bool 
       nir_opt_dce(nir);
       nir_index_ssa_defs(nir_shader_get_entrypoint(nir));
    }
+   if (nir && stage == MESA_SHADER_VERTEX)
+      fill_clip_distances(nir);
    bool writes_psize = false;
    if (nir && stage == MESA_SHADER_VERTEX && point_size)
       nir_shader_intrinsics_pass(nir, find_point_size, nir_metadata_all, &writes_psize);
@@ -667,6 +803,10 @@ xfb_lower(nir_shader *nir, struct g5p_xfb_layout *layout, char *refusal, size_t 
       const nir_xfb_output_info *o = &x->outputs[i];
       if (o->data_is_16bit) {
          snprintf(refusal, refusal_size, "transform feedback of 16-bit data");
+         return false;
+      }
+      if (o->location == VARYING_SLOT_CLIP_DIST0 || o->location == VARYING_SLOT_CLIP_DIST1) {
+         snprintf(refusal, refusal_size, "transform feedback of gl_ClipDistance (capture not qualified)");
          return false;
       }
       const unsigned r = layout->nranges++;
@@ -896,6 +1036,88 @@ bool
 pvr_g5p_compile_load_raw(struct pco_g5p_program *out, bool is_signed)
 {
    return g5p_compile_load_type(out, is_signed ? 2 : 1);
+}
+
+/*
+ * The 4x LOAD background (a loaded 4-sample colour attachment), Apple's loader (an iOS capture
+ * of a 4x colour load: the 1x loader plus the own-sample operand, dimension f9, kicked at
+ * sample rate): a sample of the target's 2D-multisample state at the pixel centre in normalized
+ * coordinates, color = texture(prev, gl_FragCoord.xy / textureSize(prev, 0)), compiled with the key's
+ * ms_own_sample, so the sample reads the sample the task shades (pco_g5p_general.c
+ * emit_tex_ms_own_sample()). Its uploads: the image state, the sampler, the size block.
+ */
+bool
+pvr_g5p_compile_load_ms(struct pco_g5p_program *out)
+{
+   static util_once_flag once = UTIL_ONCE_FLAG_INIT;
+   util_call_once(&once, g5p_init_options);
+   memset(out, 0, sizeof(*out));
+   glsl_type_singleton_init_or_ref();
+
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT, &g5p_options, "g5p-load-ms4");
+   nir_variable *prev = nir_variable_create(b.shader, nir_var_uniform,
+                                            glsl_sampler_type(GLSL_SAMPLER_DIM_2D, false, false, GLSL_TYPE_FLOAT),
+                                            "prev");
+   prev->data.descriptor_set = 0;
+   prev->data.binding = 0;
+   nir_variable *color = nir_variable_create(b.shader, nir_var_shader_out, glsl_vec4_type(), "color");
+   color->data.location = FRAG_RESULT_DATA0;
+   nir_deref_instr *deref = nir_build_deref_var(&b, prev);
+   nir_def *size = nir_i2f32(&b, nir_trim_vector(&b, nir_txs(&b, .texture_deref = deref, .lod = nir_imm_int(&b, 0),
+                                                              .dim = GLSL_SAMPLER_DIM_2D,
+                                                              .dest_type = nir_type_int32), 2));
+   nir_def *uv = nir_fdiv(&b, nir_trim_vector(&b, nir_load_frag_coord(&b), 2), size);
+   nir_def *texel = nir_tex(&b, uv, .texture_deref = deref, .sampler_deref = deref, .dim = GLSL_SAMPLER_DIM_2D,
+                            .dest_type = nir_type_float32);
+   nir_store_var(&b, color, texel, 0xf);
+
+   bool sample_mask = false;
+   nir_shader *nir = graphics_lower(g5p_nir_prepare(b.shader), 1, &sample_mask, false, NULL);
+   struct pco_g5p_fs_key key = PCO_G5P_FS_KEY_DEFAULT;
+   key.last_read_groups = true;
+   key.ms_own_sample = true;
+   bool ok = nir && pco_g5p_compile_general_link(nir, true, NULL, &key, NULL, out);
+   if (!nir)
+      snprintf(out->refusal, sizeof(out->refusal), "the 4x load program's NIR");
+   ralloc_free(nir);
+   glsl_type_singleton_decref();
+   return ok;
+}
+
+bool
+pvr_g5p_compile_load_mrt(struct pco_g5p_program *out, unsigned targets, bool bgra)
+{
+   static util_once_flag once = UTIL_ONCE_FLAG_INIT;
+   util_call_once(&once, g5p_init_options);
+   memset(out, 0, sizeof(*out));
+   glsl_type_singleton_init_or_ref();
+
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT, &g5p_options, "g5p-load-mrt");
+   nir_def *xy = nir_f2i32(&b, nir_trim_vector(&b, nir_load_frag_coord(&b), 2));
+   for (unsigned t = 0; t < targets; t++) {
+      nir_variable *prev = nir_variable_create(b.shader, nir_var_uniform,
+                                               glsl_sampler_type(GLSL_SAMPLER_DIM_2D, false, false, GLSL_TYPE_FLOAT),
+                                               "prev");
+      prev->data.descriptor_set = 0;
+      prev->data.binding = t;
+      nir_variable *color = nir_variable_create(b.shader, nir_var_shader_out, glsl_vec4_type(), "color");
+      color->data.location = FRAG_RESULT_DATA0 + t;
+      nir_def *texel = nir_txf(&b, xy, .texture_deref = nir_build_deref_var(&b, prev), .lod = nir_imm_int(&b, 0),
+                               .dim = GLSL_SAMPLER_DIM_2D, .dest_type = nir_type_float32);
+      nir_store_var(&b, color, texel, 0xf);
+   }
+   bool sample_mask = false;
+   nir_shader *nir = graphics_lower(g5p_nir_prepare(b.shader), targets, &sample_mask, false, NULL);
+   struct pco_g5p_fs_key key = PCO_G5P_FS_KEY_DEFAULT;
+   key.last_read_groups = true;
+   key.color_targets = targets;
+   key.color_output = bgra ? PCO_G5P_COLOR_PACKED_BGRA8 : PCO_G5P_COLOR_PACKED_RGBA8;
+   bool ok = nir && pco_g5p_compile_general_link(nir, true, NULL, &key, NULL, out);
+   if (!nir)
+      snprintf(out->refusal, sizeof(out->refusal), "the compact load program's NIR");
+   ralloc_free(nir);
+   glsl_type_singleton_decref();
+   return ok;
 }
 
 nir_shader *

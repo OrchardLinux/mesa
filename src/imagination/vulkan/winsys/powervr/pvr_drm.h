@@ -29,9 +29,16 @@
 #include <vulkan/vulkan.h>
 
 #include "pvr_winsys.h"
+#include "vk_drm_syncobj.h"
 #include "util/macros.h"
 #include "util/rwlock.h"
 #include "util/sparse_array.h"
+
+/* Identify job out-fences without inspecting ordinary poll waits. */
+struct pvr_drm_job_sync {
+   struct vk_drm_syncobj base;
+   const char *job_type;
+};
 
 struct pvr_drm_winsys_heap {
    struct pvr_winsys_heap base;
@@ -42,6 +49,15 @@ struct pvr_drm_winsys {
 
    /* Packed bvnc */
    uint64_t bvnc;
+
+   bool is_g5p;
+   /* The kernel sets a job fence's error when it resets (pvr_apple.c);
+    * upstream pvr_queue.c does not.
+    */
+   bool job_fence_errors;
+   int loss_reported;
+   int lost; /* Atomic and terminal. */
+   int unmap_loss_reported;
 
    /* Protects imported BOs creation/freeing, which includes the bo_map member
     * below.
@@ -84,6 +100,21 @@ struct pvr_drm_winsys {
 
    uint32_t vm_context;
 };
+
+struct drm_pvr_ioctl_submit_jobs_args;
+VkResult pvr_drm_submit_jobs(struct pvr_drm_winsys *ws,
+                             struct drm_pvr_ioctl_submit_jobs_args *args,
+                             const char *job_type);
+void pvr_drm_report_loss(struct pvr_drm_winsys *ws, const char *job_type,
+                         const char *source, int status);
+
+static inline void pvr_drm_tag_job_sync(struct pvr_drm_winsys *ws,
+                                         struct vk_sync *sync, const char *job_type)
+{
+   if (ws->job_fence_errors && sync && ws->base.job_sync_size &&
+       sync->type->size == ws->base.job_sync_size)
+      ((struct pvr_drm_job_sync *)sync)->job_type = job_type;
+}
 
 /*******************************************
     helper macros

@@ -550,6 +550,9 @@ Capability about the features and limits of the driver/GPU.
 * ``pipe_caps.image_store_formatted``: True if a format for image stores does not need to be specified in the shader IR
 * ``pipe_caps.throttle``: Whether or not gallium frontends should throttle pipe_context
   execution. 0 = throttling is disabled.
+* ``pipe_caps.throttle_frames``: How many frames a throttling frontend lets be
+  in flight: a swap waits for the frame that many swaps back. 0 and 1 wait for
+  the previous frame. The default is 1; the DRI frontend supports up to 3.
 * ``pipe_caps.dmabuf``: Whether Linux DMABUF handles are supported by
   resource_from_handle and resource_get_handle.
   Possible bit field values:

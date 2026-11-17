@@ -54,6 +54,7 @@ public:
       reserved_block_mode_2,
       dual_plane_and_too_many_partitions,
       invalid_range_in_void_extent,
+      reserved_void_extent_bits,
       weight_grid_exceeds_block_size,
       invalid_colour_endpoints_size,
       invalid_colour_endpoints_count,
@@ -690,6 +691,13 @@ decode_error::type Block::decode_void_extent(InputBitVector block)
 
    if (void_extent_d) {
       return decode_error::unsupported_hdr_void_extent;
+   }
+
+   /* The Khronos Data Format specification's ASTC void-extent block requires
+    * reserved bits [11:10] to be 11. Other values decode to the error colour,
+    * matching astcenc's error-block handling. */
+   if (block.get_bits(10, 2) != 0x3) {
+      return decode_error::reserved_void_extent_bits;
    }
 
    if (void_extent_min_s == 0x1fff && void_extent_max_s == 0x1fff

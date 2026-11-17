@@ -253,6 +253,21 @@ struct pvr_device_ident {
    const char *public_name;
 };
 
+/* Per-pipeline residency parameters for Apple's compute dispatch. */
+struct pvr_apple_compute_dispatch_limits {
+   uint32_t bank0_budget;
+   uint32_t bank1_budget;
+   uint32_t register_granularity;
+   uint32_t bank0_scale;
+   uint32_t bank0_rounding_bias;
+   uint32_t bank0_granularity;
+   uint32_t bank1_scale;
+   uint32_t bank1_rounding_bias;
+   uint32_t bank1_granularity;
+   uint32_t task_size;
+   uint32_t max_workgroup_size;
+};
+
 struct pvr_device_features {
    /*
     * Apple A-chip GPUs (G9P on the A10): Rogue-like data masters, PDS and
@@ -360,6 +375,10 @@ struct pvr_device_features {
     * other field's position.
     */
    bool has_apple_g5p : 1;
+
+   /* Only set where Apple's compute residency parameters are established. */
+   bool has_apple_compute_dispatch : 1;
+   struct pvr_apple_compute_dispatch_limits apple_compute_dispatch;
 };
 
 struct pvr_device_enhancements {

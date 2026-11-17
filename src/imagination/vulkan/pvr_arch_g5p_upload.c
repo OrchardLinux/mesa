@@ -13,6 +13,7 @@
 #include <string.h>
 
 #include "util/log.h"
+#include "pvr_g5p.h"
 #include "vk_alloc.h"
 #include "vk_enum_to_str.h"
 #include "vk_log.h"
@@ -34,10 +35,6 @@
 #include "pvr_g5p_upload.h"
 #include "pvr_g5p_vtex.h"
 
-/* A refusal, by name, on stderr too (vk_errorf() is silent in release builds) */
-#define G5P_UP_REFUSE(obj, ...)                                                                                    \
-   (mesa_logw("G5P refuses: " __VA_ARGS__),                                                              \
-    vk_errorf((obj), VK_ERROR_FEATURE_NOT_PRESENT, "G5P: " __VA_ARGS__))
 
 /* The loader: DOUTD c(2i):c(2i+1) -> common store with the control word in
  * c(2n+2i), the last one ends, then HALT (the fragment loader's shape) */
@@ -100,7 +97,7 @@ PVR_PER_ARCH(g5p_vs_uploads_create)(struct pvr_device *device, const struct pco_
             return pvr_arch_g5p_vtex_create(device, vs, out);
    }
    if (vs->num_uploads > PVR_G5P_MAX_STAGE_UPLOADS)
-      return G5P_UP_REFUSE(device, "%u vertex-stage uploads (at most %u)", vs->num_uploads,
+      return G5P_REFUSE(device, "%u vertex-stage uploads (at most %u)", vs->num_uploads,
                            PVR_G5P_MAX_STAGE_UPLOADS);
 
    for (unsigned i = 0; i < vs->num_uploads; i++) {
@@ -115,11 +112,11 @@ PVR_PER_ARCH(g5p_vs_uploads_create)(struct pvr_device *device, const struct pco_
       default:
          /* textures and samplers in a vertex program: lane b's descriptor
           * words exist, the vertex stage does not take them yet */
-         return G5P_UP_REFUSE(device, "vertex-stage upload %u: %s", i, g5p_up_kind_str(u->kind));
+         return G5P_REFUSE(device, "vertex-stage upload %u: %s", i, g5p_up_kind_str(u->kind));
       }
       if (!u->dwords || u->dwords > 0xfff || u->set >= PVR_MAX_DESCRIPTOR_SETS || u->binding > UINT8_MAX ||
           u->element > UINT16_MAX || u->offset > UINT16_MAX || u->common > UINT16_MAX)
-         return G5P_UP_REFUSE(device,
+         return G5P_REFUSE(device,
                               "vertex-stage upload %u: set %u binding %u[%u] offset %u, %u dwords at common %u",
                               i, u->set, u->binding, u->element, u->offset, u->dwords, u->common);
    }
@@ -168,10 +165,10 @@ g5p_up_buffer(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_stage_uplo
 
    /* a set without a layout: a pushed set not instantiated (never dereferenced) */
    if (!set || !set->layout || u->binding >= set->layout->binding_count)
-      return G5P_UP_REFUSE(cmd_buffer, "upload: set %u binding %u is not bound", u->set, u->binding);
+      return G5P_REFUSE(cmd_buffer, "upload: set %u binding %u is not bound", u->set, u->binding);
    const struct pvr_descriptor_set_layout_binding *lb = &set->layout->bindings[u->binding];
    if (u->element >= lb->descriptor_count)
-      return G5P_UP_REFUSE(cmd_buffer, "upload: set %u binding %u element %u past %u descriptors", u->set,
+      return G5P_REFUSE(cmd_buffer, "upload: set %u binding %u element %u past %u descriptors", u->set,
                            u->binding, u->element, lb->descriptor_count);
    struct pvr_buffer_descriptor d;
    switch (lb->type) {
@@ -185,11 +182,11 @@ g5p_up_buffer(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_stage_uplo
       d = set->dynamic_buffers[lb->dynamic_buffer_idx + u->element];
       break;
    default:
-      return G5P_UP_REFUSE(cmd_buffer, "upload: set %u binding %u is a %s, not a buffer", u->set,
+      return G5P_REFUSE(cmd_buffer, "upload: set %u binding %u is a %s, not a buffer", u->set,
                            u->binding, vk_DescriptorType_to_str(lb->type));
    }
    if (!d.addr)
-      return G5P_UP_REFUSE(cmd_buffer, "upload: set %u binding %u holds no buffer", u->set, u->binding);
+      return G5P_REFUSE(cmd_buffer, "upload: set %u binding %u holds no buffer", u->set, u->binding);
    /* a dynamic buffer's range starts at its dynamic offset (VkDescriptorBufferInfo.range from there) */
    *addr = d.addr + d.offset;
    *size = d.size;
@@ -203,7 +200,7 @@ PVR_PER_ARCH(g5p_upload_buffer)(struct pvr_cmd_buffer *cmd_buffer, unsigned set,
 {
    const struct pvr_g5p_stage_upload u = { .set = set, .binding = binding, .element = element };
    if (set >= PVR_MAX_DESCRIPTOR_SETS)
-      return G5P_UP_REFUSE(cmd_buffer, "upload: set %u", set);
+      return G5P_REFUSE(cmd_buffer, "upload: set %u", set);
    return g5p_up_buffer(cmd_buffer, &u, addr, size);
 }
 
@@ -229,7 +226,7 @@ PVR_PER_ARCH(g5p_vs_uploads_draw)(struct pvr_cmd_buffer *cmd_buffer, const struc
       case PCO_G5P_UPLOAD_PUSH:
          /* the bytes the program reads, as they are now (a copy per draw) */
          if (u->offset + bytes > PVR_MAX_PUSH_CONSTANTS_SIZE)
-            return G5P_UP_REFUSE(cmd_buffer, "vertex push constants [%u, %u) past %u bytes", u->offset,
+            return G5P_REFUSE(cmd_buffer, "vertex push constants [%u, %u) past %u bytes", u->offset,
                                  u->offset + bytes, PVR_MAX_PUSH_CONSTANTS_SIZE);
          result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, push->data + u->offset, bytes, &bo);
          if (result != VK_SUCCESS)
@@ -242,7 +239,7 @@ PVR_PER_ARCH(g5p_vs_uploads_draw)(struct pvr_cmd_buffer *cmd_buffer, const struc
          if (result != VK_SUCCESS)
             return result;
          if (u->offset + bytes > size)
-            return G5P_UP_REFUSE(cmd_buffer, "vertex uniform buffer at set %u binding %u: [%u, %u) past its %" PRIu64
+            return G5P_REFUSE(cmd_buffer, "vertex uniform buffer at set %u binding %u: [%u, %u) past its %" PRIu64
                                  " bytes", u->set, u->binding, u->offset, u->offset + bytes, size);
          src[i] = addr + u->offset;
          break;
@@ -252,8 +249,19 @@ PVR_PER_ARCH(g5p_vs_uploads_draw)(struct pvr_cmd_buffer *cmd_buffer, const struc
          result = g5p_up_buffer(cmd_buffer, u, &addr, &size);
          if (result != VK_SUCCESS)
             return result;
+         if (u->kind == PCO_G5P_UPLOAD_SSBO_ADDR && u->offset == PCO_G5P_SSBO_SIZE_OFFSET) {
+            /* get_ssbo_size: the bound size in bytes */
+            const uint32_t sz[2] = { (uint32_t)MIN2(size, UINT32_MAX), 0 };
+            if (u->dwords > 2)
+               return G5P_REFUSE(cmd_buffer, "vertex storage buffer size: %u dwords", u->dwords);
+            result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, sz, sizeof(sz), &bo);
+            if (result != VK_SUCCESS)
+               return result;
+            src[i] = bo->dev_addr.addr;
+            break;
+         }
          if (u->dwords != 2 || (u->kind == PCO_G5P_UPLOAD_UBO_ADDR && u->offset >= size))
-            return G5P_UP_REFUSE(cmd_buffer, "vertex %s: %u dwords at offset %u of %" PRIu64 " bytes",
+            return G5P_REFUSE(cmd_buffer, "vertex %s: %u dwords at offset %u of %" PRIu64 " bytes",
                                  g5p_up_kind_str(u->kind), u->dwords, u->offset, size);
          const uint64_t va = addr + (u->kind == PCO_G5P_UPLOAD_UBO_ADDR ? u->offset : 0);
          result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, &va, sizeof(va), &bo);
@@ -268,7 +276,7 @@ PVR_PER_ARCH(g5p_vs_uploads_draw)(struct pvr_cmd_buffer *cmd_buffer, const struc
          uint32_t zero[PCO_G5P_XFB_DWORDS];
          memset(zero, 0, sizeof(zero));
          if (u->dwords != PCO_G5P_XFB_DWORDS || out->xfb_block)
-            return G5P_UP_REFUSE(cmd_buffer, "a transform feedback block of %u dwords", u->dwords);
+            return G5P_REFUSE(cmd_buffer, "a transform feedback block of %u dwords", u->dwords);
          result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, zero, sizeof(zero), &bo);
          if (result != VK_SUCCESS)
             return result;
@@ -278,7 +286,7 @@ PVR_PER_ARCH(g5p_vs_uploads_draw)(struct pvr_cmd_buffer *cmd_buffer, const struc
          break;
       }
       default:
-         return G5P_UP_REFUSE(cmd_buffer, "vertex upload %u: %s", i, g5p_up_kind_str(u->kind));
+         return G5P_REFUSE(cmd_buffer, "vertex upload %u: %s", i, g5p_up_kind_str(u->kind));
       }
    }
 

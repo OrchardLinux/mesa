@@ -16,6 +16,14 @@ pvr_entrypoints = custom_target(
   depend_files : vk_entrypoints_gen_depend_files,
 )
 
+pvr_errlog_gen = custom_target(
+  'pvr_errlog_gen',
+  input : [files('pvr_errlog_gen.py'), vk_api_xml],
+  output : 'pvr_errlog_gen.h',
+  command : [prog_python, '@INPUT0@', '--xml', '@INPUT1@', '--out', '@OUTPUT@'],
+  depend_files : vk_entrypoints_gen_depend_files,
+)
+
 pvr_drirc = custom_target(
   'pvr_drirc',
   input  : [files('pvr_drirc_gen.py'), drirc_gen, '00-pvr-defaults.conf'],
@@ -39,6 +47,7 @@ pvr_files = files(
   'winsys/pvr_winsys.c',
   'winsys/pvr_winsys_helper.c',
   'pvr_bo.c',
+  'pvr_bo_log.c',
   'pvr_csb.c',
   'pvr_descriptor_set.c',
   'pvr_device.c',
@@ -164,6 +173,8 @@ pvr_files += files(
   'pvr_g5p_formats.c',
   'pvr_g5p_image.c',
   'pvr_g5p_nir.c',
+  'pvr_g5p_shader_dump.c',
+  'pvr_errlog.c',
   'pvr_g5p_texel_buffer.c',
   'pvr_g5p_xfb_query.c',
   'pvr_g5p_ds.c',
@@ -218,7 +229,7 @@ endforeach
 
 libvulkan_powervr_mesa = shared_library(
   'vulkan_powervr_mesa',
-  [pvr_files, pvr_entrypoints, pvr_drirc, u_format_pack_h],
+  [pvr_files, pvr_entrypoints, pvr_drirc, pvr_errlog_gen, u_format_pack_h],
   include_directories : [
     pvr_includes,
     inc_imagination,

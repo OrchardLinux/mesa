@@ -30,6 +30,23 @@
 
 static const struct pvr_device_features pvr_device_features_9_V_6_2 = {
    .has_apple_g5p = true,
+   .has_apple_compute_dispatch = true,
+   /* AGXMetalA9 ComputeProgramVariant -> +0xb08 (maximum threadgroup size).
+    * Bank 0 uses DOUTU temps; bank 1 uses the kernel-record allocation.
+    */
+   .apple_compute_dispatch = {
+      .bank0_budget = 3329U,
+      .bank1_budget = 393216U,
+      .register_granularity = 8U,
+      .bank0_scale = 4U,
+      .bank0_rounding_bias = 28U,
+      .bank0_granularity = 32U,
+      .bank1_scale = 64U,
+      .bank1_rounding_bias = 448U,
+      .bank1_granularity = 512U,
+      .task_size = 32U,
+      .max_workgroup_size = 512U,
+   },
    .has_num_clusters = true,            /* A9 */
    .has_tile_size_x = true,             /* A9 */
    .has_tile_size_y = true,             /* A9 */

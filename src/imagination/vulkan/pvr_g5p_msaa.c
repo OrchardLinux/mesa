@@ -117,6 +117,18 @@ pvr_g5p_msaa_pbe_store(uint64_t q[3], uint32_t key, uint64_t va, uint32_t width,
    q[2] = 0;
 }
 
+/* Texture state q0 bit 55: the 4-sample image (Apple's 4x LOAD state, the PBE store state has it clear) */
+#define G5P_TEX_Q0_MS4 (1ull << 55)
+
+void
+pvr_g5p_msaa_tex_state(uint64_t q[3], uint32_t key, uint64_t va, uint32_t width, uint32_t height, bool srgb)
+{
+   q[0] = (uint64_t)(height - 1) << 41 | (uint64_t)(width - 1) << 27 |
+          ((key & ~G5P_PBE_LAYOUT_MASK) | G5P_PBE_LAYOUT_MS_TWIDDLED) | G5P_TEX_Q0_MS4;
+   q[1] = va >> 1 | (srgb ? G5P_PBE_Q1_SRGB : 0);
+   q[2] = 0;
+}
+
 void
 pvr_g5p_msaa_pbe_resolve(uint64_t q[3])
 {

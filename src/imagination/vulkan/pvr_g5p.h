@@ -20,8 +20,39 @@
 #include <string.h>
 #include <vulkan/vulkan_core.h>
 
+/* Zink retries device-memory errors; wgpu survives only OOM failures.
+ * Keep refusal internal and map it at creation/recording API boundaries. */
+static inline VkResult pvr_refusal_to_api(VkResult result)
+{
+   return result == VK_ERROR_FEATURE_NOT_PRESENT ? VK_ERROR_OUT_OF_HOST_MEMORY : result;
+}
+
+#include "util/log.h"
+#include "util/u_atomic.h"
+#include "vk_log.h"
+
+/* Refusal kinds are keyed by their call site (pipeline validation or pass/draw
+ * validation). Count atomically across recording threads; warn on occurrences
+ * 1, 2, 4, ... so tolerant workloads cannot emit one warning per draw. Keep
+ * vk_errorf for debug callbacks and preserve the internal refusal result. */
+#define G5P_REFUSE(obj, ...)                                                  \
+   ({                                                                        \
+      static uint32_t refusal_count;                                         \
+      uint32_t occurrence = p_atomic_inc_return(&refusal_count);              \
+      if (occurrence && !(occurrence & (occurrence - 1)))                     \
+         mesa_logw("G5P refuses: " __VA_ARGS__);                              \
+      vk_errorf((obj), VK_ERROR_FEATURE_NOT_PRESENT, "G5P: " __VA_ARGS__);     \
+   })
+
 #include "pvr_common.h"
 #include "pvr_limits.h"
+
+/* User clip distances are written to the A9 TA user planes. */
+static inline bool
+pvr_g5p_clip_distance_probe(void)
+{
+   return true;
+}
 #include "pvr_macros.h"
 #include "util/simple_mtx.h"
 #include "vk_meta.h"
@@ -35,8 +66,9 @@ struct pvr_renderpass_hwsetup_render;
 struct pvr_sub_cmd_gfx;
 struct pvr_suballoc_bo;
 
-/* Colour-target counts with programs: 1, 2 and 4, the counts with an Apple witness (others are refused) */
-#define PVR_G5P_MRT_VARIANTS 3
+/* Colour-target counts with programs: 1, 2 and 4 (Apple's packed-f16 pass), then 5..8 compact UNORM8
+ * with a BGRA8 clear (variants 3..6) and an RGBA8 clear (7..10). 3 runs as 4. */
+#define PVR_G5P_MRT_VARIANTS 11
 
 /*
  * The device-level programs every G5P render uses, uploaded once per
@@ -84,11 +116,15 @@ struct pvr_g5p_programs {
    unsigned load_temps, load_common_dwords, load_uploads;
    struct {
       unsigned kind; /* PCO_G5P_UPLOAD_IMAGE, _SAMPLER or _IMAGE_SIZE */
-      unsigned dwords, common;
-   } load_upload[3];
+      unsigned dwords, common, binding; /* binding: the target an IMAGE upload reads (5..8 targets) */
+   } load_upload[32];
    char load_refusal[128];
    /* Lazy integer variants: float device allocation order remains identical. */
    struct pvr_g5p_programs *raw_load[11]; /* scalar R8 uses10/11, separate fromRGBA8 */
+   /* Lazy compact LOAD programs: 5..8 targets, BGRA8 [0..3] and RGBA8 [4..7] */
+   struct pvr_g5p_programs *mrt_load[8];
+   /* Lazy 4x LOAD (one UNORM/float target, pvr_g5p_compile_load_ms()), kicked at sample rate */
+   struct pvr_g5p_programs *ms_load;
    /* raw clear programs by total output words: 2, 4, 8 (two 32-bit integer targets) */
    struct pvr_suballoc_bo *raw_clear_usc[4]; /*2/4/8 words, then scalar1 */
    /* raw end-of-tile programs by target count: 1, 2 */
@@ -177,6 +213,9 @@ enum pvr_g5p_fetch_rate {
 struct pvr_g5p_fetch {
    uint8_t binding, dwords, ao, rate;
    uint32_t offset, divisor;
+   /* bytes the fetch reads past the end of its binding's last attribute in the element (the fetch reads whole
+    * dwords, the ICD layout 16 bytes a location): the draw keeps that inside the buffer's GPU mapping */
+   uint16_t overread;
 };
 
 /* One common-store upload of the fragment program (the backend's
@@ -218,6 +257,11 @@ struct pvr_g5p_pipeline {
     * pointers and sizes (6 words) */
    struct pvr_suballoc_bo *static_vary, *static_frag;
    uint32_t static_vary_words[4], static_frag_words[6];
+   /* flat varyings from the provoking vertex 1 and 2 (pvr_arch_g5p_gfx.c, PVR_G5P_FLATSHADE_CONTROL()): the
+    * coefficient program with FLAT_VERTEX1/2 and the fragment pointers naming it; [0] is varying/static_frag */
+   struct pvr_pds_upload varying_pv[2];
+   struct pvr_suballoc_bo *static_frag_pv[2];
+   uint32_t static_frag_pv_words[2][6];
    /* the vertex program: DOUTU temps, output dwords, unified-store size,
     * system values the fetch writes (bit 0 vertex index, 1 instance index)
     * and their registers */
@@ -235,6 +279,8 @@ struct pvr_g5p_pipeline {
     * Original colour-only programs remain byte-identical. */
    struct pvr_g5p_pipeline *punch;
    bool punch_variant;
+   const char *punch_why; /* no punch variant: why (static string; g5p_pipeline_build_punch()) */
+   bool fs_mask_upass; /* Apple's masked form: OPAQUE / FAST_PUNCH_THROUGH, upass 7 (pco_g5p_fs_key::mask_upass) */
    /* the program writes memory (pco_g5p_program::side_effects): a fragment
     * program's draws bound the shaded pixels with the ISP scissor; a vertex
     * program's draws run even when no pixel is left (pvr_arch_g5p_gfx.c) */
@@ -248,6 +294,7 @@ struct pvr_g5p_pipeline {
     * ISP object type, as AGXMetalA9 encodeISPPrimitiveType picks it from
     * its triangle fill mode (desktop-gl-polygon-mode.md) */
    VkPolygonMode polygon_mode;
+   unsigned vs_clip_count; /* user clip distances: TA user planes 0..n-1 (Apple's VertexProgramVariant) */
    /* the fragment program's tile read (pco_g5p_program::blend_mode: 0 none)
     * and colour write mask, for the ISP pass type (pvr_g5p_blend.h) */
    unsigned fs_blend_mode;
@@ -310,6 +357,12 @@ bool pvr_g5p_compile_load_rgb10a2ui(struct pco_g5p_program *out);
 bool pvr_g5p_compile_load_rgba8ui(struct pco_g5p_program *out);
 bool pvr_g5p_compile_load_rgba16ui(struct pco_g5p_program *out);
 bool pvr_g5p_compile_load_raw(struct pco_g5p_program *out, bool is_signed);
+/* the 4x LOAD background (Apple's loader at sample rate, pvr_g5p_nir.c) */
+#define PVR_G5P_HAVE_LOAD_MS 1
+bool pvr_g5p_compile_load_ms(struct pco_g5p_program *out);
+/* The compact LOAD background of 5..8 UNORM8 targets: texelFetch of every
+ * target (set 0, binding t), packed as the compact output. */
+bool pvr_g5p_compile_load_mrt(struct pco_g5p_program *out, unsigned targets, bool bgra);
 /* The clear quad's stages, built with nir_builder (pvr_g5p_nir.c): the
  * vertex stage passes its vec4 position at location 0 through, the
  * fragment stage writes the push constant's colour (bytes 0..15) to colour
@@ -422,5 +475,13 @@ uint32_t PVR_PER_ARCH(g5p_compute_stream)(const struct pvr_device *device, uint6
 #   define pvr_arch_g5p_compute_stream PVR_PER_ARCH(g5p_compute_stream)
 
 #endif /* PVR_PER_ARCH */
+
+/* VDM_STATE0 flatshade_control (Rogue's field, bits 1-2): the vertex of a strip's or fan's triangle whose flat
+ * varyings the triangle takes. 2 for the last provoking vertex, 1 for fans, 0 otherwise (G9P's 5a7204430d1 ("pvr/g9p: the flat colour's vertex in VDM_STATE0"): without it odd strip triangles took another vertex's colour, dEQP
+ * rasterization.flatshading.triangle_strip). @dyn: a vk_dynamic_graphics_state. */
+#define PVR_G5P_FLATSHADE_CONTROL(dyn)                                                                          \
+   ((dyn)->rs.provoking_vertex == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT       ? 2u                          \
+    : (dyn)->ia.primitive_topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN ? 1u                                  \
+                                                                         : 0u)
 
 #endif /* PVR_G5P_H */

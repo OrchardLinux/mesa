@@ -292,7 +292,11 @@ struct pvr_winsys_transfer_submit_info {
    struct pvr_winsys_transfer_cmd cmds[PVR_TRANSFER_MAX_PREPARES_PER_SUBMIT];
 };
 
+struct pvr_g5p_dispatch_log;
+
 struct pvr_winsys_compute_submit_info {
+   const struct pvr_g5p_dispatch_log *g5p_log;
+   unsigned g5p_log_count;
    uint32_t frame_num;
    uint32_t job_num;
 
@@ -356,8 +360,17 @@ struct pvr_winsys_render_submit_info {
    } fragment, fragment_pr;
 };
 
+static inline bool pvr_winsys_never_lost(struct pvr_winsys *ws)
+{
+   (void)ws;
+   return false;
+}
+
 struct pvr_winsys_ops {
    void (*destroy)(struct pvr_winsys *ws);
+   bool (*is_lost)(struct pvr_winsys *ws);
+   VkResult (*check_job_fences)(struct pvr_winsys *ws, uint32_t count,
+                                const struct vk_sync_wait *waits);
    VkResult (*device_info_init)(struct pvr_winsys *ws,
                                 struct pvr_device_info *dev_info,
                                 struct pvr_device_runtime_info *runtime_info);
@@ -459,6 +472,8 @@ struct pvr_winsys {
    uint32_t log2_page_size;
 
    const struct vk_sync_type *sync_types[3];
+   const char *loss_source;
+   uint32_t job_sync_size;
    struct vk_sync_type syncobj_type;
    struct vk_sync_timeline_type timeline_syncobj_type;
 
@@ -473,6 +488,9 @@ struct pvr_winsys {
 
    const struct pvr_winsys_ops *ops;
 };
+
+void pvr_winsys_count_bo(int kind, int64_t delta);
+uint64_t pvr_winsys_counted_bytes(int kind);
 
 void pvr_winsys_destroy(struct pvr_winsys *ws);
 VkResult pvr_winsys_create(const char *render_path,

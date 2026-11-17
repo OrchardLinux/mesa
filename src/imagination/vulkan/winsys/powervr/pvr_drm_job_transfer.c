@@ -128,7 +128,7 @@ VkResult pvr_drm_winsys_transfer_submit(
    UNUSED const struct pvr_device_info *const dev_info,
    struct vk_sync *signal_sync)
 {
-   const struct pvr_drm_winsys *drm_ws = to_pvr_drm_winsys(ctx->ws);
+   struct pvr_drm_winsys *drm_ws = to_pvr_drm_winsys(ctx->ws);
    const struct pvr_drm_winsys_transfer_ctx *drm_ctx =
       to_pvr_drm_winsys_transfer_ctx(ctx);
 
@@ -172,9 +172,8 @@ VkResult pvr_drm_winsys_transfer_submit(
    }
 
    /* Returns VK_ERROR_OUT_OF_DEVICE_MEMORY to match pvrsrv. */
-   return pvr_ioctlf(drm_ws->base.render_fd,
-                     DRM_IOCTL_PVR_SUBMIT_JOBS,
-                     &args,
-                     VK_ERROR_OUT_OF_DEVICE_MEMORY,
-                     "Failed to submit transfer job");
+   const VkResult result = pvr_drm_submit_jobs(drm_ws, &args, "transfer");
+   if (result == VK_SUCCESS)
+      pvr_drm_tag_job_sync(drm_ws, signal_sync, "transfer");
+   return result;
 }

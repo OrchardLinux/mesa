@@ -22,8 +22,7 @@
       result = pvr_flush_push_descriptors(cmd_buffer, &state->gfx_desc_state); \
       if (result == VK_SUCCESS) \
          result = pvr_arch_g5p_cmd_draw_indirect(cmd_buffer, buffer, offset, drawCount, stride, true); \
-      if (result != VK_SUCCESS) \
-         vk_command_buffer_set_error(&cmd_buffer->vk, result); \
+      g5p_draw_result(cmd_buffer, result); /* a refusal skips the draw */ \
       goto end_cmd_draw_indexed_indirect; \
    }
 #define PVR_G5P_HOOK_g5p_indirect() \
@@ -31,8 +30,7 @@
       result = pvr_flush_push_descriptors(cmd_buffer, &state->gfx_desc_state); \
       if (result == VK_SUCCESS) \
          result = pvr_arch_g5p_cmd_draw_indirect(cmd_buffer, buffer, offset, drawCount, stride, false); \
-      if (result != VK_SUCCESS) \
-         vk_command_buffer_set_error(&cmd_buffer->vk, result); \
+      g5p_draw_result(cmd_buffer, result); /* a refusal skips the draw */ \
       goto end_cmd_draw_indirect; \
    }
 

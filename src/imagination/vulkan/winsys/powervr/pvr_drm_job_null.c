@@ -44,6 +44,8 @@ VkResult pvr_drm_winsys_null_job_submit(struct pvr_winsys *ws,
                                         struct vk_sync_signal *signal_sync)
 {
    const struct pvr_drm_winsys *drm_ws = to_pvr_drm_winsys(ws);
+   pvr_drm_tag_job_sync(to_pvr_drm_winsys(ws), signal_sync->sync,
+                         "queue completion (geometry/fragment/compute)");
    uint32_t tmp_syncobj;
    VkResult result;
    int ret;

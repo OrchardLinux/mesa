@@ -40,7 +40,7 @@ struct pvr_sampler_descriptor;
 /* What the texture state needs of a format (pvr_arch_g5p_tex.c looks it
  * up). Lane (f)'s format table, pvr_arch_g5p_formats.c, is to provide it;
  * until then pvr_arch_g5p_tex.c has the formats of the rendered and
- * textured rungs only. */
+ * textured cases only. */
 struct pvr_g5p_tex_format {
    VkFormat format;
    uint32_t key; /* PVR_G5P_TEX_KEY(): format code and channel selectors */
@@ -51,12 +51,15 @@ struct pvr_g5p_tex_format {
 
 const char *PVR_PER_ARCH(g5p_pack_image_view)(const struct pvr_image_view *iview,
                                               struct pvr_image_descriptor *desc);
+const char *PVR_PER_ARCH(g5p_pack_storage_image_view)(const struct pvr_image_view *iview,
+                                                      struct pvr_image_descriptor *desc);
 const char *PVR_PER_ARCH(g5p_pack_sampler)(const VkSamplerCreateInfo *info,
                                            struct pvr_sampler_descriptor *desc);
 void PVR_PER_ARCH(g5p_combine_sampler)(struct pvr_combined_image_sampler_descriptor *desc,
                                        const struct pvr_image_view *iview);
 
 #   define pvr_arch_g5p_pack_image_view PVR_PER_ARCH(g5p_pack_image_view)
+#   define pvr_arch_g5p_pack_storage_image_view PVR_PER_ARCH(g5p_pack_storage_image_view)
 #   define pvr_arch_g5p_pack_sampler PVR_PER_ARCH(g5p_pack_sampler)
 #   define pvr_arch_g5p_combine_sampler PVR_PER_ARCH(g5p_combine_sampler)
 

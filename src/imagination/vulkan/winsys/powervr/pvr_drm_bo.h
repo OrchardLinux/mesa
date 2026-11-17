@@ -40,6 +40,8 @@ struct pvr_drm_winsys_bo {
    struct pvr_winsys_bo base;
    uint32_t ref_count;
 
+   /* 0: CREATE_BO, 1: display, 2: plain import (not counted). */
+   uint8_t count_kind;
    uint32_t handle;
    uint64_t flags;
 };

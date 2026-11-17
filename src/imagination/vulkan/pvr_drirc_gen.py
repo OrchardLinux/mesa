@@ -17,7 +17,8 @@ def declare_options():
     debug_options = []
     features_options = []
     performance_options = []
-    misc_options = []
+    misc_options = [drirc_gen.DrircBool("pvr_skip_refused_work", False,
+        "Skip unsupported work, allowing incorrect rendering", c_name="pvr_skip_refused_work")]
 
     drirc_gen.add_common_vk_options(debug_options, features_options, misc_options,
                                     valid_options=VALID_COMMON_VK_OPTIONS)

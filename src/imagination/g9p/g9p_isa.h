@@ -16,14 +16,31 @@
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <limits.h>
+#include <string.h>
+#include "util/ralloc.h"
 
-#define G9P_MAX_CODE_WORDS 65536
+#define G9P_INITIAL_CODE_WORDS 65536
 
 struct g9p_code {
-   uint16_t w[G9P_MAX_CODE_WORDS];
+   uint16_t *w;
+   unsigned capacity;
+   void *alloc_ctx;
+   const char *error;
+   /* Small generated graphics helpers are calloc/free objects, not ralloc
+    * objects. Preserve their inline storage and lifetime. Compiler programs
+    * grow beyond this initial storage under alloc_ctx. */
+   uint16_t initial_w[G9P_INITIAL_CODE_WORDS];
+   uint16_t failed_patch;
    unsigned n;
    /* a fragment shader: registers in the other bank, see g9p_w0() */
    bool fragment;
+   /* registers above r31 ("homes") in the fragment bank (bank 0) while the code's own stay in bank 1: A9 compute
+    * (g9p_mov_to_high()) */
+   bool high_bank0;
+   /* A9 compute: Apple's A9 mask-stack rule, the stack register's last-read bit only on the program's
+    * last stack operation (g9p_pop()), not on every pop (g9p_pop_levels()) */
+   bool a9_stack;
    /* the code pushes onto the mask stack (needs g9p_push_init()) */
    bool uses_stack;
 };
@@ -51,9 +68,51 @@ g9p_dst(const struct g9p_code *c, unsigned r)
 static inline void
 g9p_emit(struct g9p_code *c, const uint16_t *w, unsigned count)
 {
-   assert(c->n + count <= G9P_MAX_CODE_WORDS);
-   for (unsigned i = 0; i < count; i++)
-      c->w[c->n++] = w[i];
+   if (c->error) return;
+   if (!c->w) {
+      c->w = c->initial_w;
+      c->capacity = G9P_INITIAL_CODE_WORDS;
+   }
+   /* Signed 32-bit byte-relative jumps and unsigned byte code_size. */
+   if (count > INT_MAX / 2u - c->n) {
+      c->error = "program exceeds the 32-bit jump-offset range";
+      return;
+   }
+   if (count > c->capacity - c->n) {
+      unsigned capacity = c->capacity;
+      while (capacity < c->n + count)
+         capacity = capacity > INT_MAX / 4u ? INT_MAX / 2u : capacity * 2;
+      if (!c->alloc_ctx) {
+         c->error = "generated helper exceeds inline code storage";
+         return;
+      }
+      uint16_t *w = reralloc(c->alloc_ctx, c->w == c->initial_w ? NULL : c->w,
+                            uint16_t, capacity);
+      if (!w) {
+         c->error = "allocation failure growing program code";
+         return;
+      }
+      if (c->w == c->initial_w)
+         memcpy(w, c->w, c->n * sizeof(*w));
+      c->w = w;
+      c->capacity = capacity;
+   }
+   memcpy(c->w + c->n, w, count * sizeof(*w));
+   c->n += count;
+}
+
+/* Patches retain word indices, never pointers across an emit/reallocation.
+ * A failed append must not turn its following patch into an out-of-bounds
+ * write. The compile reports error before exporting code. */
+static inline uint16_t *
+g9p_code_word(struct g9p_code *c, unsigned at)
+{
+   if (c->error) return &c->failed_patch;
+   if (at >= c->n) {
+      c->error = "program back-patch outside emitted code";
+      return &c->failed_patch;
+   }
+   return &c->w[at];
 }
 
 #define G9P_EMIT(c, ...)                                     \
@@ -130,10 +189,10 @@ g9p_end(struct g9p_code *c)
    unsigned end = (jump + 6 + 63) / 64 * 64;
 
    G9P_EMIT(c, 0x0100, 0x0100 | (end - jump), 0x0000);
-   while (2 * c->n < end)
+   while (!c->error && 2 * c->n < end)
       G9P_EMIT(c, 0xc000);
    G9P_EMIT(c, 0x8000);
-   while (c->n % 32)
+   while (!c->error && c->n % 32)
       G9P_EMIT(c, 0xc000);
 }
 
@@ -157,6 +216,25 @@ g9p_mov_imm(struct g9p_code *c, unsigned dst, uint32_t imm)
                0x0038);
    }
 }
+
+/*
+ * Word fields, named for the encoders below: W0 holds the class byte, the continuation bit 8 and, outside fragment
+ * code (g9p_w0()), the register-bank bits of sources B (bit 12) and A (bit 13); a destination word (g9p_dst())
+ * the half index, the continuation and the bank bit 9; a source word (g9p_srcs()) source A's register at bit 2
+ * and B's at bit 10, each with its last-read bit (7 and 15). A register source above r31 sets the source word's
+ * bit 0 and puts r >> 5 in an extension word (A at bit 1, B at bit 9).
+ */
+#define G9P_CONT           0x0100
+#define G9P_W0_SRC_B_BANK1 0x1000
+#define G9P_W0_SRC_A_BANK1 0x2000
+#define G9P_W1_BANK1       0x0200
+#define G9P_CLASS_ALU2     0x99 /* g9p_alu2()'s class: two register sources */
+#define G9P_W0_ALU2        (G9P_CLASS_ALU2 | G9P_CONT | G9P_W0_SRC_A_BANK1 | G9P_W0_SRC_B_BANK1)
+#define G9P_SRC_A_SHIFT    2
+#define G9P_SRC_B_SHIFT    10
+#define G9P_SRCS_EXT       0x0001
+#define G9P_EXT_A_SHIFT    1
+#define G9P_EXT_B_SHIFT    9
 
 /* Two register sources; @kill marks both as last use */
 static inline uint16_t
@@ -182,19 +260,40 @@ g9p_alu2(struct g9p_code *c, unsigned op, unsigned dst, unsigned a, unsigned b,
  * r31"). The compiler parks NIR registers there ("homes") and moves them
  * with OR, which copies any bit pattern.
  */
+/*
+ * A9 compute (c->high_bank0): its registers r0-r31 are in bank 1 (W0 bits 11-13, W1 bit 9), but the
+ * registers above r31 are bank 0's, as in Apple's A9 kernels:
+ * examined kernels write bank 0 up to r60 and bank 1 up to r2 or r7, and declare 64
+ * registers (__GPU_METADATA r.0.0), so the count covers bank 0. The kernel's register allocation comes
+ * from it (CDM K0 bits 12+ = ceil(regs / 4), AGXMetalA9 ComputeProgramVariant 0x207d2c4b0 -> +0x9b8;
+ * DOUTU temps (regs & ~3) << 1, EncodeComputePDSProgram 0x207d1ea4c). Homes in bank 1 above r31
+ * read wrong values on every lane of a 69-register kernel and lost the GPU; that bank 1
+ * holds only 32, as in vertex code, is inferred. A home move keeps its low side in the code's bank and
+ * its high side in bank 0, the fragment form above (validated at r40/r77/r100 on the A9): an operand's
+ * header bit and the destination's W1 bit 9 name each side's bank.
+ */
+/* A9 compute (high_bank0): bank-0 homes up to r239. Above r127 the destination's half-index bit 8 is W0 bit 9
+ * (header bit 1), as in Apple's A9 code (moves to r127 and r128 differ in that bit and the half index; a
+ * move to r218 with bank-1 sources sets it too). */
+#define G9P_W0_DST_HALF_BIT8 0x0200 /* the destination half index's bit 8 */
 static inline void
 g9p_mov_to_high(struct g9p_code *c, unsigned hi, unsigned src)
 {
-   assert(src < 32 && hi < 128);
-   G9P_EMIT(c, g9p_w0(c, 0x3199), g9p_dst(c, hi), 0x0100 | src << 2 | src << 10, 0x00ce);
+   assert(src < 32 && hi < (c->high_bank0 ? 240u : 128u));
+   G9P_EMIT(c, g9p_w0(c, G9P_W0_ALU2) | (c->high_bank0 && hi >= 128 ? G9P_W0_DST_HALF_BIT8 : 0),
+            c->high_bank0 ? G9P_CONT | ((2 * hi) & 0xff) : g9p_dst(c, hi),
+            g9p_srcs(src, src, false), G9P_OR);
 }
 
 static inline void
 g9p_mov_from_high(struct g9p_code *c, unsigned dst, unsigned hi)
 {
-   assert(dst < 32 && hi < 128);
-   G9P_EMIT(c, g9p_w0(c, 0x3199), g9p_dst(c, dst), 0x0101 | (hi & 31) << 2 | (hi & 31) << 10,
-            0x0100 | (hi >> 5) << 1 | (hi >> 5) << 9, 0x00ce);
+   assert(dst < 32 && hi < (c->high_bank0 ? 240u : 128u));
+   /* Three-bit source extensions (hi >> 5 in the fourth word), as Apple's A9 compute reads r182;
+    * on A9 compute (high_bank0) both sources are bank 0's. */
+   G9P_EMIT(c, g9p_w0(c, G9P_W0_ALU2) & ~(c->high_bank0 ? G9P_W0_SRC_A_BANK1 | G9P_W0_SRC_B_BANK1 : 0),
+            g9p_dst(c, dst), g9p_srcs(hi & 31, hi & 31, false) | G9P_SRCS_EXT,
+            G9P_CONT | (hi >> 5) << G9P_EXT_A_SHIFT | (hi >> 5) << G9P_EXT_B_SHIFT, G9P_OR);
 }
 
 /* dst = src + imm, 0 <= imm < 64 */
@@ -221,6 +320,58 @@ g9p_tg_load(struct g9p_code *c, unsigned dst, unsigned word)
 {
    G9P_EMIT(c, 0x2314, 0x0100 | 2 * dst, 0x8100 | (word & 0xff),
             0x0200 | (word >> 8));
+}
+
+/*
+ * Threadgroup-memory access (g9p_tg_load()'s class), Apple's A9 compiler's forms: W0 the class byte, the load's
+ * bank bits (g9p_mem_at()) and the access size at bit 11 (G9P_SIZE_*); W1 the data register's half, the store
+ * bit and the index register's half at bit 9; then the word offset. With no index it takes two words, W2 with
+ * G9P_SHARED_OFFSET and the offset's low byte, W3 with G9P_SHARED_OFFSET_HIGH and its high bits; after an index,
+ * W2 adds G9P_SHARED_INDEXED and holds an offset below 256 alone, a larger one in the same two-word layout without
+ * G9P_SHARED_OFFSET_HIGH. Those three bits are named by their observed roles.
+ */
+#define G9P_CLASS_SHARED       0x14
+#define G9P_MEM_W0_BANKS       0x0300
+#define G9P_SIZE_SHIFT         11
+#define G9P_SIZE_4X32          7
+#define G9P_MEM_STORE          0x0080
+#define G9P_MEM_INDEX_SHIFT    9
+#define G9P_SHARED_OFFSET      0x8000
+#define G9P_SHARED_INDEXED     0x0800
+#define G9P_SHARED_OFFSET_HIGH 0x0200
+static inline void
+g9p_shared_access(struct g9p_code *c, unsigned size, bool store, unsigned reg, unsigned word, int index_half)
+{
+   const uint16_t w0 = size << G9P_SIZE_SHIFT | G9P_MEM_W0_BANKS | G9P_CLASS_SHARED;
+   uint16_t w1 = G9P_CONT | (store ? G9P_MEM_STORE : 0) | 2 * reg;
+
+   if (index_half < 0) {
+      G9P_EMIT(c, w0, w1, G9P_SHARED_OFFSET | G9P_CONT | (word & 255), G9P_SHARED_OFFSET_HIGH | (word >> 8));
+      return;
+   }
+   w1 |= (unsigned)index_half << G9P_MEM_INDEX_SHIFT;
+   if (word < 256)
+      G9P_EMIT(c, w0, w1, G9P_SHARED_OFFSET | G9P_SHARED_INDEXED | word);
+   else
+      G9P_EMIT(c, w0, w1, G9P_SHARED_OFFSET | G9P_SHARED_INDEXED | G9P_CONT | (word & 255), word >> 8);
+}
+
+/*
+ * A shared-memory index after its shift, as Apple's A9 compiler emits it: r[@dst] = 0 + r[@src], an integer add
+ * of the literal 0 (g9p_add_imm()'s literal form) in g9p_addr()'s class, with @shift in g9p_addr()'s shift field.
+ * G9P_INDEX_SHIFT_CTL is named by its observed role (seen in this form only).
+ */
+#define G9P_CLASS_ADDR      0x89 /* g9p_addr()'s class */
+#define G9P_SRC_A_IMM       0x0001 /* source A is a literal, its value from bit 1 (g9p_add_imm()) */
+#define G9P_IMM_SHORT       0x0020 /* g9p_add_imm()'s short-literal word */
+#define G9P_INDEX_SHIFT_CTL 0x0e00
+#define G9P_ADDR_SHIFT_BIT  13 /* g9p_addr()'s shift field */
+static inline void
+g9p_shared_index(struct g9p_code *c, unsigned dst, unsigned src, unsigned shift)
+{
+   G9P_EMIT(c, G9P_CLASS_ADDR | G9P_CONT | G9P_W0_SRC_B_BANK1, G9P_CONT | G9P_W1_BANK1 | 2 * dst,
+            G9P_SRC_A_IMM | G9P_CONT | src << G9P_SRC_B_SHIFT, G9P_CONT | G9P_IMM_SHORT,
+            G9P_CONT | G9P_INDEX_SHIFT_CTL | G9P_IADD, shift << G9P_ADDR_SHIFT_BIT);
 }
 
 /*
@@ -425,10 +576,27 @@ g9p_else(struct g9p_code *c, unsigned st)
    G9P_EMIT(c, g9p_w0(c, 0x21c8), g9p_st_dst(c, st), g9p_st_src(c, st), 0x46d4);
 }
 
+/*
+ * Pop @levels. Bit 7 of the source word is the stack register's last-read bit. G9P (A10) sets it on every
+ * pop; Apple's A9 compiler sets it only on the program's last stack operation (G5P's fragment port
+ * g5p_usc_stack() does the same, and so does Apple's captured divergent loop: the loop's pop leaves
+ * the bit clear, the last pop sets it). An intermediate pop that marks the register read for the last time
+ * lets the counter go while lanes still wait on it: on A9 compute a loop whose lanes leave at different
+ * iterations ((g & 3) + 2 rounds) lost the GPU before any store, while uniform loops ran.
+ */
+#define G9P_SRC_A_LAST_READ    0x0080
+#define G9P_CLASS_STACK        0xc8 /* the mask stack: its register as destination and as source A */
+#define G9P_W0_STACK           (G9P_CLASS_STACK | G9P_CONT | G9P_W0_SRC_A_BANK1)
+#define G9P_STACK_PUSH         0xd1
+#define G9P_STACK_POP          0xd2
+#define G9P_STACK_CTL          0x0600 /* set in every stack operation's last word (observed role) */
+#define G9P_STACK_LEVELS_SHIFT 14
 static inline void
 g9p_pop_levels(struct g9p_code *c, unsigned st, unsigned levels)
 {
-   G9P_EMIT(c, g9p_w0(c, 0x21c8), g9p_st_dst(c, st), 0x0080 | g9p_st_src(c, st), 0x06d2 | levels << 14);
+   G9P_EMIT(c, g9p_w0(c, G9P_W0_STACK), g9p_st_dst(c, st),
+            (c->a9_stack ? 0 : G9P_SRC_A_LAST_READ) | g9p_st_src(c, st),
+            G9P_STACK_CTL | G9P_STACK_POP | levels << G9P_STACK_LEVELS_SHIFT);
 }
 
 /* Loops: start (two levels), break the lanes whose compare passed/failed */
@@ -459,8 +627,8 @@ g9p_jump_patch(struct g9p_code *c, unsigned at, int offset)
 {
    uint32_t off = (uint32_t)offset;
 
-   c->w[at + 1] = (off & 0xfefe) | 0x0100 | ((off >> 8) & 1);
-   c->w[at + 2] = ((off >> 16) & 0xfefe) | ((off >> 24) & 1);
+   *g9p_code_word(c, at + 1) = (off & 0xfefe) | 0x0100 | ((off >> 8) & 1);
+   *g9p_code_word(c, at + 2) = ((off >> 16) & 0xfefe) | ((off >> 24) & 1);
 }
 
 static inline unsigned
@@ -493,10 +661,10 @@ g9p_end_vertex(struct g9p_code *c, unsigned reg, unsigned slot)
    unsigned end = (jump + 6 + 63) / 64 * 64;
 
    G9P_EMIT(c, 0x0100, 0x0100 | (end - jump), 0x0000);
-   while (2 * c->n < end)
+   while (!c->error && 2 * c->n < end)
       G9P_EMIT(c, 0xc000);
    G9P_EMIT(c, 0x155e, 0xc100 | 2 * reg, slot);
-   while (c->n % 32)
+   while (!c->error && c->n % 32)
       G9P_EMIT(c, 0x0000);
 }
 
@@ -508,10 +676,10 @@ g9p_end_vertex_stores(struct g9p_code *c)
    unsigned end = (jump + 6 + 63) / 64 * 64;
 
    G9P_EMIT(c, 0x0100, 0x0100 | (end - jump), 0x0000);
-   while (2 * c->n < end)
+   while (!c->error && 2 * c->n < end)
       G9P_EMIT(c, 0xc000);
    G9P_EMIT(c, 0x015e, 0xa000);
-   while (c->n % 32)
+   while (!c->error && c->n % 32)
       G9P_EMIT(c, 0x0000);
 }
 
@@ -726,7 +894,7 @@ g9p_end_fragment(struct g9p_code *c, unsigned words)
    if (words)
       G9P_EMIT(c, (words & 7) << 12 | 0x011c, 0x0800);
    G9P_EMIT(c, 0x8000);
-   while (c->n % 32)
+   while (!c->error && c->n % 32)
       G9P_EMIT(c, 0x0000);
 }
 

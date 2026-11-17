@@ -371,6 +371,7 @@ VkResult pvr_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
       goto err_free_instance;
 
    pvr_process_debug_variable();
+   instance->vk.enable_debug_logging = PVR_IS_DEBUG_SET(ERRORS);
    pvr_init_dri_options(instance);
 
    instance->active_device_count = 0;

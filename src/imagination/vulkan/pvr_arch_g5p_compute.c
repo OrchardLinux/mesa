@@ -8,20 +8,29 @@
 #include "vk_pipeline.h"
 #include "vk_alloc.h"
 #include "util/ralloc.h"
+#include "util/u_atomic.h"
+#include "util/u_debug.h"
+#include "util/u_call_once.h"
+#include "util/log.h"
 #include "g9p_cdm.h"
 #include "g9p_compile.h"
 #include "g5p_cdm.h"
 #include "g5p_usc.h"
 #include "g5p_end_barrier.h"
 #include "pvr_bo.h"
+#include "pvr_compute_limits.h"
 #include "pvr_cmd_buffer.h"
 #include "pvr_csb.h"
 #include "pds/pvr_rogue_pds_defs.h"
 #include "pvr_descriptor_set.h"
+#include "pvr_image.h"
+#include "vk_enum_to_str.h"
 #include "pvr_device.h"
 #include "pvr_physical_device.h"
 #include "pvr_pipeline.h"
 #include "pvr_g5p.h"
+#include "pvr_g5p_tex_encode.h"
+#include "pvr_g5p_shader_dump.h"
 #include "pvr_g5p_compute.h"
 #include "pvr_job_context.h"
 #include "pvr_winsys.h"
@@ -35,6 +44,8 @@ PVR_PER_ARCH(g5p_compute_pipeline_compile)(
    struct pvr_compute_pipeline *pipeline)
 {
    struct pvr_g9p_compute_state *state = &pipeline->g9p;
+   state->a9_compute_log = pvr_g5p_compute_log();
+   pvr_g5p_shader_id(&create_info->stage, state->a9_pipeline_id);
    void *mem_ctx = ralloc_context(NULL);
    struct g9p_shader shader;
    nir_shader *nir;
@@ -45,13 +56,65 @@ PVR_PER_ARCH(g5p_compute_pipeline_compile)(
                                             &create_info->stage,
                                             g9p_spirv_options(),
                                             g9p_nir_options(), mem_ctx, &nir);
-   if (result != VK_SUCCESS)
+   if (result != VK_SUCCESS) {
+      pvr_g5p_shader_dump(&create_info->stage, create_info->layout, "comp", NULL, 0, "REFUSE",
+                          "SPIR-V to NIR failed");
       goto out;
+   }
 
-   if (!g9p_a9_compile_compute(nir, &shader, mem_ctx)) {
-      result = vk_errorf(device, VK_ERROR_FEATURE_NOT_PRESENT,
-                         "G5P compute: shader not supported by the backend yet");
-      goto out;
+   const bool compiled = g9p_a9_compile_compute(nir, &shader, mem_ctx);
+   for (unsigned i = 0; i < 3; i++) state->a9_log_local[i] = nir->info.workgroup_size[i];
+   state->a9_log_shared = nir->info.shared_size;
+   if (!compiled) {
+      /* PVR_DEBUG=shader_dump / PVR_DEBUG=capture_stub (pvr_g5p_shader_dump.h) */
+      const bool stub = pvr_g5p_capture_stub();
+      char reason[sizeof(shader.a9_refusal)];
+      snprintf(reason, sizeof(reason), "%s", shader.a9_refusal[0] ? shader.a9_refusal : g9p_a9_last_refusal());
+      pvr_g5p_shader_dump(&create_info->stage, create_info->layout, "comp", NULL, 0, stub ? "STUB" : "REFUSE",
+                          reason);
+      if (!stub) {
+         mesa_logw("pvr/g5p: compute pipeline refused: %s", reason);
+         result = vk_errorf(device, VK_ERROR_FEATURE_NOT_PRESENT,
+                            "G5P compute: shader not supported by the backend yet");
+         goto out;
+      }
+      state->a9_capture_stub = true;
+      mesa_logw("G5P capture stub: compute shader refused (%s): empty kernel, dispatches omitted", reason);
+      VkPipelineShaderStageCreateInfo stub_info;
+      VkShaderModuleCreateInfo stub_module;
+      pvr_g5p_stub_stage(VK_SHADER_STAGE_COMPUTE_BIT, &stub_info, &stub_module);
+      result = vk_pipeline_shader_stage_to_nir(&device->vk, pipeline->base.pipeline_flags, &stub_info,
+                                               g9p_spirv_options(), g9p_nir_options(), mem_ctx, &nir);
+      if (result != VK_SUCCESS)
+         goto out;
+      const bool compiled = g9p_a9_compile_compute(nir, &shader, mem_ctx);
+   for (unsigned i = 0; i < 3; i++) state->a9_log_local[i] = nir->info.workgroup_size[i];
+   state->a9_log_shared = nir->info.shared_size;
+   if (!compiled) {
+         result = vk_errorf(device, VK_ERROR_FEATURE_NOT_PRESENT, "G5P compute: the capture stub was refused");
+         goto out;
+      }
+   } else {
+      pvr_g5p_shader_dump(&create_info->stage, create_info->layout, "comp", NULL, 0, "ADMIT", NULL);
+   }
+   {
+      const unsigned threads = shader.local_size[0] * shader.local_size[1] * shader.local_size[2];
+      unsigned max;
+      if (!pvr_compute_wg_residency_ok(&device->pdevice->dev_info,
+                                      shader.num_regs,
+                                      shader.a9_bank1_regs,
+                                      threads,
+                                      shader.a9_has_barriers,
+                                      &max)) {
+         const unsigned t = 8 * DIV_ROUND_UP(MAX2(shader.num_regs, 1), 8);
+         const unsigned f = 8 * DIV_ROUND_UP(shader.a9_bank1_regs ? shader.a9_bank1_regs : shader.num_regs, 8);
+         mesa_logw("G5P refuses: a %u-lane workgroup with %u bank-0 and %u bank-1 registers per lane, above "
+                   "the %u lanes Apple's A9 driver allows for that allocation", threads, t, f, max);
+         result = vk_errorf(device, VK_ERROR_FEATURE_NOT_PRESENT,
+                            "G5P compute: %u-lane workgroup above the %u-lane limit of its allocation", threads,
+                            max);
+         goto out;
+      }
    }
 
    result = pvr_gpu_upload_usc(device, shader.code, shader.code_size, 64,
@@ -65,8 +128,9 @@ PVR_PER_ARCH(g5p_compute_pipeline_compile)(
       state->buffers[i].binding = shader.buffers[i].binding;
    }
    state->num_regs = shader.num_regs;
+   state->a9_bank1_regs = shader.a9_bank1_regs;
    state->a9_bodyless = shader.a9_bodyless;
-   state->a9_unit_z = shader.a9_unit_z;
+   state->a9_wgid_z = shader.a9_wgid_z;
    state->a9_local_dwords = shader.a9_local_dwords;
    state->a9_has_barriers = shader.a9_has_barriers;
    state->a9_device_fence = shader.a9_device_fence;
@@ -75,12 +139,28 @@ PVR_PER_ARCH(g5p_compute_pipeline_compile)(
       state->a9_images[i].set=shader.textures[i].set;
       state->a9_images[i].binding=shader.textures[i].binding;
    }
+   /* sampled textures' descriptor words (g9p_a9_tex.h) */
+   STATIC_ASSERT(ARRAY_SIZE(state->a9_uploads) == G9P_A9_MAX_UPLOADS);
+   state->a9_num_uploads = shader.a9_num_uploads;
+   for (unsigned i = 0; i < shader.a9_num_uploads; i++) {
+      const struct g9p_a9_upload *u = &shader.a9_uploads[i];
+      state->a9_uploads[i].kind = u->kind;
+      state->a9_uploads[i].set = u->set;
+      state->a9_uploads[i].binding = u->binding;
+      state->a9_uploads[i].element = u->element;
+      state->a9_uploads[i].combined = u->combined;
+      state->a9_uploads[i].level = u->level;
+      state->a9_uploads[i].common = u->common;
+      state->a9_uploads[i].dwords = u->dwords;
+      state->a9_uploads[i].value = u->value;
+   }
+   state->shared_spill_stride = shader.shared_spill_stride;
    state->uses_workgroup_id = shader.uses_workgroup_id;
    memcpy(state->local_size, shader.local_size, sizeof(state->local_size));
 
 out:
    ralloc_free(mem_ctx);
-   return result;
+   return pvr_refusal_to_api(result);
 }
 
 static void
@@ -92,6 +172,103 @@ emit_record(struct pvr_csb *csb, const struct g5p_cdm_record *rec)
       memcpy(w, rec->w, sizeof(rec->w));
 }
 
+/* Capture complete bound compute resources, including a stub's original
+ * descriptors. No descriptor or pipeline pointers survive command recording. */
+static VkResult
+g5p_record_dispatch(struct pvr_cmd_buffer *cmd, struct pvr_sub_cmd_compute *sub,
+                    uint64_t indirect_va, uint64_t indirect_offset, const uint32_t groups[3])
+{
+   const struct pvr_g9p_compute_state *s = &cmd->state.compute_pipeline->g9p;
+   struct pvr_g5p_dispatch_log *l = calloc(1, sizeof(*l));
+   if (!l) return vk_error(cmd, VK_ERROR_OUT_OF_HOST_MEMORY);
+   size_t size;
+   FILE *f = open_memstream(&l->line, &size);
+   if (!f) { free(l); return vk_error(cmd, VK_ERROR_OUT_OF_HOST_MEMORY); }
+   memcpy(l->pipeline, s->a9_pipeline_id, sizeof(l->pipeline));
+   l->stub = s->a9_capture_stub;
+   fprintf(f, "pipe=%s stub=%u local=%ux%ux%u shared=%u ", l->pipeline, l->stub,
+           s->a9_log_local[0], s->a9_log_local[1], s->a9_log_local[2], s->a9_log_shared);
+   if (indirect_va)
+      fprintf(f, "groups=indirect buffer_va=%#" PRIx64 " offset=%" PRIu64 " args_va=%#" PRIx64,
+              indirect_va - indirect_offset, indirect_offset, indirect_va);
+   else
+      fprintf(f, "groups=%ux%ux%u", groups[0], groups[1], groups[2]);
+   fprintf(f, " res=[");
+   const struct pvr_descriptor_state *desc = &cmd->state.compute_desc_state;
+   const char *sep = "";
+   for (unsigned si = 0; si < PVR_MAX_DESCRIPTOR_SETS; si++) {
+      const struct pvr_descriptor_set *set = desc->sets[si];
+      /* a set of dynamic buffers only has no descriptor memory (no mapping) */
+      if (!set || !set->layout) continue;
+      for (unsigned bi = 0; bi < set->layout->binding_count; bi++) {
+         const struct pvr_descriptor_set_layout_binding *b = &set->layout->bindings[bi];
+         if (!(b->stage_flags & VK_SHADER_STAGE_COMPUTE_BIT)) continue;
+         if (!set->mapping && !pvr_descriptor_set_binding_is_dynamic(b)) continue;
+         for (unsigned e = 0; e < b->descriptor_count; e++) {
+            const uint8_t *d = set->mapping ? (uint8_t *)set->mapping + b->offset + e * b->stride : NULL;
+            switch (b->type) {
+            case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+            case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+            case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+            case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC: {
+               struct pvr_buffer_descriptor buf;
+               if (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC ||
+                   b->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC)
+                  buf = set->dynamic_buffers[b->dynamic_buffer_idx + e];
+               else
+                  memcpy(&buf, d, sizeof(buf));
+               fprintf(f, "%sbuffer %u/%u[%u] VA=%#" PRIx64 " range=%u", sep, si, bi, e, buf.addr + buf.offset, buf.size);
+               sep = "; ";
+               break;
+            }
+            case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+            case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+            case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE: {
+               const struct pvr_image_view *v;
+               uintptr_t ptr;
+               memcpy(&ptr, d + 24, sizeof(ptr));
+               v = (const struct pvr_image_view *)ptr;
+               if (!v) {
+                  fprintf(f, "%simage %u/%u[%u] unbound", sep, si, bi, e);
+               } else {
+                  const struct pvr_image *im = pvr_image_view_get_image(v);
+                  uint64_t q[3];
+                  memcpy(q, d, sizeof(q));
+                  const bool linear = !(q[0] & PVR_G5P_TEX_TWIDDLED);
+                  uint64_t va = (q[1] & ((UINT64_C(1) << 39) - 1) & ~UINT64_C(31)) << 1;
+                  if (linear && (q[1] >> 63)) va |= ((q[2] >> 58) & 3) << 4;
+                  fprintf(f, "%s%s %u/%u[%u] VA=%#" PRIx64 " bytes=%" PRIu64
+                          " %ux%ux%u format=%s view=%s", sep,
+                          b->type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ? "storage" : "sampled",
+                          si, bi, e, va, im->total_size,
+                          u_minify(im->vk.extent.width, v->vk.base_mip_level),
+                          u_minify(im->vk.extent.height, v->vk.base_mip_level), v->vk.layer_count,
+                          vk_Format_to_str(v->vk.format), vk_ImageViewType_to_str(v->vk.view_type));
+                  if (b->type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+                     fprintf(f, " dim=%#x", (q[0] & 7) == PVR_G5P_TEX_LAYOUT_2D_ARRAY ? 0xf7 : 0xf5);
+               }
+               sep = "; ";
+               break;
+            }
+            default: break;
+            }
+         }
+      }
+   }
+   fprintf(f, "]");
+   const bool failed = ferror(f);
+   if (fclose(f) || failed) { free(l->line); free(l); return vk_error(cmd, VK_ERROR_OUT_OF_HOST_MEMORY); }
+   if (sub->g5p_log_last) sub->g5p_log_last->next = l;
+   else sub->g5p_log_first = l;
+   sub->g5p_log_last = l;
+   sub->g5p_log_count++;
+   return VK_SUCCESS;
+}
+
+/* This translation unit is A9-only. Read the override once, off the hot path. */
+/* Bound per-dispatch shared-memory spill allocations to 64 MiB. */
+#define PVR_G5P_SHARED_SPILL_MAX_BYTES (64u << 20)
+
 /*
  * One dispatch: a DMA task loading the buffer addresses (from the bound
  * descriptor sets) and the thread count into the common store, then the
@@ -101,7 +278,7 @@ emit_record(struct pvr_csb *csb, const struct g5p_cdm_record *rec)
 VkResult
 PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
                                struct pvr_sub_cmd_compute *sub_cmd,
-                               uint64_t indirect_va, const uint32_t base_group[static 3],
+                               uint64_t indirect_va, uint64_t indirect_offset, const uint32_t base_group[static 3],
                                const uint32_t group_count[static 3])
 {
    struct pvr_device *device = cmd_buffer->device;
@@ -114,34 +291,33 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
    const uint32_t hw_threads = g5p_cdm_workgroup_threads(threads);
    const uint32_t count = threads | threads << 16;
    struct pvr_suballoc_bo *uniforms_bo;
-   uint32_t uniforms[2 * G9P_MAX_BUFFERS + 4] = { 0 };
-   uint32_t bind_data[4 * (G9P_MAX_BUFFERS + 1) + 4] = { 0 };
-   uint32_t bind_code[G9P_MAX_BUFFERS + 5];
+   uint32_t uniforms[2 * G9P_MAX_BUFFERS + 4 + 8 * G9P_A9_MAX_UPLOADS] = { 0 };
+   uint32_t bind_data[4 * (G9P_MAX_BUFFERS + 1) + 4 + 3 * G9P_A9_MAX_UPLOADS] = { 0 };
+   uint32_t bind_code[G9P_MAX_BUFFERS + 5 + G9P_A9_MAX_UPLOADS];
    uint32_t kernel_data[12] = { 0 }, kernel_code[8];
+   bool from_uniforms[G9P_MAX_BUFFERS] = { false };
    struct pvr_pds_upload bind, kernel;
    unsigned bind_dwords, ctrl0, nc = 0;
    VkResult result;
 
+   if (state->a9_compute_log) {
+      result = g5p_record_dispatch(cmd_buffer, sub_cmd, indirect_va, indirect_offset, group_count);
+      if (result != VK_SUCCESS) return result;
+   }
+
    if (base_group[0] || base_group[1] || base_group[2])
-      return vk_errorf(cmd_buffer, VK_ERROR_FEATURE_NOT_PRESENT, "G5P: base dispatch not implemented yet");
+      return vk_errorf(cmd_buffer, VK_ERROR_OUT_OF_HOST_MEMORY, "G5P: base dispatch not implemented yet");
    if (indirect_va && ((indirect_va & 3) || indirect_va >> 40))
-      return vk_error(cmd_buffer, VK_ERROR_FEATURE_NOT_PRESENT);
+      return vk_error(cmd_buffer, VK_ERROR_OUT_OF_HOST_MEMORY);
    if (!indirect_va && (!group_count[0] || !group_count[1] || !group_count[2]))
       return VK_SUCCESS;
    if (!threads || threads > 512 || group_count[0] > 65536 || group_count[1] > 65536 || group_count[2] > 65536)
-      return vk_error(cmd_buffer, VK_ERROR_FEATURE_NOT_PRESENT);
+      return vk_error(cmd_buffer, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    /* A bodyless shader has no observable invocation.  Apple's standalone
     * empty program does not retire under our CDM launch contract, so do not
     * launch it: the sub-command's ordinary completion tail still establishes
     * command-buffer ordering and signals the submit fence. */
-   /* The compiler's unit-Z specialization is valid only for these actual
-    * dispatch dimensions. Indirect dimensions cannot be checked here. */
-   if (state->a9_unit_z && (indirect_va || group_count[2] != 1)) {
-      return vk_errorf(cmd_buffer, VK_ERROR_FEATURE_NOT_PRESENT,
-                       "compute workgroup Z specialization requires a direct dispatch with one Z group");
-   }
-
    if (state->a9_bodyless) {
       /* An indirect bodyless dispatch has no consumer of its dimensions,
        * so its argument read is unobservable and is omitted like the kernel
@@ -152,11 +328,68 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
       return VK_SUCCESS;
    }
 
+   struct pvr_bo *shared_spill = NULL;
+   if (state->shared_spill_stride) {
+      if (indirect_va) {
+         if (p_atomic_cmpxchg(&state->shared_spill_logged, 0, 1) == 0)
+            mesa_logw("G5P refuses: indirect dispatch of a spilling workgroup-memory pipeline");
+         vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+      }
+
+      uint64_t groups = (uint64_t)group_count[0] * group_count[1] * group_count[2];
+      /* Divide before multiplying: even a valid grid can overflow bytes. */
+      if (groups > PVR_G5P_SHARED_SPILL_MAX_BYTES / state->shared_spill_stride) {
+         if (p_atomic_cmpxchg(&state->shared_spill_logged, 0, 1) == 0)
+            mesa_logw("G5P refuses: a dispatch of %" PRIu64 " groups × %u bytes of spilled workgroup memory "
+                      "(%.2f MB, above the cap)", groups, state->shared_spill_stride,
+                      (double)groups * state->shared_spill_stride / (1024 * 1024));
+         vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+      }
+      /* bo_list is freed as pvr_suballoc_bo, despite its pvr_bo comment.
+       * Give the dedicated generic BO a normal ownership wrapper. Reset
+       * may cache it in suballoc_general, so use that allocator's mapping
+       * flags too; a later ordinary upload must find a mapped BO. */
+      struct pvr_suballoc_bo *owner = vk_zalloc(&device->vk.alloc, sizeof(*owner), 8,
+                                                VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+      if (!owner) {
+         vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+      }
+      result = pvr_bo_alloc(device, device->heaps.general_heap,
+                           groups * state->shared_spill_stride, 64,
+                           PVR_BO_ALLOC_FLAG_CPU_MAPPED, &shared_spill);
+      if (result != VK_SUCCESS) {
+         vk_free(&device->vk.alloc, owner);
+         vk_command_buffer_set_error(&cmd_buffer->vk, result);
+         return result;
+      }
+      owner->allocator = &device->suballoc_general;
+      owner->bo = shared_spill;
+      owner->dev_addr = shared_spill->vma->dev_addr;
+      owner->size = groups * state->shared_spill_stride;
+      list_add(&owner->link, &cmd_buffer->bo_list);
+   }
+
    /*
     * Values the DMA copies that are not in descriptor memory: the
     * push-constant buffer's address and the thread count.
     */
    for (unsigned k = 0; k < n; k++) {
+      /* gl_NumWorkGroups (the A9 compiler's G9P_NUM_WORKGROUPS slots, g9p_compile.c): x and y in binding 0's
+       * slot, z in binding 1's (G9P's 496e44739dc ("pvr/g9p: gl_NumWorkGroups, workgroup ID z, storage buffer array elements in compute")). An indirect dispatch's counts are the GPU's. */
+      if (state->buffers[k].set == G9P_NUM_WORKGROUPS) {
+         if (indirect_va)
+            return vk_errorf(cmd_buffer, VK_ERROR_OUT_OF_HOST_MEMORY,
+                             "G5P: gl_NumWorkGroups in an indirect dispatch");
+         uniforms[2 * k] = group_count[state->buffers[k].binding ? 2 : 0];
+         uniforms[2 * k + 1] = state->buffers[k].binding ? 0 : group_count[1];
+      }
+      if (state->buffers[k].set == G9P_SHARED_SPILL) {
+         uniforms[2 * k] = shared_spill->vma->dev_addr.addr;
+         uniforms[2 * k + 1] = shared_spill->vma->dev_addr.addr >> 32;
+      }
       if (state->buffers[k].set == G9P_PUSH_CONSTANTS) {
          const struct pvr_push_constants *pc =
             &cmd_buffer->state.push_consts[PVR_STAGE_ALLOCATION_COMPUTE];
@@ -164,10 +397,77 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
          uniforms[2 * k] = pc->dev_addr.addr;
          uniforms[2 * k + 1] = pc->dev_addr.addr >> 32;
       }
+      if (state->buffers[k].set < PVR_MAX_DESCRIPTOR_SETS) {
+         /* A dynamic buffer has no descriptor in set memory (its binding
+          * offset is ~0: a DMA from there reads set->dev_addr + 0xffffffff).
+          * Its address with the bound dynamic offset, or its range for
+          * arrayLength(), goes through this upload. */
+         const unsigned element = (state->buffers[k].binding & ~G9P_BINDING_SIZE) >> G9P_BINDING_ELEMENT_SHIFT;
+         const unsigned b = state->buffers[k].binding & BITFIELD_MASK(G9P_BINDING_ELEMENT_SHIFT);
+
+         if (!pvr_descriptor_set_dynamic_slot(desc->sets[state->buffers[k].set], b, element,
+                                              state->buffers[k].binding & G9P_BINDING_SIZE,
+                                              &uniforms[2 * k], &from_uniforms[k]))
+            return vk_errorf(cmd_buffer, VK_ERROR_UNKNOWN,
+                             "G5P compute: set %u binding %u element %u holds no bound buffer",
+                             state->buffers[k].set, b, element);
+      }
    }
    unsigned images=state->a9_num_images;
-   if(images && n>15)return vk_errorf(cmd_buffer,VK_ERROR_FEATURE_NOT_PRESENT,"G5P image LOD common31 overlaps the16th buffer pointer");
-   unsigned transfers=n+1+images+(state->a9_device_fence ? 1 : 0)+(images ? 1 : 0);
+   if(images && n>15)return vk_errorf(cmd_buffer,VK_ERROR_OUT_OF_HOST_MEMORY,"G5P image LOD common31 overlaps the16th buffer pointer");
+   const unsigned base_transfers=n+1+images+(state->a9_device_fence ? 1 : 0)+(images ? 1 : 0);
+   const unsigned tex0=2*n+1+(state->a9_device_fence ? 2 : 0)+(images ? 1 : 0);
+   const unsigned nup=state->a9_num_uploads;
+   unsigned transfers=base_transfers+nup;
+   /* sampled textures' words, validated as the fragment path's (pvr_arch_g5p_gfx.c), from the
+    * bound sets' CPU mappings into the uniforms upload, then DMAed to their common dwords */
+   for(unsigned i=0;i<nup;i++) {
+      const __typeof__(state->a9_uploads[0]) *u=&state->a9_uploads[i];
+      uint32_t *out=&uniforms[tex0+8*i];
+      if (u->kind == G9P_A9_UP_LOD) {
+         out[0] = u->value;
+         continue;
+      }
+      if(u->kind==G9P_A9_UP_FETCH_SAMPLER) {
+         const uint64_t policy=pvr_g5p_fetch_sampler_word();
+         memcpy(out,&policy,sizeof(policy));
+         continue;
+      }
+      const struct pvr_descriptor_set *set=u->set<PVR_MAX_DESCRIPTOR_SETS ? desc->sets[u->set] : NULL;
+      if(!set || !set->layout || !set->mapping || u->binding>=set->layout->binding_count)
+         return vk_errorf(cmd_buffer,VK_ERROR_UNKNOWN,"G5P compute: texture set %u binding %u is not bound",u->set,u->binding);
+      const struct pvr_descriptor_set_layout_binding *lb=&set->layout->bindings[u->binding];
+      if(u->element>=MAX2(lb->descriptor_count,1))
+         return vk_errorf(cmd_buffer,VK_ERROR_UNKNOWN,"G5P compute: set %u binding %u element %u past its descriptors",u->set,u->binding,u->element);
+      const uint32_t *d=(const uint32_t *)((const uint8_t *)set->mapping+lb->offset+(size_t)u->element*lb->stride);
+      switch(u->kind) {
+      case G9P_A9_UP_IMAGE:
+         if(lb->type==VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || !pvr_g5p_tex_state_valid(d)) {
+            mesa_logw("G5P refuses: compute set %u binding %u: a view without A9 texture state",u->set,u->binding);
+            return vk_errorf(cmd_buffer,VK_ERROR_OUT_OF_HOST_MEMORY,"G5P compute: a view without A9 texture state");
+         }
+         memcpy(out,d,4*8);
+         break;
+      case G9P_A9_UP_SAMPLER:
+         /* a combined descriptor's sampler is at +32, a standalone sampler's at +0 */
+         if(lb->type!=VK_DESCRIPTOR_TYPE_SAMPLER)
+            d+=8;
+         if(!pvr_g5p_sampler_valid(d)) {
+            mesa_logw("G5P refuses: compute set %u binding %u: a sampler without A9 words",u->set,u->binding);
+            return vk_errorf(cmd_buffer,VK_ERROR_OUT_OF_HOST_MEMORY,"G5P compute: a sampler without A9 words");
+         }
+         memcpy(out,d,4*2);
+         break;
+      case G9P_A9_UP_SIZE:
+         if(!pvr_g5p_tex_size(d,u->level,out)) {
+            mesa_logw("G5P refuses: compute set %u binding %u: an image size without A9 texture state",u->set,u->binding);
+            return vk_errorf(cmd_buffer,VK_ERROR_OUT_OF_HOST_MEMORY,"G5P compute: an image size without A9 texture state");
+         }
+         break;
+      default:
+         return vk_error(cmd_buffer,VK_ERROR_UNKNOWN);
+      }
+   }
    if (state->a9_device_fence) {
       uint32_t zero=0;
       struct pvr_suballoc_bo *fence;
@@ -178,7 +478,7 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
    }
    uniforms[2 * n] = count;
    result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, uniforms,
-                                               sizeof(uint32_t) * (2 * n + 1 + (state->a9_device_fence ? 2 : 0) + (images ? 1 : 0)),
+                                               sizeof(uint32_t) * (tex0 + 8 * nup),
                                                &uniforms_bo);
    if (result != VK_SUCCESS)
       return result;
@@ -193,15 +493,29 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
       uint64_t src;
       uint32_t dest = 2 * k, dwords = 2;
 
-      if (k < n && state->buffers[k].set != G9P_PUSH_CONSTANTS) {
+      if (k >= base_transfers) {
+         const unsigned i = k - base_transfers;
+         src = uniforms_bo->dev_addr.addr + 4 * (tex0 + 8 * i);
+         dest = state->a9_uploads[i].common;
+         dwords = state->a9_uploads[i].dwords;
+      } else if (k < n && !from_uniforms[k] && state->buffers[k].set != G9P_PUSH_CONSTANTS &&
+                 state->buffers[k].set != G9P_NUM_WORKGROUPS &&
+                 state->buffers[k].set != G9P_SHARED_SPILL) {
          const struct pvr_descriptor_set *set = desc->sets[state->buffers[k].set];
+         /* an array's element (Zink keeps every storage buffer in one array) and the size flag (the
+          * descriptor's size word at byte 8, arrayLength()): G9P's 496e44739dc ("pvr/g9p: gl_NumWorkGroups, workgroup ID z, storage buffer array elements in compute"), 1d51ff5cec6 */
+         const unsigned element = (state->buffers[k].binding & ~G9P_BINDING_SIZE) >> G9P_BINDING_ELEMENT_SHIFT;
+         const unsigned b = state->buffers[k].binding & BITFIELD_MASK(G9P_BINDING_ELEMENT_SHIFT);
          const struct pvr_descriptor_set_layout_binding *binding;
 
-         if (!set)
+         if (!set || b >= set->layout->binding_count)
             return vk_error(cmd_buffer, VK_ERROR_UNKNOWN);
-         binding = &set->layout->bindings[state->buffers[k].binding];
-         /* pvr_buffer_descriptor: the address comes first */
-         src = set->dev_addr.addr + binding->offset;
+         binding = &set->layout->bindings[b];
+         if (element >= MAX2(binding->descriptor_count, 1))
+            return vk_error(cmd_buffer, VK_ERROR_UNKNOWN);
+         /* pvr_buffer_descriptor: the address comes first, the size at byte 8 */
+         src = set->dev_addr.addr + binding->offset + element * binding->stride +
+               (state->buffers[k].binding & G9P_BINDING_SIZE ? 8 : 0);
       } else if(k>n && k<n+1+images) {
          unsigned i=k-n-1;
          const struct pvr_descriptor_set *set=desc->sets[state->a9_images[i].set];
@@ -242,9 +556,13 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
    /*
     * Kernel task: DOUTU source (USC offset, 0x10), the local-ID control
     * word (temps q0 -> r0) and the workgroup-ID one (temps q0, 64 bits ->
-    * threadgroup words 0-1) in the coefficient task.
+    * threadgroup words 0-1, and z from q1's upper half -> word 3 when the
+    * kernel reads it) in the coefficient task.
     */
    g9p_pds_kick_data(kernel_data, usc_offset(device, state->shader_bo));
+   /* the DOUTU temps allocate bank 0 (homes up to r(num_regs - 1)); the record's register field below
+    * allocates bank 1, the code's own registers (g9p_cdm.h G9P_CDM_KERNEL_REGS) */
+   const unsigned bank1 = state->a9_bank1_regs ? state->a9_bank1_regs : state->num_regs;
    kernel_data[1] = 0x10 * DIV_ROUND_UP(MAX2(state->num_regs, 1), 8);
    kernel_data[2] = 0x80000000;
    kernel_data[4] = 0x90000002;
@@ -270,6 +588,22 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
       kernel_code[5] = g9p_pds_dout(G9P_DOUTW, 0, G9P_PDS_TEMPS, 2, 0);
       kernel_code[6] = g9p_pds_dout(G9P_DOUTU, 0, G9P_PDS_DATA, 0, G9P_PDS_END | G9P_PDS_CC);
    }
+   if (state->a9_wgid_z) {
+      /* Workgroup ID z, only for a kernel that reads it: AGXMetalA9's EncodeComputePDSProgram (0x207d1ea4c, flags
+       * bit 2) adds a DOUTW of temps q1's upper half (g9p_pds_dout(G9P_DOUTW, 1, G9P_PDS_TEMPS, ...); its source-1
+       * word below: last, the common store, the destination word, the upper 32 bits) after the x/y one (all 64
+       * bits), which then drops its last bit; G9P's 496e44739dc uses the same form on the A10.
+       * Our word is G9P_A9_TG_WGID_Z (3): word 2 is the barrier counter, whose zero pair is written first. */
+      const unsigned at = state->a9_has_barriers ? 2 : 1;
+      kernel_data[4] = PVR_ROGUE_PDSINST_DOUT_FIELDS_DOUTW_SRC1_DEST_COMMON_STORE |
+                       PVR_ROGUE_PDSINST_DOUT_FIELDS_DOUTW_SRC1_BSIZE_ALL64;
+      kernel_data[5] = PVR_ROGUE_PDSINST_DOUT_FIELDS_DOUTW_SRC1_LAST_EN |
+                       PVR_ROGUE_PDSINST_DOUT_FIELDS_DOUTW_SRC1_DEST_COMMON_STORE |
+                       G9P_A9_TG_WGID_Z << PVR_ROGUE_PDSINST_DOUT_FIELDS_DOUTW_SRC1_AO_SHIFT |
+                       PVR_ROGUE_PDSINST_DOUT_FIELDS_DOUTW_SRC1_BSIZE_UPPER;
+      kernel_code[at] = g9p_pds_dout(G9P_DOUTW, 0, G9P_PDS_TEMPS, 4, 0);
+      kernel_code[at + 1] = g9p_pds_dout(G9P_DOUTW, 1, G9P_PDS_TEMPS, 5, G9P_PDS_END);
+   }
    result = pvr_arch_cmd_buffer_upload_pds(cmd_buffer, kernel_data,
                                            kernel_dwords,
                                            ROGUE_CDMCTRL_KERNEL1_DATA_ADDR_ALIGNMENT,
@@ -284,9 +618,10 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
       struct pvr_csb *csb = &sub_cmd->control_stream;
       const struct g5p_cdm_record bind_rec =
          g5p_cdm_dma_task(G9P_CDM_DATA_BLOCKS(bind_dwords / 4), bind.data_offset,
-                          bind.code_offset, (state->a9_device_fence || images) ? 4 : DIV_ROUND_UP(2 * n + 1, 16));
+                          bind.code_offset, (state->a9_device_fence || images || nup) ? 4 : DIV_ROUND_UP(2 * n + 1, 16));
       const struct g5p_cdm_record kernel_rec = g5p_cdm_kernel(
-         G9P_CDM_KERNEL_REGS(state->num_regs) | G9P_CDM_ANY_CLUSTER | G9P_CDM_FENCE |
+         G9P_CDM_KERNEL_REGS(bank1) | G9P_CDM_ANY_CLUSTER |
+            G9P_CDM_FENCE |
             G9P_CDM_DATA_BLOCKS(kernel_dwords / 4),
          kernel.data_offset, kernel.code_offset, group_count[0], group_count[1],
          group_count[2], hw_threads, DIV_ROUND_UP(state->a9_local_dwords, 16));
@@ -516,8 +851,9 @@ PVR_PER_ARCH(g5p_compute_job_submit)(struct pvr_compute_ctx *ctx,
     * first block here. A chained CDM stream is refused until that form has
     * run on the device. */
    if (cs->pvr_bo != list_first_entry(&cs->pvr_bo_list, struct pvr_bo, link))
-      return vk_errorf(d, VK_ERROR_FEATURE_NOT_PRESENT, "G5P: chained CDM stream not implemented yet");
+      return vk_errorf(d, VK_ERROR_OUT_OF_HOST_MEMORY, "G5P: chained CDM stream not implemented yet");
    struct pvr_winsys_compute_submit_info info = { .wait = wait,
+      .g5p_log = sub->g5p_log_first, .g5p_log_count = sub->g5p_log_count,
       .frame_num = d->global_queue_present_count, .job_num = d->global_cmd_buffer_submit_count };
    info.fw_stream_len =
       pvr_arch_g5p_compute_stream(d, pvr_csb_get_start_address(cs).addr,

@@ -33,6 +33,9 @@
 #include "frontend/api.h"
 #include "dri_util.h"
 
+/* most frames a throttled swap lets be in flight (pipe_caps.throttle_frames) */
+#define DRI_THROTTLE_MAX_FRAMES 3
+
 #ifdef VK_USE_PLATFORM_XCB_KHR
 #include <xcb/xcb.h>
 #endif
@@ -59,7 +62,9 @@ struct dri_drawable
    unsigned int texture_mask, texture_stamp;
    int swap_interval;
 
-   struct pipe_fence_handle *throttle_fence;
+   /* the last frames' fences, one slot per frame in flight (dri_throttle_frame()) */
+   struct pipe_fence_handle *throttle_fence[DRI_THROTTLE_MAX_FRAMES];
+   unsigned throttle_slot;
    bool flushing; /* prevents recursion in dri_flush */
 
    /**
@@ -136,6 +141,10 @@ dri_flush(struct dri_context *ctx,
           struct dri_drawable *drawable,
           unsigned flags,
           enum __DRI2throttleReason reason);
+
+void
+dri_throttle_frame(struct dri_drawable *drawable,
+                   struct pipe_fence_handle *new_fence);
 
 void
 dri_flush_drawable(struct dri_drawable *dPriv);

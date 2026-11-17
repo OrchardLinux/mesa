@@ -34,6 +34,7 @@
 #include <string.h>
 
 #include "util/log.h"
+#include "pvr_g5p.h"
 #include "vk_log.h"
 
 #include "pvr_bo.h"
@@ -43,9 +44,6 @@
 #include "winsys/pvr_winsys.h"
 #include "pvr_g5p_vdm.h"
 
-#define G5P_VDM_REFUSE(cmd_buffer, ...)                                                                            \
-   (mesa_logw("G5P refuses: " __VA_ARGS__),                                                              \
-    vk_errorf((cmd_buffer), VK_ERROR_FEATURE_NOT_PRESENT, "G5P: " __VA_ARGS__))
 
 /* The bytes of a block before its chaining link to `next`, or -1 when the
  * block holds no such link */
@@ -91,13 +89,13 @@ PVR_PER_ARCH(g5p_vdm_stream)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr
       const struct pvr_bo *n = list_entry(b->link.next, struct pvr_bo, link);
       const int64_t len = block_commands(b, n->vma->dev_addr);
       if (len < 0)
-         return G5P_VDM_REFUSE(cmd_buffer, "control stream block %u of %u has no link to block %u", i, blocks,
+         return G5P_REFUSE(cmd_buffer, "control stream block %u of %u has no link to block %u", i, blocks,
                                i + 1);
       total += (uint64_t)len;
    }
    const uint32_t limit = PVR_G5P_MAX_VDM_BYTES;
    if (total > limit)
-      return G5P_VDM_REFUSE(cmd_buffer, "a control stream of %" PRIu64 " bytes in %u blocks (at most %u)",
+      return G5P_REFUSE(cmd_buffer, "a control stream of %" PRIu64 " bytes in %u blocks (at most %u)",
                             total, blocks, limit);
 
    const size_t size = total + ROGUE_VDMCTRL_GUARD_SIZE_DEFAULT;

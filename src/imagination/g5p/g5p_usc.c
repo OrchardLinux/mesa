@@ -15,7 +15,7 @@ const char *const g5p_binop_name[G5P_BIN_COUNT] = {"fadd", "fmul", "iadd", "imul
 const char *const g5p_minmax_name[G5P_MINMAX_COUNT] = {"umin", "umax", "imin", "imax"};
 const char *const g5p_convert_name[G5P_CONVERT_COUNT] = {"f2i32", "f2u32", "i2f32", "u2f32", "f2i32_rte"};
 const char *const g5p_unary_name[G5P_UNARY_COUNT] = {"floor", "log2", "exp2", "not", "popcount", "bitreverse"};
-const char *const g5p_tex_dim_name[G5P_TEX_DIM_COUNT] = {"2d", "2d_array", "3d", "cube"};
+const char *const g5p_tex_dim_name[G5P_TEX_DIM_COUNT] = {"2d", "2d_array", "3d", "cube", "2d_ms"};
 const char *const g5p_cmp_name[G5P_CMP_COUNT] = {"flt", "fgt", "feq", "ilt", "igt", "ult", "ugt", "ieq"};
 const char *const g5p_sfu_name[G5P_SFU_COUNT] = {"rcp_approx", "rsqrt_approx", "sin_core", "cos_core"};
 
@@ -26,7 +26,7 @@ static const uint8_t convert_code[G5P_CONVERT_COUNT] = {0x60, 0x60, 0x68, 0x68, 
 static const uint8_t cmp_code[G5P_CMP_COUNT] = {0x59, 0x5d, 0x55, 0xbe, 0xbf, 0xb6, 0xb7, 0xbd};
 static const uint8_t sfu_code[G5P_SFU_COUNT] = {0x80, 0x81, 0x82, 0x86};
 static const uint8_t unary_code[G5P_UNARY_COUNT] = {0x40, 0x84, 0x85, 0xc5, 0xe8, 0xe4};
-static const uint8_t dim_code[G5P_TEX_DIM_COUNT] = {0xf5, 0xf7, 0xfb, 0xfd};
+static const uint8_t dim_code[G5P_TEX_DIM_COUNT] = {0xf5, 0xf7, 0xfb, 0xfd, 0xf9};
 static const uint8_t mov_trailer[4] = {0x54, 0x01, 0x38, 0x00};
 
 /* Split immediate map (g5p_isa.IMM_MAP): bit -> (byte, bit). */
@@ -742,6 +742,16 @@ unsigned g5p_usc_mov_shared(uint8_t *out, unsigned dst_half, unsigned src_dword,
    return finish(out, raw, 12);
 }
 
+/* Byte fields of the address add (g5p_usc_address_add_shift()) and later encoders. */
+#define G5P_HEADER_FRAGMENT 0x01    /* the header's continuation into the destination parcel, nothing else */
+#define G5P_HEADER_SRC_B_BANK1 0x10 /* source B in register bank 1 (g9p_w0()'s W0 bit 12; vertex code) */
+#define G5P_PARCEL_CONTINUES 0x01
+#define G5P_SRC_LAST_READ 0x80      /* a register source read for the last time (in the group bit's place) */
+#define G5P_CLASS_ADDR_ADD 0x89     /* the address add's class byte (the binary class with the 16-bit result) */
+#define G5P_ADDR_ADD_ROUTING_NONE 0x00
+#define G5P_ADDR_ADD_CTL 0x06       /* set in every witnessed address add (observed role) */
+#define G5P_ADDR_ADD_SHIFT_BIT 5    /* the shift, bits 5..7 of the control byte */
+
 /* ---- ISA round 2: inline shared sources (g5p_usc_resources.py) ---- */
 static unsigned alu_header(uint8_t *raw, unsigned cls, unsigned dst_half, unsigned bank, unsigned header,
                            unsigned source_extension, unsigned dst_control)
@@ -781,6 +791,74 @@ static unsigned add_route(uint8_t *raw, unsigned n, int route)
       raw[n++] = 0;
    }
    return n;
+}
+
+/* Names shared by the fragment encoders. */
+#define G5P_CLASS_TERNARY_RESULT_HALF 0x8a /* g5p_usc_literal_ternary() with result_half */
+#define G5P_TERNARY_CTL_RESULT_HALF 0x02
+
+/* One byte of a packed UNORM8 colour, for the clear of 5..8 colour targets (g5p_mrt_programs.h): the f32 in
+ * common-store dword src_dword, converted to an unsigned normalized byte, into byte 0 or byte 1 of the 16-bit
+ * dst_half, bank 0. Two of them fill one half: the byte-1 form reads dst_half as B and keeps the byte that the
+ * byte-0 form wrote. It is the float-to-integer conversion in the three-source class with the 16-bit result,
+ * laid out as literal_prefix() followed by a common-store C:
+ *   A        a short literal, the conversion's target format: G5P_SMALL_UN8, the format code of
+ *            g5p_usc_convert_small() (g5p_usc_f2u16_half() puts G5P_SMALL_U16 in the same place);
+ *   B        byte 0: unused (selector 0); byte 1: dst_half, group 1;
+ *   C        the common-store dword (shared_src(), group 1);
+ *   opcode   the float-to-integer conversion (convert_code[], as g5p_usc_f2u16_half());
+ *   control  bit 0 the continuation into the last parcel; bit 1 the 16-bit result; bit 2 set by every
+ *            conversion form (g5p_usc_convert2(), g5p_usc_f2u16_half(), g5p_usc_convert_small()); the byte-1
+ *            form adds bits 4 and 6, which were only observed together (bit 6 also selects the source's high
+ *            byte in g5p_usc_convert_small());
+ *   routing  the low byte of the last parcel, observed per byte; its high byte, the source control, is 0.
+ * The form was recovered from controlled probes; the clear was tested on the A9 at 5, 6, 7 and 8 targets. */
+#define G5P_CONVERT_CTL 0x04
+#define G5P_UNORM8_CTL_BYTE1 0x50
+#define G5P_UNORM8_ROUTING_BYTE0 0x10
+#define G5P_UNORM8_ROUTING_BYTE1 0x1c
+#define G5P_SOURCE_CONTROL_NONE 0x00
+
+unsigned g5p_usc_unorm8_byte(uint8_t *out, unsigned dst_half, unsigned byte, unsigned src_dword)
+{
+   CHECK(byte <= 1, "a half has bytes 0 and 1");
+   const unsigned dst_bank = 0, c_group = 1;
+   const unsigned b_half = byte ? dst_half : 0, b_group = byte ? 1 : 0;
+   uint8_t raw[G5P_USC_MAX];
+   unsigned n = literal_prefix(raw, G5P_CLASS_TERNARY_RESULT_HALF, dst_half, dst_bank, G5P_SMALL_UN8, b_half,
+                               b_group, G5P_HEADER_FRAGMENT, 0);
+   if (!n)
+      return 0;
+   if (!shared_src(raw + n, src_dword, c_group))
+      return 0;
+   n += 4;
+   raw[n++] = convert_code[G5P_F2U32];
+   raw[n++] = G5P_TERNARY_CTL_RESULT_HALF | G5P_CONVERT_CTL | (byte ? G5P_UNORM8_CTL_BYTE1 : 0) |
+              G5P_PARCEL_CONTINUES;
+   raw[n++] = byte ? G5P_UNORM8_ROUTING_BYTE1 : G5P_UNORM8_ROUTING_BYTE0;
+   raw[n++] = G5P_SOURCE_CONTROL_NONE;
+   return finish(out, raw, n);
+}
+
+/* A move of a common-store dword into a 16-bit half of bank 0 (the end-of-tile program's state moves,
+ * g5p_mrt_programs.h): alu_header() with the 16-bit move class (G5P_CLASS_MOVE_HALF, as g5p_usc_half_immediate())
+ * and the fragment header, A = the common-store dword (shared_src(), group 1), then the half move's opcode and
+ * control (G5P_HALF_MOVE_OP, G5P_HALF_MOVE_CTL: the bytes of g5p_usc_half_immediate()'s last parcel, named by
+ * that observed role) and no source control. */
+#define G5P_CLASS_MOVE_HALF 0x88
+#define G5P_HALF_MOVE_OP 0x28
+#define G5P_HALF_MOVE_CTL 0x39
+unsigned g5p_usc_mov_shared_half(uint8_t *out, unsigned dst_half, unsigned src_dword)
+{
+   uint8_t raw[12];
+   if (!alu_header(raw, G5P_CLASS_MOVE_HALF, dst_half, 0, G5P_HEADER_FRAGMENT, 0, 0) ||
+       !shared_src(raw + 4, src_dword, 1))
+      return 0;
+   raw[8] = G5P_HALF_MOVE_OP;
+   raw[9] = G5P_PARCEL_CONTINUES;
+   raw[10] = G5P_HALF_MOVE_CTL;
+   raw[11] = G5P_SOURCE_CONTROL_NONE;
+   return finish(out, raw, 12);
 }
 
 unsigned g5p_usc_alu_shared(uint8_t *out, enum g5p_binop op, unsigned dst_half, unsigned a_dword,
@@ -910,6 +988,8 @@ static unsigned texture_base(uint8_t *raw, const struct g5p_tex *t)
    CHECK(t->class_variant <= 1, "class_variant must be an integer in [0,1]");
    CHECK(t->dim < G5P_TEX_DIM_COUNT, "unmeasured texture dimension");
    CHECK(!t->read || t->dim == G5P_TEX_2D, "only 2d read has been isolated");
+   CHECK(t->dim != G5P_TEX_2D_MS || (!t->read && !t->class_variant),
+         "the 2D-multisample fetch is witnessed only as the narrow class0 sample");
    raw[0] = 0x1a | t->class_variant;
    raw[1] = dim_code[t->dim];
    raw[2] = t->dst_half | (t->read ? 0x40 : 0);
@@ -925,11 +1005,51 @@ unsigned g5p_usc_sample(uint8_t *out, const struct g5p_tex *t)
    uint8_t raw[G5P_USC_MAX];
    if (!texture_base(raw, t))
       return 0;
+   CHECK(t->dim != G5P_TEX_2D_MS || (t->narrow && t->coord_control),
+         "the 2D-multisample sample is witnessed only narrow with coordinate control");
    if (t->narrow) {
-      CHECK(!t->class_variant && t->dim == G5P_TEX_2D, "narrow sample witnessed only as 2d class0");
+      CHECK(!t->class_variant && (t->dim == G5P_TEX_2D || t->dim == G5P_TEX_2D_MS),
+            "narrow sample witnessed only as 2d and 2d-multisample class0");
       raw[0] &= ~2;
    }
    return finish(out, raw, 6);
+}
+
+/* A move of a special value: the layout of g5p_usc_immediate()'s short move, with the source kind "special
+ * value" where the immediate sets "literal". Fields, by byte:
+ *   0  the single-source class of g5p_usc_move() and g5p_usc_immediate();
+ *   1  the header: only the continuation into the destination parcel;
+ *   2  the destination half, 3 its bank (destination());
+ *   4  bit 0: slot A is not a register; bits 1..6: the special value's index (where the immediate keeps its
+ *      bits 0..5); bit 7: zero (the register form's group bit);
+ *   5  slot B unused (selector 0) with the continuation;
+ *   6  the source kind (G5P_MOV_SOURCE_*); the immediate's long-form bit 0 and literal bits stay zero;
+ *   7  the continuation, the immediate's literal bits zero;
+ *   8  the move's trailer (mov_trailer, as g5p_usc_move()).
+ * The A9 compiler emits this form for two indices: G5P_SPECIAL_OWN_SAMPLE, and 24 for the primitive's facing,
+ * which no encoder here takes. */
+#define G5P_CLASS_MOVE 0x98
+#define G5P_SRC_A_NOT_REGISTER 0x01
+#define G5P_SRC_B_UNUSED 0x00
+#define G5P_MOV_SOURCE_SPECIAL 0x10 /* observed with the two indices above; the immediate sets 0x20 */
+#define G5P_SPECIAL_OWN_SAMPLE 12   /* the sample the task shades */
+
+unsigned g5p_usc_ms_own_sample(uint8_t *out, unsigned dst_half)
+{
+   CHECK(half_register(dst_half, "the sample operand's destination must be a 32-bit aligned half index"),
+         g5p_usc_error);
+   const unsigned dst_bank = 0;
+   uint8_t raw[12];
+   raw[0] = G5P_CLASS_MOVE;
+   raw[1] = G5P_HEADER_FRAGMENT;
+   if (!destination(raw + 2, dst_half, dst_bank))
+      return 0;
+   raw[4] = G5P_SRC_A_NOT_REGISTER | G5P_SPECIAL_OWN_SAMPLE << 1;
+   raw[5] = G5P_SRC_B_UNUSED | G5P_PARCEL_CONTINUES;
+   raw[6] = G5P_MOV_SOURCE_SPECIAL;
+   raw[7] = G5P_PARCEL_CONTINUES;
+   memcpy(raw + 8, mov_trailer, sizeof(mov_trailer));
+   return finish(out, raw, 12);
 }
 
 unsigned g5p_usc_texture_lod(uint8_t *out, const struct g5p_tex *t)
@@ -984,7 +1104,7 @@ unsigned g5p_usc_sample_ext(uint8_t *out, const struct g5p_tex_ext *t)
    CHECK((unsigned)t->tuple <= G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL_COMPARE_OFFSET, "unqualified texture recipe");
    CHECK(!coupled || t->lod_shared == (t->tuple == G5P_TEX_TUPLE_COUPLED_SHARED_LEVEL),
          "unqualified independent texture continuation choices");
-   static const uint8_t dim_low[G5P_TEX_DIM_COUNT] = {0x5, 0x7, 0xb, 0xd};
+   static const uint8_t dim_low[G5P_TEX_DIM_COUNT] = {0x5, 0x7, 0xb, 0xd, 0x9};
    static const uint8_t lod_mode[] = {0, 0x40, 0x20, 0x60};
    CHECK(half_register(t->dst_half, "dst_half requires a measured 32-bit aligned half index"), g5p_usc_error);
    /* A9 Metal v_images31 and v_units16_sample witness the complete 7-bit
@@ -993,6 +1113,7 @@ unsigned g5p_usc_sample_ext(uint8_t *out, const struct g5p_tex_ext *t)
    CHECK(t->sampler_qword <= 124, "sampler_qword must be an integer in [0,124]");
    CHECK(t->coord_dword <= 31 && t->lod_dword <= 31 && t->extras_half <= 63, "operand beyond r31");
    CHECK(t->dim < G5P_TEX_DIM_COUNT, "unmeasured texture dimension");
+   CHECK(t->dim != G5P_TEX_2D_MS, "no general-form 2D-multisample fetch is witnessed");
    CHECK(t->mask == 0xf || (t->mask == 1 && t->compare), "only rgba and compare results are measured");
    CHECK(!t->read || (!t->compare && !t->offset && t->lod == G5P_TEX_LOD_LEVEL && t->dim != G5P_TEX_CUBE),
          "read takes a level and no compare/offset (cube reads are refused by Apple)");
@@ -1037,7 +1158,7 @@ unsigned g5p_usc_sample_ext(uint8_t *out, const struct g5p_tex_ext *t)
    raw[9] = 0;
    if (coupled) {
       /* Complete native operand/result recipe, reconstructed against the
-       * paired Metal programs and exact in r1c's non-cube device rungs.
+       * paired Metal programs and exact in the non-cube device cases.
        * Individual destination/coordinate continuation bits are unknown;
        * keep this suffix indivisible rather than guessing mixed forms. */
       raw[9] = (1u << 7) | 1u;
@@ -1057,6 +1178,22 @@ unsigned g5p_usc_sample_ext(uint8_t *out, const struct g5p_tex_ext *t)
       return finish(out, raw, 12);
    }
    return finish(out, raw, 10);
+}
+
+/* A9 compute's array or cube sample with the level in a register (Apple's A9 compiler's form): the coupled
+ * temporary-level tuple of g5p_usc_sample_ext(). Its fetch form (read) keeps the coordinate operand live: it
+ * clears the coordinate's last-read bit, which every other sample form sets (texture_base()'s coordinate byte). */
+#define G5P_TEX_COORD_BYTE 5
+#define G5P_TEX_COORD_LAST_READ 0x80
+unsigned g5p_usc_sample_register_lod(uint8_t *out, const struct g5p_tex_ext *t)
+{
+   CHECK(t->tuple == G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL && t->lod == G5P_TEX_LOD_LEVEL && !t->lod_shared &&
+         (t->dim == G5P_TEX_2D_ARRAY || t->dim == G5P_TEX_CUBE),
+         "the register-LOD form is an array or cube sample at a level");
+   const unsigned n = g5p_usc_sample_ext(out, t);
+   if (n && t->read)
+      out[G5P_TEX_COORD_BYTE] &= ~G5P_TEX_COORD_LAST_READ;
+   return n;
 }
 
 unsigned g5p_usc_half_immediate(uint8_t *out, unsigned dst_half, uint16_t value)
@@ -1190,10 +1327,25 @@ unsigned g5p_usc_address_add_shift(uint8_t *out, unsigned pair_half, unsigned ba
    CHECK(half_register(pair_half, "pair_half requires a 64-bit aligned register pair") && !(pair_half & 2),
          "pair_half requires a 64-bit aligned register pair");
    CHECK(half_register(index_half, "index_half requires a measured 32-bit register"), g5p_usc_error);
-   CHECK(base_common_dword < 32 && !(base_common_dword & 1), "pointer base must be an even common dword below 32");
+   CHECK(base_common_dword < 256 && !(base_common_dword & 1), "pointer base must be an even common dword below 256");
    CHECK(shift <= 4, "only shifts 0-4 are corpus-verified");
-   uint8_t raw[12] = {0x89, vs ? 0x11 : 0x01, pair_half, vs ? 0x03 : 0x01, 0x81 | 4 * base_common_dword,
-                      (kill ? 0x80 : 0) | 1 | index_half << 1, 0x00, 0x41, 0xa1, 0x01, 0x00, 0x06 | shift << 5};
+   /* The layout of g5p_usc_alu_shared(): alu_header() (vertex code: destination bank 1, and B's bank bit in
+    * the header), A = the pointer base (shared_src(), group 1; above dword 31 its high bits are the field that
+    * the vertex XFB record's address add and every shared ALU operand use), B = the index with its last read,
+    * the integer add, then the last parcel: no routing, and the control byte with the shift. */
+   uint8_t raw[12], a[4];
+   if (!alu_header(raw, G5P_CLASS_ADDR_ADD, pair_half, vs, G5P_HEADER_FRAGMENT | (vs ? G5P_HEADER_SRC_B_BANK1 : 0),
+                   0, 0) ||
+       !shared_src(a, base_common_dword, 1))
+      return 0;
+   raw[4] = a[0];
+   raw[5] = (index_half << 1) | (kill ? G5P_SRC_LAST_READ : 0) | G5P_PARCEL_CONTINUES;
+   raw[6] = a[2];
+   raw[7] = a[3];
+   raw[8] = binop_code[G5P_BIN_IADD];
+   raw[9] = G5P_PARCEL_CONTINUES;
+   raw[10] = G5P_ADDR_ADD_ROUTING_NONE;
+   raw[11] = G5P_ADDR_ADD_CTL | shift << G5P_ADDR_ADD_SHIFT_BIT;
    return finish(out, raw, 12);
 }
 
@@ -1350,6 +1502,50 @@ unsigned g5p_usc_discard_test(uint8_t *out, enum g5p_cmp op, unsigned dst_half, 
       raw[n++] = 0;
       raw[n++] = relation_control;
    }
+   return finish(out, raw, n);
+}
+
+/* The 4x discard test is a packed ternary of g5p_usc_literal_ternary()'s layout: the 16-bit-result class,
+ * A a long literal (literal_prefix()), B the tested value, C a short literal, then the opcode, the operation
+ * control and a last parcel of routing and relation. Its values:
+ *   A  -0.0f, the literal Apple's compiler compares against zero with (as the rsqrt and sign recipes);
+ *   C  the kill's sample mask, all four samples;
+ *   opcode  the float-equality compare of g5p_usc_compare_write();
+ *   control  bit 1 the 16-bit result (as g5p_usc_binary()'s result_half flag); bit 4 observed with a short C
+ *            literal (set in this form and in the cos-scale and bool-to-half recipes, clear in the rsqrt and
+ *            sign recipes' long C literals; the rcp-refine recipe also sets it, with a register C); bit 0 the
+ *            continuation into the last parcel;
+ *   routing  the low byte, the routing of the literal forms (g5p_usc_binary_literal2());
+ *   relation  the high byte, as relation_control in g5p_usc_discard_test() and g5p_usc_compare_write(): 0, so
+ *             with this opcode the test is A != B, as Apple's compiler emits it for (v != 0.0f) discard. The ==
+ *             relation (0x10) killed the samples a discard should keep on the device. Its continuation bit is
+ *             clear: the parcel ends the instruction. */
+#define G5P_F32_NEG_ZERO 0x80000000u
+#define G5P_MS4_ALL_SAMPLES 0xfu
+#define G5P_TERNARY_CTL_C_SHORT 0x10
+#define G5P_ROUTING_LITERAL 0x70
+#define G5P_RELATION_NE 0x00
+
+unsigned g5p_usc_discard_test_ms4(uint8_t *out, unsigned dst_half, struct g5p_src a)
+{
+   CHECK(!a.neg && !a.abs, "the 4x discard test is witnessed without source modifiers");
+   const unsigned dst_bank = 0;
+   const int a_long = 1, c_long = 0;
+   uint8_t raw[G5P_USC_MAX], c[G5P_USC_MAX];
+   unsigned n = literal_prefix(raw, G5P_CLASS_TERNARY_RESULT_HALF, dst_half, dst_bank, G5P_F32_NEG_ZERO, a.half,
+                               a.group, G5P_HEADER_FRAGMENT, a_long);
+   if (!n)
+      return 0;
+   /* C's literal: its parcels from byte 4 on of a literal prefix (as g5p_usc_literal_ternary()). */
+   unsigned m = literal_prefix(c, 0, 0, 0, G5P_MS4_ALL_SAMPLES, 0, 0, G5P_HEADER_FRAGMENT, c_long);
+   if (!m)
+      return 0;
+   memcpy(raw + n, c + 4, m - 4);
+   n += m - 4;
+   raw[n++] = cmp_code[G5P_FEQ];
+   raw[n++] = G5P_TERNARY_CTL_RESULT_HALF | G5P_TERNARY_CTL_C_SHORT | G5P_PARCEL_CONTINUES;
+   raw[n++] = G5P_ROUTING_LITERAL;
+   raw[n++] = G5P_RELATION_NE;
    return finish(out, raw, n);
 }
 
@@ -2108,6 +2304,35 @@ unsigned g5p_usc_alu2_wide(uint8_t *out, unsigned op, unsigned dst, unsigned a, 
    }
    const uint16_t w[] = {0x0199, 0x0100 | 2 * dst, srcs | 1, 0x0100 | (a >> 5) << 1 | (b >> 5) << 9, op};
    return put_words(out, w, 5);
+}
+
+#define G5P_CLASS_BINARY 0x99        /* g5p_usc_binary()'s class byte with the 32-bit result */
+#define G5P_HEADER_SRC_A_BANK1 0x20  /* source A in register bank 1 (g9p_w0()'s W0 bit 13) */
+unsigned g5p_usc_vs_or_wide(uint8_t *out, unsigned dst_half, unsigned dst_bank, unsigned a, unsigned a_group,
+                            unsigned b, unsigned b_group)
+{
+   CHECK(dst_half < 256 && !(dst_half & 1) && dst_bank <= 1 && a < 128 && b < 128, "registers r0..r127");
+   /* g5p_usc_binary()'s layout for A | B with both sources' bank bits in the header; a source above r31 keeps
+    * r & 31 in its selector, sets A's selector bit 0 and puts r >> 5 in an extension parcel (A at bit 1, B at
+    * bit 9 of the parcel, as g5p_usc_alu2_wide()). */
+   const bool wide = a >= 32 || b >= 32;
+   uint8_t raw[10];
+   raw[0] = G5P_CLASS_BINARY;
+   raw[1] = G5P_HEADER_FRAGMENT | G5P_HEADER_SRC_A_BANK1 | G5P_HEADER_SRC_B_BANK1;
+   if (!destination(raw + 2, dst_half, dst_bank))
+      return 0;
+   SEL(sa, 2 * (a & 31), a_group & 1, wide);
+   SEL(sb, 2 * (b & 31), b_group & 1, G5P_PARCEL_CONTINUES);
+   raw[4] = sa;
+   raw[5] = sb;
+   unsigned n = 6;
+   if (wide) {
+      raw[n++] = (a >> 5) << 1;
+      raw[n++] = (b >> 5) << 1 | G5P_PARCEL_CONTINUES;
+   }
+   raw[n++] = binop_code[G5P_BIN_OR];
+   raw[n++] = 0;
+   return finish(out, raw, n);
 }
 
 /* Graphics storage differential host compiles, compute-gfx-storage-isa.md.

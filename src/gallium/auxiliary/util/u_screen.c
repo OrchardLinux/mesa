@@ -174,6 +174,7 @@ u_init_pipe_screen_caps(struct pipe_screen *pscreen, int accel)
       VARYING_BIT_BOUNDING_BOX1;
 
    caps->throttle = true;
+   caps->throttle_frames = 1;
 
 #if defined(HAVE_LIBDRM) && (DETECT_OS_LINUX || DETECT_OS_BSD || DETECT_OS_MANAGARM)
    if (pscreen->get_screen_fd) {

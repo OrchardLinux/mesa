@@ -214,7 +214,7 @@ write_storage_image(const struct pvr_descriptor_set *set,
    struct pvr_image_descriptor storage_image_desc =
       image_view->image_state[is_cube ? PVR_TEXTURE_STATE_STORAGE
                                       : PVR_TEXTURE_STATE_SAMPLE];
-
+   PVR_G5P_HOOK(storage_image, dev_info, image_view, &storage_image_desc)
    if (!PVR_G5P_NATIVE_STORAGE(dev_info) && !PVR_HAS_FEATURE(dev_info, tpu_extended_integer_lookup)) {
       struct ROGUE_TEXSTATE_STRIDE_IMAGE_WORD1 word1;
       ROGUE_TEXSTATE_STRIDE_IMAGE_WORD1_unpack(&storage_image_desc.words[1],

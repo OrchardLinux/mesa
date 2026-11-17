@@ -70,6 +70,31 @@ a9_alu_fma_literals(struct g9p_ctx *ctx, nir_alu_instr *alu, nir_scalar s[3], bo
    ctx->reg[key(&alu->def, 0)] = dst;
    return true;
 }
+/* wa_h/wa_f8: Apple's f32-to-f16 conversion writes one half of a bank-1
+ * dword. Convert both scalar sources without a software float pack. */
+static bool
+a9_alu_pack_half(struct g9p_ctx *ctx, nir_alu_instr *alu, nir_scalar s[3])
+{
+   int dst = alloc_reg(ctx);
+   if (dst < 0) return false;
+   ctx->temps |= BITFIELD64_BIT(dst);
+   for (unsigned i = 0; i < 2; i++) {
+      int r = src_reg(ctx, s[i]);
+      if (r < 0 || (r = one_src(ctx, r)) < 0) return false;
+      unsigned at = ctx->c->n;
+      g9p_f16_of(ctx->c, dst, r);
+      (*g9p_code_word(ctx->c, at + 1)) |= i; /* the high half: bit 0 of the destination half index, as Apple's half packs */
+   }
+   release(ctx, &alu->instr);
+   ctx->busy |= BITFIELD64_BIT(dst);
+   ctx->reg[key(&alu->def, 0)] = dst;
+   return true;
+}
+#   define G9P_A9_ALU_PACK_HALF() do { \
+      if (ctx->out->a9 && ctx->stage == MESA_SHADER_COMPUTE && \
+          alu->op == nir_op_pack_half_2x16_split) \
+         return a9_alu_pack_half(ctx, alu, s); \
+   } while (0)
 #   define G9P_A9_BRANCH_IMMEDIATE() do {                                \
       uint32_t value;                                                    \
       if (ctx->out->a9 && !is_float && a >= 0 &&                          \

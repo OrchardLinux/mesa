@@ -203,6 +203,8 @@ VkResult PVR_PER_ARCH(CreateImageView)(VkDevice _device,
 
    util_format_compose_swizzles(format_swizzle, input_swizzle, info.swizzle);
 
+   info.skip_rogue_words = PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p) ||
+                           PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p);
    result = pvr_arch_pack_tex_state(device,
                                     &info,
                                     &iview->image_state[info.tex_state_type]);
@@ -220,6 +222,7 @@ VkResult PVR_PER_ARCH(CreateImageView)(VkDevice _device,
     */
    if (info.is_cube && image->vk.usage & VK_IMAGE_USAGE_STORAGE_BIT) {
       info.tex_state_type = PVR_TEXTURE_STATE_STORAGE;
+      info.skip_rogue_words = PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p);
 
       result =
          pvr_arch_pack_tex_state(device,
@@ -230,6 +233,7 @@ VkResult PVR_PER_ARCH(CreateImageView)(VkDevice _device,
    }
 
    if (image->vk.usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) {
+      info.skip_rogue_words = false;
       /* Attachment state is created as if the mipmaps are not supported, so the
        * baselevel is set to zero and num_mip_levels is set to 1. Which gives an
        * impression that this is the only level in the image. This also requires

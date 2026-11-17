@@ -122,6 +122,9 @@ vtex_descriptor(struct pvr_cmd_buffer *cmd, const struct pco_g5p_upload *u, uint
       if (!image || u->dwords != 8 || !pvr_g5p_tex_state_valid(desc))
          return VTEX_REFUSE(cmd, "set %u binding %u has no A9 image state", u->set, u->binding);
       memcpy(out, desc, 32);
+      const char *why = pvr_g5p_tex_state_for(out, u->offset);
+      if (why)
+         return VTEX_REFUSE(cmd, "set %u binding %u: %s", u->set, u->binding, why);
    } else if (u->kind == PCO_G5P_UPLOAD_SAMPLER) {
       if (lb->type != VK_DESCRIPTOR_TYPE_SAMPLER && lb->type != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
          return VTEX_REFUSE(cmd, "set %u binding %u is not a sampler", u->set, u->binding);
@@ -174,6 +177,12 @@ PVR_PER_ARCH(g5p_vtex_draw)(struct pvr_cmd_buffer *cmd, const struct pvr_g5p_sta
             if (u->offset > size || bytes > size - u->offset)
                return VTEX_REFUSE(cmd, "UBO interval exceeds the bound range");
             direct[i] = addr + u->offset;
+         } else if (u->kind == PCO_G5P_UPLOAD_SSBO_ADDR && u->offset == PCO_G5P_SSBO_SIZE_OFFSET) {
+            /* get_ssbo_size: the bound size in bytes */
+            const uint32_t sz = (uint32_t)MIN2(size, UINT32_MAX);
+            if (u->dwords != 1)
+               return VTEX_REFUSE(cmd, "invalid storage buffer size upload");
+            memcpy(dst, &sz, sizeof(sz));
          } else {
             if (u->dwords != 2 || (u->kind == PCO_G5P_UPLOAD_UBO_ADDR && u->offset >= size))
                return VTEX_REFUSE(cmd, "invalid buffer pointer upload");

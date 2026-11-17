@@ -62,6 +62,9 @@
  * buffer starts at CODE_INITIAL and doubles. */
 #define CODE_INITIAL 16384
 #define NUM_DWORDS 32
+/* Vertex input dwords: the PDS fetches up to this many into bank 1. Those above r31 are read through a move
+ * (g5p_usc_vs_or_wide(), Apple's vertex form for attributes above r31), as the fragment homes are. */
+#define VS_INPUT_DWORDS 64
 #define F32_ONE 0x3f800000u
 #define LAST_END (INT_MAX - 1) /* read by the output block */
 #define DISCARD_AT (INT_MAX - 2) /* read by the deferred discards, before the output */
@@ -92,6 +95,7 @@ struct tex_bind {
    unsigned element, selement; /* array elements of the texture / sampler binding */
    unsigned image, sampler; /* common dwords */
    bool needs_sampler, needs_fetch_sampler;
+   unsigned image_flags; /* PCO_G5P_UPLOAD_IMAGE_AS_2D / _ARRAY: how its samples read the state */
 };
 
 struct range {
@@ -102,12 +106,14 @@ struct range {
 };
 
 enum { BLEND_NONE, BLEND_PREMULT, BLEND_STRAIGHT_OVER, BLEND_REPLACE, BLEND_GENERAL };
+/* nir_tex_instr.backend_flags: an array sample of layer 0 drawn as 2D (layer0_as_2d()) */
+#define G5P_TEX_LAYER0_AS_2D (1u << 30)
 
 /* The general blend epilogue (g5p_blend.c, hyprland-gpu.md §11.2) for
  * settings without a measured epilogue. Premultiplied, straight-over and
  * replace keep their paths. By default only the settings of the device
- * blend ladder (linux-a9 blend-ladder.c, release7 2026-11-02: 45 rungs,
- * every pixel within 1 LSB) and of the bench ladder's three blend rungs
+ * blend ladder (45 cases on the A9,
+ * every pixel within 1 LSB) and of the bench ladder's three blend cases
  * take their original byte-identical shape. All other core equations use
  * the same tile protocol with canonical native-f16 ALU lowering. */
 bool pco_g5p_blend_general(void)
@@ -180,6 +186,9 @@ struct gctx {
    nir_def *discards[16]; /* demote_if/terminate_if conditions, emitted before the output */
    unsigned ndiscards;
    bool discard_always;
+   /* the kill held for the destination-reading epilogue (fs_output(): Apple's order, the tile read
+    * issued before the kill): -2 none, -1 unconditional, else the condition register */
+   int deferred_kill;
    int fragcoord;      /* dword of the raw X (Y at +1), -1 when unused */
    bool remat;         /* register-pressure retry: constants/uniforms re-read per use */
    bool count_pass;    /* round 19: first codegen pass only records register reads */
@@ -233,9 +242,11 @@ struct gctx {
    unsigned nvout;
    const struct pco_g5p_vs_link *link;
    unsigned psize_dword; /* a point pipeline's point size: the last output dword */
+   unsigned clip_dword;  /* the first user clip distance (Apple's A9 vertex: they follow the point size) */
    bool eager_vout; /* VS temps retry: each output written as soon as its value is final */
    bool compact_vs; /* last retry: compact movable bank1 values between instructions */
    bool vs_bank0;   /* VS pressure retry: temps in bank 0, outputs in bank 1 (vs-two-bank-allocator.md) */
+   bool vs_evict;   /* last VS retry: held bank-1 values move to bank 0 to keep room for bank-1-only forms */
    nir_intrinsic_instr *vend_store; /* eager: the output component written by the final vend */
    unsigned vend_comp;
    /* common store */
@@ -244,10 +255,15 @@ struct gctx {
    bool cube_gradient; /* fixed native bank0 r0..r8 operand tuple */
    struct { unsigned set, binding, element, lod, common; } tsize[4]; /* textureSize/QueryLevels */
    unsigned nsize;
-   struct range ranges[8];
+   struct range ranges[16]; /* 13 UBOs per stage (maxPerStageDescriptorUniformBuffers) + push constants */
    unsigned nranges;
-   unsigned ssbo_set[2], ssbo_binding[2];
+   /* Storage buffers: one pointer pair each. Up to two take Apple's witnessed
+    * fixed-load bases common0/common2 (the hardware-tested layout, byte-identical);
+    * more, or any with blend constants, sit after the stage's other common
+    * dwords (ssbo_high) and every access goes through addr.add_shift. */
+   unsigned ssbo_set[PCO_G5P_MAX_SSBOS], ssbo_binding[PCO_G5P_MAX_SSBOS], ssbo_common[PCO_G5P_MAX_SSBOS];
    unsigned nssbo;
+   bool ssbo_high;
    /* register-indexed UBO loads: one pointer (UBO VA + constant base) each.
     * The pairs sit at even common dwords below 32 (addr.add_shift's base
     * field), so at most 16; plan_common() refuses a pair past dword 30 and
@@ -391,6 +407,8 @@ static void vs_bank1_only(struct gctx *c, const char *what, int r0, int r1, int 
       if (r[i] >= 0 && !vbank(c, r[i]))
          refuse(c, "%s with a register in vertex bank 0 (no witnessed mixed-bank form)", what);
 }
+
+static unsigned vs_bank1_index(struct gctx *c, unsigned reg);
 
 /* ---- registers (dwords) ---- */
 /* A vertex bank-0 register: the first free one, else -1. */
@@ -759,6 +777,7 @@ static bool alu_supported(struct gctx *c, nir_alu_instr *a)
 /* Register-indexed UBO loads (defined with the common-store plan). */
 static bool dyn_offset_alu(nir_alu_instr *a);
 static bool dyn_ubo_load(nir_intrinsic_instr *in);
+static bool eval_offset(nir_def *d, unsigned comp, uint32_t *v);
 static bool dyn_ubo_offset(nir_intrinsic_instr *in, struct ref *idx, unsigned *shift, uint32_t *base);
 
 /* Vertex iadd that only feeds UBO/push offsets folds into the upload plan. */
@@ -1175,11 +1194,15 @@ static void scan_cf(struct gctx *c, struct exec_list *list, struct unsupported *
             case nir_intrinsic_load_ubo:
                ok = true;
                break;
+            case nir_intrinsic_get_ssbo_size:
+               ok = in->def.bit_size == 32 && in->def.num_components == 1;
+               break;
             case nir_intrinsic_store_ssbo:
                ok = in->src[0].ssa->bit_size==32 && in->num_components==1 && nir_intrinsic_write_mask(in)==1;
                break;
             case nir_intrinsic_load_ssbo:
-               ok = !c->vs;
+               /* 4- or 16-byte loads (g5p_nir_prepare splits the rest) */
+               ok = in->def.bit_size == 32 && (in->def.num_components == 1 || in->def.num_components == 4);
                break;
             case nir_intrinsic_load_vertex_id:
             case nir_intrinsic_load_instance_id:
@@ -1399,6 +1422,19 @@ static bool smooth_centre(nir_intrinsic_instr *in)
           interp == PCO_G5P_INTERP_SMOOTH && !centroid;
 }
 
+/* A vertex output store's location, its constant slot offset included (a
+ * compact gl_ClipDistance[4..7] store is CLIP_DIST0 at offset 1); other
+ * offsets are refused by collect_vs_outputs(). */
+static unsigned
+out_location(nir_intrinsic_instr *in)
+{
+   unsigned loc = nir_intrinsic_io_semantics(in).location;
+   nir_src *off = nir_get_io_offset_src(in);
+   if ((loc == VARYING_SLOT_CLIP_DIST0 || loc == VARYING_SLOT_CLIP_DIST1) && off && nir_src_is_const(*off))
+      loc += nir_src_as_uint(*off);
+   return loc;
+}
+
 /* First output dword of a vertex output location: 0 for the position, -1
  * when the location is not written (its fragment program does not read it),
  * -2 for a location without an output slot. */
@@ -1408,6 +1444,8 @@ static int vs_base(struct gctx *c, unsigned loc)
       return 0;
    if (loc == VARYING_SLOT_PSIZ && c->link && c->link->point_size)
       return c->psize_dword;
+   if ((loc == VARYING_SLOT_CLIP_DIST0 || loc == VARYING_SLOT_CLIP_DIST1) && c->p->clip_count)
+      return c->clip_dword + 4 * (loc - VARYING_SLOT_CLIP_DIST0);
    if (loc < VARYING_SLOT_VAR0 || loc > VARYING_SLOT_VAR31)
       return -2;
    unsigned d = c->p->vout_dword[loc - VARYING_SLOT_VAR0];
@@ -1468,6 +1506,21 @@ static void plan_vs_layout(struct gctx *c)
     * alpha for the size) */
    if (c->link && c->link->point_size)
       c->psize_dword = c->p->outputs++;
+   /* User clip distances: the vertex's last dwords, after the point size,
+    * one per declared distance (Apple's applegpu_g5p layout, LD_MD +164; the
+    * TA's user planes 0..n-1, TA_OUTPUT_SEL plane0..7). Disabled GL planes
+    * are the program's business (Zink's nir_lower_clip_disable, Apple's
+    * clipDistanceEnableMask in the program key). */
+   const unsigned clips = c->nir->info.clip_distance_array_size;
+   if (c->nir->info.cull_distance_array_size)
+      refuse(c, "cull distances (A9's TA user planes are clip planes; Apple's A9 driver sets no cull plane)");
+   if (clips && !(c->link && c->link->clip_distance))
+      refuse(c, "user clip distances");
+   if (clips > 8)
+      refuse(c, "%u clip distances (the TA has 8 user planes)", clips);
+   c->clip_dword = c->p->outputs;
+   c->p->clip_count = clips;
+   c->p->outputs += clips;
    /* The A9 TA vertex holds 128 dwords, the position included
     * (varyings-capacity-1: 124 varying components exact, 128 wrong as a
     * whole with no GPU event); refuse past it by name, never draw it. */
@@ -1480,7 +1533,7 @@ static void plan_vs_layout(struct gctx *c)
       if (ins->type != nir_instr_type_intrinsic)
          continue;
       nir_intrinsic_instr *in = nir_instr_as_intrinsic(ins);
-      if (in->intrinsic != nir_intrinsic_store_output || vs_base(c, nir_intrinsic_io_semantics(in).location) < 0)
+      if (in->intrinsic != nir_intrinsic_store_output || vs_base(c, out_location(in)) < 0)
          continue;
       last = in;
       last_comp = util_last_bit(nir_intrinsic_write_mask(in)) - 1;
@@ -1528,8 +1581,8 @@ static void plan_varyings(struct gctx *c)
       mask[n] |= BITFIELD64_MASK(in->def.num_components) << nir_intrinsic_component(in);
    }
    if (util_bitcount(read) > PCO_G5P_MAX_FS_VARYINGS)
-      refuse(c, "%u varying locations read (%u vec4: the reported 64 components)", util_bitcount(read),
-             PCO_G5P_MAX_FS_VARYINGS);
+      refuse(c, "%u varying locations read (%u vec4: the reported %u components)", util_bitcount(read),
+             PCO_G5P_MAX_FS_VARYINGS, 4 * PCO_G5P_MAX_FS_VARYINGS);
    bool smooth = false;
    u_foreach_bit(n, read)
       smooth |= interp[n] == PCO_G5P_INTERP_SMOOTH;
@@ -1723,6 +1776,12 @@ static void liveness(struct gctx *c)
             mark(c, ix, idx);
             continue;
          }
+         if (in->intrinsic == nir_intrinsic_load_ssbo) {
+            uint32_t off;
+            if (!eval_offset(in->src[1].ssa, 0, &off))
+               mark(c, resolve_value(c, in->src[1].ssa, 0), idx);
+            continue;
+         }
          if (in->intrinsic == nir_intrinsic_store_global) {
             unsigned b, k;
             struct ref off;
@@ -1757,7 +1816,7 @@ static void liveness(struct gctx *c)
             continue;
          if (in->instr.block->cf_node.parent->type != nir_cf_node_function)
             refuse(c, "store_output inside control flow");
-         unsigned loc = nir_intrinsic_io_semantics(in).location;
+         unsigned loc = c->vs ? out_location(in) : nir_intrinsic_io_semantics(in).location;
          unsigned comp = nir_intrinsic_component(in);
          u_foreach_bit(k, nir_intrinsic_write_mask(in)) {
             if (c->vs) {
@@ -2000,6 +2059,8 @@ static void tex_bindings(struct gctx *c, nir_tex_instr *t, struct tex_bind *b)
                           sv->data.binding, element, selement};
    b->needs_sampler = t->op != nir_texop_txf;
    b->needs_fetch_sampler = t->op == nir_texop_txf;
+   b->image_flags = (t->backend_flags & G5P_TEX_LAYER0_AS_2D) ? PCO_G5P_UPLOAD_IMAGE_AS_2D :
+                    t->is_array ? PCO_G5P_UPLOAD_IMAGE_ARRAY : 0;
 }
 
 static struct tex_bind *tex_for(struct gctx *c, nir_tex_instr *t)
@@ -2008,7 +2069,8 @@ static struct tex_bind *tex_for(struct gctx *c, nir_tex_instr *t)
    tex_bindings(c, t, &b);
    for (unsigned i = 0; i < c->ntex; i++)
       if (c->tex[i].set == b.set && c->tex[i].binding == b.binding && c->tex[i].sset == b.sset &&
-          c->tex[i].sbinding == b.sbinding && c->tex[i].element == b.element && c->tex[i].selement == b.selement)
+          c->tex[i].sbinding == b.sbinding && c->tex[i].element == b.element && c->tex[i].selement == b.selement &&
+          c->tex[i].image_flags == b.image_flags)
          { c->tex[i].needs_sampler |= b.needs_sampler;
            c->tex[i].needs_fetch_sampler |= b.needs_fetch_sampler;
            return &c->tex[i]; }
@@ -2106,6 +2168,13 @@ static void plan_common(struct gctx *c)
             c->uptr[c->nuptr].element = element;
             c->uptr[c->nuptr++].base = base;
          }
+      } else if (in->intrinsic == nir_intrinsic_get_ssbo_size) {
+         /* the bound size, a CPU-written dword (PCO_G5P_SSBO_SIZE_OFFSET) */
+         if (!block_binding_element(in->src[0].ssa, &set, &binding, &element))
+            refuse(c, "get_ssbo_size: block index is not a constant descriptor binding");
+         struct range *r = range_for(c, PCO_G5P_UPLOAD_SSBO_ADDR, set, binding, element);
+         r->lo = PCO_G5P_SSBO_SIZE_OFFSET;
+         r->hi = PCO_G5P_SSBO_SIZE_OFFSET + 4;
       } else if (in->intrinsic == nir_intrinsic_load_ubo) {
          if (!block_binding_element(in->src[0].ssa, &set, &binding, &element))
             refuse(c, "load_ubo: block index is not a constant descriptor binding");
@@ -2121,25 +2190,33 @@ static void plan_common(struct gctx *c)
          for (unsigned i = 0; i < c->nssbo; i++)
             found |= c->ssbo_set[i] == set && c->ssbo_binding[i] == binding;
          if (!found) {
-            if (c->nssbo == 2)
-               refuse(c, "load_ssbo: only pointer bases common0/common2 are witnessed (two buffers)");
+            if (c->nssbo == PCO_G5P_MAX_SSBOS)
+               refuse(c, "more than %u storage buffers", PCO_G5P_MAX_SSBOS);
             c->ssbo_set[c->nssbo] = set;
             c->ssbo_binding[c->nssbo++] = binding;
          }
       }
    }
    unsigned next = 0;
-   if (!c->vs && c->blend == BLEND_GENERAL && c->binfo.uses_constants) {
-      /* Apple's layout: the blend colour in common 0..3, everything else after it */
-      if (c->nssbo)
-         refuse(c, "blend constants with storage buffers (both want common dwords 0..3)");
+   bool blend_constants = !c->vs && c->blend == BLEND_GENERAL && c->binfo.uses_constants;
+   /* Apple's layout: the blend colour in common 0..3, everything else after
+    * it. Storage buffers keep common0/common2 only when they are at most two
+    * and the blend colour does not want those dwords; otherwise their
+    * pointers follow the stage's other common dwords (below). */
+   c->ssbo_high = c->nssbo > 2 || (c->nssbo && blend_constants);
+   if (blend_constants) {
       add_upload(c, PCO_G5P_UPLOAD_BLEND_CONSTANTS, 0, 0, 0, 0, 4, G5P_BLEND_CONST_BASE);
       next = 4;
    }
-   for (unsigned i = 0; i < c->nssbo; i++)
+   for (unsigned i = 0; !c->ssbo_high && i < c->nssbo; i++) {
+      c->ssbo_common[i] = 2 * i;
       add_upload(c, PCO_G5P_UPLOAD_SSBO_ADDR, c->ssbo_set[i], c->ssbo_binding[i], 0, 0, 2, 2 * i);
-   if (c->nssbo)
+   }
+   if (c->nssbo && !c->ssbo_high)
       next = MAX2(next, 4);
+   /* High storage pointers: an even dword each after the data, so the
+    * plan reserves their dwords (plus one for alignment) at its end. */
+   const unsigned ssbo_reserve = c->ssbo_high ? 2 * c->nssbo + 1 : 0;
    bool qualified = c->vs && g5p_vtex_qualified();
    /* Preserve the flown <=4-texture layout. Larger fragment programs use
     * Apple's f16 capacity layout: all eight-dword images, then samplers.
@@ -2167,7 +2244,7 @@ static void plan_common(struct gctx *c)
       }
       if (!g5p_stage_common_plan(next, c->ntex, sampler_count + fetch_sampler,
                                  compact, c->nuptr, c->nsize, ubos,
-                                 ubo_dwords, push_dwords, &common_plan))
+                                 ubo_dwords, push_dwords + ssbo_reserve, &common_plan))
          refuse(c, "common layout cannot fit pointers below 32 and data below 256 dwords");
       compact = common_plan.compact;
       if (common_plan.low_pointers) {
@@ -2202,7 +2279,7 @@ static void plan_common(struct gctx *c)
       next = compact ? c->fetch_sampler_common + 2 * (qualified && fetch_sampler) : t->image + 10;
       if (t->image / 2 > (compact ? 120 : 28) || t->sampler / 2 > (compact ? 124 : 32))
          refuse(c, "texture descriptors beyond the bounded qualified selectors");
-      add_upload(c, PCO_G5P_UPLOAD_IMAGE, t->set, t->binding, t->element, 0, 8, t->image);
+      add_upload(c, PCO_G5P_UPLOAD_IMAGE, t->set, t->binding, t->element, t->image_flags, 8, t->image);
       if (!qualified || t->needs_sampler)
          add_upload(c, PCO_G5P_UPLOAD_SAMPLER, t->sset, t->sbinding, t->selement, 32, 2, t->sampler);
    }
@@ -2266,7 +2343,16 @@ static void plan_common(struct gctx *c)
                  (r->hi - r->lo) / 4, r->common);
    }
    if (planned)
-      assert(next == common_plan.end);
+      assert(next + ssbo_reserve == common_plan.end);
+   /* addr.add_shift reads a pointer pair at any even common dword below 256
+    * (the shared-operand field's high bits, g5p_usc_address_add_shift). */
+   for (unsigned i = 0; c->ssbo_high && i < c->nssbo; i++) {
+      c->ssbo_common[i] = next = align(next, 2);
+      next += 2;
+      if (next > limit)
+         refuse(c, "storage-buffer pointers exceed %u common-store dwords", limit);
+      add_upload(c, PCO_G5P_UPLOAD_SSBO_ADDR, c->ssbo_set[i], c->ssbo_binding[i], 0, 0, 2, c->ssbo_common[i]);
+   }
    /* Transform feedback block: pointer pairs at even dwords (address add). */
    if (xfb) {
       c->xfb_common = align(next, 2);
@@ -2362,7 +2448,11 @@ static unsigned reg_of(struct gctx *c, struct ref r, const char *what)
    case VAL_HOME: {
       /* parked above r31: back into a register for this instruction */
       unsigned reg = alloc_reg(c, -1);
-      put(c, raw, g5p_usc_alu2_wide(raw, G5P_OP_OR, reg, v->reg, 0, v->reg, 0), "move from a home above r31");
+      if (c->vs) /* a vertex input fetched above r31 (setup_inputs()): v->reg is its bank-1 register */
+         put(c, raw, g5p_usc_vs_or_wide(raw, H(c, reg), vbank(c, reg), v->reg, 0, v->reg, 0),
+             "move a vertex input from above r31");
+      else
+         put(c, raw, g5p_usc_alu2_wide(raw, G5P_OP_OR, reg, v->reg, 0, v->reg, 0), "move from a home above r31");
       c->scratch |= BITFIELD64_BIT(reg);
       return reg;
    }
@@ -2398,6 +2488,18 @@ static unsigned scratch_imm(struct gctx *c, uint32_t value)
    unsigned reg = alloc_reg(c, -1);
    put(c, raw, g5p_usc_immediate(raw, H(c, reg), value, vbank(c, reg), -1), "movi");
    c->scratch |= BITFIELD64_BIT(reg);
+   return reg;
+}
+
+/* A scratch immediate in vertex bank 1, also when the program allocates its
+ * temps in bank 0 (alloc_bank1_run()). */
+static unsigned scratch_imm_bank1(struct gctx *c, uint32_t value)
+{
+   bool bank0 = c->vs_bank0, tex_bank0 = c->tex_bank0;
+   c->vs_bank0 = c->tex_bank0 = false;
+   unsigned reg = scratch_imm(c, value);
+   c->vs_bank0 = bank0;
+   c->tex_bank0 = tex_bank0;
    return reg;
 }
 
@@ -3431,7 +3533,7 @@ static void emit_isub(struct gctx *c, nir_alu_instr *a)
  * tools/mesa-a9-vtx-re/probes.metal, byte-equal to these encoders). The
  * fragment form (bank 0, header 1) in a vertex program reads and writes
  * other registers: x >> 2 then read again gave x on hardware (vertex-input's
- * gl_VertexIndex rungs). Dynamic amounts have no vertex probe. */
+ * gl_VertexIndex cases). Dynamic amounts have no vertex probe. */
 static void emit_shift(struct gctx *c, nir_alu_instr *a)
 {
    struct ref x = alu_src(c, a, 0), amt = alu_src(c, a, 1);
@@ -4160,13 +4262,24 @@ bool pco_g5p_fuse_ffma(void)
    return true;
 }
 
-/* The index is clamp_dyn_ubo's umin(i, last), a constant bound inside the block. */
+/* The index is clamp_dyn_ubo's umin(i, last), a constant bound inside the
+ * block; or nir_opt_algebraic removed that umin because the index is
+ * already proven to be at most `last` (x & 3 into uvec4[4]). The second form
+ * is accepted only with a proven bound inside the largest UBO
+ * (maxUniformBufferRange 64 KiB = 4096 elements of 16 bytes), never a
+ * wild 32-bit index. */
 static bool clamped_index(struct ref ix)
 {
    nir_alu_instr *a = alu_of(ix.def);
-   if (!a || a->op != nir_op_umin)
-      return false;
-   return nir_src_is_const(a->src[0].src) || nir_src_is_const(a->src[1].src);
+   if (a && a->op == nir_op_umin &&
+       (nir_src_is_const(a->src[0].src) || nir_src_is_const(a->src[1].src)))
+      return true;
+   nir_instr *ins = nir_def_instr(ix.def);
+   nir_shader *shader = nir_cf_node_get_function(&ins->block->cf_node)->function->shader;
+   struct hash_table *ht = _mesa_pointer_hash_table_create(NULL);
+   uint32_t bound = nir_unsigned_upper_bound(shader, ht, nir_get_scalar(ix.def, ix.comp));
+   _mesa_hash_table_destroy(ht, NULL);
+   return bound < 4096;
 }
 
 static void emit_dyn_ubo(struct gctx *c, nir_intrinsic_instr *in)
@@ -4177,11 +4290,14 @@ static void emit_dyn_ubo(struct gctx *c, nir_intrinsic_instr *in)
    uint32_t base;
    block_binding_element(in->src[0].ssa, &set, &binding, &element);
    dyn_ubo_offset(in, &ix, &shift, &base);
-   unsigned bytes = 4 * n;
    /* Witnessed: 16-byte loads (Apple's v_cexpr, vec4 elements at shift 4) and
     * 4-byte loads (G9P's, at any byte offset); the shift field is
-    * corpus-verified 0-4. vec2/vec3 (8-byte, 12-byte) loads are not. */
-   if (in->def.bit_size != 32 || !((n == 4 && shift == 4) || (n == 1 && shift != 1)) || base % bytes)
+    * corpus-verified 0-4. vec2/vec3 (8-byte, 12-byte) loads are not: a
+    * vec2/vec3 at the start of a 16-byte element (nir_opt_shrink_vectors of
+    * a vec4 read) loads the whole element and drops the unused registers. */
+   const unsigned loaded = (n == 2 || n == 3) && shift == 4 && !(base % 16) ? 4 : n;
+   unsigned bytes = 4 * loaded;
+   if (in->def.bit_size != 32 || !((loaded == 4 && shift == 4) || (n == 1 && shift != 1)) || base % bytes)
       refuse(c, "load_ubo: register-indexed %u x %u-bit at shift %u, base %u (witnessed: vec4 at shift 4, "
                 "scalar at shift 0/2-4, element-aligned base)", n, in->def.bit_size, shift, base);
    /* Apple's form for an unsigned index is this one: umin, then addr.add_shift
@@ -4204,8 +4320,10 @@ static void emit_dyn_ubo(struct gctx *c, nir_intrinsic_instr *in)
           c->uptr[i].element == element && c->uptr[i].base == base)
          common = c->uptr[i].common;
    unsigned index = reg_of(c, ix, "register-indexed UBO load index");
+   /* a bank-0 index is copied into bank 1 first (the witnessed mixed-bank move), as a storage
+    * buffer's offset is (vs_bank1_index()): nfsu2's vertex pulling indexes its uniforms so */
    if (c->vs)
-      vs_bank1_only(c, "vertex register-indexed UBO load", index, -1, -1, -1);
+      index = vs_bank1_index(c, index);
    bool kill = dies(c, ix);
    /* Registers are read at issue: like Apple's v_cexpr (index r0 -> pair
     * r0:r1 -> data r0..r3), the pair may take a dying index's register and
@@ -4221,18 +4339,22 @@ static void emit_dyn_ubo(struct gctx *c, nir_intrinsic_instr *in)
    c->max_dword = MAX2(c->max_dword, pair + 2);
    put(c, raw, g5p_usc_address_add_shift(raw, 2 * pair, common, 2 * index, shift, kill, c->vs), "addr.add_shift");
    unsigned dst = 0;
-   for (dst = 0; dst + n <= NUM_DWORDS; dst += n)
-      if (!((c->busy | c->reserved | c->tex_coord_pending | c->tex_pending) & BITFIELD64_RANGE(dst, n)))
+   for (dst = 0; dst + loaded <= NUM_DWORDS; dst += loaded)
+      if (!((c->busy | c->reserved | c->tex_coord_pending | c->tex_pending) & BITFIELD64_RANGE(dst, loaded)))
          break;
-   if (dst + n > NUM_DWORDS)
-      refuse(c, "register pressure: load_ubo needs %u aligned dword(s)", n);
-   c->busy |= BITFIELD64_RANGE(dst, n);
-   c->max_dword = MAX2(c->max_dword, dst + n);
+   if (dst + loaded > NUM_DWORDS)
+      refuse(c, "register pressure: load_ubo needs %u aligned dword(s)", loaded);
+   c->busy |= BITFIELD64_RANGE(dst, loaded);
+   c->max_dword = MAX2(c->max_dword, dst + loaded);
+   if (loaded != n) /* the new whole-element form; hardware-tested forms keep their bytes */
+      c->max_written = MAX2(c->max_written, dst + loaded);
    if (c->vs)
       put(c, raw, g5p_usc_vertex_address_load(raw, 2 * dst, bytes, 2 * pair), "vertex address load");
    else
       put(c, raw, g5p_usc_address_load(raw, 2 * dst, bytes, 2 * pair, 0), "fragment address load");
    put(c, raw, g5p_usc_wait(raw, 0), "wait");
+   /* the load has completed (wait): the element's unused tail is free */
+   c->busy &= ~BITFIELD64_RANGE(dst + n, loaded - n);
    for (unsigned k = 0; k < n; k++) {
       struct val *v = V(c, &in->def, k);
       v->state = VAL_REG;
@@ -4253,7 +4375,10 @@ static void emit_memory_ubo(struct gctx *c, nir_intrinsic_instr *in,
    if (in->def.bit_size != 32 || !n || n > 4)
       refuse(c, "memory UBO load: only 1..4 aligned 32-bit components");
 
-   const unsigned dst = alloc_run(c, n, "memory UBO load");
+   /* A vertex load writes bank 1, the witnessed form, also when the program
+    * allocates its temps in bank 0 (control flow, or the bank-0 pressure
+    * retry), as a vertex storage-buffer load does (emit_address_ssbo_load). */
+   const unsigned dst = c->vs ? alloc_bank1_run(c, n, "memory UBO load") : alloc_run(c, n, "memory UBO load");
    if (c->vs)
       vs_bank1_only(c, "vertex memory UBO load", dst, -1, -1, -1);
    const unsigned first = off - r->lo;
@@ -4264,7 +4389,10 @@ static void emit_memory_ubo(struct gctx *c, nir_intrinsic_instr *in,
    for (unsigned i = 0; i < loads; i++) {
       const unsigned bytes = vector ? 16 : 4;
       const unsigned at = first + (vector ? 0 : 4 * i);
-      const unsigned index = scratch_imm(c, at);
+      /* the vertex addr.add_shift reads its offset from bank 1 only (vs_bank1_index()) */
+      const unsigned index = c->vs ? scratch_imm_bank1(c, at) : scratch_imm(c, at);
+      if (c->vs)
+         vs_bank1_only(c, "vertex constant UBO address offset", index, -1, -1, -1);
       unsigned pair;
 
       for (pair = 0; pair + 2 <= NUM_DWORDS; pair += 2)
@@ -4343,7 +4471,7 @@ static void stage_ssbo_store(struct gctx *c,nir_intrinsic_instr *in)
       nir_intrinsic_offset_shift(in)!=0 || nir_intrinsic_align_mul(in)<4 || nir_intrinsic_align_offset(in)%4)
       refuse(c,"store_ssbo: aligned scalar32-bit byte offsets only");
    unsigned set,binding,base=0;block_binding(in->src[1].ssa,&set,&binding);
-   for(unsigned i=0;i<c->nssbo;i++)if(c->ssbo_set[i]==set && c->ssbo_binding[i]==binding)base=2*i;
+   for(unsigned i=0;i<c->nssbo;i++)if(c->ssbo_set[i]==set && c->ssbo_binding[i]==binding)base=c->ssbo_common[i];
    struct ref offset=resolve_value(c,in->src[2].ssa,0),value=resolve_value(c,in->src[0].ssa,0);
    unsigned index=reg_of(c,offset,"store_ssbo byte offset"),data=reg_of(c,value,"store_ssbo value");
    if(c->vs)vs_bank1_only(c,"vertex SSBO store",index,data,-1,-1);
@@ -4363,6 +4491,89 @@ static void stage_ssbo_store(struct gctx *c,nir_intrinsic_instr *in)
    put(c,raw,g5p_usc_wait(raw,0),"SSBO store completion");
    c->busy&=~BITFIELD64_RANGE(pair,2);free_scratch(c);
    c->p->evidence|=c->vs?PCO_G5P_EV_VS_STORE:PCO_G5P_EV_FS_STORE;
+}
+
+/* A vertex address operand from bank 0 is copied into bank 1 (the only
+ * witnessed vertex addr.add_shift form reads bank 1). */
+static unsigned vs_bank1_index(struct gctx *c, unsigned reg)
+{
+   if (!c->vs || vbank(c, reg))
+      return reg;
+   uint8_t raw[G5P_USC_MAX];
+   bool bank0 = c->vs_bank0;
+   c->vs_bank0 = false;
+   unsigned b1 = alloc_reg(c, -1);
+   c->vs_bank0 = bank0;
+   put(c, raw, g5p_usc_move(raw, H(c, b1), H(c, reg), 1, 0, vhdr(c, 0x21, reg, -1, -1)),
+       "bank0 address offset into bank1");
+   c->scratch |= BITFIELD64_BIT(b1);
+   vs_bank1_only(c, "vertex storage-buffer address offset", b1, -1, -1, -1);
+   return b1;
+}
+
+/* A storage-buffer load through its pointer pair: pair = pointer + byte
+ * offset (addr.add_shift, shift 0), then the addressed 4/16-byte load that
+ * Apple's register-indexed constant-buffer programs use (emit_dyn_ubo).
+ * The offset is the load's own register, or a scratch immediate for a
+ * constant offset that the fixed form cannot encode. g5p_nir_prepare()
+ * leaves only scalar loads and 16-byte-aligned vec4 loads. */
+static void emit_address_ssbo_load(struct gctx *c, nir_intrinsic_instr *in, unsigned base)
+{
+   uint8_t raw[G5P_USC_MAX];
+   const unsigned n = in->def.num_components, bytes = 4 * n;
+   uint32_t off;
+   bool constant = eval_offset(in->src[1].ssa, 0, &off);
+   if (constant && off % 4)
+      refuse(c, "load_ssbo: unaligned constant offset %u", off);
+   bool kill;
+   unsigned index;
+   struct ref ix = {0};
+   if (constant) {
+      index = scratch_imm(c, off);
+      kill = true;
+   } else {
+      if (n == 4 && nir_intrinsic_align(in) < 16)
+         refuse(c, "load_ssbo: 16-byte load without 16-byte alignment");
+      ix = resolve_value(c, in->src[1].ssa, 0);
+      index = reg_of(c, ix, "load_ssbo byte offset");
+      kill = dies(c, ix);
+   }
+   unsigned raw_index = index;
+   index = vs_bank1_index(c, index);
+   if (index != raw_index)
+      kill = true; /* the bank-1 copy is scratch */
+   if (!constant && kill && index == raw_index)
+      drop(c, V(c, ix.def, ix.comp));
+   unsigned pair;
+   for (pair = 0; pair + 2 <= NUM_DWORDS; pair += 2)
+      if (!((c->busy | c->reserved | c->tex_coord_pending | c->tex_pending) & BITFIELD64_RANGE(pair, 2)))
+         break;
+   if (pair + 2 > NUM_DWORDS)
+      refuse(c, "load_ssbo: register pressure for an address pair");
+   c->busy |= BITFIELD64_RANGE(pair, 2);
+   c->max_dword = MAX2(c->max_dword, pair + 2);
+   c->max_written = MAX2(c->max_written, pair + 2);
+   put(c, raw, g5p_usc_address_add_shift(raw, 2 * pair, base, H(c, index), 0, kill, c->vs),
+       "storage-buffer address");
+   /* a vertex load writes bank 1 (the witnessed form), also when the program allocates in
+    * bank 0: its results are ordinary bank-1 registers, as a vertex sample's are */
+   const unsigned dst = c->vs ? alloc_bank1_run(c, n, "load_ssbo") : alloc_run(c, n, "load_ssbo");
+   if (c->vs) {
+      vs_bank1_only(c, "vertex storage-buffer load", dst, -1, -1, -1);
+      put(c, raw, g5p_usc_vertex_address_load(raw, 2 * dst, bytes, 2 * pair), "vertex storage-buffer load");
+   } else {
+      put(c, raw, g5p_usc_address_load(raw, 2 * dst, bytes, 2 * pair, 0), "fragment storage-buffer load");
+   }
+   put(c, raw, g5p_usc_wait(raw, 0), "wait");
+   c->busy &= ~BITFIELD64_RANGE(pair, 2);
+   free_scratch(c);
+   for (unsigned k = 0; k < n; k++) {
+      struct val *v = V(c, &in->def, k);
+      v->state = VAL_REG;
+      v->reg = dst + k;
+      v->held = true;
+   }
+   c->p->evidence |= PCO_G5P_EV_BUFFER_LOAD;
 }
 
 static void emit_intrinsic(struct gctx *c, nir_intrinsic_instr *in)
@@ -4450,17 +4661,33 @@ static void emit_intrinsic(struct gctx *c, nir_intrinsic_instr *in)
       }
       break;
    }
+   case nir_intrinsic_get_ssbo_size: {
+      unsigned set, binding, element;
+      if (!block_binding_element(in->src[0].ssa, &set, &binding, &element))
+         refuse(c, "get_ssbo_size: block index is not a constant descriptor binding");
+      struct range *r = range_for(c, PCO_G5P_UPLOAD_SSBO_ADDR, set, binding, element);
+      struct val *v = V(c, &in->def, 0);
+      v->state = VAL_SHARED;
+      v->imm = r->common;
+      break;
+   }
    case nir_intrinsic_load_ssbo: {
       unsigned set, binding;
       block_binding(in->src[0].ssa, &set, &binding);
       unsigned base = 0;
       for (unsigned i = 0; i < c->nssbo; i++)
          if (c->ssbo_set[i] == set && c->ssbo_binding[i] == binding)
-            base = 2 * i;
-      unsigned off = load_offset(c, in, 1, 0);
+            base = c->ssbo_common[i];
+      uint32_t off = 0;
       unsigned n = in->def.num_components, bytes = n == 1 ? 4 : n == 4 ? 16 : 0;
-      if (!bytes || off % bytes || off / bytes > 255)
-         refuse(c, "load_ssbo: only 4/16-byte element loads at a constant element index <= 255 are witnessed");
+      if (!bytes || in->def.bit_size != 32)
+         refuse(c, "load_ssbo: only 4/16-byte 32-bit loads");
+      bool fixed = eval_offset(in->src[1].ssa, 0, &off) && !c->vs && base <= 2 &&
+                   !(off % bytes) && off / bytes <= 255;
+      if (!fixed) {
+         emit_address_ssbo_load(c, in, base);
+         break;
+      }
       unsigned dst = alloc_run(c, n, "load_ssbo");
       put(c, raw, g5p_usc_buffer_load(raw, 2 * dst, bytes, base, off / bytes, 0), "fixed buffer load");
       put(c, raw, g5p_usc_wait(raw, 0), "wait");
@@ -4910,6 +5137,35 @@ static void emit_vertex_qualified_texture(struct gctx *c, nir_tex_instr *t)
    c->p->evidence |= PCO_G5P_EV_TEX_TYPES;
 }
 
+/* The 4x LOAD background's sample (key ms_own_sample): Apple's loader form. The coordinates in a
+ * three-register run, the own-sample operand in its third register (the fetch reads it implicitly, so it is
+ * part of the run), then the narrow sample of dimension G5P_TEX_2D_MS with coordinate control. Only the narrow form
+ * is witnessed: anything else is refused. */
+static void emit_tex_ms_own_sample(struct gctx *c, nir_tex_instr *t, struct tex_bind *b, bool narrow)
+{
+   uint8_t raw[G5P_USC_MAX];
+   if (!narrow || varying_coord_slot(c, t) >= 0 || c->mrt.targets != 1) {
+      refuse(c, "the 4x LOAD sample: only Apple's narrow form with computed coordinates is witnessed");
+      return;
+   }
+   tex_flush(c);
+   nir_def *cd = nir_get_tex_src(t, nir_tex_src_coord);
+   struct ref x = resolve_value(c, cd, 0), y = resolve_value(c, cd, 1);
+   unsigned xr = reg_of(c, x, "texture coordinate"), yr = reg_of(c, y, "texture coordinate");
+   const unsigned coord = alloc_run(c, 3, "multisample coordinates and sample operand");
+   put(c, raw, g5p_usc_move(raw, 2 * coord, 2 * xr, 0, vgrp(c, x), 1), "coordinate x");
+   put(c, raw, g5p_usc_move(raw, 2 * coord + 2, 2 * yr, 0, vgrp(c, y), 1), "coordinate y");
+   put(c, raw, g5p_usc_ms_own_sample(raw, 2 * coord + 4), "the task's own sample");
+   c->scratch |= BITFIELD64_RANGE(coord, 3);
+   struct g5p_tex s = {.image_qword = b->image / 2, .sampler_qword = b->sampler / 2, .coord_dword = coord,
+                       .coord_control = true, .dim = G5P_TEX_2D_MS, .narrow = true, .dst_half = 0};
+   put(c, raw, g5p_usc_sample(raw, &s), "texture sample (2D multisample)");
+   c->tex_coord_pending |= BITFIELD64_RANGE(coord, 3);
+   c->tex_batch++;
+   tex_flush(c);
+   c->p->evidence |= PCO_G5P_EV_TEX_CAPTURE;
+}
+
 static void emit_tex(struct gctx *c, nir_tex_instr *t)
 {
    if (c->tex_batch == 4 || c->vs || !plain_tex(t) || size_query(t) || c->narrow_tex == t)
@@ -4931,6 +5187,10 @@ static void emit_tex(struct gctx *c, nir_tex_instr *t)
    int slot = varying_coord_slot(c, t);
    bool narrow = c->narrow_tex == t;
    unsigned coord;
+   if (c->key && c->key->ms_own_sample) {
+      emit_tex_ms_own_sample(c, t, b, narrow);
+      return;
+   }
    if (slot >= 0) {
       tex_flush(c);
       coord = narrow ? 0 : alloc_run(c, 2, "texture coordinate");
@@ -5005,6 +5265,14 @@ static void vs_converts(struct gctx *c, struct vs_convert *cv, unsigned n)
    c->alloc_out = true; /* converted attributes stay in bank 1, where they are fetched */
    qsort(cv, n, sizeof(*cv), vs_convert_order);
    for (unsigned i = 0; i < n; i++) {
+      if (cv[i].reg >= NUM_DWORDS) {
+         /* a dword fetched above r31 (sorted last, after the low converts freed their registers): moved into a
+          * register first (Apple's vertex OR form, g5p_usc_vs_or_wide()), its converts then read it there */
+         const unsigned hi = cv[i].reg, lo = alloc_reg(c, -1);
+         put(c, raw, g5p_usc_vs_or_wide(raw, H(c, lo), vbank(c, lo), hi, 0, hi, 0), "move a vertex input from above r31");
+         for (unsigned k = i; k < n && cv[k].reg == hi; k++)
+            cv[k].reg = lo;
+      }
       const unsigned half = 2 * cv[i].reg + (cv[i].byte >> 1);
       bool last_half = true, last_reg = true;
       for (unsigned k = i + 1; k < n; k++) {
@@ -5046,8 +5314,8 @@ static void setup_inputs(struct gctx *c)
           !nir_src_is_const(in->src[0]) || nir_src_as_uint(in->src[0]) || in->def.bit_size != 32)
          refuse(c, "load_input: only direct 32-bit generic attributes");
       unsigned l = loc - VERT_ATTRIB_GENERIC0, first = nir_intrinsic_component(in);
-      if (4 * l + 4 > NUM_DWORDS)
-         refuse(c, "vertex input location %u: its fetch lands beyond r%u", l, NUM_DWORDS - 1);
+      if (4 * l + 4 > VS_INPUT_DWORDS)
+         refuse(c, "vertex input location %u: its fetch lands beyond r%u", l, VS_INPUT_DWORDS - 1);
       c->p->input_mask |= 1u << l;
       for (unsigned k = 0; k < in->def.num_components; k++) {
          unsigned comp = first + k;
@@ -5069,7 +5337,9 @@ static void setup_inputs(struct gctx *c)
             if (fmt >= PCO_G5P_VSF_COUNT || in->def.num_components != 1 ||
                 (fmt >= PCO_G5P_VSF_U16 && (byte & 1)))
                refuse(c, "vertex input location %u: converted load %#x", l, base);
-            raw_regs |= BITFIELD64_BIT(4 * l + comp);
+            /* a fetched dword above r31: vs_converts() moves it down first (not in the low-register masks) */
+            if (4 * l + comp < NUM_DWORDS)
+               raw_regs |= BITFIELD64_BIT(4 * l + comp);
             if (v->uses) {
                if (ncv == ARRAY_SIZE(cv))
                   refuse(c, "more than %u converted vertex input components", (unsigned)ARRAY_SIZE(cv));
@@ -5078,6 +5348,13 @@ static void setup_inputs(struct gctx *c)
             continue;
          }
          v->input = true;
+         if (4 * l + comp >= NUM_DWORDS) {
+            /* above r31: read through a move at each use */
+            v->state = VAL_HOME;
+            v->reg = 4 * l + comp;
+            c->p->evidence |= PCO_G5P_EV_VS_ALU;
+            continue;
+         }
          if (v->uses)
             hold(c, v, 4 * l + comp);
       }
@@ -5111,12 +5388,17 @@ static void setup_inputs(struct gctx *c)
    for (unsigned i = 0; i < 2; i++) {
       if (!ids[i])
          continue;
-      if (next >= NUM_DWORDS)
+      if (next >= VS_INPUT_DWORDS)
          refuse(c, "%s index: no register after the last attribute", i ? "instance" : "vertex");
       struct val *v = V(c, ids[i], 0);
-      v->state = VAL_REG;
       v->input = true;
-      hold(c, v, next);
+      if (next >= NUM_DWORDS) { /* after attributes above r31: read through a move, as they are */
+         v->state = VAL_HOME;
+         v->reg = next;
+      } else {
+         v->state = VAL_REG;
+         hold(c, v, next);
+      }
       c->p->id_mask |= 1u << i;
       c->p->id_reg[i] = next++;
       c->p->evidence |= PCO_G5P_EV_VS_IDS;
@@ -5244,9 +5526,43 @@ static bool out_const(struct gctx *c, unsigned k, uint16_t *h)
    return true;
 }
 
+static bool compact_output(const struct pco_g5p_fs_key *key)
+{
+   return key->color_output == PCO_G5P_COLOR_PACKED_BGRA8 ||
+          key->color_output == PCO_G5P_COLOR_PACKED_RGBA8;
+}
+
+/* Semantic UNORM8 conversion, the same saturate/round-even rule as
+ * nir_format_float_to_unorm(), lowered through existing G5P ALU encoders.
+ * Packing occurs at each output store, so eight targets keep eight dwords
+ * rather than 32 live float components. */
+static bool lower_compact_store(nir_builder *b, nir_intrinsic_instr *in, void *data)
+{
+   const struct pco_g5p_fs_key *key = data;
+   if (in->intrinsic != nir_intrinsic_store_output)
+      return false;
+   if (nir_intrinsic_component(in) || in->src[0].ssa->num_components != 4 || nir_intrinsic_write_mask(in) != 15)
+      return false; /* refused in fs_output: no partial packed output contract */
+   b->cursor = nir_before_instr(&in->instr);
+   nir_def *rgba = in->src[0].ssa;
+   nir_def *packed = nir_imm_int(b, 0);
+   for (unsigned c = 0; c < 4; c++) {
+      const unsigned channel = key->color_output == PCO_G5P_COLOR_PACKED_BGRA8 && !(c & 1) ? 2 - c : c;
+      nir_def *v = nir_fsat(b, nir_channel(b, rgba, channel));
+      v = nir_f2u32(b, nir_fround_even(b, nir_fmul_imm(b, v, 255.0f)));
+      packed = nir_ior(b, packed, nir_ishl_imm(b, v, 8 * c));
+   }
+   nir_src_rewrite(&in->src[0], packed);
+   nir_intrinsic_set_write_mask(in, 1);
+   in->num_components = 1;
+   return true;
+}
+
 /* Output-plan decisions that need use counts. */
 static void plan_fs_output(struct gctx *c)
 {
+   if (compact_output(c->key))
+      return; /* g5p_mrt_out_plan_make(): one word per target, width 8 */
    if (c->key->color_output != PCO_G5P_COLOR_F16) {
       /* four raw words per target: 4, or 8 for two targets (emitpix field 0, Apple's 4-target width) */
       if (c->mrt.targets > 1) { /* one emitpix writes both targets: both need their stores */
@@ -5345,28 +5661,79 @@ static void fs_prologue(struct gctx *c)
 
 /* Discards run after the body (no derivative work follows them): a test
  * of the 0.0/1.0 condition against 0.0 feeding `04 61`, or `04 68`. */
-static void fs_discards(struct gctx *c)
+static void fs_discards(struct gctx *c, bool defer)
 {
    tex_flush(c);
    uint8_t raw[G5P_USC_MAX];
    c->p->discard_tokens = c->ndiscards + c->discard_always;
+   c->deferred_kill = -2;
    for (unsigned i = 0; i < c->ndiscards; i++) {
       struct cond k = cond_of(c, c->discards[i], 0);
       unsigned b = k.zero_b ? reg_of(c, k.a, "discard condition")
                             : select_into(c, k, NULL, K_ONE, NULL, K_ZERO);
-      unsigned t = alloc_reg(c, -1);
+      /* held past the output moves (halves 0..7: the colour, then the epilogue's tile read at
+       * half 4): a register from dword 4 up */
+      int t = -1;
+      /* above the colour halves (dwords 0..1), the tile read (2..3) and dual-source outputs (halves 8..11) */
+      for (unsigned r = c->has_secondary ? 6 : 4; defer && t < 0 && r < 32; r++)
+         if (!((c->busy | c->reserved | c->tex_coord_pending | c->tex_pending) & BITFIELD64_BIT(r)))
+            t = alloc_reg(c, r);
+      if (t < 0)
+         t = alloc_reg(c, -1);
+      if (defer && t < (c->has_secondary ? 6 : 4))
+         refuse(c, "no free register above the outputs for the held discard condition");
+      if (c->key && c->key->ms4_kill && c->ndiscards == 1 && !c->discard_always) {
+         /* 4 samples, one conditional discard: b != 0.0 writes the kill's sample mask 15 (Apple's 4x form, the
+          * same relation as the one-sample test below).
+          * Several discards keep the one-sample test; their draws are refused at 4x (pvr_arch_g5p_gfx.c). */
+         unsigned gb = k.zero_b ? vgrp(c, k.a) : 1;
+         put(c, raw, g5p_usc_discard_test_ms4(raw, 2 * t, S(2 * b, gb)), "discard test (4 samples)");
+      } else {
       unsigned z = zero_reg(c);
       unsigned gb = k.zero_b ? vgrp(c, k.a) : 1, gz = kgrp(c, K_ZERO);
       put(c, raw, g5p_usc_discard_test(raw, G5P_FEQ, 2 * t, S(2 * b, gb), S(2 * z, gz), 0), "discard test");
-      put(c, raw, g5p_usc_discard(raw, 2 * t), "discard");
-      c->busy &= ~BITFIELD64_BIT(t);
+      }
+      if (defer) {
+         c->deferred_kill = t; /* stays busy until fs_kill() */
+      } else {
+         put(c, raw, g5p_usc_discard(raw, 2 * t), "discard");
+         c->busy &= ~BITFIELD64_BIT(t);
+      }
       free_scratch(c);
       c->p->evidence |= PCO_G5P_EV_DISCARD;
    }
    if (c->discard_always) {
-      put(c, raw, g5p_usc_discard(raw, -1), "discard");
+      if (defer)
+         c->deferred_kill = -1;
+      else
+         put(c, raw, g5p_usc_discard(raw, -1), "discard");
       c->p->evidence |= PCO_G5P_EV_DISCARD;
    }
+}
+
+/* A held kill (fs_discards(defer)), in Apple's place: after the epilogue's tile read is issued,
+ * before its wait. A9 AGXMetalA9 compiles every destination-reading discarding program that way
+ * (three Metal probes of discarding programs with a blended or RGB-masked colour output: the tile read,
+ * then the kill, the wait for the tile read later), PUNCH_THROUGH and FAST_PUNCH_THROUGH alike; ours issued
+ * the kill first and read the tile after it. @epi: the epilogue's bytes; with no leading tile read
+ * the kill goes first, the old order. Used by masked and general-blend programs. */
+static void fs_put_epilogue(struct gctx *c, const uint8_t *epi, unsigned n, const char *what)
+{
+   uint8_t raw[G5P_USC_MAX];
+   if (c->deferred_kill == -2) {
+      put(c, epi, n, what);
+      return;
+   }
+   const unsigned read = n >= 4 && epi[0] == 0x1c && epi[3] == 0x28 ? 4
+                       : n >= 6 && epi[0] == 0x1c && epi[3] == 0x29 ? 6 : 0;
+   if (read)
+      put(c, epi, read, "tile read (before the kill: Apple's order)");
+   put(c, raw, g5p_usc_discard(raw, c->deferred_kill < 0 ? -1 : 2 * c->deferred_kill), "discard");
+   if (c->deferred_kill >= 0)
+      c->busy &= ~BITFIELD64_BIT(c->deferred_kill);
+   c->deferred_kill = -2;
+   if (n > read)
+      put(c, epi + read, n - read, what);
 }
 
 static void fs_output(struct gctx *c)
@@ -5382,8 +5749,43 @@ static void fs_output(struct gctx *c)
       put(c, raw, g5p_usc_depth_feedback(raw, 2 * reg), "fragment depth feedback");
       c->p->depth_feedback = true;
    }
-   fs_discards(c);
+   /* a discarding program whose epilogue reads the tile: the kill waits for that read (fs_put_epilogue()).
+    * A general-blend epilogue always takes Apple's order (a blending Metal probe: test, tile read,
+    * kill, blend), the form its default PUNCH_THROUGH runs in; the premultiplied production form keeps its
+    * bytes. */
+   const bool defer = (c->key->mask_upass || c->blend == BLEND_GENERAL) &&
+                      c->ndiscards + c->discard_always == 1 &&
+                      c->key->color_output == PCO_G5P_COLOR_F16 && !compact_output(c->key) &&
+                      !c->key->mrt_blend_state && any_color(c) &&
+                      (c->blend == 1 || c->blend == 2 || c->blend == BLEND_GENERAL);
+   fs_discards(c, defer);
    c->now = LAST_END;
+   if (compact_output(c->key)) {
+      /* target t's packed dword: output word t (c->out[4t], lower_compact_store()) */
+      struct pvr_g5p_dgl_source sources[8] = {0};
+      for (unsigned t = 0; t < c->mrt.targets; t++) {
+         if (c->slot_written[t] != 1)
+            refuse(c, "compact MRT requires a full four-channel store to each target");
+         struct ref r = c->out[4 * t];
+         sources[t].immediate = is_const(c, r);
+         if (sources[t].immediate) {
+            sources[t].value = V(c, r.def, r.comp)->imm;
+         } else {
+            sources[t].value = reg_of(c, r, "compact MRT output");
+            sources[t].group = vgrp(c, r);
+            for (unsigned j = t + 1; j < c->mrt.targets; j++)
+               if (c->out[4 * j].def == r.def && c->out[4 * j].comp == r.comp)
+                  sources[t].group = 0;
+         }
+      }
+      uint8_t code[10 * G5P_USC_MAX];
+      size_t size = pvr_g5p_dgl_output_words(code, sizeof(code), sources, c->mrt.words, 0xf);
+      if (!size)
+         refuse(c, "compact MRT output source cannot be encoded");
+      put(c, code, size, "compact MRT packed output and emitpix");
+      free_scratch(c);
+      return;
+   }
    if (c->key->color_output != PCO_G5P_COLOR_F16) {
       /* target t's channels: output words 4t..4t+3 (c->out[] is indexed 4 * slot + component) */
       const unsigned words = c->mrt.words;
@@ -5481,7 +5883,7 @@ static void fs_output(struct gctx *c)
       unsigned n = g5p_blend_epilogue(buf, sizeof(buf));
       if (!n)
          refuse(c, "blend epilogue encoder rejected its fields (%s)", g5p_usc_error ? g5p_usc_error : "?");
-      put(c, buf, n, "premultiplied blend epilogue");
+      fs_put_epilogue(c, buf, n, "premultiplied blend epilogue");
       c->max_dword = MAX2(c->max_dword, 7); /* destination halves 4..7, 1-alpha in half 12 */
       c->p->evidence |= PCO_G5P_EV_BLEND;
    } else if (c->blend == BLEND_GENERAL) {
@@ -5498,13 +5900,15 @@ static void fs_output(struct gctx *c)
       if (c->ndiscards + c->discard_always > 1)
          refuse(c, "discard in a program with a general blend epilogue needs one merged kill");
       /* A kill before a general epilogue runs PUNCH_THROUGH with a general
-       * blend, base program or punch variant alike. r39-6.1 hard-hung the
-       * iPad in Aquarium with that form under depth writes (not bisected
-       * yet), so it is off: such a program is refused at pipeline
-       * creation, the r39-6 rule. */
-      if (c->ndiscards || c->discard_always)
-         refuse(c, "discard in a program with a general blend epilogue "
-                   "(general-blend punch-through is off)");
+       * blend, base program or punch variant alike, in Apple's order: the
+       * tile read, then the kill, then the blend (fs_output()'s defer;
+       * Apple's straight-alpha punch-through capture runs its draw in the PUNCH_THROUGH pass).
+       * Aquarium hard-hung the iPad with the old
+       * order (the kill before the tile read), which is no longer used. */
+      /* Opaque mode retains the masked form for non-discarding programs only. */
+      if ((c->ndiscards || c->discard_always) && c->deferred_kill == -2 && c->key->mask_upass != 1)
+         refuse(c, "discard in a program with a general blend epilogue: no held kill for Apple's order "
+                   "(several discards, MRT, compact or integer output)");
       uint8_t buf[512];
       const char *err;
       struct g5p_blend_key bk = general_key(c->key);
@@ -5513,11 +5917,13 @@ static void fs_output(struct gctx *c)
       if (err)
          refuse(c, "general blend epilogue: %s", err);
       if (n) {
-         put(c, buf, n, "general blend epilogue");
+         fs_put_epilogue(c, buf, n, "general blend epilogue");
          c->max_dword = MAX2(c->max_dword, c->binfo.max_half / 2);
       }
       c->p->evidence |= PCO_G5P_EV_BLEND;
    }
+   if (c->deferred_kill != -2) /* no epilogue took the held kill (a general epilogue of no bytes) */
+      fs_put_epilogue(c, NULL, 0, "no epilogue");
    /* One emitpix carries the total word count over all targets (2/4/8). */
    put(c, raw, g5p_usc_emit_mrt(raw, c->mrt.words, 0), "emit");
    put(c, raw, g5p_usc_special(raw, true), "end");
@@ -5531,13 +5937,18 @@ static void collect_vs_outputs(struct gctx *c)
       nir_intrinsic_instr *in = nir_instr_as_intrinsic(ins);
       if (in->intrinsic != nir_intrinsic_store_output)
          continue;
-      unsigned loc = nir_intrinsic_io_semantics(in).location;
+      const unsigned sem_loc = nir_intrinsic_io_semantics(in).location;
+      const unsigned loc = out_location(in);
       int base = vs_base(c, loc);
       if (base == -2)
-         refuse(c, "store_output to %s (only position and generic varyings have output slots)",
+         refuse(c, "store_output to %s (only position, generic varyings and clip distances have output slots)",
                 gl_varying_slot_name_for_stage(loc, MESA_SHADER_VERTEX));
-      if (!nir_src_is_const(in->src[1]) || nir_src_as_uint(in->src[1]))
+      if (!nir_src_is_const(in->src[1]) || (loc == sem_loc && nir_src_as_uint(in->src[1])))
          refuse(c, "indirect store_output");
+      if (base >= 0 && (loc == VARYING_SLOT_CLIP_DIST0 || loc == VARYING_SLOT_CLIP_DIST1) &&
+          4 * (loc - VARYING_SLOT_CLIP_DIST0) + nir_intrinsic_component(in) +
+                util_last_bit(nir_intrinsic_write_mask(in)) > c->p->clip_count)
+         refuse(c, "a clip distance past the %u declared", c->p->clip_count);
       if (base == -1)
          continue; /* not read by the fragment program */
       u_foreach_bit(k, nir_intrinsic_write_mask(in)) {
@@ -5950,9 +6361,134 @@ static bool hoist_branch_derivatives(nir_shader *nir)
    return nir_progress(progress, impl, nir_metadata_control_flow);
 }
 
+/* An array sample at a constant layer that clamps to 0 reads the view's
+ * base layer: Vulkan's layer is clamp(RNE(z), 0, layers - 1). It is drawn
+ * as a 2D sample of that layer (the upload's PCO_G5P_UPLOAD_IMAGE_AS_2D),
+ * which also samples a single-layer array view of a linear image: the A9 has
+ * no array state for a linear image, and its array sample needs one even
+ * for one layer (pvr_arch_g5p_tex.c). PPSSPP binds every texture and
+ * framebuffer as a 2D_ARRAY view and samples layer 0.0. */
+static bool layer0_as_2d(nir_builder *b, nir_tex_instr *t, void *data)
+{
+   if (!t->is_array || t->sampler_dim != GLSL_SAMPLER_DIM_2D || t->coord_components != 3 ||
+       (t->op != nir_texop_tex && t->op != nir_texop_txb && t->op != nir_texop_txl &&
+        t->op != nir_texop_txd && t->op != nir_texop_txf && t->op != nir_texop_tg4))
+      return false;
+   const int ci = nir_tex_instr_src_index(t, nir_tex_src_coord);
+   if (ci < 0)
+      return false;
+   nir_scalar z = nir_scalar_chase_movs(nir_get_scalar(t->src[ci].src.ssa, 2));
+   if (!nir_scalar_is_const(z))
+      return false;
+   if (t->op == nir_texop_txf ? nir_scalar_as_int(z) != 0 : !(nir_scalar_as_float(z) <= 0.5))
+      return false;
+   b->cursor = nir_before_instr(&t->instr);
+   nir_def *c = t->src[ci].src.ssa;
+   nir_src_rewrite(&t->src[ci].src, nir_channels(b, c, 0x3));
+   t->coord_components = 2;
+   t->is_array = false;
+   t->backend_flags |= G5P_TEX_LAYER0_AS_2D;
+   return true;
+}
+
+/* A 4-sample texture (texture_multisampled_2d, sampler2DMS) is sampled as the 2W x 2H 2D
+ * texture of its samples (pvr_arch_g5p_tex.c): sample s of texel p is texel
+ * 2p + (s >> 1, s & 1); its size is half that texture's; it has 4 samples. */
+static bool ms_as_2d(nir_builder *b, nir_tex_instr *t, void *data)
+{
+   if (t->sampler_dim != GLSL_SAMPLER_DIM_MS || t->is_array)
+      return false;
+   b->cursor = nir_after_instr(&t->instr);
+   if (t->op == nir_texop_texture_samples) {
+      nir_def_replace(&t->def, nir_imm_int(b, 4));
+      return true;
+   }
+   if (t->op == nir_texop_txs) {
+      t->sampler_dim = GLSL_SAMPLER_DIM_2D;
+      nir_def *half = nir_ushr_imm(b, &t->def, 1);
+      nir_def_rewrite_uses_after(&t->def, half);
+      return true;
+   }
+   if (t->op != nir_texop_txf_ms)
+      return false;
+   const int ci = nir_tex_instr_src_index(t, nir_tex_src_coord);
+   const int si = nir_tex_instr_src_index(t, nir_tex_src_ms_index);
+   if (ci < 0 || si < 0)
+      return false;
+   b->cursor = nir_before_instr(&t->instr);
+   nir_def *c = t->src[ci].src.ssa, *s = t->src[si].src.ssa;
+   nir_def *x = nir_iadd(b, nir_ishl_imm(b, nir_channel(b, c, 0), 1), nir_ushr_imm(b, s, 1));
+   nir_def *y = nir_iadd(b, nir_ishl_imm(b, nir_channel(b, c, 1), 1), nir_iand_imm(b, s, 1));
+   nir_tex_instr_remove_src(t, si);
+   nir_src_rewrite(&t->src[nir_tex_instr_src_index(t, nir_tex_src_coord)].src, nir_vec2(b, x, y));
+   if (nir_tex_instr_src_index(t, nir_tex_src_lod) < 0)
+      nir_tex_instr_add_src(t, nir_tex_src_lod, nir_imm_int(b, 0));
+   t->op = nir_texop_txf;
+   t->sampler_dim = GLSL_SAMPLER_DIM_2D;
+   return true;
+}
+
+/* A half float's bits (in a 32-bit value) as a 32-bit float, in integer code (G9P's 26b4dcbc83d ("pvr/g9p: packing built-ins")) */
+static nir_def *
+half_to_f32(nir_builder *b, nir_def *h)
+{
+   nir_def *magnitude = nir_iand_imm(b, h, 0x7fff);
+   nir_def *shifted = nir_ishl_imm(b, magnitude, 13);
+   /* exponent 31: inf and NaN; exponent 0: zero and subnormals */
+   nir_def *bits = nir_bcsel(b, nir_uge_imm(b, magnitude, 0x7c00), nir_ior_imm(b, shifted, 0x7f800000),
+                             nir_iadd_imm(b, shifted, 0x38000000));
+
+   bits = nir_bcsel(b, nir_ult_imm(b, magnitude, 0x400),
+                    nir_fmul_imm(b, nir_u2f32(b, magnitude), 1.0f / (1 << 24)), bits);
+   return nir_ior(b, bits, nir_ishl_imm(b, nir_iand_imm(b, h, 0x8000), 16));
+}
+
+/* A 32-bit float as a half float's bits, rounded to nearest, in integer code */
+static nir_def *
+f32_to_half(nir_builder *b, nir_def *f)
+{
+   nir_def *sign = nir_iand_imm(b, nir_ushr_imm(b, f, 16), 0x8000);
+   nir_def *abs = nir_iand_imm(b, f, 0x7fffffff);
+   nir_def *normal = nir_ushr_imm(b, nir_iadd_imm(b, abs, 0x1000 - 0x38000000), 13);
+   nir_def *shift = nir_isub(b, nir_imm_int(b, 126), nir_ushr_imm(b, abs, 23));
+   nir_def *mantissa = nir_ior_imm(b, nir_iand_imm(b, abs, 0x7fffff), 0x800000);
+   nir_def *rounded = nir_iadd(b, mantissa, nir_ishl(b, nir_imm_int(b, 1), nir_iadd_imm(b, shift, -1)));
+   nir_def *subnormal = nir_ushr(b, rounded, shift);
+   nir_def *v = nir_bcsel(b, nir_uge_imm(b, abs, 0x38800000), normal,
+                          nir_bcsel(b, nir_uge_imm(b, abs, 0x33000000), subnormal, nir_imm_int(b, 0)));
+
+   v = nir_bcsel(b, nir_uge_imm(b, abs, 0x47800000), nir_imm_int(b, 0x7c00), v);
+   v = nir_bcsel(b, nir_ult(b, nir_imm_int(b, 0x7f800000), abs), nir_imm_int(b, 0x7e00), v);
+   return nir_ior(b, sign, nir_iand_imm(b, v, 0x7fff));
+}
+
+/* packHalf2x16(), unpackHalf2x16(): no 16-bit values in G5P programs (g9p 26b4dcbc83d) */
+static bool
+lower_half_packing(nir_builder *b, nir_instr *instr, void *data)
+{
+   if (instr->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+
+   if (alu->op != nir_op_pack_half_2x16 && alu->op != nir_op_unpack_half_2x16)
+      return false;
+   b->cursor = nir_before_instr(instr);
+   nir_def *src = nir_ssa_for_alu_src(b, alu, 0);
+
+   if (alu->op == nir_op_pack_half_2x16) {
+      nir_def_replace(&alu->def, nir_ior(b, f32_to_half(b, nir_channel(b, src, 0)),
+                                         nir_ishl_imm(b, f32_to_half(b, nir_channel(b, src, 1)), 16)));
+   } else {
+      nir_def_replace(&alu->def, nir_vec2(b, half_to_f32(b, nir_iand_imm(b, src, 0xffff)),
+                                          half_to_f32(b, nir_ushr_imm(b, src, 16))));
+   }
+   return true;
+}
+
 static bool lower(nir_shader *nir, bool preserve_cf)
 {
    bool progress;
+   NIR_PASS(_, nir, nir_shader_instructions_pass, lower_half_packing, nir_metadata_control_flow, NULL);
    /* Projective sampling (GLSL textureProj/texture2DProj, Mesa's fixed-function
     * fragment program; Zink passes 2D projectors on as OpImageSampleProj*):
     * Apple's GPU has no projected sample, Metal divides in the program, so
@@ -5971,8 +6507,13 @@ static bool lower(nir_shader *nir, bool preserve_cf)
        * This adds no TPU instruction or shadow-sampling recipe. */
       .lower_txs_lod = nir->info.stage == MESA_SHADER_FRAGMENT ||
                        (nir->info.stage == MESA_SHADER_VERTEX && g5p_vtex_size_lod_probe()),
+      /* Explicit gradients in a vertex program as an explicit level, GL's isotropic formula (G9P's 2e5d5bc3e2f ("pvr/g9p: explicit gradients as explicit levels")): the qualified vertex txl instead of the unqualified gradient recipe. Fragment
+       * gradients keep their device-qualified recipe (R24). */
+      .lower_txd = nir->info.stage == MESA_SHADER_VERTEX && !g5p_vtex_gradient_probe(),
    };
    NIR_PASS(_, nir, nir_lower_tex, &txp);
+   NIR_PASS(_, nir, nir_shader_tex_pass, ms_as_2d, nir_metadata_control_flow, NULL);
+   NIR_PASS(_, nir, nir_shader_tex_pass, layer0_as_2d, nir_metadata_control_flow, NULL);
    pvr_g5p_tbo_lower(nir);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const, nir_address_format_32bit_offset);
    NIR_PASS(_, nir, nir_lower_flrp, 32, false);
@@ -6974,6 +7515,88 @@ static void compact_vertex_bank1(struct gctx *c)
    }
 }
 
+/* Last vertex pressure retry (vs_evict). The forms that must use bank 1 (the
+ * addressed UBO/SSBO loads: data, offset and address pair; the vertex math
+ * bridge; an output's bank-1 copy) found no room there when the fetched
+ * attributes fill r0..r31 until their first reads, which come after a UBO
+ * load (a translated D3D9-style skinning shader: eight vec4 attributes, every
+ * one masked by a UBO word). Apple's vertex programs hold their temps in
+ * bank 0 and read each attribute once into one (Apple's offline compiler on
+ * this shape, 12 float4 attributes and a 4 KiB constant buffer, does the
+ * same). Before each instruction, keep one
+ * aligned run of eight bank-1 registers free, which holds every bank-1 demand
+ * of one instruction in its first-fit order (a memory UBO load's data, offset
+ * and aligned pair; a register-indexed load's offset, pair and aligned vec4),
+ * by moving held values into bank 0, the run needing the fewest moves, with the
+ * class-98 move whose destination is bank 0 and source A bank 1, the move
+ * cf_operand() and the vertex texture park already emit. */
+static bool evict_movable(struct gctx *c, unsigned r)
+{
+   if ((c->reserved | c->scratch | c->tex_pending | c->tex_coord_pending) & BITFIELD64_BIT(r))
+      return false;
+   if (!(c->busy & BITFIELD64_BIT(r)))
+      return true;
+   bool owned = false;
+   for (unsigned i = 0; i < c->nvals; i++)
+      if (c->vals[i].held && c->vals[i].reg == r) {
+         if (c->vals[i].last <= c->now)
+            return false; /* an operand of this instruction stays where it is */
+         owned = true;
+      }
+   return owned; /* a busy register with no value (a pair, a persistent constant) stays */
+}
+
+static int evict_last(struct gctx *c, unsigned r)
+{
+   int last = -1;
+   for (unsigned i = 0; i < c->nvals; i++)
+      if (c->vals[i].held && c->vals[i].reg == r)
+         last = MAX2(last, c->vals[i].last);
+   return last;
+}
+
+/* The aligned run of n bank-1 registers that is cheapest to free (fewest
+ * moves, then the latest nearest read), or -1. */
+static int evict_run(struct gctx *c, unsigned n)
+{
+   int best = -1, best_cost = INT_MAX, best_near = -1;
+   for (unsigned r = 0; r + n <= NUM_DWORDS; r += n) {
+      int cost = 0, near = INT_MAX;
+      bool ok = true;
+      for (unsigned k = r; k < r + n && ok; k++) {
+         ok = evict_movable(c, k);
+         if (ok && (c->busy & BITFIELD64_BIT(k))) {
+            cost++;
+            near = MIN2(near, evict_last(c, k));
+         }
+      }
+      if (ok && (cost < best_cost || (cost == best_cost && near > best_near))) {
+         best = r;
+         best_cost = cost;
+         best_near = near;
+      }
+   }
+   return best;
+}
+
+static void evict_vertex_bank1(struct gctx *c)
+{
+   int run = evict_run(c, 8);
+   if (run < 0)
+      return;
+   uint8_t raw[G5P_USC_MAX];
+   u_foreach_bit64(src, BITFIELD64_RANGE(run, 8) & c->busy) {
+      int dst = alloc_bank0(c);
+      if (dst < 0)
+         return; /* bank 0 is full too: the instruction refuses as before */
+      put(c, raw, g5p_usc_move(raw, H(c, dst), H(c, src), 0, 1, 0x21), "attribute bank value into bank 0");
+      for (unsigned i = 0; i < c->nvals; i++)
+         if (c->vals[i].held && c->vals[i].reg == src)
+            c->vals[i].reg = dst;
+      c->busy &= ~BITFIELD64_BIT(src);
+   }
+}
+
 static void emit_block(struct gctx *c, nir_block *block)
 {
    nir_foreach_instr(ins, block) {
@@ -6984,6 +7607,8 @@ static void emit_block(struct gctx *c, nir_block *block)
          decl_alloc(c, c->now);
       if (c->vs && c->vs_bank0 && c->compact_vs && !c->cf)
          compact_vertex_bank1(c);
+      if (c->vs && c->vs_bank0 && c->vs_evict && !c->cf)
+         evict_vertex_bank1(c);
       switch (ins->type) {
       case nir_instr_type_alu:
          emit_alu(c, nir_instr_as_alu(ins));
@@ -7625,7 +8250,7 @@ bool pco_g5p_compile_general_key(nir_shader *nir, bool half_output, const uint8_
 
 static bool compile_general_link(nir_shader *nir, bool half_output, const uint8_t *attrib_components,
                                   const struct pco_g5p_fs_key *key, const struct pco_g5p_vs_link *link,
-                                  struct pco_g5p_program *out, bool preserve_cf)
+                                  struct pco_g5p_program *out, bool preserve_cf, bool evict)
 {
    static const struct pco_g5p_fs_key default_key = {.write_mask = 0xf};
    memset(out, 0, sizeof(*out));
@@ -7659,7 +8284,15 @@ static bool compile_general_link(nir_shader *nir, bool half_output, const uint8_
          mr = g5p_mrt_check_key(&c->mrt, c->key->blend, c->key->write_mask);
       if (mr != G5P_MRT_OK)
          refuse(c, "%s", g5p_mrt_refusal_str(mr));
-      if (c->key->color_output != PCO_G5P_COLOR_F16) {
+      if (compact_output(c->key) != (c->mrt.targets > 4))
+         refuse(c, "five to eight colour targets take the compact UNORM8 output, fewer do not");
+      if (compact_output(c->key)) {
+         if (c->key->blend || c->key->write_mask != 15 || c->key->mrt_blend_state)
+            refuse(c, "five to eight colour targets: blending and partial write masks are not built "
+                      "(compact MRT is full-write and unblended)");
+         NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_compact_store, nir_metadata_control_flow,
+                  (void *)c->key);
+      } else if (c->key->color_output != PCO_G5P_COLOR_F16) {
          if (c->key->mrt_blend_state)
             refuse(c, "raw32 MRT blend or masks are not qualified");
          if (c->key->color_output != PCO_G5P_COLOR_UINT32 &&
@@ -7740,6 +8373,16 @@ static bool compile_general_link(nir_shader *nir, bool half_output, const uint8_
       refuse(c, "out of memory");
    memset(c->home, -1, c->impl->ssa_alloc * 4);
    schedule_texture_batches(c);
+   if (evict) {
+      /* pco_g5p_compile_general_link()'s last vertex retry: the program's own order, temps in bank 0, attributes
+       * moved out of bank 1 where a bank-1-only form needs room (evict_vertex_bank1()) */
+      /* as the other between-instruction mover (compact_vs): straight-line programs without stores */
+      if (!c->vs || c->cf || impl_has_side_effects(c->impl))
+         refuse(c, "register pressure: bank-1 eviction is a straight-line vertex retry without stores");
+      c->vs_bank0 = c->remat = c->eager_vout = c->vs_evict = true;
+      ok = two_pass(c);
+      goto done;
+   }
    ok = two_pass(c);
    if (!ok && !c->vs && strstr(out->refusal, "register pressure")) {
       /* Retry: constants and uniforms re-read per use (round 19). */
@@ -7872,11 +8515,22 @@ bool pco_g5p_compile_general_link(nir_shader *nir, bool half_output, const uint8
     * together. Retry the original fragment control flow only on pressure;
     * the existing scalar register/mask-stack lowering handles the branches.
     * Keep all phis scalar in that retry, including texture-result phis. */
-   nir_shader *original = nir->info.stage == MESA_SHADER_FRAGMENT && cf_left(nir)
+   /* A vertex program every pressure retry refused is compiled once more
+    * from its own order, before the scheduling retries reordered it, with the
+    * attributes moved out of bank 1 where a bank-1-only form needs room
+    * (evict_vertex_bank1()). Programs that compile today never get there. */
+   nir_shader *original = (nir->info.stage == MESA_SHADER_FRAGMENT && cf_left(nir)) ||
+                                nir->info.stage == MESA_SHADER_VERTEX
                              ? nir_shader_clone(NULL, nir) : NULL;
-   bool ok = compile_general_link(nir, half_output, attrib_components, key, link, out, false);
-   if (!ok && original && strstr(out->refusal, "register pressure"))
-      ok = compile_general_link(original, half_output, attrib_components, key, link, out, true);
+   bool ok = compile_general_link(nir, half_output, attrib_components, key, link, out, false, false);
+   if (!ok && original && strstr(out->refusal, "register pressure")) {
+      char first[sizeof(out->refusal)];
+      memcpy(first, out->refusal, sizeof(first));
+      const bool vs = nir->info.stage == MESA_SHADER_VERTEX;
+      ok = compile_general_link(original, half_output, attrib_components, key, link, out, !vs, vs);
+      if (!ok && vs) /* the ladder's own reason stays the one reported */
+         memcpy(out->refusal, first, sizeof(first));
+   }
    ralloc_free(original);
    return ok;
 }

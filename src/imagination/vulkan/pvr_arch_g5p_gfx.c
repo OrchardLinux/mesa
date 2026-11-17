@@ -9,7 +9,7 @@
  * static arena are not used, so a draw is only what pvr_* records here plus
  * the render job of pvr_arch_g5p.c.
  *
- * The first form this drew (docs: orchard-mesa-pr-plan.md, rung A): one
+ * The first form this drew (the initial triangle path): one
  * linear colour target, no depth/stencil, one vertex buffer, non-indexed
  * single-instance draws, scissors and partial render areas as the ICD clips
  * them (region clip, ISP scissor table); blending as
@@ -45,6 +45,7 @@
 #include "pvr_cmd_buffer.h"
 #include "pvr_csb.h"
 #include "pvr_device.h"
+#include "pvr_physical_device.h"
 #include "pvr_framebuffer.h"
 #include "pvr_g5p.h"
 #include "pvr_g5p_vdm.h"
@@ -55,6 +56,8 @@
 #include "pvr_g5p_tex_encode.h"
 #include "pvr_g5p_upload.h"
 #include "pvr_g5p_xfb.h"
+#include "pvr_g5p_shader_dump.h"
+#include "pvr_g9p.h"
 #include "pvr_g5p_ds.h"
 #include "pvr_g5p_msaa.h"
 #include "pvr_g5p_vertex.h"
@@ -77,10 +80,6 @@
 #define G5P_TILE 32
 
 /* USC programs have byte sizes and need not end on a dword boundary. */
-/* A refusal, by name, on stderr too (vk_errorf() is silent in release builds) */
-#define G5P_REFUSE(obj, ...)                                                                                       \
-   (mesa_logw("G5P refuses: " __VA_ARGS__),                                                                        \
-    vk_errorf((obj), VK_ERROR_FEATURE_NOT_PRESENT, "G5P: " __VA_ARGS__))
 
 /* ---- PDS programs (pdsc, Apple's DOUT form: the A9 ICD's) ---- */
 
@@ -333,9 +332,12 @@ launch_program(uint32_t *dest)
  * the TA vertex, which drops x, y, z: dword d is TA dword d - 3, in 16-bit
  * units). Returns the data dwords; *code_dwords the code's.
  */
+/* pvr_physical_device.c reports what the fragment compiler admits */
+static_assert(4 * PCO_G5P_MAX_FS_VARYINGS == 112, "G5P varying components");
+
 static unsigned
 varying_program(const struct pco_g5p_program *fs, const struct pco_g5p_program *vs, uint32_t *data,
-                uint32_t *code, unsigned *code_dwords)
+                uint32_t *code, unsigned *code_dwords, unsigned pv)
 {
    pdsc_init();
    pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-varying");
@@ -349,8 +351,10 @@ varying_program(const struct pco_g5p_program *fs, const struct pco_g5p_program *
       const bool flat = v->interp == PCO_G5P_INTERP_FLAT;
       item[items++] = (struct pdsc_douti_src0){
          .dest = v->set,
-         /* PPP_CTRL flatshade_vtx is VERTEX_0 */
-         .shademodel = flat ? PDSC_DOUTI_SHADEMODEL_FLAT_VERTEX0 : PDSC_DOUTI_SHADEMODEL_GOURAUD,
+         /* flat: the triangle's vertex pv (0, or 1/2 for a fan / the last provoking vertex:
+          * PVR_G5P_FLATSHADE_CONTROL(), G9P's c74fd92b9fc ("pvr/g9p: flat varyings") + 5a7204430d1) */
+         .shademodel = flat ? (enum pdsc_douti_shademodel)(PDSC_DOUTI_SHADEMODEL_FLAT_VERTEX0 + pv)
+                            : PDSC_DOUTI_SHADEMODEL_GOURAUD,
          .size = PDSC_DOUTI_SIZE_4D,
          .perspective = v->interp == PCO_G5P_INTERP_SMOOTH,
          .f32_offset = off,
@@ -391,8 +395,8 @@ g5p_native_bresenham_line(const struct vk_graphics_pipeline_state *s)
       s->rs->line.mode == VK_LINE_RASTERIZATION_MODE_BRESENHAM;
 }
 
-/* What rung A draws: refused by name otherwise (the ICD's validate_state()
- * with rung A's limits) */
+/* What initial triangle path draws: refused by name otherwise (the ICD's validate_state()
+ * with initial triangle path's limits) */
 static VkResult
 g5p_check_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo *create_info,
                 const struct vk_graphics_pipeline_state *s, struct pco_g5p_fs_key *key)
@@ -506,6 +510,10 @@ g5p_check_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo *c
    /* three colour targets compile as four: the fourth (the pass's null target) is written zeros */
    if (colors == 3)
       key->color_targets = 4;
+   /* five to eight: one packed UNORM8 dword per target (pvr_arch_g5p_mrt_pipeline_check() admits RGBA8 or
+    * BGRA8, one format; pvr_arch_g5p_blend_fs_key() full-write and unblended) */
+   if (colors > 4)
+      key->color_output = cf == VK_FORMAT_B8G8R8A8_UNORM ? PCO_G5P_COLOR_PACKED_BGRA8 : PCO_G5P_COLOR_PACKED_RGBA8;
    /* 32-bit integer targets: the raw32 output (four raw words, pvr_g5p_raw32_kind()); the PBE stores the
     * target's own channels from them */
    const unsigned raw32 = colors ? pvr_g5p_raw32_kind(cf) : 0;
@@ -525,6 +533,17 @@ g5p_check_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo *c
     * discarding program still runs for its feedback) */
    if (!colors)
       key->write_mask = 0;
+   /* Apple's masked form (discarding and non-discarding shaders under write mask RGB,
+    * no blending, BGRA8: kill mode 1 / 0, A none, B 7 -> FAST_PUNCH_THROUGH / OPAQUE, output mask 7; the program
+    * reads the tile's alpha word, then kills, and moves it to its alpha half). Enabled by default: on the
+    * device, masked RGB, overlap and mixed-rendering tests pass (300 s each, every frame exact,
+    * 0 kernel errors); without it a masked discard is skipped and a game scene
+    * stays black. */
+   const unsigned mask_mode = 1;
+   key->mask_upass = mask_mode && colors == 1 && !key->blend &&
+                     key->write_mask == 0x7 && key->color_output == PCO_G5P_COLOR_F16 &&
+                     (cf == VK_FORMAT_B8G8R8A8_UNORM || cf == VK_FORMAT_R8G8B8A8_UNORM) &&
+                     (!s->ms || s->ms->rasterization_samples == VK_SAMPLE_COUNT_1_BIT) ? mask_mode : 0;
    return VK_SUCCESS;
 }
 
@@ -544,6 +563,10 @@ g5p_pipeline_free(struct pvr_device *device, struct pvr_g5p_pipeline *g)
    pvr_arch_g5p_vs_uploads_destroy(device, g->vs_uploads);
    pvr_bo_suballoc_free(g->static_vary);
    pvr_bo_suballoc_free(g->static_frag);
+   for (unsigned i = 0; i < 2; i++) {
+      pvr_bo_suballoc_free(g->varying_pv[i].pvr_bo);
+      pvr_bo_suballoc_free(g->static_frag_pv[i]);
+   }
    g5p_pipeline_free(device, g->xfb);
    g5p_pipeline_free(device, g->punch);
    vk_free(&device->vk.alloc, g);
@@ -570,7 +593,10 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
    if (result != VK_SUCCESS)
       return result;
    key.punch = g->punch_variant;
+   g->fs_mask_upass = key.mask_upass;
    g->samples = s->ms ? MAX2(s->ms->rasterization_samples, VK_SAMPLE_COUNT_1_BIT) : VK_SAMPLE_COUNT_1_BIT;
+   /* 4x: a discard kills the four samples (Apple's 4x discard test) */
+   key.ms4_kill = g->samples == 4;
    g->bresenham_line_probe = g5p_native_bresenham_line(s);
 
    for (uint32_t i = 0; i < create_info->stageCount; i++) {
@@ -594,20 +620,65 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
    key.depth_feedback = false;
    /* the fragment program first: the vertex program is compiled against the
     * varyings it reads (Apple's VertexProgramKey; Rogue's pco_rev_link_nir) */
-   if (!pvr_g5p_compile_stage(fs_info, true, g->samples, NULL, &key, NULL, fs))
-      return G5P_REFUSE(device, "fragment shader: %s", fs->refusal);
+   /* PVR_DEBUG=shader_dump / PVR_DEBUG=capture_stub (pvr_g5p_shader_dump.h) */
+   VkPipelineShaderStageCreateInfo stub_info, fs_stub_info;
+   VkShaderModuleCreateInfo stub_module, fs_stub_module;
+   const uint32_t dump_samples = g->samples;
+   const struct pvr_g5p_dump_blob fs_blobs[] = { { "fs_key", &key, sizeof(key) },
+                                                 { "samples", &dump_samples, sizeof(dump_samples) } };
+   if (!pvr_g5p_compile_stage(fs_info, true, g->samples, NULL, &key, NULL, fs)) {
+      const bool stub = pvr_g5p_capture_stub();
+      pvr_g5p_shader_dump(fs_info, create_info->layout, "frag", fs_blobs, ARRAY_SIZE(fs_blobs),
+                          stub ? "STUB" : "REFUSE", fs->refusal);
+      if (!stub)
+         return G5P_REFUSE(device, "fragment shader: %s", fs->refusal);
+      mesa_logw("G5P capture stub: fragment shader refused (%s): magenta stub", fs->refusal);
+      *fs = (struct pco_g5p_program){ 0 };
+      fs_info = pvr_g5p_stub_stage(VK_SHADER_STAGE_FRAGMENT_BIT, &fs_stub_info, &fs_stub_module);
+      if (!pvr_g5p_compile_stage(fs_info, true, g->samples, NULL, &key, NULL, fs))
+         return G5P_REFUSE(device, "fragment shader stub: %s", fs->refusal);
+   } else {
+      pvr_g5p_shader_dump(fs_info, create_info->layout, "frag", fs_blobs, ARRAY_SIZE(fs_blobs), "ADMIT", NULL);
+   }
    struct pco_g5p_vs_link link = { .valid = true };
    /* points (Apple's g3b-points): the point size after the position; the
     * topology class is fixed per pipeline even when the topology is dynamic */
    link.point_size = s->ia && s->ia->primitive_topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
    g->vs_point_size = link.point_size;
    g->polygon_mode = s->rs ? s->rs->polygon_mode : VK_POLYGON_MODE_FILL;
+   link.clip_distance = pvr_g5p_clip_distance_probe();
    for (unsigned i = 0; i < fs->num_varyings; i++)
       link.interp[fs->vary[i].location] = fs->vary[i].interp;
    /* the transform feedback variant (pvr_g5p_xfb.h): the capturing vertex program */
+   /* the vertex input state itself (the layout holds a pointer to it) and the link, for replay */
+   const struct pvr_g5p_dump_blob vs_blobs[] = { { "vertex_input", s->vi, s->vi ? sizeof(*s->vi) : 0 },
+                                                 { "dynamic_strides", &vertex.dynamic_strides, 1 },
+                                                 { "vs_link", &link, sizeof(link) } };
    if (g->xfb_variant ? !pvr_g5p_compile_vs_xfb(vs_info, &vertex, &link, &g->xfb_layout, vs)
-                      : !pvr_g5p_compile_stage(vs_info, false, 1, &vertex, NULL, &link, vs))
-      return G5P_REFUSE(device, "vertex shader%s: %s", g->xfb_variant ? " (transform feedback)" : "", vs->refusal);
+                      : !pvr_g5p_compile_stage(vs_info, false, 1, &vertex, NULL, &link, vs)) {
+      const bool stub = pvr_g5p_capture_stub() && !g->xfb_variant;
+      pvr_g5p_shader_dump(vs_info, create_info->layout, g->xfb_variant ? "vert-xfb" : "vert", vs_blobs,
+                          ARRAY_SIZE(vs_blobs), stub ? "STUB" : "REFUSE", vs->refusal);
+      if (!stub)
+         return G5P_REFUSE(device, "vertex shader%s: %s", g->xfb_variant ? " (transform feedback)" : "", vs->refusal);
+      mesa_logw("G5P capture stub: vertex shader refused (%s): point stub, nothing drawn", vs->refusal);
+      *vs = (struct pco_g5p_program){ 0 };
+      vs_info = pvr_g5p_stub_stage(VK_SHADER_STAGE_VERTEX_BIT, &stub_info, &stub_module);
+      /* the stub writes no varyings: a fragment program reading some becomes the magenta stub too */
+      if (fs->num_varyings) {
+         free(fs->code);
+         *fs = (struct pco_g5p_program){ 0 };
+         fs_info = pvr_g5p_stub_stage(VK_SHADER_STAGE_FRAGMENT_BIT, &fs_stub_info, &fs_stub_module);
+         if (!pvr_g5p_compile_stage(fs_info, true, g->samples, NULL, &key, NULL, fs))
+            return G5P_REFUSE(device, "fragment shader stub: %s", fs->refusal);
+         memset(link.interp, 0, sizeof(link.interp));
+      }
+      if (!pvr_g5p_compile_stage(vs_info, false, 1, &vertex, NULL, &link, vs))
+         return G5P_REFUSE(device, "vertex shader stub: %s", vs->refusal);
+   } else {
+      pvr_g5p_shader_dump(vs_info, create_info->layout, g->xfb_variant ? "vert-xfb" : "vert", vs_blobs,
+                          ARRAY_SIZE(vs_blobs), "ADMIT", NULL);
+   }
    if (g->xfb_variant && !g->xfb_layout.buffers)
       return VK_SUCCESS; /* captures nothing: no variant */
    /* point fill rasterizes ISP points of one size per draw (pointlinewidth): a per-vertex
@@ -704,6 +775,7 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
    g->vs_written_temps = vs->written_temps;
    g->fs_temps = fs->temps;
    g->vs_outputs = vs->outputs;
+   g->vs_clip_count = vs->clip_count;
    g->vs_id_mask = vs->id_mask;
    memcpy(g->vs_id_reg, vs->id_reg, sizeof(g->vs_id_reg));
    g->fs_discard = (fs->evidence & PCO_G5P_EV_DISCARD) != 0;
@@ -724,8 +796,16 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
 
    g->fetch_count = vertex.fetch_count;
    memcpy(g->fetch_list, vertex.fetch_list, sizeof(g->fetch_list));
-   if (!g->fetch_count && !(g->vs_id_mask & 1))
-      return G5P_REFUSE(device, "a vertex shader without attributes or vertex index (no fetch-less PDS form)");
+   /* A vertex program that reads no attribute and no vertex index (WGSL vertex pulling from a
+    * storage buffer by instance only, or constants: nfsu2) still runs once per vertex: it is
+    * launched with the vertex-index PDS form that a gl_VertexIndex-only program uses (proven:
+    * a fullscreen vertex shader), the index written to an input register the program never
+    * reads (r0, or the one after the instance index). Apple's vertex task always receives the
+    * vertex id the same way. */
+   if (!g->fetch_count && !(g->vs_id_mask & 1)) {
+      g->vs_id_reg[0] = (g->vs_id_mask & 2) ? g->vs_id_reg[1] + 1 : 0;
+      g->vs_id_mask |= 1;
+   }
 
    /* The unified store holds every input dword: Apple's sizes fit 4 units
     * per 8 input dwords; above 8 temps or 8 input dwords it grows with the
@@ -785,10 +865,17 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
    unsigned varying_data_dwords = 0;
    if (fs->num_varyings || fs->w_set) {
       unsigned code_dwords;
-      varying_data_dwords = varying_program(fs, vs, data, code, &code_dwords);
+      varying_data_dwords = varying_program(fs, vs, data, code, &code_dwords, 0);
       result = pvr_gpu_upload_pds(device, data, varying_data_dwords, 16, code, code_dwords, 16, 64, &g->varying);
       if (result != VK_SUCCESS)
          return result;
+      for (unsigned pv = 1; g->fs_flat && pv <= 2; pv++) {
+         varying_program(fs, vs, data, code, &code_dwords, pv);
+         result = pvr_gpu_upload_pds(device, data, varying_data_dwords, 16, code, code_dwords, 16, 64,
+                                     &g->varying_pv[pv - 1]);
+         if (result != VK_SUCCESS)
+            return result;
+      }
       if (g->varying.code_offset != g->varying.data_offset + 4 * varying_data_dwords)
          return vk_errorf(device, VK_ERROR_INITIALIZATION_FAILED, "G5P: the coefficient code is at data + %#x, not + %#x",
                           g->varying.code_offset - g->varying.data_offset, 4 * varying_data_dwords);
@@ -866,6 +953,17 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
       result = pvr_gpu_upload(device, device->heaps.general_heap, w, 24, 16, &g->static_frag);
       if (result != VK_SUCCESS)
          return result;
+      /* the same pointers naming the flat programs of vertices 1 and 2 */
+      for (unsigned pv = 1; g->fs_flat && (fs->num_varyings || fs->w_set) && pv <= 2; pv++) {
+         uint32_t *v = g->static_frag_pv_words[pv - 1];
+         memcpy(v, w, sizeof(g->static_frag_words));
+         pvr_csb_pack (&v[5], TA_STATE_PDS_VARYINGBASE, vb) {
+            vb.addr = PVR_DEV_ADDR(g->varying_pv[pv - 1].data_offset);
+         }
+         result = pvr_gpu_upload(device, device->heaps.general_heap, v, 24, 16, &g->static_frag_pv[pv - 1]);
+         if (result != VK_SUCCESS)
+            return result;
+      }
    }
 
    return VK_SUCCESS;
@@ -883,13 +981,7 @@ g5p_pipeline_build_punch(struct pvr_device *device,
 {
    if (g->fs_discard_tokens < 2 && !g->fs_discard_select)
       return VK_SUCCESS;
-   /* The general-blend punch variant (r39-6.1's form: PUNCH_THROUGH +
-    * general blend + depth write) is not built: r39-6.1 hard-hung the iPad
-    * in Aquarium with it, cause not yet bisected. Without the variant,
-    * g5p_pipeline_check_draw_variants() refuses the pipeline at creation
-    * when a depth/stencil state could need it, the non-fatal form r39-3 had. */
-   if (g->fs_blend_mode == 4 /* general */)
-      return VK_SUCCESS;
+   /* General-blend punch variants use Apple's tile-read-before-kill order. */
    struct pvr_g5p_pipeline *p =
       vk_zalloc(&device->vk.alloc, sizeof(*p), 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
    if (!p)
@@ -906,18 +998,17 @@ g5p_pipeline_build_punch(struct pvr_device *device,
       g5p_pipeline_free(device, p);
       /* A normal colour-only shader remains valid. A draw that requires the
        * absent punch variant refuses by name before emitting any draw state. */
-      if (result == VK_ERROR_FEATURE_NOT_PRESENT)
+      if (result == VK_ERROR_FEATURE_NOT_PRESENT) {
+         g->punch_why = "the variant's compile was refused (see the refusal above)";
          return VK_SUCCESS;
+      }
    }
    return result;
 }
 
-/* Every refusal a draw could meet because of its programs is decided here,
- * at pipeline creation, never while recording: a refused draw fails the
- * whole command buffer (vkEndCommandBuffer), and Zink then drops the batch
- * (Aquarium on r39-6: no water/background, 3 fps). The draw selects the
- * punch variant from the dynamic depth/stencil state (g5p_draw()); this
- * takes every state the pipeline allows: a dynamic enable may be on, a
+/* Program variants are checked at creation under the selected refusal
+ * policy. The draw selects its punch variant from dynamic depth/stencil
+ * state (g5p_draw()); this takes every state the pipeline allows: a dynamic enable may be on, a
  * depth write needs the depth test, and a stencil test may write. */
 static VkResult
 g5p_pipeline_check_draw_variants(struct pvr_device *device,
@@ -927,8 +1018,13 @@ g5p_pipeline_check_draw_variants(struct pvr_device *device,
    if (state->rs && !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_RS_RASTERIZER_DISCARD_ENABLE) &&
        state->rs->rasterizer_discard_enable)
       return VK_SUCCESS;
-   const bool depth = !state->rp || state->rp->depth_attachment_format != VK_FORMAT_UNDEFINED;
-   const bool stencil = !state->rp || state->rp->stencil_attachment_format != VK_FORMAT_UNDEFINED;
+   /* VkRenderPass supplies attachment bits without formats; dynamic rendering
+    * supplies both. Include both representations when deciding which
+    * depth/stencil variants this pipeline can select. */
+   const bool depth = !state->rp || (state->rp->attachments & MESA_VK_RP_ATTACHMENT_DEPTH_BIT) ||
+                      state->rp->depth_attachment_format != VK_FORMAT_UNDEFINED;
+   const bool stencil = !state->rp || (state->rp->attachments & MESA_VK_RP_ATTACHMENT_STENCIL_BIT) ||
+                        state->rp->stencil_attachment_format != VK_FORMAT_UNDEFINED;
    const struct vk_depth_stencil_state *ds = state->ds;
 #define G5P_DYN_DS(x) BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_DS_##x)
    const bool depth_test = depth && (G5P_DYN_DS(DEPTH_TEST_ENABLE) || (ds && ds->depth.test_enable));
@@ -937,10 +1033,22 @@ g5p_pipeline_check_draw_variants(struct pvr_device *device,
 #undef G5P_DYN_DS
    const bool testing = depth_test || stencil_test, writing = depth_write || stencil_test;
    const bool needs_punch = (testing && g->fs_discard_tokens > 1) || (writing && g->fs_discard_select);
-   if (needs_punch && !g->punch)
-      return G5P_REFUSE(device, "pipeline: discard under depth/stencil requires an unsupported punch-through variant");
-   if (testing && (g->fs_discard || needs_punch) && g->samples != 1)
-      return G5P_REFUSE(device, "pipeline: discard under multisample depth/stencil is not hardware-qualified");
+   /* Strict mode rejects a pipeline at creation if any permitted dynamic
+    * depth/stencil state requires an unavailable program variant. Tolerant
+    * mode admits it and skips only draws that select the missing variant. */
+   /* 4x: one conditional discard kills the four samples (Apple's 4x test, pco_g5p_fs_key::ms4_kill), run
+    * FAST_PUNCH_THROUGH as at one sample (an iOS 4x punch-through capture); several discards are not ported */
+   const char *why = needs_punch && !g->punch ? "discard under depth/stencil requires an unsupported punch-through variant"
+                   : g->fs_discard && g->samples != 1 && (g->fs_discard_tokens != 1 || g->fs_discard_select)
+                      ? "several discards at 4 samples (Apple's several-discard 4x form is not ported)" : NULL;
+   if (!why)
+      return VK_SUCCESS;
+   if (!device->pdevice->skip_refused_work)
+      return G5P_REFUSE(device, "pipeline: %s", why);
+   mesa_logw("G5P: pipeline admitted; its draws under depth/stencil will be refused: %s (discard tokens %u, "
+           "select %u, blend mode %u, write mask %#x, samples %u%s%s)", why, g->fs_discard_tokens,
+           g->fs_discard_select, g->fs_blend_mode, g->fs_write_mask, g->samples,
+           g->punch_why ? "; no punch variant: " : "", g->punch_why ? g->punch_why : "");
    return VK_SUCCESS;
 }
 
@@ -962,14 +1070,22 @@ PVR_PER_ARCH(g5p_graphics_pipeline_compile)(struct pvr_device *device,
    free(fs.code);
    if (result != VK_SUCCESS) {
       g5p_pipeline_free(device, g);
-      return result;
+      /* Unsupported programs fail creation unless the application explicitly
+       * opts into incorrect pixels. Internal pipelines always fail. */
+      if (result == VK_ERROR_FEATURE_NOT_PRESENT && !pvr_g5p_internal_pipeline &&
+          device->pdevice->skip_refused_work) {
+         mesa_logw("pvr/g5p: pipeline admitted without programs after a compile refusal");
+         pipeline->g5p = NULL;
+         return VK_SUCCESS;
+      }
+      return pvr_refusal_to_api(result);
    }
    result = g5p_pipeline_build_punch(device, create_info, vk_state, g);
    if (result == VK_SUCCESS)
       result = g5p_pipeline_check_draw_variants(device, vk_state, g);
    if (result != VK_SUCCESS) {
       g5p_pipeline_free(device, g);
-      return result;
+      return pvr_refusal_to_api(result);
    }
    pipeline->g5p = g;
 
@@ -1000,7 +1116,7 @@ PVR_PER_ARCH(g5p_graphics_pipeline_compile)(struct pvr_device *device,
          if (result != VK_SUCCESS) {
             g5p_pipeline_free(device, g);
             pipeline->g5p = NULL;
-            return result;
+            return pvr_refusal_to_api(result);
          }
       }
    }
@@ -1087,7 +1203,9 @@ g5p_clear_pipeline(struct pvr_cmd_buffer *cmd_buffer, VkFormat format, uint8_t w
       .pStages = stages, .pVertexInputState = &vi, .pInputAssemblyState = &ia, .pViewportState = &vp,
       .pRasterizationState = &rs, .pMultisampleState = &ms, .pColorBlendState = &cb, .pDynamicState = &dy,
       .layout = gd->clear_layout };
+   pvr_g5p_internal_pipeline++;
    result = device->vk.dispatch_table.CreateGraphicsPipelines(vk_dev, VK_NULL_HANDLE, 1, &gci, NULL, &pipe);
+   pvr_g5p_internal_pipeline--;
    pvr_g5p_clear_nir_free(vs);
    pvr_g5p_clear_nir_free(fs);
    if (result != VK_SUCCESS) {
@@ -1423,6 +1541,17 @@ fs_uploads(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_pipeline *g, 
          result = pvr_arch_g5p_upload_buffer(cmd_buffer, u->set, u->binding, u->element, &addr, &size);
          if (result != VK_SUCCESS)
             return result;
+         if (u->kind == PCO_G5P_UPLOAD_SSBO_ADDR && u->offset == PCO_G5P_SSBO_SIZE_OFFSET) {
+            /* get_ssbo_size: the bound size in bytes */
+            const uint32_t sz[2] = { (uint32_t)MIN2(size, UINT32_MAX), 0 };
+            if (u->dwords > 2)
+               return G5P_REFUSE(cmd_buffer, "fragment storage buffer size: %u dwords", u->dwords);
+            result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, sz, sizeof(sz), &bo);
+            if (result != VK_SUCCESS)
+               return result;
+            src[i] = bo->dev_addr.addr;
+            continue;
+         }
          if (u->dwords != 2 || (u->kind == PCO_G5P_UPLOAD_UBO_ADDR && u->offset >= size))
             return G5P_REFUSE(cmd_buffer, "fragment buffer address: %u dwords at offset %u of %" PRIu64 " bytes",
                               u->dwords, u->offset, size);
@@ -1454,12 +1583,16 @@ fs_uploads(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_pipeline *g, 
          continue;
       }
       switch (u->kind) {
-      case PCO_G5P_UPLOAD_IMAGE:
+      case PCO_G5P_UPLOAD_IMAGE: {
          if (!pvr_g5p_tex_state_valid(desc))
             return G5P_REFUSE(cmd_buffer, "set %u binding %u: a view without A9 texture state", u->set,
                               u->binding);
          memcpy(out, desc, 4 * u->dwords);
+         const char *why = u->dwords == 8 ? pvr_g5p_tex_state_for(out, u->offset) : NULL;
+         if (why)
+            return G5P_REFUSE(cmd_buffer, "set %u binding %u: %s", u->set, u->binding, why);
          break;
+      }
       case PCO_G5P_UPLOAD_SAMPLER:
          /* a combined descriptor's sampler is at +32 (the upload's offset),
           * a standalone sampler's at +0 */
@@ -1557,6 +1690,95 @@ g5p_record_ds_usage(struct pvr_sub_cmd_gfx *sub, const struct vk_dynamic_graphic
    }
 }
 
+/* ---- unaligned vertex bindings (G9P's 52e91eea418 ("pvr/g9p: copy unaligned vertex bindings at submission, linear blits"), its pvr_arch_g9p_gfx.c realign) ----
+ * The DDMAD fetch reads dwords from base + index * stride. A binding whose address or stride is not a multiple
+ * of 4 draws from a copy whose elements start on dwords: new stride = align(max(stride, 16), 4), room for the
+ * widest attribute past a small stride (GL's byte vec4 of stride 2). The bytes inside an element keep their
+ * offsets; an attribute at an unaligned offset is shifted out in the vertex program (pvr_g5p_vertex_nir.c).
+ * The copy runs when the job is submitted (pvr_arch_queue.c drains sub_cmd->gfx.g9p_realigns): a transfer
+ * recorded before the draw (they run on the CPU at submission) may be what fills the source; a source the GPU
+ * can write waits for the jobs before it. */
+static uint32_t
+g5p_realigned_stride(uint32_t stride)
+{
+   return stride ? align(MAX2(stride, 16), 4) : 0;
+}
+
+static uint8_t *
+g5p_cpu_addr(struct pvr_device *device, uint64_t addr, uint64_t *available)
+{
+   uint8_t *p = NULL;
+   *available = 0;
+   simple_mtx_lock(&device->g9p_vmas.lock);
+   util_dynarray_foreach (&device->g9p_vmas.vmas, struct pvr_winsys_vma *, v) {
+      struct pvr_winsys_vma *vma = *v;
+      if (addr < vma->dev_addr.addr || addr >= vma->dev_addr.addr + vma->mapped_size)
+         continue;
+      if (!vma->bo->map && device->ws->ops->buffer_map(vma->bo, NULL) != VK_SUCCESS)
+         break;
+      const uint64_t offset = addr - vma->dev_addr.addr;
+      p = (uint8_t *)vma->bo->map + vma->bo_offset + offset;
+      *available = MIN2(vma->mapped_size - offset, vma->bo->size - vma->bo_offset - offset);
+      break;
+   }
+   simple_mtx_unlock(&device->g9p_vmas.lock);
+   return p;
+}
+
+static VkResult
+g5p_realign_binding(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_vertex_binding *vb, uint32_t stride,
+                    uint32_t extra, uint64_t *addr)
+{
+   uint64_t available;
+   const uint8_t *src = g5p_cpu_addr(cmd_buffer->device, vb->buffer->dev_addr.addr + vb->offset, &available);
+   if (!src)
+      return G5P_REFUSE(cmd_buffer, "an unaligned vertex binding without a CPU mapping to copy it from");
+   const uint32_t new_stride = g5p_realigned_stride(stride);
+   uint64_t size = vb->size == VK_WHOLE_SIZE ? vb->buffer->vk.size - vb->offset : vb->size;
+   size = MIN2(size, available);
+   const uint64_t count = stride ? size / stride + 1 : 1;
+   /* the sub-command's draws from the same binding share one copy (all are copied at submission) */
+   if (cmd_buffer->vk.level != VK_COMMAND_BUFFER_LEVEL_SECONDARY) {
+      util_dynarray_foreach (&cmd_buffer->state.current_sub_cmd->gfx.g9p_realigns, struct g9p_realign, e) {
+         if (e->src == src && e->size == size && e->stride == stride && e->extra >= extra && e->dst_addr) {
+            *addr = e->dst_addr;
+            return VK_SUCCESS;
+         }
+      }
+   }
+   /* the elements, then zeros for the fetches' reads past the last one (extra: its fetch extent) */
+   const uint64_t copy_size = (uint64_t)MAX2(new_stride, 16) * count + extra;
+   if (copy_size > 64u << 20)
+      return G5P_REFUSE(cmd_buffer, "an unaligned vertex binding of %" PRIu64 " bytes to copy", copy_size);
+   uint8_t *zero = calloc(1, copy_size);
+   if (!zero)
+      return vk_error(cmd_buffer, VK_ERROR_OUT_OF_HOST_MEMORY);
+   struct pvr_suballoc_bo *bo;
+   VkResult result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, zero, copy_size, &bo);
+   free(zero);
+   if (result != VK_SUCCESS)
+      return result;
+   *addr = bo->dev_addr.addr;
+   const struct g9p_realign r = {
+      .src = src, .dst = pvr_bo_suballoc_get_map_addr(bo), .size = size, .count = count, .stride = stride,
+      .new_stride = new_stride, .dst_addr = bo->dev_addr.addr, .extra = extra,
+      .gpu_written = vb->buffer->g9p_gpu_written ||
+                     (vb->buffer->vk.usage & (VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                              VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT |
+                                              VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT)),
+   };
+   /* a secondary's render joins its primary's job: copied now */
+   if (cmd_buffer->vk.level == VK_COMMAND_BUFFER_LEVEL_SECONDARY) {
+      for (uint64_t i = 0; i < r.count; i++)
+         if (i * r.stride < r.size)
+            memcpy(r.dst + i * r.new_stride, r.src + i * r.stride,
+                   MIN2(MAX2(r.new_stride, 16), r.size - i * r.stride));
+   } else {
+      util_dynarray_append_typed(&cmd_buffer->state.current_sub_cmd->gfx.g9p_realigns, struct g9p_realign, r);
+   }
+   return VK_SUCCESS;
+}
+
 VkResult
 PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_draw *draw)
 {
@@ -1571,7 +1793,7 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
    bool lines;
 
    if (!g)
-      return G5P_REFUSE(cmd_buffer, "a draw without a G5P graphics pipeline");
+      return G5P_REFUSE(cmd_buffer, "a draw of a pipeline without G5P programs (refused at creation, named there)");
    /* transform feedback: while capturing, the pipeline's capturing variant
     * (pvr_g5p_xfb.h); a pipeline that captures nothing draws as it is */
    const bool xfb = g->xfb && pvr_arch_g5p_xfb_capturing(cmd_buffer);
@@ -1645,9 +1867,9 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
             return G5P_REFUSE(cmd_buffer, "discard under depth/stencil requires an unsupported punch-through variant");
          g = g->punch;
       }
-      if (testing && g->fs_discard && g->samples != 1)
-         return G5P_REFUSE(cmd_buffer, "discard under multisample depth/stencil is not hardware-qualified");
    }
+   if (g->fs_discard && g->samples != 1 && (g->fs_discard_tokens != 1 || g->fs_discard_select))
+      return G5P_REFUSE(cmd_buffer, "several discards at 4 samples (Apple's several-discard 4x form is not ported)");
    result = pvr_arch_g5p_vertex_draw_check(cmd_buffer, g, draw);
    if (result != VK_SUCCESS)
       return result;
@@ -1715,9 +1937,8 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
          return result;
    }
 
-   /* flat varyings take vertex 0; a fan's first vertex is the hardware's vertex 1 */
-   if (dyn->ia.primitive_topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN && g->fs_flat)
-      return G5P_REFUSE(cmd_buffer, "flat varyings with a triangle fan");
+   /* flat varyings: a fan's triangle takes them from the vertex VDM_STATE0's flatshade_control names
+    * (PVR_G5P_FLATSHADE_CONTROL(): 1 for fans; the refusal "flat varyings with a triangle fan" before) */
    /* a depth/stencil attachment: its tests and bias (pvr_arch_g5p_ds.c) */
    /* rasterizer discard: no depth/stencil aspects (Rogue's rule), the colour-only ISP form */
    const VkImageAspectFlags ds_aspects = discard ? 0 : pvr_arch_g5p_ds_aspects(cmd_buffer);
@@ -1767,15 +1988,47 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
       const unsigned last_id = g->vs_id_mask ? util_last_bit(g->vs_id_mask) - 1 : 0;
       u_foreach_bit (i, g->vs_id_mask)
          fdata[fetch_ids(g->fetch_count) + k++] = doutw_control(g->vs_id_reg[i], i == 1, i == last_id);
+      uint64_t realigned[PVR_MAX_VERTEX_INPUT_BINDINGS] = { 0 };
+      /* A binding draws from a dword-aligned, zero-padded copy (g5p_realign_binding()) when its address or stride
+       * is off dwords, or when a fetch's whole-dword overread past the bound range could leave the buffer's GPU
+       * mapping (a sub-dword attribute at the very end of its BO) */
+      bool copy[PVR_MAX_VERTEX_INPUT_BINDINGS] = { false };
+      uint32_t extent[PVR_MAX_VERTEX_INPUT_BINDINGS] = { 0 };
       for (unsigned f = 0; f < g->fetch_count; f++) {
          const struct pvr_g5p_fetch *fe = &g->fetch_list[f];
          const struct pvr_vertex_binding *vb = &cs->vertex_bindings[fe->binding];
          if (!vb->buffer)
             return G5P_REFUSE(cmd_buffer, "no vertex buffer bound at binding %u", fe->binding);
          const uint32_t stride = dyn->vi_binding_strides[fe->binding];
+         const uint64_t binding_base = vb->buffer->dev_addr.addr + vb->offset;
+         extent[fe->binding] = MAX2(extent[fe->binding], fe->offset + 4 * fe->dwords);
+         if ((binding_base | stride) & 3) {
+            copy[fe->binding] = true;
+         } else if (fe->overread) {
+            const uint64_t range = vb->size == VK_WHOLE_SIZE ? vb->buffer->vk.size - vb->offset : vb->size;
+            const struct pvr_winsys_vma *vma = vb->buffer->vma;
+            const uint64_t gpu_end = vma && vma->bo ? vma->dev_addr.addr + vma->mapped_size : 0;
+            if (gpu_end && binding_base + range + fe->overread > gpu_end)
+               copy[fe->binding] = true;
+         }
+      }
+      for (unsigned f = 0; f < g->fetch_count; f++) {
+         const struct pvr_g5p_fetch *fe = &g->fetch_list[f];
+         const struct pvr_vertex_binding *vb = &cs->vertex_bindings[fe->binding];
+         uint32_t stride = dyn->vi_binding_strides[fe->binding];
+         uint64_t binding_base = vb->buffer->dev_addr.addr + vb->offset;
+         if (copy[fe->binding]) {
+            if (!realigned[fe->binding]) {
+               result = g5p_realign_binding(cmd_buffer, vb, stride, extent[fe->binding], &realigned[fe->binding]);
+               if (result != VK_SUCCESS)
+                  return result;
+            }
+            binding_base = realigned[fe->binding];
+            stride = g5p_realigned_stride(stride);
+         }
          /* divisor 0: every instance reads the first instance's element */
          const bool divisor0 = fe->rate == PVR_G5P_FETCH_INSTANCE_DIVISOR0;
-         const uint64_t base = vb->buffer->dev_addr.addr + vb->offset + fe->offset +
+         const uint64_t base = binding_base + fe->offset +
                                (divisor0 ? (uint64_t)draw->first_instance * stride : 0);
          const uint64_t ctl = ddmad_src3(fe->dwords, fe->ao, f == g->fetch_count - 1);
          fdata[8 * f] = (uint32_t)base;
@@ -1809,6 +2062,17 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
       os.rhw_pres = true;
       /* points: the size follows the position (g3b-points) */
       os.psprite_size_pres = g->vs_point_size;
+      /* user planes 0..n-1 from the declared clip distances, the vertex's
+       * last dwords (AGXMetalA9 VertexProgramVariant 0x207d28594:
+       * ~(-1 << count) into TA_OUTPUT_SEL; no cull plane) */
+      os.plane0 = g->vs_clip_count > 0;
+      os.plane1 = g->vs_clip_count > 1;
+      os.plane2 = g->vs_clip_count > 2;
+      os.plane3 = g->vs_clip_count > 3;
+      os.plane4 = g->vs_clip_count > 4;
+      os.plane5 = g->vs_clip_count > 5;
+      os.plane6 = g->vs_clip_count > 6;
+      os.plane7 = g->vs_clip_count > 7;
    }
    PPP_BLOCK(w, 2);
    /* 6. ISP: the colour-only form (no depth/stencil attachment); Apple's
@@ -1817,6 +2081,12 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
    {
       struct pvr_g5p_blend_isp isp;
       pvr_arch_g5p_blend_isp(g->fs_blend_mode, g->fs_discard, g->fs_write_mask, discard, &isp);
+      /* Apple's masked form (pco_g5p_fs_key::mask_upass): no destination term in the colour math, so OPAQUE, or
+       * FAST_PUNCH_THROUGH with a discard, and output mask 7 */
+      if (g->fs_mask_upass && !discard)
+         isp.pass_type = !g->fs_discard ? ROGUE_TA_PASSTYPE_OPAQUE
+                                        : ROGUE_TA_PASSTYPE_FAST_PUNCH_THROUGH;
+      const unsigned upass = g->fs_mask_upass && !discard ? 7 : pvr_g5p_msaa_upass(g->samples);
       const enum ROGUE_TA_PASSTYPE pass = g->fs_depth_feedback ? ROGUE_TA_PASSTYPE_DEPTH_FEEDBACK : isp.pass_type;
       /* points rasterize as sprites (g3b-points: SPRITE_01UV, front and back) */
       /* triangles in line/point polygon mode: AGXMetalA9 encodeISPPrimitiveType
@@ -1845,7 +2115,7 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
       pvr_csb_pack (&w[1], TA_STATE_ISPCTL, ctl) {
          /* 0 for a program that writes no colour (pvr_g5p_blend.h), else the sample rate's user pass
           * (pvr_g5p_msaa.h: 15, or 7 at 4x) */
-         ctl.upass = isp.upass ? pvr_g5p_msaa_upass(g->samples) : 0;
+         ctl.upass = isp.upass ? upass : 0;
          ctl.bpres = true;
          ctl.scenable = scissor;
          ctl.tagwritedisable = isp.tag_write_disable;
@@ -1877,7 +2147,7 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
        * Mask-zero kill programs still need feedback, with upass0. */
       struct ROGUE_TA_STATE_ISPCTL ctl;
       ROGUE_TA_STATE_ISPCTL_unpack(&w[1], &ctl);
-      ctl.upass = isp.upass ? pvr_g5p_msaa_upass(g->samples) : 0;
+      ctl.upass = isp.upass ? upass : 0;
       ctl.tagwritedisable = isp.tag_write_disable;
       /* Rogue TA_STATE_ISPCTL: VISTEST enables accumulated sample counting;
        * VISREG selects the counter in ISP_OCLQRY_BASE. Match the generic
@@ -2013,6 +2283,7 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
       pvr_csb_pack (&w[0], VDMCTRL_VDM_STATE0, v0) {
          v0.vs_other_present = true;
          v0.cam_size = cam;
+         v0.flatshade_control = PVR_G5P_FLATSHADE_CONTROL(dyn);
       }
       pvr_csb_pack (&w[1], VDMCTRL_VDM_STATE3, v3) {
          v3.vs_pds_code_base_addr = PVR_DEV_ADDR(fetch_code->code_offset);
@@ -2050,6 +2321,7 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
       pvr_csb_pack (&w[0], VDMCTRL_VDM_STATE0, v0) {
          v0.vs_data_addr_present = true;
          v0.cam_size = cam;
+         v0.flatshade_control = PVR_G5P_FLATSHADE_CONTROL(dyn);
       }
       pvr_csb_pack (&w[1], VDMCTRL_VDM_STATE2, v2) {
          v2.vs_pds_data_base_addr = PVR_DEV_ADDR(fetch_data.data_offset);
@@ -2058,7 +2330,14 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
    }
 
    /* 4. the fragment pointers and sizes */
-   emit_ppp(csb, "ppp fragment", g->static_frag->dev_addr.addr, g->static_frag_words, 6);
+   {
+      /* flat varyings from the draw's provoking vertex (PVR_G5P_FLATSHADE_CONTROL()) */
+      const unsigned pv = g->static_frag_pv[0] ? PVR_G5P_FLATSHADE_CONTROL(dyn) : 0;
+      if (pv)
+         emit_ppp(csb, "ppp fragment", g->static_frag_pv[pv - 1]->dev_addr.addr, g->static_frag_pv_words[pv - 1], 6);
+      else
+         emit_ppp(csb, "ppp fragment", g->static_frag->dev_addr.addr, g->static_frag_words, 6);
+   }
    if (g->fs_num_uploads) {
       /* then, as in the ICD's draws, the per-draw loader data pointer */
       emit_ppp(csb, "ppp uniform data", uniform_va, uniform_block, 2);

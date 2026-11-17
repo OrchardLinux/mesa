@@ -16,6 +16,8 @@
  * ICD's job arena is what bounds a draw's programs, see pco_g5p_general.c). */
 #define PCO_G5P_PROGRAM_MAX (1u << 20)
 #define PCO_G5P_MAX_UPLOADS 40
+/* storage buffers per stage (maxPerStageDescriptorStorageBuffers) */
+#define PCO_G5P_MAX_SSBOS 16
 #define PCO_G5P_MAX_ATTRIBS 16
 #define PCO_G5P_COMMON_DWORDS 64
 /* Every vertex program that has flown needs <= 12 temps; 16 and 20 wedged
@@ -80,6 +82,10 @@ enum pco_g5p_color_output {
    PCO_G5P_COLOR_F16 = 0,
    PCO_G5P_COLOR_UINT32,
    PCO_G5P_COLOR_SINT32,
+   /* 5..8 UNORM8 targets: each target's RGBA packed into one dword (BGRA8:
+    * bytes B,G,R,A), stored through a physical R32UI PBE */
+   PCO_G5P_COLOR_PACKED_BGRA8,
+   PCO_G5P_COLOR_PACKED_RGBA8,
 };
 
 struct pco_g5p_rt_blend {
@@ -114,7 +120,22 @@ struct pco_g5p_fs_key {
    bool packed_sint; /* saturate signed channels, then preserve low bits */
    bool packed_scalar8; /* R8: one scalar source; never pack unused G/B/A */
    uint8_t packed_uint_bits; /* 8/10/16: packed output, scalar8 is one word; full mask only */
+   /* Apple's masked form (enabled): no blending, write mask RGB, one 4-byte UNORM8 target, one
+    * sample. AGXMetalA9 runs it OPAQUE (FAST_PUNCH_THROUGH with a discard) with ISPCTL upass 7, the program
+    * keeping the destination alpha from a tile read issued before its kill. 1: the program may discard;
+    * The qualified masked form is selected at pipeline creation. */
+   uint8_t mask_upass;
+   /* The 4x LOAD background only (pvr_g5p_compile_load_ms()): its one plain 2D sample reads the target's
+    * 2D-multisample state at the task's own sample, as Apple's loader (an iOS capture of a
+    * 4x colour load): the operand g5p_usc_ms_own_sample() in the register after the coordinates, then the
+    * narrow sample with dimension code f9. False everywhere else. */
+   bool ms_own_sample;
+   /* 4 raster samples: a program's one conditional discard kills all four samples (g5p_usc_discard_test_ms4(),
+    * Apple's 4x form); several discards keep the one-sample test (Apple's several-discard 4x form is not
+    * ported: such draws are refused at 4x) */
+   bool ms4_kill;
 };
+#define PCO_G5P_HAS_MASK_UPASS 1
 #define PCO_G5P_FS_KEY_DEFAULT ((struct pco_g5p_fs_key){.write_mask = 0xf})
 
 enum pco_g5p_upload_kind {
@@ -132,17 +153,30 @@ enum pco_g5p_upload_kind {
    PCO_G5P_UPLOAD_BLEND_CONSTANTS, /* 4 dwords: the dynamic blend constants (f32) */
    PCO_G5P_UPLOAD_FETCH_SAMPLER, /* two generated samplerless-read policy words */
 };
+/* PCO_G5P_UPLOAD_IMAGE's offset (the state is always descriptor +0): how the
+ * program samples it. AS_2D: an array sample at the constant layer 0, drawn
+ * as a 2D sample, so the driver uploads the view's base layer as a 2D state
+ * (a 2D_ARRAY state converted, pvr_g5p_tex_state_as_2d()); ARRAY: an array
+ * sample, which needs a 2D_ARRAY state (the A9's array sample reads its
+ * layer through the array descriptor even for one layer). */
+/* PCO_G5P_UPLOAD_SSBO_ADDR at this offset: not the buffer's address but its
+ * bound size in bytes (one dword; get_ssbo_size, WGSL arrayLength) */
+#define PCO_G5P_SSBO_SIZE_OFFSET 0xfffcu
+#define PCO_G5P_UPLOAD_IMAGE_AS_2D 1u
+#define PCO_G5P_UPLOAD_IMAGE_ARRAY 2u
+
 
 /* Varyings (docs/gpu/experiments/varyings.md). Apple's A9 compiler takes at
  * most 60 interpolated components ("Number of varying components(64)
  * exceeds the limit (60)"): 15 vec4 fragment inputs. */
-/* Plan row R2 (desktop-gl-varyings.md section 5): 16 vec4, the 64 components
- * the driver reports (maxVertexOutputComponents, maxFragmentInputComponents)
- * and stock Zink's IMG GL limit at 64 (16 varyings). Beyond Apple's per-target
- * 60, inside the hardware-proven range (varyings-capacity-1: exact to 124 on
- * the A9, flat included). With the position, a point size and 8 clip
- * distances the vertex is 4 + 64 + 1 + 8 = 77 dwords, inside the TA's 128. */
-#define PCO_G5P_MAX_FS_VARYINGS 16
+/* 28 vec4, the 112 components the driver reports (maxVertexOutputComponents,
+ * maxFragmentInputComponents): WebGPU core wants 16 inter-stage locations
+ * (wgpu: components / 4 - 1). With the position, a point size
+ * and 8 clip distances the vertex is 4 + 112 + 1 + 8 = 125 dwords, inside the
+ * TA's 128. Beyond Apple's per-target 60, inside the hardware-proven range
+ * (varying-capacity and geometry-shader probes: exact to 124 on the A9, flat
+ * included). Before: 16 vec4, 64 components. */
+#define PCO_G5P_MAX_FS_VARYINGS 28
 #define PCO_G5P_VARYING_SLOTS 32 /* VARYING_SLOT_VAR0..VAR31 */
 
 enum pco_g5p_interp {
@@ -171,6 +205,9 @@ struct pco_g5p_vs_link {
    /* a point pipeline: gl_PointSize is the last output dword, after the
     * varyings (TA_OUTPUT_SEL psprite_size_pres; Apple's g3b-points) */
    bool point_size;
+   /* user clip distances admitted (the enabled user-plane path): their
+    * dwords follow the point size, the vertex's last (Apple's applegpu_g5p) */
+   bool clip_distance;
 };
 
 /* Per-draw transform feedback block (PCO_G5P_UPLOAD_XFB): the VA each
@@ -233,6 +270,7 @@ struct pco_g5p_program {
    /* VS of a non-point pipeline: it wrote gl_PointSize, which was dropped
     * (set by pvr_g5p_nir.c after compilation; polygon mode POINT refuses it) */
    bool psize_dropped;
+   uint8_t clip_count;  /* VS: user clip distances, the last output dwords (TA user planes 0..n-1) */
    char refusal[512];
 };
 

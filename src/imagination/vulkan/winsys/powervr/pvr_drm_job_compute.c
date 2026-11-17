@@ -22,6 +22,9 @@
  */
 
 #include <errno.h>
+#include <inttypes.h>
+#include <stdio.h>
+#include "pvr_g5p_compute.h"
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -45,6 +48,7 @@ struct pvr_drm_winsys_compute_ctx {
 
    /* Handle to kernel context. */
    uint32_t handle;
+   uint64_t submit_seq;
 };
 
 #define to_pvr_drm_winsys_compute_ctx(ctx) \
@@ -122,6 +126,7 @@ VkResult pvr_drm_winsys_compute_ctx_create(
 
    drm_ctx->base.ws = ws;
    drm_ctx->handle = ctx_args.handle;
+   drm_ctx->submit_seq = 0;
 
    *ctx_out = &drm_ctx->base;
 
@@ -138,7 +143,7 @@ void pvr_drm_winsys_compute_ctx_destroy(struct pvr_winsys_compute_ctx *ctx)
 {
    struct pvr_drm_winsys *drm_ws = to_pvr_drm_winsys(ctx->ws);
    struct pvr_drm_winsys_compute_ctx *drm_ctx =
-      to_pvr_drm_winsys_compute_ctx(ctx);
+      to_pvr_drm_winsys_compute_ctx((struct pvr_winsys_compute_ctx *)ctx);
    struct drm_pvr_ioctl_destroy_context_args args = {
       .handle = drm_ctx->handle,
    };
@@ -172,9 +177,9 @@ VkResult pvr_drm_winsys_compute_submit(
    UNUSED const struct pvr_device_info *dev_info,
    struct vk_sync *signal_sync)
 {
-   const struct pvr_drm_winsys *drm_ws = to_pvr_drm_winsys(ctx->ws);
-   const struct pvr_drm_winsys_compute_ctx *drm_ctx =
-      to_pvr_drm_winsys_compute_ctx(ctx);
+   struct pvr_drm_winsys *drm_ws = to_pvr_drm_winsys(ctx->ws);
+   struct pvr_drm_winsys_compute_ctx *drm_ctx =
+      to_pvr_drm_winsys_compute_ctx((struct pvr_winsys_compute_ctx *)ctx);
 
    struct drm_pvr_sync_op sync_ops[2];
    struct drm_pvr_job job_args = {
@@ -215,9 +220,25 @@ VkResult pvr_drm_winsys_compute_submit(
    }
 
    /* Returns VK_ERROR_OUT_OF_DEVICE_MEMORY to match pvrsrv. */
-   return pvr_ioctlf(drm_ws->base.render_fd,
-                     DRM_IOCTL_PVR_SUBMIT_JOBS,
-                     &args,
-                     VK_ERROR_OUT_OF_DEVICE_MEMORY,
-                     "Failed to submit compute job");
+   const VkResult result = pvr_drm_submit_jobs(drm_ws, &args, "compute");
+   if (result == VK_SUCCESS)
+      pvr_drm_tag_job_sync(drm_ws, signal_sync, "compute");
+   if (drm_ws->is_g5p && result == VK_SUCCESS) {
+      const uint64_t seq = ++drm_ctx->submit_seq;
+      if (submit_info->g5p_log) {
+         flockfile(stderr);
+         fprintf(stderr, "G5P compute ctx=%u submit=%" PRIu64 " out_syncobj=%u dispatches=%u\n",
+                 drm_ctx->handle, seq,
+                 signal_sync ? vk_sync_as_drm_syncobj(signal_sync)->syncobj : 0,
+                 submit_info->g5p_log_count);
+         unsigned i = 0;
+         for (const struct pvr_g5p_dispatch_log *l = submit_info->g5p_log; l; l = l->next, i++) {
+            fprintf(stderr, "G5P compute   #%u %s\n", i, l->line);
+            if (l->stub)
+               fprintf(stderr, "G5P compute omitted pipe=%s\n", l->pipeline);
+         }
+         funlockfile(stderr);
+      }
+   }
+   return result;
 }

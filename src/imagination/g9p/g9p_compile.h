@@ -89,6 +89,8 @@ g9p_fs_buf_base(unsigned n)
 #define G9P_SHARED_BASE 16
 /* Compute: gl_NumWorkGroups, x and y in binding 0's slot, z in binding 1's (filled per dispatch) */
 #define G9P_NUM_WORKGROUPS (~22u)
+/* Device-backed workgroup memory, binding 0. */
+#define G9P_SHARED_SPILL (~24u)
 /* A draw's parameters: binding 0's slot holds firstInstance (filled per draw) */
 #define G9P_DRAW_PARAMS (~23u)
 /* The set of the push-constant slot (its address is loaded like a buffer's) */
@@ -193,6 +195,7 @@ struct g9p_shader {
    unsigned local_size[3];
    /* compute: bytes of shared variables (after G9P_SHARED_BASE) */
    unsigned shared_size;
+   unsigned shared_spill_stride; /* 0: hardware threadgroup memory */
 
    /*
     * Vertex: varyings written (VARn, each 4 components after the position);

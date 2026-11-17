@@ -649,6 +649,7 @@ PER_ARCH_FUNCS(rogue);
 
 #define SRV_WINSYS(arch)                                                      \
    static const struct pvr_winsys_ops pvr_##arch##_srv_winsys_ops = {         \
+      .is_lost = pvr_winsys_never_lost,                                     \
       .destroy = pvr_srv_winsys_destroy,                                      \
       .device_info_init = pvr_srv_winsys_device_info_init,                    \
       .get_heaps_info = pvr_srv_winsys_get_heaps_info,                        \
@@ -823,7 +824,7 @@ static VkResult pvr_srv_create_presignaled_sync(struct pvr_device *device,
       goto err_close_sw_fence;
 
    result = vk_sync_create(&device->vk,
-                           &device->pdevice->ws->syncobj_type,
+                           &device->pdevice->sync_type,
                            0U,
                            0UL,
                            &sync);

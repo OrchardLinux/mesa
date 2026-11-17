@@ -21,6 +21,7 @@
  * SOFTWARE.
  */
 
+#include "pvr_bo_log.h"
 #include "pvr_image.h"
 
 #include <assert.h>
@@ -430,6 +431,9 @@ VkResult pvr_image_init(struct pvr_device *device,
 
 void pvr_image_fini(struct pvr_device *device, struct pvr_image *image)
 {
+   if (unlikely(device->bo_log))
+      pvr_bo_log_unbind(device, image);
+
    if (image->vma)
       pvr_unbind_memory(device, image->vma);
 }
@@ -509,11 +513,15 @@ VkResult pvr_BindImageMemory2(VkDevice _device,
          while (i--) {
             VK_FROM_HANDLE(pvr_image, image, pBindInfos[i].image);
 
+            if (unlikely(device->bo_log))
+               pvr_bo_log_unbind(device, image);
             pvr_unbind_memory(device, image->vma);
          }
 
          return result;
       }
+      if (unlikely(device->bo_log))
+         pvr_bo_log_image(device, image, mem, offset);
    }
 
    return VK_SUCCESS;

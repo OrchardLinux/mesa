@@ -10,6 +10,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "pvr_bo_log.h"
 #include "pvr_device.h"
 
 #include "vk_log.h"
@@ -35,6 +36,7 @@
 #include "pvr_g9p.h"
 #   include "pvr_g5p.h"
 #include "pvr_utrace.h"
+#include "pvr_errlog.h"
 #include "util/os_misc.h"
 
 #define PVR_GLOBAL_FREE_LIST_INITIAL_SIZE (2U * 1024U * 1024U)
@@ -213,6 +215,14 @@ VkResult pvr_arch_pds_compute_shader_create_and_upload(
    vk_free(&device->vk.alloc, staging_buffer);
 
    return result;
+}
+
+static VkResult pvr_device_check_status(struct vk_device *vk)
+{
+   struct pvr_device *device = container_of(vk, struct pvr_device, vk);
+   if (device->ws->ops->is_lost(device->ws))
+      return vk_device_set_lost(vk, "device lost (%s)", device->ws->loss_source ? device->ws->loss_source : "kernel job error");
+   return VK_SUCCESS;
 }
 
 static VkResult pvr_device_init_compute_fence_program(struct pvr_device *device)
@@ -821,9 +831,14 @@ VkResult PVR_PER_ARCH(create_device)(struct pvr_physical_device *pdevice,
    if (result != VK_SUCCESS)
       goto err_free_device;
 
+   result = pvr_errlog_install(device);
+   if (result != VK_SUCCESS)
+      goto err_vk_device_finish;
+
    device->instance = instance;
    device->pdevice = pdevice;
    device->ws = ws;
+   device->vk.check_status = pvr_device_check_status;
 
    /* Before anything that creates a render target dataset. */
    simple_mtx_init(&device->rt_cache_mtx, mtx_plain);
@@ -843,6 +858,8 @@ VkResult PVR_PER_ARCH(create_device)(struct pvr_physical_device *pdevice,
    result = pvr_bo_store_create(device);
    if (result != VK_SUCCESS)
       goto err_vk_device_finish;
+
+   pvr_bo_log_device_init(device);
 
    pvr_bo_suballocator_init(&device->suballoc_general,
                             device->heaps.general_heap,
@@ -1043,6 +1060,10 @@ err_pvr_finish_null_pages:
 err_dec_device_count:
    p_atomic_dec(&device->instance->active_device_count);
 
+   if (unlikely(device->bo_log)) {
+      pvr_bo_log_summary(device, "destroy");
+      pvr_bo_log_device_finish(device);
+   }
    pvr_bo_suballocator_fini(&device->suballoc_vis_test);
    pvr_bo_suballocator_fini(&device->suballoc_usc);
    pvr_bo_suballocator_fini(&device->suballoc_transfer);
@@ -1052,6 +1073,7 @@ err_dec_device_count:
    pvr_bo_store_destroy(device);
 
 err_vk_device_finish:
+   vk_free(&device->vk.alloc, device->errlog_orig);
    vk_device_finish(&device->vk);
 
 err_free_device:
@@ -1114,6 +1136,10 @@ void PVR_PER_ARCH(destroy_device)(struct pvr_device *device,
    pvr_bo_suballoc_free(device->nop_program.usc);
    pvr_free_list_destroy(device->global_free_list);
    pvr_finish_null_pages(device);
+   if (unlikely(device->bo_log)) {
+      pvr_bo_log_summary(device, "destroy");
+      pvr_bo_log_device_finish(device);
+   }
    pvr_bo_suballocator_fini(&device->suballoc_vis_test);
    pvr_bo_suballocator_fini(&device->suballoc_usc);
    pvr_bo_suballocator_fini(&device->suballoc_transfer);
@@ -1122,6 +1148,7 @@ void PVR_PER_ARCH(destroy_device)(struct pvr_device *device,
    pvr_bo_store_destroy(device);
    pvr_winsys_destroy(device->ws);
    p_atomic_dec(&device->instance->active_device_count);
+   vk_free(&device->vk.alloc, device->errlog_orig);
    vk_device_finish(&device->vk);
    vk_free(&device->vk.alloc, device);
 }

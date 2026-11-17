@@ -101,6 +101,13 @@ struct pvr_render_subpass {
 struct pvr_render_pass {
    struct vk_object_base base;
 
+   /* The pass's dependencies on commands outside it (srcSubpass or
+    * dstSubpass VK_SUBPASS_EXTERNAL), merged: G5P records them as pipeline
+    * barriers when the pass begins and ends (a copy after a render pass that
+    * declares 0 -> EXTERNAL must see its colour). */
+   bool ext_begin, ext_end;
+   VkMemoryBarrier2 ext_begin_barrier, ext_end_barrier;
+
    /* Saved information from pCreateInfo. */
    uint32_t attachment_count;
 

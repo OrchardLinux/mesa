@@ -18,6 +18,9 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <stdio.h>
+#include "c11/threads.h"
+#include <stdarg.h>
+#include "util/log.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -40,6 +43,45 @@
 #include "util/format/u_format.h"
 #include "g9p_compile.h"
 #include "g9p_isa.h"
+#include "util/u_debug.h"
+#include "util/log.h"
+
+DEBUG_GET_ONCE_BOOL_OPTION(g9p_pressure, "G9P_PRESSURE", false)
+
+/* Pipeline compilation may run on several threads. Keep the fallback for
+ * the current compile, never a different pipeline's last diagnostic. */
+static thread_local char a9_last_refusal[192];
+const char *g9p_a9_last_refusal(void)
+{
+   return a9_last_refusal[0] ? a9_last_refusal : "A9 backend failed without a diagnostic";
+}
+
+static bool
+g9p_fail(struct g9p_shader *out, const char *fmt, ...)
+{
+   char why[192];
+   va_list ap;
+   va_start(ap, fmt);
+   vsnprintf(why, sizeof(why), fmt, ap);
+   va_end(ap);
+   if (out->a9) {
+      if (!out->a9_refusal[0])
+         snprintf(out->a9_refusal, sizeof(out->a9_refusal), "%s", why);
+      snprintf(a9_last_refusal, sizeof(a9_last_refusal), "%s", out->a9_refusal);
+   }
+   if (!out->a9) {
+      /* Preserve main's non-A9 diagnostics. */
+      if (!strcmp(why, "shader has no entry point"))
+         return false;
+      if (!strncmp(why, "too many loops", 14))
+         snprintf(why, sizeof(why), "too many loops");
+      char *suffix = strstr(why, " (no parking victim)");
+      if (!suffix) suffix = strstr(why, " (bank-0 homes exhausted)");
+      if (suffix) *suffix = 0;
+      fprintf(stderr, "g9p: %s\n", why);
+   }
+   return false;
+}
 
 /* r0-r29 for values, the mask stack after them (G9P_REGS: debug override) */
 static unsigned
@@ -50,13 +92,56 @@ g9p_num_regs(void)
    return e ? MIN2(atoi(e), 63) : 30;
 }
 #define G9P_NUM_REGS g9p_num_regs()
+
+/*
+ * A9 compute: the bank-1 registers per lane (values and the mask stack: the kernel record's register field)
+ * that a workgroup of @threads lanes may use. Apple's limit for a bank-1 allocation of f registers is
+ * 393216 / ((64f + 448) & ~511) lanes (AGXMetalA9 ComputeProgramVariant 0x207d2c4b0 -> +0xb08; its bank-0
+ * term reserves one task's allocation). Apple's kernels always ask for 8 there, and put the rest in bank 0.
+ * Ours took up to 32: at 256 lanes and 24 (field 6), one group fills the whole bank-1 capacity, and 64 such
+ * groups lost the GPU before their stores; one group alone, or 16 registers, ran successfully.
+ * So a group keeps one task (32 lanes) of that capacity free, as Apple's bank-0
+ * term does: 16 at 256 lanes, 24 up to 224, 32 up to 160. What does not fit goes to bank 0 (homes).
+ */
+/*
+ * A9 compute: the homes (bank-0 registers above r31) a workgroup of @threads lanes may use. Apple's bank-0
+ * limit for t DOUTU temps is 32 * floor((3329 - a) / a) lanes, a = (4t + 28) & ~31 (the same +0xb08 value);
+ * the temps are 32 + homes rounded up to 8. Apple's A9 allocator declares up to 240 temps at 64 lanes without
+ * spilling (loop144 240, p120 reads r238). Homes run r32..r239, fewer as the workgroup grows (256 lanes: 56).
+ * A kernel that needs more is refused by name here, instead of at pipeline creation.
+ */
+static unsigned
+g9p_a9_max_homes(unsigned threads)
+{
+   unsigned homes = 208;
+   while (homes > 0) {
+      const unsigned t = 8 * DIV_ROUND_UP(32 + homes, 8), a = (4 * t + 28) & ~31u;
+      if (32 * ((3329 - a) / a) >= threads)
+         break;
+      homes -= 8;
+   }
+   return homes;
+}
+
+static unsigned
+g9p_a9_bank1_limit(unsigned threads)
+{
+   for (unsigned f = 32; f > 8; f -= 8) {
+      if (393216 / ((64 * f + 448) & ~511u) >= threads + 32)
+         return f;
+   }
+   return 8;
+}
 /*
  * Registers for values: vertex shaders keep the mask stack in r15 (compile_back()), so
  * r30-r31 hold values too there (G9P_REGS still overrides, for tests)
  */
 #define VALUE_REGS(ctx) ((ctx)->stage == MESA_SHADER_VERTEX && (ctx)->st == 15 && !getenv("G9P_REGS") \
-                            ? 32u : G9P_NUM_REGS)
-#define G9P_MAX_LOOPS 64
+                            ? 32u : (ctx)->value_cap ? MIN2(G9P_NUM_REGS, (ctx)->value_cap) : G9P_NUM_REGS)
+#define LOW_REGS(ctx) MIN2(16u, VALUE_REGS(ctx))
+/* The immediate source of a break's stack word is six bits (W2[6:1]);
+ * bit 7 is last-read, bit 8 continuation. It encodes if_depth + 3. */
+#define G9P_MAX_IF_DEPTH (63 - 3)
 /* nir_tex_instr.backend_flags: a seamful cube's gradients, for the hardware */
 #define G9P_TEX_NATIVE_GRADIENTS 1
 
@@ -88,6 +173,8 @@ static const nir_shader_compiler_options nir_options = {
    .lower_fround_even = true,
    .lower_flrp32 = true,
    .lower_fsat = true,
+   .lower_bit_count = true,
+   .lower_bitfield_reverse = true,
    .lower_find_lsb = true,
    .lower_ifind_msb = true,
    .lower_iadd_sat = true,
@@ -95,6 +182,52 @@ static const nir_shader_compiler_options nir_options = {
    .lower_device_index_to_zero = true,
    .lower_bitfield_insert = true,
    .lower_bitfield_extract = true,
+   .lower_pack_unorm_4x8 = true,
+   .lower_unpack_unorm_4x8 = true,
+   .lower_pack_snorm_4x8 = true,
+   .lower_unpack_snorm_4x8 = true,
+   .lower_pack_snorm_2x16 = true,
+   .lower_unpack_snorm_2x16 = true,
+   .lower_pack_unorm_2x16 = true,
+   .lower_unpack_unorm_2x16 = true,
+   .lower_extract_byte = true,
+   .lower_extract_word = true,
+   .lower_insert_byte = true,
+   .lower_insert_word = true,
+   .max_unroll_iterations = 0,
+};
+
+/* A9 compute options. */
+static const nir_shader_compiler_options nir_options_a9 = {
+   /* multiply-adds as one instruction (g9p_ffma()), not a mul and an add */
+   .float_mul_add32 = nir_float_muladd_support_has_ffma | nir_float_muladd_support_fuse,
+   .lower_int64_options = ~0U,
+   .lower_fdiv = true,
+   .lower_iabs = true,
+   .lower_mul_high = true,
+   .lower_isign = true,
+   .lower_fmod = true,
+   .lower_fpow = true,
+   .lower_fsqrt = true,
+   .lower_ffract = true,
+   .lower_fceil = true,
+   .lower_ftrunc = true,
+   .lower_fround_even = true,
+   .lower_flrp32 = true,
+   .lower_fsat = true,
+   .lower_bit_count = true,
+   .lower_bitfield_reverse = true,
+   .lower_find_lsb = true,
+   .lower_ifind_msb = true,
+   .lower_iadd_sat = true,
+   .lower_mul_2x32_64 = true,
+   .lower_device_index_to_zero = true,
+   .lower_bitfield_insert = true,
+   .lower_bitfield_extract = true,
+   .lower_pack_unorm_4x8 = true,
+   .lower_unpack_unorm_4x8 = true,
+   .lower_pack_snorm_4x8 = true,
+   .lower_unpack_snorm_4x8 = true,
    .lower_pack_snorm_2x16 = true,
    .lower_unpack_snorm_2x16 = true,
    .lower_pack_unorm_2x16 = true,
@@ -125,6 +258,8 @@ struct g9p_vs_store {
 };
 
 struct g9p_ctx {
+   /* A9 compute: at most this many value registers in bank 1 (0: no cap; g9p_a9_bank1_limit()) */
+   unsigned value_cap;
    /* a sample iterated straight to the sampler has been emitted */
    bool straight_done;
    /*
@@ -177,13 +312,19 @@ struct g9p_ctx {
    /* The decl_reg defs */
    nir_def **decls;
    unsigned num_decls;
+   bool pressure;
+   /* Keys grouped by last use, and ownership released in this generation. */
+   unsigned *dies_at, *dies_keys;
+   uint8_t *released, *is_decl;
+   unsigned emit_loop_index;
 
    /*
     * Fragment NIR registers parked above r31 (per decl_reg key, -1: none),
     * chosen across generate() attempts when registers run out
     */
-   int8_t *home;
+   int16_t *home;
    unsigned num_homes;
+   bool oom_low;      /* the failed allocation needs r0-r15 */
    bool oom;          /* the last generate() ran out of registers */
    unsigned oom_ip;
 
@@ -215,13 +356,35 @@ struct g9p_ctx {
 
    struct {
       unsigned start, end;
-   } loops[G9P_MAX_LOOPS];
+   } *loops;
    unsigned num_loops, loop_index;
 
    /* Jumps to the innermost loop's exit (after a break), patched at its end */
    unsigned *exit_jumps;
    unsigned num_exit_jumps, max_exit_jumps;
 };
+
+/* Every compile_back failure reaches this helper, including control flow
+ * failures outside emit_instr(). An instruction's precise reason wins. */
+static bool
+backend_failure(struct g9p_shader *out, const struct g9p_ctx *ctx)
+{
+   if (ctx->c && debug_get_option_g9p_pressure())
+      mesa_logi("g9p: failed attempt reached %u bytes of code, %u loop records, instruction %u\n",
+              2 * ctx->c->n, ctx->num_loops, ctx->ip);
+   if (ctx->c && ctx->c->error)
+      return g9p_fail(out, "%s", ctx->c->error);
+   if (out->a9) {
+      if (out->a9_refusal[0]) {
+         char why[sizeof(out->a9_refusal)];
+         memcpy(why, out->a9_refusal, sizeof(why));
+         return g9p_fail(out, "%s", why);
+      }
+      return ctx->oom ? g9p_fail(out, "out of registers at instruction %u", ctx->oom_ip) :
+                        g9p_fail(out, "backend control flow or register allocation failed at instruction %u", ctx->ip);
+   }
+   return false;
+}
 
 static unsigned
 key(const nir_def *def, unsigned comp)
@@ -258,9 +421,9 @@ helper_samples_end(struct g9p_ctx *ctx)
       const unsigned at = ctx->frag_samples[i];
 
       /* Apple's word pair for a sample before the last: W3 0600, W4 044d */
-      if (at != last && ctx->c->w[at + 4] == 0x0200) {
-         ctx->c->w[at + 3] &= ~0x0100;
-         ctx->c->w[at + 4] = 0x044d;
+      if (at != last && (*g9p_code_word(ctx->c, at + 4)) == 0x0200) {
+         (*g9p_code_word(ctx->c, at + 3)) &= ~0x0100;
+         (*g9p_code_word(ctx->c, at + 4)) = 0x044d;
       }
    }
 }
@@ -340,6 +503,7 @@ alloc_reg(struct g9p_ctx *ctx)
       flush_loads(ctx);
       return alloc_reg(ctx);
    }
+   ctx->oom_low = false;
    dump_busy(ctx);
    return -1;
 }
@@ -375,7 +539,7 @@ reads_def(nir_src *src, void *data)
 static bool
 evict_low(struct g9p_ctx *ctx, unsigned lo, unsigned n)
 {
-   uint64_t high_free = ~ctx->busy & BITFIELD64_RANGE(16, VALUE_REGS(ctx) - 16);
+   uint64_t high_free = VALUE_REGS(ctx) > 16 ? ~ctx->busy & BITFIELD64_RANGE(16, VALUE_REGS(ctx) - 16) : 0;
    int keys[16];
 
    if (ctx->c->fragment || lo + n > 16 || getenv("G9P_NO_EVICT"))
@@ -419,7 +583,7 @@ evict_low(struct g9p_ctx *ctx, unsigned lo, unsigned n)
          return false;
       high_free &= high_free - 1;
    }
-   high_free = ~ctx->busy & BITFIELD64_RANGE(16, VALUE_REGS(ctx) - 16);
+   high_free = VALUE_REGS(ctx) > 16 ? ~ctx->busy & BITFIELD64_RANGE(16, VALUE_REGS(ctx) - 16) : 0;
    for (unsigned r = lo; r < lo + n; r++) {
       if (keys[r - lo] < 0)
          continue;
@@ -441,7 +605,9 @@ evict_low(struct g9p_ctx *ctx, unsigned lo, unsigned n)
 static int
 evict_low_window(struct g9p_ctx *ctx, unsigned n)
 {
-   for (int r = 16 - n; r >= 0; r--) {
+   if (n > LOW_REGS(ctx))
+      return -1;
+   for (int r = LOW_REGS(ctx) - n; r >= 0; r--) {
       if (evict_low(ctx, r, n))
          return r;
    }
@@ -452,7 +618,7 @@ evict_low_window(struct g9p_ctx *ctx, unsigned n)
 static int
 alloc_low_temp(struct g9p_ctx *ctx)
 {
-   for (unsigned r = 0; r < MIN2(16, G9P_NUM_REGS); r++) {
+   for (unsigned r = 0; r < LOW_REGS(ctx); r++) {
       if (!(ctx->busy & BITFIELD64_BIT(r))) {
          ctx->busy |= BITFIELD64_BIT(r);
          ctx->temps |= BITFIELD64_BIT(r);
@@ -474,6 +640,7 @@ alloc_low_temp(struct g9p_ctx *ctx)
          return r;
       }
    }
+   ctx->oom_low = true;
    dump_busy(ctx);
    return -1;
 }
@@ -482,7 +649,7 @@ alloc_low_temp(struct g9p_ctx *ctx)
 static int
 alloc_low_range(struct g9p_ctx *ctx, unsigned n)
 {
-   for (unsigned r = 0; r + n <= MIN2(16, G9P_NUM_REGS); r++) {
+   for (unsigned r = 0; r + n <= LOW_REGS(ctx); r++) {
       if (!(ctx->busy & BITFIELD64_RANGE(r, n))) {
          ctx->busy |= BITFIELD64_RANGE(r, n);
          ctx->max_reg = MAX2(ctx->max_reg, r + n - 1);
@@ -502,6 +669,7 @@ alloc_low_range(struct g9p_ctx *ctx, unsigned n)
          return r;
       }
    }
+   ctx->oom_low = true;
    dump_busy(ctx);
    return -1;
 }
@@ -538,7 +706,7 @@ one_src(struct g9p_ctx *ctx, int r)
 static int
 alloc_pair(struct g9p_ctx *ctx)
 {
-   for (unsigned r = 0; r + 1 < MIN2(16, G9P_NUM_REGS); r++) {
+   for (unsigned r = 0; r + 1 < LOW_REGS(ctx); r++) {
       if (!(ctx->busy & BITFIELD64_RANGE(r, 2))) {
          ctx->busy |= BITFIELD64_RANGE(r, 2);
          ctx->max_reg = MAX2(ctx->max_reg, r + 1);
@@ -558,6 +726,7 @@ alloc_pair(struct g9p_ctx *ctx)
          return r;
       }
    }
+   ctx->oom_low = true;
    dump_busy(ctx);
    return -1;
 }
@@ -573,6 +742,7 @@ alloc_range(struct g9p_ctx *ctx, unsigned n)
          return r;
       }
    }
+   ctx->oom_low = false;
    dump_busy(ctx);
    return -1;
 }
@@ -675,6 +845,8 @@ release_scalar(struct g9p_ctx *ctx, nir_def *def, unsigned comp)
 
    if (ctx->last_use[k] > ctx->ip || ctx->reg[k] < 0)
       return;
+   if (ctx->released)
+      ctx->released[k] = 1;
    /* a NIR register's last use: unpinned and free */
    if (nir_def_is_intrinsic(def) &&
        nir_def_as_intrinsic(def)->intrinsic == nir_intrinsic_decl_reg) {
@@ -936,12 +1108,11 @@ walk_liveness(struct g9p_ctx *ctx, struct exec_list *list, bool uses)
          nir_loop *loop = nir_cf_node_as_loop(node);
          unsigned l = ctx->loop_index++;
 
-         if (!uses && l < G9P_MAX_LOOPS) {
+         if (!uses && l < ctx->num_loops) {
             ctx->loops[l].start = ctx->ip + 1;
-            ctx->num_loops = MAX2(ctx->num_loops, l + 1);
          }
          walk_liveness(ctx, &loop->body, uses);
-         if (!uses && l < G9P_MAX_LOOPS)
+         if (!uses && l < ctx->num_loops)
             ctx->loops[l].end = ctx->ip;
          break;
       }
@@ -949,6 +1120,177 @@ walk_liveness(struct g9p_ctx *ctx, struct exec_list *list, bool uses)
          break;
       }
    }
+}
+
+/* Register ranges from CFG liveness, intersected with reaching writes. SSA
+ * ranges stay as recorded by walk_liveness(). */
+struct reg_block_range { unsigned first, last; };
+
+static void
+number_reg_blocks(struct exec_list *list, unsigned *ip, struct reg_block_range *blk, unsigned *instr_ip)
+{
+   foreach_list_typed(nir_cf_node, node, node, list) {
+      switch (node->type) {
+      case nir_cf_node_block: {
+         nir_block *b = nir_cf_node_as_block(node);
+         blk[b->index].first = *ip + 1;
+         nir_foreach_instr(instr, b) {
+            (*ip)++;
+            instr_ip[instr->index] = *ip;
+         }
+         blk[b->index].last = *ip;
+         if (blk[b->index].first > blk[b->index].last)
+            blk[b->index].first = blk[b->index].last; /* empty block */
+         break;
+      }
+      case nir_cf_node_if: {
+         nir_if *nif = nir_cf_node_as_if(node);
+         (*ip)++;
+         number_reg_blocks(&nif->then_list, ip, blk, instr_ip);
+         number_reg_blocks(&nif->else_list, ip, blk, instr_ip);
+         break;
+      }
+      case nir_cf_node_loop:
+         number_reg_blocks(&nir_cf_node_as_loop(node)->body, ip, blk, instr_ip);
+         break;
+      default:
+         break;
+      }
+   }
+}
+
+static void
+reg_liveness(struct g9p_ctx *ctx, nir_function_impl *impl, void *mem_ctx)
+{
+   const unsigned nd = ctx->num_decls, words = BITSET_WORDS(MAX2(nd, 1));
+   unsigned *decl_of = rzalloc_array(mem_ctx, unsigned, impl->ssa_alloc); /* decl def index -> d + 1 */
+
+   for (unsigned d = 0; d < nd; d++)
+      decl_of[ctx->decls[d]->index] = d + 1;
+   nir_metadata_require(impl, nir_metadata_block_index);
+   const unsigned ni = nir_index_instrs(impl);
+   const unsigned nb = impl->num_blocks;
+   struct reg_block_range *blk = rzalloc_array(mem_ctx, struct reg_block_range, nb);
+   unsigned *instr_ip = rzalloc_array(mem_ctx, unsigned, MAX2(ni, 1)); /* by instr index */
+   BITSET_WORD *gen = rzalloc_array(mem_ctx, BITSET_WORD, nb * words);
+   BITSET_WORD *kill = rzalloc_array(mem_ctx, BITSET_WORD, nb * words);
+   BITSET_WORD *in = rzalloc_array(mem_ctx, BITSET_WORD, nb * words);
+   BITSET_WORD *out = rzalloc_array(mem_ctx, BITSET_WORD, nb * words);
+   unsigned ip = 0;
+
+   number_reg_blocks(&impl->body, &ip, blk, instr_ip);
+   nir_foreach_block(b, impl) {
+      BITSET_WORD *g = gen + b->index * words, *k = kill + b->index * words;
+      nir_foreach_instr(instr, b) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic == nir_intrinsic_load_reg) {
+            const unsigned d = decl_of[intr->src[0].ssa->index] - 1;
+            if (!BITSET_TEST(k, d))
+               BITSET_SET(g, d);
+         } else if (intr->intrinsic == nir_intrinsic_store_reg) {
+            BITSET_SET(k, decl_of[intr->src[1].ssa->index] - 1);
+         }
+      }
+   }
+   for (bool progress = true; progress;) {
+      progress = false;
+      nir_foreach_block_reverse(b, impl) {
+         BITSET_WORD *o = out + b->index * words, *i = in + b->index * words;
+         for (unsigned s = 0; s < 2; s++) {
+            if (!b->successors[s] || b->successors[s] == impl->end_block)
+               continue;
+            const BITSET_WORD *si = in + b->successors[s]->index * words;
+            for (unsigned w = 0; w < words; w++)
+               o[w] |= si[w];
+         }
+         for (unsigned w = 0; w < words; w++) {
+            const BITSET_WORD n = gen[b->index * words + w] | (o[w] & ~kill[b->index * words + w]);
+            if (n != i[w]) {
+               i[w] = n;
+               progress = true;
+            }
+         }
+      }
+   }
+   /* forward: a write reaches the block (an undefined value needs no register: uninitialised paths) */
+   BITSET_WORD *din = rzalloc_array(mem_ctx, BITSET_WORD, nb * words);
+   BITSET_WORD *dout = rzalloc_array(mem_ctx, BITSET_WORD, nb * words);
+   for (bool progress = true; progress;) {
+      progress = false;
+      nir_foreach_block(b, impl) {
+         BITSET_WORD *di = din + b->index * words, *dd = dout + b->index * words;
+         nir_foreach_pred(p, b) {
+            if (p->index >= nb)
+               continue;
+            for (unsigned w = 0; w < words; w++)
+               di[w] |= dout[p->index * words + w];
+         }
+         for (unsigned w = 0; w < words; w++) {
+            const BITSET_WORD n = di[w] | kill[b->index * words + w];
+            if (n != dd[w]) {
+               dd[w] = n;
+               progress = true;
+            }
+         }
+      }
+   }
+   for (unsigned i = 0; i < nb * words; i++) {
+      in[i] &= din[i];
+      out[i] &= dout[i];
+   }
+   unsigned *lo = ralloc_array(mem_ctx, unsigned, MAX2(nd, 1)), *hi = rzalloc_array(mem_ctx, unsigned, MAX2(nd, 1));
+   memset(lo, 0xff, MAX2(nd, 1) * sizeof(unsigned));
+#define REG_SPAN(d, a, z) do { lo[d] = MIN2(lo[d], (a)); hi[d] = MAX2(hi[d], (z)); } while (0)
+   nir_foreach_block(b, impl) {
+      for (unsigned d = 0; d < nd; d++) {
+         if (BITSET_TEST(in + b->index * words, d))
+            REG_SPAN(d, blk[b->index].first, blk[b->index].first);
+         if (BITSET_TEST(out + b->index * words, d))
+            REG_SPAN(d, blk[b->index].last, blk[b->index].last);
+      }
+      nir_foreach_instr(instr, b) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         const unsigned at = instr_ip[instr->index];
+         if (intr->intrinsic == nir_intrinsic_load_reg) {
+            const unsigned d = decl_of[intr->src[0].ssa->index] - 1;
+            REG_SPAN(d, at, MAX2(at, ctx->last_use[key(&intr->def, 0)]));
+         } else if (intr->intrinsic == nir_intrinsic_store_reg) {
+            const unsigned d = decl_of[intr->src[1].ssa->index] - 1;
+            REG_SPAN(d, at, at);
+         }
+      }
+   }
+   /* in+out over a loop: a register live into a block of a loop is live over the whole block range
+    * between; the hull covers it. Replace the walk's stretched ranges. */
+   for (unsigned d = 0; d < nd; d++) {
+      const unsigned k = key(ctx->decls[d], 0);
+      if (lo[d] == UINT_MAX)
+         continue;
+      ctx->reg_first[ctx->decls[d]->index] = lo[d];
+      ctx->last_use[k] = hi[d];
+   }
+}
+#undef REG_SPAN
+
+/* Exactly the loop records visited by walk_liveness(), including nested
+ * loops in either arm. Allocate before its two traversals. */
+static unsigned
+count_loop_records(struct exec_list *list)
+{
+   unsigned count = 0;
+   foreach_list_typed(nir_cf_node, node, node, list) {
+      if (node->type == nir_cf_node_loop) {
+         count += 1 + count_loop_records(&nir_cf_node_as_loop(node)->body);
+      } else if (node->type == nir_cf_node_if) {
+         nir_if *nif = nir_cf_node_as_if(node);
+         count += count_loop_records(&nif->then_list) + count_loop_records(&nif->else_list);
+      }
+   }
+   return count;
 }
 
 /* --- Code ---------------------------------------------------------------- */
@@ -1120,6 +1462,7 @@ emit_alu(struct g9p_ctx *ctx, nir_alu_instr *alu)
    }
    for (unsigned i = 0; i < num_inputs; i++)
       s[i] = nir_get_scalar(alu->src[i].src.ssa, alu->src[i].swizzle[0]);
+   G9P_A9_ALU_PACK_HALF();
    G9P_A9_ALU_LITERAL_FMA();
    /* compared where it is used (emit_branch_cmp()) */
    if (branch_compare(&alu->def))
@@ -2207,6 +2550,7 @@ emit_fb_fetch(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
       }
    }
    if (pair < 0) {
+      ctx->oom_low = false;
       dump_busy(ctx);
       return false;
    }
@@ -2474,9 +2818,9 @@ sample_lod(struct g9p_ctx *ctx, nir_tex_instr *tex, unsigned at, int lod)
 {
    if (lod < 0)
       return;
-   ctx->c->w[at + 3] = (ctx->c->w[at + 3] & 0xff00) | 0x80 |
+   (*g9p_code_word(ctx->c, at + 3)) = ((*g9p_code_word(ctx->c, at + 3)) & 0xff00) | 0x80 |
                        (tex->op == nir_texop_txl ? 0x40 : 0x20) | lod;
-   ctx->c->w[at + 4] = (ctx->c->w[at + 4] & 0xff00) | 0x80;
+   (*g9p_code_word(ctx->c, at + 4)) = ((*g9p_code_word(ctx->c, at + 4)) & 0xff00) | 0x80;
 }
 
 /*
@@ -2620,11 +2964,11 @@ extras_patch(struct g9p_ctx *ctx, unsigned at, const struct tex_extras *e)
 {
    if (e->half < 0)
       return;
-   ctx->c->w[at + 4] |= 0x40 | e->half;
+   (*g9p_code_word(ctx->c, at + 4)) |= 0x40 | e->half;
    if (e->compare)
-      ctx->c->w[at + 3] |= 0x8000;
+      (*g9p_code_word(ctx->c, at + 3)) |= 0x8000;
    if (e->offset)
-      ctx->c->w[at + 2] |= 0x4000;
+      (*g9p_code_word(ctx->c, at + 2)) |= 0x4000;
 }
 
 /*
@@ -2682,7 +3026,7 @@ emit_tex_layered(struct g9p_ctx *ctx, nir_tex_instr *tex)
       return false;
    at = ctx->c->n;
    g9p_sample_regs(ctx->c, dst, tex_state_dword(ctx, slot), tex_sampler_dword(ctx, slot));
-   ctx->c->w[at] = (ctx->c->w[at] & ~0x0f00) |
+   (*g9p_code_word(ctx->c, at)) = ((*g9p_code_word(ctx->c, at)) & ~0x0f00) |
                    (cube ? G9P_TEX_CUBE : is3d ? G9P_TEX_3D : G9P_TEX_2D_ARRAY) << 8;
    sample_lod(ctx, tex, at, lod);
    extras_patch(ctx, at, &extras);
@@ -2798,18 +3142,18 @@ emit_tex_vertex(struct g9p_ctx *ctx, nir_tex_instr *tex)
    g9p_sample_vertex(ctx->c, dst, tex_state_dword(ctx, slot), tex_sampler_dword(ctx, slot), coord,
                      lod);
    if (cube) {
-      ctx->c->w[at] = (ctx->c->w[at] & ~0x0f00) | G9P_TEX_CUBE << 8;
-      ctx->c->w[at + 2] |= 0x8000;
+      (*g9p_code_word(ctx->c, at)) = ((*g9p_code_word(ctx->c, at)) & ~0x0f00) | G9P_TEX_CUBE << 8;
+      (*g9p_code_word(ctx->c, at + 2)) |= 0x8000;
    } else if (is3d) {
-      ctx->c->w[at] = (ctx->c->w[at] & ~0x0f00) | G9P_TEX_3D << 8;
+      (*g9p_code_word(ctx->c, at)) = ((*g9p_code_word(ctx->c, at)) & ~0x0f00) | G9P_TEX_3D << 8;
    } else if (tex->is_array) {
-      ctx->c->w[at] = (ctx->c->w[at] & ~0x0f00) | G9P_TEX_2D_ARRAY << 8;
-      ctx->c->w[at + 2] |= 0x8000;
+      (*g9p_code_word(ctx->c, at)) = ((*g9p_code_word(ctx->c, at)) & ~0x0f00) | G9P_TEX_2D_ARRAY << 8;
+      (*g9p_code_word(ctx->c, at + 2)) |= 0x8000;
    }
    extras_patch(ctx, at, &extras);
    /* the vertex form's compare also sets bit 15 of W6 (Apple's sample_compare at a level) */
    if (extras.compare)
-      ctx->c->w[at + 6] |= 0x8000;
+      (*g9p_code_word(ctx->c, at + 6)) |= 0x8000;
    g9p_wait(ctx->c);
    release(ctx, &tex->instr);
    for (unsigned c = 0; c < 4; c++) {
@@ -2827,9 +3171,11 @@ emit_tex_vertex(struct g9p_ctx *ctx, nir_tex_instr *tex)
  * where the sample reads them (as Apple's code for t.sample(s, uv * 2.0 +
  * 0.25) does; r0-r1 are free until the colour output).
  */
+#include "g9p_a9_tex.h"
 static bool
 emit_tex(struct g9p_ctx *ctx, nir_tex_instr *tex)
 {
+   G9P_A9_TEX(ctx, tex);
    int ci = nir_tex_instr_src_index(tex, nir_tex_src_coord);
    int slot = texture_slot(ctx, tex);
    int first, second, dst;
@@ -2930,7 +3276,11 @@ emit_intrinsic(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
          r = alloc_reg(ctx);
          if (r < 0)
             return false;
-         g9p_tg_load(ctx->c, r, c);
+         /* A9: z is in its own word after the barrier counter (g9p_a9.h G9P_A9_TG_WGID_Z) */
+         const bool a9_z = ctx->out->a9 && c == 2;
+         g9p_tg_load(ctx->c, r, a9_z ? G9P_A9_TG_WGID_Z : c);
+         if (a9_z)
+            ctx->out->a9_wgid_z = true;
          ctx->reg[key(&intr->def, c)] = r;
       }
       g9p_wait(ctx->c);
@@ -3480,8 +3830,13 @@ emit_break(struct g9p_ctx *ctx, bool when_true)
    }
    g9p_loop_break(ctx->c, ctx->st, when_true);
    if (ctx->num_exit_jumps == ctx->max_exit_jumps) {
-      fprintf(stderr, "g9p: too many breaks\n");
-      return false;
+      unsigned capacity = ctx->max_exit_jumps * 2;
+      unsigned *jumps = capacity > ctx->max_exit_jumps ?
+         reralloc(ctx->c, ctx->exit_jumps, unsigned, capacity) : NULL;
+      if (!jumps)
+         return g9p_fail(ctx->out, "allocation failure growing loop exits");
+      ctx->exit_jumps = jumps;
+      ctx->max_exit_jumps = capacity;
    }
    ctx->exit_jumps[ctx->num_exit_jumps++] = g9p_jump(ctx->c, G9P_JMP_NONE, 0);
    return true;
@@ -3497,6 +3852,8 @@ emit_if_else(struct g9p_ctx *ctx, nir_if *nif, bool sense)
 {
    unsigned to_else, to_pop;
 
+   if (ctx->if_depth >= G9P_MAX_IF_DEPTH)
+      return g9p_fail(ctx->out, "control flow nested deeper than %u", G9P_MAX_IF_DEPTH);
    /* keep the lanes for which the condition holds */
    g9p_push_if(ctx->c, ctx->st, !sense);
    ctx->if_depth++;
@@ -3564,10 +3921,33 @@ emit_if(struct g9p_ctx *ctx, nir_if *nif)
    return true;
 }
 
+/* A stretched range may end without an instruction reading its key. */
+static void
+expire_keys(struct g9p_ctx *ctx, unsigned end, bool decls_only)
+{
+   if (!ctx->pressure)
+      return;
+   for (unsigned i = ctx->dies_at[end]; i < ctx->dies_at[end + 1]; i++) {
+      const unsigned k = ctx->dies_keys[i];
+      const int r = ctx->reg[k];
+      if (r < 0 || ctx->released[k] ||
+          (decls_only && (!ctx->is_decl[k] || r >= 32)))
+         continue;
+      ctx->released[k] = 1;
+      if (ctx->is_decl[k]) {
+         ctx->pinned &= ~BITFIELD64_BIT(r);
+         ctx->busy &= ~BITFIELD64_BIT(r);
+      } else if (!(ctx->pinned & BITFIELD64_BIT(r))) {
+         ctx->busy &= ~BITFIELD64_BIT(r);
+      }
+   }
+}
+
 static bool
 emit_loop(struct g9p_ctx *ctx, nir_loop *loop)
 {
    unsigned body;
+   const unsigned lidx = ctx->emit_loop_index++;
 
    unsigned first_exit = ctx->num_exit_jumps;
    const unsigned outer_depth = ctx->if_depth;
@@ -3585,6 +3965,8 @@ emit_loop(struct g9p_ctx *ctx, nir_loop *loop)
                      2 * (int)(ctx->c->n - ctx->exit_jumps[j]));
    ctx->num_exit_jumps = first_exit;
    g9p_pop_levels(ctx->c, ctx->st, 2);
+   if (ctx->pressure)
+      expire_keys(ctx, ctx->loops[lidx].end, false);
    return true;
 }
 
@@ -3595,6 +3977,7 @@ emit_cf_list(struct g9p_ctx *ctx, struct exec_list *list)
       switch (node->type) {
       case nir_cf_node_block:
          nir_foreach_instr(instr, nir_cf_node_as_block(node)) {
+            if (ctx->c->error) return false;
             ctx->ip++;
             /* NIR registers whose live range starts here (a loop's start) */
             for (unsigned d = 0; d < ctx->num_decls; d++) {
@@ -3622,9 +4005,21 @@ emit_cf_list(struct g9p_ctx *ctx, struct exec_list *list)
                   nir_print_instr(instr, stderr);
                   fprintf(stderr, "\n");
                }
+               /* the refusal for the shader dump (pvr_g5p_shader_dump.h): the backend's own reason
+                * if it gave one, then the instruction */
+               if (ctx->out->a9) {
+                  const size_t used = strnlen(ctx->out->a9_refusal, sizeof(ctx->out->a9_refusal));
+                  FILE *f = fmemopen(ctx->out->a9_refusal + used, sizeof(ctx->out->a9_refusal) - used, "w");
+                  if (f) {
+                     fprintf(f, "%s%s", used ? ": " : "", ctx->oom ? "out of registers at " : "cannot compile ");
+                     nir_print_instr(instr, f);
+                     fclose(f);
+                  }
+               }
                return false;
             }
             nir_foreach_def(instr, park_def, ctx);
+            expire_keys(ctx, ctx->ip, true);
          }
          break;
       case nir_cf_node_if:
@@ -3649,6 +4044,10 @@ emit_cf_list(struct g9p_ctx *ctx, struct exec_list *list)
 static bool
 generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
 {
+   if (ctx->out->a9) {
+      ctx->out->a9_refusal[0] = a9_last_refusal[0] = 0;
+      ctx->out->a9_num_uploads = 0;
+   }
    uint16_t *body;
    unsigned body_n;
 
@@ -3656,6 +4055,9 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
 
    memset(ctx->reg, -1, impl->ssa_alloc * 4);
    memset(ctx->uni, -1, impl->ssa_alloc * 4 * sizeof(*ctx->uni));
+   if (ctx->released)
+      memset(ctx->released, 0, ctx->num_keys);
+   ctx->emit_loop_index = 0;
    ctx->c->n = 0;
    ctx->c->uses_stack = false;
    ctx->busy = ctx->pinned = ctx->temps = 0;
@@ -3735,11 +4137,12 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
     * write is the end.
     */
    stack = ctx->stage == MESA_SHADER_COMPUTE || ctx->c->uses_stack;
+   if (ctx->c->error) return g9p_fail(ctx->out, "%s", ctx->c->error);
    body_n = ctx->c->n;
    G9P_A9_SET_BODYLESS(ctx, body_n);
    body = malloc(body_n * sizeof(uint16_t) + 1);
    if (!body)
-      return false;
+      return g9p_fail(ctx->out, "allocation failure framing program code");
    memcpy(body, ctx->c->w, body_n * sizeof(uint16_t));
    ctx->c->n = 0;
    if (ctx->stage == MESA_SHADER_COMPUTE)
@@ -3852,7 +4255,7 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
                g9p_mov_from_high(ctx->c, data, st->data);
             }
             g9p_mem_at(ctx->c, true, G9P_SIZE_U32, data, addrs[k].pair);
-            ctx->c->w[ctx->c->n - 1] |= st->dword;
+            (*g9p_code_word(ctx->c, ctx->c->n - 1)) |= st->dword;
             if (++batch == 8 && i + 1 < ctx->num_vs_stores) {
                g9p_wait(ctx->c);
                batch = 0;
@@ -3904,7 +4307,7 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
       G9P_A9_END_PAD(ctx); g9p_end(ctx->c);
       break;
    }
-   return true;
+   return !ctx->c->error || g9p_fail(ctx->out, "%s", ctx->c->error);
 }
 
 int
@@ -3934,6 +4337,27 @@ phis_scalar(const nir_instr *instr, const void *data)
    return 1;
 }
 
+/* No native find-MSB emitter yet: branchless binary search, including zero
+ * and GLSL's signed negative-input convention. */
+static bool
+lower_find_msb(nir_builder *b, nir_alu_instr *alu, void *data)
+{
+   if (alu->op != nir_op_ufind_msb && alu->op != nir_op_ifind_msb)
+      return false;
+   b->cursor = nir_before_instr(&alu->instr);
+   nir_def *x = nir_ssa_for_alu_src(b, alu, 0);
+   if (alu->op == nir_op_ifind_msb)
+      x = nir_bcsel(b, nir_ilt_imm(b, x, 0), nir_inot(b, x), x);
+   nir_def *t = x, *r = nir_imm_int(b, 0);
+   for (unsigned shift = x->bit_size / 2; shift; shift /= 2) {
+      nir_def *upper = nir_ugt_imm(b, t, (1ull << shift) - 1);
+      t = nir_bcsel(b, upper, nir_ushr_imm(b, t, shift), t);
+      r = nir_iadd(b, r, nir_bcsel(b, upper, nir_imm_int(b, shift), nir_imm_int(b, 0)));
+   }
+   nir_def_replace(&alu->def, nir_bcsel(b, nir_ieq_imm(b, x, 0), nir_imm_int(b, -1), r));
+   return true;
+}
+
 static void
 optimize(nir_shader *nir)
 {
@@ -3949,6 +4373,11 @@ optimize(nir_shader *nir)
       NIR_PASS(progress, nir, nir_opt_cse);
       NIR_PASS(progress, nir, nir_opt_constant_folding);
       NIR_PASS(progress, nir, nir_opt_algebraic);
+      /* Algebraic lowering of find_lsb/ifind_msb introduces ufind_msb. */
+      NIR_PASS(progress, nir, nir_shader_alu_pass, lower_find_msb,
+               nir_metadata_control_flow, NULL);
+      /* Algebraic lowering of extended multiplies can introduce mul_high. */
+      NIR_PASS(progress, nir, nir_lower_alu);
       NIR_PASS(progress, nir, nir_opt_dead_cf);
       NIR_PASS(progress, nir, nir_opt_remove_phis);
    } while (progress);
@@ -4160,6 +4589,8 @@ lower_front(nir_shader *nir)
                glsl_get_natural_size_align_bytes);
       NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_shared, nir_address_format_32bit_offset);
    }
+   NIR_PASS(_, nir, nir_shader_alu_pass, lower_find_msb,
+            nir_metadata_control_flow, NULL);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, zero_descriptor_offset,
             nir_metadata_control_flow, NULL);
 }
@@ -4247,15 +4678,15 @@ lower_coverage(nir_shader *nir, const struct g9p_coverage *coverage)
 }
 
 /* The last attempt at a vertex shader: in program order, every load at its use */
-static _Thread_local bool g9p_no_schedule;
+static thread_local bool g9p_no_schedule;
 /*
  * Registers above r31 only once every attempt without them failed: a shader that fits
  * reloading its values runs far more instances at once (the aquarium's fish vertex shader:
  * 100 registers with homes on the first attempt, 4 instances, geometry 10x slower)
  */
-static _Thread_local bool g9p_no_homes;
+static thread_local bool g9p_no_homes;
 /* vertex shaders: attribute loads moved next to their uses (g9p_compile_vertex() tries both) */
-static _Thread_local bool g9p_move_inputs;
+static thread_local bool g9p_move_inputs;
 
 /*
  * Vertex outputs right after their values, with emit_output() writing each
@@ -4318,7 +4749,7 @@ hoist_vertex_outputs(nir_shader *nir)
    return progress;
 }
 /* the homes an attempt may use: few first (r32-r63), all of them last */
-static _Thread_local unsigned g9p_max_homes = 92;
+static thread_local unsigned g9p_max_homes = 92;
 
 /*
  * Loads that are cheap to repeat (uniform buffers, push constants,
@@ -4685,12 +5116,14 @@ size_of_sampled_level(nir_builder *b, nir_tex_instr *tex, void *data)
 static bool
 compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
              const struct g9p_vertex_attrib *attribs, unsigned frag_coord_slot,
-             bool repeat_loads, bool point_size, void *mem_ctx)
+             bool repeat_loads, bool point_size, void *mem_ctx, bool pressure, bool apple_budget)
 {
    /* G9P_LATE_OUTPUTS: outputs held to the end unless out of registers, as before */
    /* not with transform feedback: its capture reads the outputs at the end */
+   apple_budget &= stage == MESA_SHADER_COMPUTE && out->a9;
    const bool xfb = nir->xfb_info && nir->xfb_info->buffers_written;
-   struct g9p_ctx ctx = { .point_size = point_size, .repeat_loads = repeat_loads,
+   struct g9p_ctx ctx = { .pressure = pressure && stage == MESA_SHADER_COMPUTE && out->a9,
+                          .point_size = point_size, .repeat_loads = repeat_loads,
                           .flush_outputs = repeat_loads ||
                                            (!xfb && !getenv("G9P_LATE_OUTPUTS")) };
    nir_function_impl *impl;
@@ -4717,8 +5150,11 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
          NIR_PASS(_, nir, nir_lower_tex, &offsets);
          NIR_PASS(_, nir, nir_lower_tex, &levels);
       }
+      /* A9 compute reads texels with the sampler's read form and the fetch sampler (g9p_a9_tex.h) */
+      if (!(out->a9 && stage == MESA_SHADER_COMPUTE))
       NIR_PASS(_, nir, nir_shader_tex_pass, lower_txf, nir_metadata_control_flow, NULL);
-      NIR_PASS(_, nir, nir_shader_instructions_pass, lower_half_packing, nir_metadata_control_flow, NULL);
+      NIR_PASS(_, nir, nir_shader_instructions_pass, lower_half_packing, nir_metadata_control_flow,
+               (void *)(uintptr_t)(out->a9 && stage == MESA_SHADER_COMPUTE));
    }
    /* integer division through floats: no such instruction (GLSL ES 1.00 int and ivec /) */
    {
@@ -4735,6 +5171,13 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
             NULL, NULL);
    NIR_PASS(_, nir, nir_opt_algebraic_late);
    optimize(nir);
+   if (ctx.pressure) {
+      /* Fold constant shared addresses into a9_shared()'s word immediate;
+       * CSE otherwise keeps an iadd per inlined copy live. */
+      const nir_opt_offsets_options off = { .shared_max = 16336 };
+      NIR_PASS(_, nir, nir_opt_offsets, &off);
+      optimize(nir);
+   }
    if (stage == MESA_SHADER_FRAGMENT) {
       NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_dynamic_ubo_instr,
                nir_metadata_control_flow, NULL);
@@ -4776,7 +5219,7 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
 
    impl = nir_shader_get_entrypoint(nir);
    if (!impl)
-      return false;
+      return g9p_fail(out, "shader has no entry point");
    nir_index_ssa_defs(impl);
    ctx.tex_total = count_textures(impl);
    if (getenv("G9P_DEBUG"))
@@ -4794,7 +5237,18 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
    ctx.attribs = attribs;
    ctx.frag_coord_slot = frag_coord_slot;
    ctx.c = rzalloc(mem_ctx, struct g9p_code);
+   if (!ctx.c) return g9p_fail(out, "allocation failure allocating program code");
+   ctx.c->alloc_ctx = ctx.c;
+   ctx.c->w = ctx.c->initial_w;
+   ctx.c->capacity = G9P_INITIAL_CODE_WORDS;
    ctx.c->fragment = stage == MESA_SHADER_FRAGMENT;
+   ctx.c->high_bank0 = stage == MESA_SHADER_COMPUTE && out->a9;
+   ctx.c->a9_stack = stage == MESA_SHADER_COMPUTE && out->a9;
+   /* A9 compute: values in bank 1 up to the workgroup's limit, the mask stack after them; the rest in
+    * bank-0 homes (g9p_a9_bank1_limit()) */
+   if (stage == MESA_SHADER_COMPUTE && out->a9)
+      ctx.value_cap = g9p_a9_bank1_limit(MAX2(out->local_size[0], 1) * MAX2(out->local_size[1], 1) *
+                                         MAX2(out->local_size[2], 1)) - 1;
    ctx.reg = ralloc_array(mem_ctx, int8_t, impl->ssa_alloc * 4);
    ctx.uni = ralloc_array(mem_ctx, int16_t, impl->ssa_alloc * 4);
    memset(ctx.uni, -1, impl->ssa_alloc * 4 * sizeof(*ctx.uni));
@@ -4805,20 +5259,43 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
    memset(ctx.reg_first, 0xff, impl->ssa_alloc * sizeof(unsigned));
    ctx.decls = ralloc_array(mem_ctx, nir_def *, impl->ssa_alloc);
    ctx.max_exit_jumps = 256;
-   ctx.exit_jumps = ralloc_array(mem_ctx, unsigned, ctx.max_exit_jumps);
+   ctx.exit_jumps = ralloc_array(ctx.c, unsigned, ctx.max_exit_jumps);
+   ctx.num_loops = count_loop_records(&impl->body);
+   ctx.loops = ralloc_array(ctx.c, __typeof__(*ctx.loops), MAX2(ctx.num_loops, 1));
+   if (!ctx.loops || !ctx.exit_jumps)
+      return g9p_fail(out, "allocation failure allocating loop records or exits");
 
    ctx.ip = 0;
    walk_liveness(&ctx, &impl->body, false);
-   if (ctx.loop_index > G9P_MAX_LOOPS) {
-      fprintf(stderr, "g9p: too many loops\n");
-      return false;
-   }
    ctx.ip = 0;
    ctx.loop_index = 0;
    walk_liveness(&ctx, &impl->body, true);
 
+   if (ctx.pressure) {
+      reg_liveness(&ctx, impl, mem_ctx);
+      const unsigned nip = ctx.ip + 2;
+      unsigned total = 0;
+      ctx.dies_at = rzalloc_array(mem_ctx, unsigned, nip + 1);
+      ctx.released = rzalloc_array(mem_ctx, uint8_t, ctx.num_keys);
+      ctx.is_decl = rzalloc_array(mem_ctx, uint8_t, ctx.num_keys);
+      for (unsigned d = 0; d < ctx.num_decls; d++)
+         ctx.is_decl[key(ctx.decls[d], 0)] = 1;
+      for (unsigned k = 0; k < ctx.num_keys; k++)
+         if (ctx.last_use[k] && ctx.last_use[k] < nip)
+            ctx.dies_at[ctx.last_use[k] + 1]++, total++;
+      for (unsigned i = 1; i <= nip; i++)
+         ctx.dies_at[i] += ctx.dies_at[i - 1];
+      ctx.dies_keys = ralloc_array(mem_ctx, unsigned, MAX2(total, 1));
+      unsigned *fill = ralloc_array(mem_ctx, unsigned, nip);
+      memcpy(fill, ctx.dies_at, nip * sizeof(unsigned));
+      for (unsigned k = 0; k < ctx.num_keys; k++)
+         if (ctx.last_use[k] && ctx.last_use[k] < nip)
+            ctx.dies_keys[fill[ctx.last_use[k]]++] = k;
+   }
+
+
    /* G9P_PRESSURE: the most scalars live at once, from the liveness above */
-   if (getenv("G9P_PRESSURE")) {
+   if (debug_get_option_g9p_pressure()) {
       unsigned *delta = rzalloc_array(mem_ctx, unsigned, ctx.ip + 2), *dec = rzalloc_array(mem_ctx, unsigned, ctx.ip + 2);
       unsigned live = 0, peak = 0, peak_ip = 0, decls = 0;
 
@@ -4849,8 +5326,18 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
          if (live > peak)
             peak = live, peak_ip = i;
       }
-      fprintf(stderr, "g9p: pressure peak %u at instruction %u of %u (%u NIR register scalars)\n",
+      mesa_logi( "g9p: pressure peak %u at instruction %u of %u (%u NIR register scalars)\n",
               peak, peak_ip, ctx.ip, decls);
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            nir_def *def = nir_instr_def(instr);
+            if (def && ctx.def_ip[def->index] == peak_ip) {
+               mesa_logi( "g9p: pressure peak instruction: ");
+               nir_print_instr(instr, stderr);
+               fputc('\n', stderr);
+            }
+         }
+      }
    }
 
    /*
@@ -4858,17 +5345,19 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
     * Fragment shaders that run out of registers park the NIR register live
     * at that point with the furthest last use above r31 and try again.
     */
-   ctx.home = ralloc_array(mem_ctx, int8_t, impl->ssa_alloc * 4);
-   memset(ctx.home, -1, impl->ssa_alloc * 4);
+   ctx.home = ralloc_array(mem_ctx, int16_t, impl->ssa_alloc * 4);
+   memset(ctx.home, -1, impl->ssa_alloc * 4 * sizeof(*ctx.home));
    /*
     * Homes are shared: a value parks in the first one no other parked value is live in.
     * One home each ran out at 96 in Firefox's shaders.
     */
    struct {
       unsigned start, end;
-      int8_t home;
-   } *homed = ralloc_array(mem_ctx, __typeof__(*homed), 1024);
-   unsigned num_homed = 0;
+      int16_t home;
+   } *homed = NULL;
+   unsigned num_homed = 0, homed_capacity = 1024;
+   homed = ralloc_array(mem_ctx, __typeof__(*homed), homed_capacity);
+   if (!homed) return g9p_fail(out, "allocation failure allocating parked live ranges");
    /* retries that ran out at the same instruction: parking more does not help there */
    unsigned stuck = 0, last_oom_ip = UINT_MAX;
 
@@ -4883,7 +5372,7 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
       bool victim_decl = false;
 
       ctx.oom = false;
-      if (generate(&ctx, impl, ctx.reserve_st_low ? 15 : G9P_NUM_REGS))
+      if (generate(&ctx, impl, ctx.reserve_st_low ? 15 : out->a9 ? VALUE_REGS(&ctx) : G9P_NUM_REGS))
          break;
       if (ctx.oom && stage == MESA_SHADER_VERTEX &&
           (ctx.reserve_low < 2 || ctx.reserve_low == G9P_RESERVE_LOW_PAIR)) {
@@ -4891,77 +5380,135 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
          ctx.reserve_st_low = true;
          continue;
       }
-      if (!ctx.oom || stage == MESA_SHADER_COMPUTE || num_homed >= 1024 || g9p_no_homes)
-         return false;
+      /* A9 compute parks values above its bank-1 limit in bank 0. */
+      if (!ctx.oom || (stage == MESA_SHADER_COMPUTE && !(out->a9)) ||
+          g9p_no_homes)
+         return backend_failure(out, &ctx);
       stuck = ctx.oom_ip == last_oom_ip ? stuck + 1 : 0;
       last_oom_ip = ctx.oom_ip;
       /* each retry parks one more value; 40 live scalars need more than 16 (drawbench fs 2) */
-      if (stuck >= 64) {
-         fprintf(stderr, "g9p: out of registers at instruction %u (parking does not help)\n",
-                 ctx.oom_ip);
-         return false;
+      if (stuck >= (apple_budget ? 208 : 64)) {
+         g9p_fail(out, "out of registers at instruction %u (parking does not help)", ctx.oom_ip);
+         return backend_failure(out, &ctx);
       }
-      for (unsigned d = 0; d < ctx.num_decls; d++) {
-         const unsigned k = key(ctx.decls[d], 0);
-
-         if (ctx.home[k] < 0 && ctx.reg_first[ctx.decls[d]->index] <= ctx.oom_ip &&
-             ctx.last_use[k] >= ctx.oom_ip && ctx.last_use[k] > best) {
-            best = ctx.last_use[k];
-            victim = k;
-            victim_decl = true;
+      for (unsigned batch = 0; batch < (ctx.pressure ? 4 : 1); batch++) {
+         best = 0;
+         victim = -1;
+         victim_decl = false;
+         if (ctx.pressure) {
+            const int lim = ctx.oom_low ? 16 : 32;
+            for (unsigned d = 0; d < ctx.num_decls; d++) {
+               const unsigned k = key(ctx.decls[d], 0);
+               const int r = ctx.reg[k];
+               if (ctx.home[k] < 0 && r >= 0 && r < lim &&
+                   (ctx.pinned & BITFIELD64_BIT(r)) &&
+                   ctx.reg_first[ctx.decls[d]->index] <= ctx.oom_ip &&
+                   ctx.last_use[k] >= ctx.oom_ip && ctx.last_use[k] > best) {
+                  best = ctx.last_use[k];
+                  victim = k;
+                  victim_decl = true;
+               }
+            }
+            if (victim < 0) {
+               for (unsigned k = 0; k < ctx.num_keys; k++) {
+                  const int r = ctx.reg[k];
+                  if (!ctx.is_decl[k] && r >= 0 && r < lim && ctx.home[k] < 0 &&
+                      ctx.last_use[k] > ctx.oom_ip && ctx.last_use[k] > best &&
+                      !((ctx.pinned | ctx.temps) & BITFIELD64_BIT(r))) {
+                     best = ctx.last_use[k];
+                     victim = k;
+                  }
+               }
+            }
          }
-      }
-      /* else any NIR register, even past its last use: they stay pinned (dEQP tmp_array) */
-      for (unsigned d = 0; victim < 0 && d < ctx.num_decls; d++) {
-         const unsigned k = key(ctx.decls[d], 0);
+         if (victim < 0) {
+            for (unsigned d = 0; d < ctx.num_decls; d++) {
+               const unsigned k = key(ctx.decls[d], 0);
 
-         if (ctx.home[k] < 0 && ctx.reg_first[ctx.decls[d]->index] <= ctx.oom_ip) {
-            victim = k;
-            victim_decl = true;
+               if (ctx.home[k] < 0 && ctx.reg_first[ctx.decls[d]->index] <= ctx.oom_ip &&
+                   ctx.last_use[k] >= ctx.oom_ip && ctx.last_use[k] > best) {
+                  best = ctx.last_use[k];
+                  victim = k;
+                  victim_decl = true;
+               }
+            }
+            /* else any NIR register, even past its last use: they stay pinned (dEQP tmp_array) */
+            for (unsigned d = 0; victim < 0 && d < ctx.num_decls; d++) {
+               const unsigned k = key(ctx.decls[d], 0);
+
+               if (ctx.home[k] < 0 && ctx.reg_first[ctx.decls[d]->index] <= ctx.oom_ip) {
+                  victim = k;
+                  victim_decl = true;
+               }
+            }
+            /* else the live value (not a NIR register's) with the furthest last use */
+            for (unsigned k = 0, ssa_best = 0; victim < 0 && k < ctx.num_keys; k++) {
+               const int r = ctx.reg[k];
+
+               if (r < 0 || r >= 32 || ctx.home[k] >= 0 || ctx.last_use[k] <= ctx.oom_ip ||
+                   (ctx.pinned | ctx.temps) & BITFIELD64_BIT(r) || ctx.last_use[k] <= ssa_best)
+                  continue;
+               ssa_best = ctx.last_use[k];
+               best = k + 1;
+            }
+            if (victim < 0 && best && best <= ctx.num_keys && ctx.home[best - 1] < 0 &&
+                ctx.reg[best - 1] >= 0)
+               victim = best - 1;
          }
-      }
-      /* else the live value (not a NIR register's) with the furthest last use */
-      for (unsigned k = 0, ssa_best = 0; victim < 0 && k < ctx.num_keys; k++) {
-         const int r = ctx.reg[k];
-
-         if (r < 0 || r >= 32 || ctx.home[k] >= 0 || ctx.last_use[k] <= ctx.oom_ip ||
-             (ctx.pinned | ctx.temps) & BITFIELD64_BIT(r) || ctx.last_use[k] <= ssa_best)
-            continue;
-         ssa_best = ctx.last_use[k];
-         best = k + 1;
-      }
-      if (victim < 0 && best && best <= ctx.num_keys && ctx.home[best - 1] < 0 &&
-          ctx.reg[best - 1] >= 0)
-         victim = best - 1;
-      if (victim < 0) {
-         fprintf(stderr, "g9p: out of registers at instruction %u\n", ctx.oom_ip);
-         return false;
-      }
-      {
-         const unsigned start = victim_decl ? ctx.reg_first[victim / 4] : ctx.def_ip[victim / 4];
-         /* a NIR register's range takes in the loops it is used in (use_scalar()) */
-         const unsigned end = ctx.last_use[victim];
-         const unsigned max_homes = g9p_max_homes;
-         int home = -1;
-
-         for (unsigned h = 0; home < 0 && h < max_homes; h++) {
-            bool free = true;
-
-            for (unsigned i = 0; free && i < num_homed; i++)
-               free = homed[i].home != 32 + (int)h + (getenv("G9P_HOME_SKIP") ? atoi(getenv("G9P_HOME_SKIP")) : 0) || homed[i].end < start || end < homed[i].start;
-            if (free)
-               home = 32 + h + (getenv("G9P_HOME_SKIP") ? atoi(getenv("G9P_HOME_SKIP")) : 0);
+         if (victim < 0 && batch)
+            break;
+         if (victim < 0) {
+            g9p_fail(out, "out of registers at instruction %u (no parking victim)", ctx.oom_ip);
+            return backend_failure(out, &ctx);
          }
-         if (home < 0) {
-            fprintf(stderr, "g9p: out of registers above r31 at instruction %u\n", ctx.oom_ip);
-            return false;
+         {
+            const unsigned start = victim_decl ? ctx.reg_first[victim / 4] : ctx.def_ip[victim / 4];
+            /* a NIR register's range takes in the loops it is used in (use_scalar()) */
+            const unsigned end = ctx.last_use[victim];
+            /* Only the third A9 compute attempt gets Apple's full per-lane budget. */
+            const unsigned max_homes =
+               stage != MESA_SHADER_COMPUTE ? g9p_max_homes
+               : out->a9 ? MIN2(apple_budget ? 208 : 64,
+                                g9p_a9_max_homes(MAX2(out->local_size[0], 1) *
+                                                 MAX2(out->local_size[1], 1) *
+                                                 MAX2(out->local_size[2], 1)))
+                         : MIN2(g9p_max_homes, 64);
+            int home = -1;
+
+            for (unsigned h = 0; home < 0 && h < max_homes; h++) {
+               bool free = !(out->a9 && 32 + (int)h > 239);
+
+               for (unsigned i = 0; free && i < num_homed; i++)
+                  free = homed[i].home != 32 + (int)h || homed[i].end < start || end < homed[i].start;
+               if (free)
+                  home = 32 + h;
+            }
+            if (home < 0) {
+               if (batch)
+                  break;
+               g9p_fail(out, "out of registers above r31 at instruction %u (bank-0 homes exhausted)", ctx.oom_ip);
+               return backend_failure(out, &ctx);
+            }
+            if (num_homed == homed_capacity) {
+               unsigned capacity = homed_capacity * 2;
+               __typeof__(homed) ranges = capacity > homed_capacity ?
+                  reralloc(mem_ctx, homed, __typeof__(*homed), capacity) : NULL;
+               if (!ranges)
+                  return g9p_fail(out, "allocation failure growing parked live ranges");
+               homed = ranges;
+               homed_capacity = capacity;
+            }
+            homed[num_homed++] = (__typeof__(*homed)){ start, end, (int16_t)home };
+            ctx.home[victim] = home;
+            ctx.num_homes = MAX2(ctx.num_homes, (unsigned)home - 31);
          }
-         homed[num_homed++] = (__typeof__(*homed)){ start, end, (int8_t)home };
-         ctx.home[victim] = home;
-         ctx.num_homes = MAX2(ctx.num_homes, (unsigned)home - 31);
       }
    }
    st = ctx.max_reg + 1;
+   if (ctx.c->high_bank0 && ctx.value_cap && st + 1 > ctx.value_cap + 1) {
+      g9p_fail(out, "bank-1 cap exceeded");
+      return backend_failure(out, &ctx);
+   }
    /*
     * Vertex shaders: the mask stack below r16, selects use it too (dEQP vertex
     * shaders of 17 registers and more drew wrong values or hung the geometry
@@ -4978,22 +5525,22 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
       for (unsigned k = 0; k < ctx.out->num_buffers; k++)
          changed |= ctx.out->buffers[k].dwords != ctx.prev_dwords[k];
       if (changed && !generate(&ctx, impl, 15))
-         return false;
+         return backend_failure(out, &ctx);
       st = MAX2(ctx.max_reg, 15);
    } else if (stage == MESA_SHADER_VERTEX && st > 15) {
       ctx.reserve_st_low = true;
       if (!generate(&ctx, impl, 15)) {
          /* without r15, address work can run out of low registers */
          if (!ctx.oom || ctx.reserve_low)
-            return false;
+            return backend_failure(out, &ctx);
          ctx.reserve_low = true;
          ctx.oom = false;
          if (!generate(&ctx, impl, 15))
-            return false;
+            return backend_failure(out, &ctx);
       }
       st = MAX2(ctx.max_reg, 15);
    } else if (!generate(&ctx, impl, st))
-      return false;
+      return backend_failure(out, &ctx);
 
    /*
     * Buffers over the uniform operands' 512 dwords: only the dwords it reads, in as few runs
@@ -5043,8 +5590,8 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
             runs++;
          }
          if (span > 512) {
-            fprintf(stderr, "g9p: fragment shader reads %u dwords of buffers in %u runs\n", span, runs);
-            return false;
+            g9p_fail(out, "fragment shader reads %u dwords of buffers in %u runs", span, runs);
+            return backend_failure(out, &ctx);
          }
 
          unsigned next = g9p_fs_buf_base(out->num_textures);
@@ -5073,18 +5620,24 @@ compile_back(nir_shader *nir, struct g9p_shader *out, mesa_shader_stage stage,
             }
          }
          if (!generate(&ctx, impl, st))
-            return false;
+            return backend_failure(out, &ctx);
       }
    }
 
    out->num_regs = MAX2(st + 1, ctx.num_homes || ctx.num_vs_high
                                    ? 32 + ctx.num_homes + ctx.num_vs_high
                                    : 0);
+   /* A9 compute: the code's own registers (bank 1, r0..r@st) are what the CDM record's register field
+    * allocates; its homes are bank 0's, which the DOUTU temps (num_regs) allocate (g9p_mov_to_high()) */
+   if (ctx.c->high_bank0) {
+      assert(st + 1 <= 32);
+      out->a9_bank1_regs = st + 1;
+   }
    out->code = ctx.c->w;
    out->code_size = 2 * ctx.c->n;
    if (stage != MESA_SHADER_COMPUTE && st + 1 > 32) {
-      fprintf(stderr, "g9p: %u registers, a graphics task has 32\n", out->num_regs);
-      return false;
+      g9p_fail(out, "%u registers, a graphics task has 32", out->num_regs);
+      return backend_failure(out, &ctx);
    }
    if (getenv("G9P_DEBUG")) {
       fprintf(stderr, "g9p: %u registers, %u bytes of code\n", out->num_regs,
@@ -5106,7 +5659,7 @@ g9p_compile_compute(nir_shader *nir, struct g9p_shader *out, void *mem_ctx)
    memset(out, 0, sizeof(*out));
    lower_front(nir);
    NIR_PASS(_, nir, nir_lower_compute_system_values, &csv);
-   return compile_back(nir, out, MESA_SHADER_COMPUTE, NULL, 0, false, false, mem_ctx);
+   return compile_back(nir, out, MESA_SHADER_COMPUTE, NULL, 0, false, false, mem_ctx, false, false);
 }
 #include "g9p_a9_compute.h"
 /*
@@ -5217,6 +5770,11 @@ lower_half_packing(nir_builder *b, nir_instr *instr, void *data)
    nir_def *src = nir_ssa_for_alu_src(b, alu, 0);
 
    if (alu->op == nir_op_pack_half_2x16) {
+      if (data) {
+         nir_def_replace(&alu->def, nir_pack_half_2x16_split(b, nir_channel(b, src, 0),
+                                                            nir_channel(b, src, 1)));
+         return true;
+      }
       nir_def_replace(&alu->def, nir_ior(b, f32_to_half(b, nir_channel(b, src, 0)),
                                          nir_ishl_imm(b, f32_to_half(b, nir_channel(b, src, 1)), 16)));
    } else {
@@ -5490,7 +6048,7 @@ g9p_compile_vertex_attempts(nir_shader *nir, const struct g9p_vertex_attrib *att
          nir_shader *n = nir_shader_clone(mem_ctx, attempt[i]);
 
          g9p_no_schedule = i == 2;
-         if (compile_back(n, out, MESA_SHADER_VERTEX, attribs, 0, i > 0, point_size, mem_ctx)) {
+         if (compile_back(n, out, MESA_SHADER_VERTEX, attribs, 0, i > 0, point_size, mem_ctx, false, false)) {
             g9p_no_schedule = g9p_no_homes = false;
             g9p_max_homes = 92;
             return true;
@@ -5882,7 +6440,7 @@ g9p_compile_fragment(nir_shader *nir, unsigned frag_coord_slot,
          nir_shader *n = nir_shader_clone(mem_ctx, attempt[i]);
 
          g9p_no_schedule = i == 2;
-         if (compile_back(n, out, MESA_SHADER_FRAGMENT, NULL, frag_coord_slot, i > 0, false, mem_ctx)) {
+         if (compile_back(n, out, MESA_SHADER_FRAGMENT, NULL, frag_coord_slot, i > 0, false, mem_ctx, false, false)) {
             g9p_no_schedule = g9p_no_homes = false;
             g9p_max_homes = 92;
             return true;

@@ -871,6 +871,28 @@ PVR_PER_ARCH(CreateRenderPass2)(VkDevice _device,
          pass->max_sample_count = attachment->sample_count;
    }
 
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p)) {
+      /* Dependencies on commands outside the pass, merged (pvr_render_pass::ext_*) */
+      pass->ext_begin_barrier = (VkMemoryBarrier2){ .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+      pass->ext_end_barrier = (VkMemoryBarrier2){ .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+      for (uint32_t i = 0; i < pCreateInfo->dependencyCount; i++) {
+         const VkSubpassDependency2 *dep = &pCreateInfo->pDependencies[i];
+         if ((dep->srcSubpass == VK_SUBPASS_EXTERNAL) == (dep->dstSubpass == VK_SUBPASS_EXTERNAL))
+            continue;
+         /* synchronization2: a VkMemoryBarrier2 in pNext replaces the 32-bit masks */
+         const VkMemoryBarrier2 *mb2 = vk_find_struct_const(dep->pNext, MEMORY_BARRIER_2);
+         VkMemoryBarrier2 *b = dep->srcSubpass == VK_SUBPASS_EXTERNAL ? &pass->ext_begin_barrier : &pass->ext_end_barrier;
+         b->srcStageMask |= mb2 ? mb2->srcStageMask : dep->srcStageMask;
+         b->dstStageMask |= mb2 ? mb2->dstStageMask : dep->dstStageMask;
+         b->srcAccessMask |= mb2 ? mb2->srcAccessMask : dep->srcAccessMask;
+         b->dstAccessMask |= mb2 ? mb2->dstAccessMask : dep->dstAccessMask;
+         if (dep->srcSubpass == VK_SUBPASS_EXTERNAL)
+            pass->ext_begin = true;
+         else
+            pass->ext_end = true;
+      }
+   }
+
    /* Count how many dependencies each subpass has. */
    for (uint32_t i = 0; i < pCreateInfo->dependencyCount; i++) {
       const VkSubpassDependency2 *dep = &pCreateInfo->pDependencies[i];

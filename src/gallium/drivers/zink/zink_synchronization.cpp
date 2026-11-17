@@ -544,7 +544,7 @@ zink_resource_image_transfer_dst_barrier(struct zink_context *ctx, struct zink_r
 }
 
 bool
-zink_resource_buffer_transfer_dst_barrier(struct zink_context *ctx, struct zink_resource *res, unsigned offset, unsigned size)
+zink_resource_buffer_transfer_dst_barrier(struct zink_context *ctx, struct zink_resource *res, unsigned offset, unsigned size, bool unsync)
 {
    if (res->obj->copies_need_reset)
       zink_resource_copies_reset(res);
@@ -555,7 +555,12 @@ zink_resource_buffer_transfer_dst_barrier(struct zink_context *ctx, struct zink_
    /* must barrier if something read the valid buffer range */
    bool valid_read = (res->obj->access || res->obj->unordered_access) &&
                      util_ranges_intersect(&res->valid_buffer_range, offset, offset + size) && !can_unordered_write;
-   if (valid_read || zink_screen(ctx->base.screen)->driver_workarounds.broken_cache_semantics || zink_check_unordered_transfer_access(res, 0, &box)) {
+   /* the reordered cmdbuf runs after earlier batches only in submission order, which orders nothing:
+    * a range an unfinished earlier batch may still read needs a barrier */
+   bool earlier_read = !unsync && !zink_resource_usage_matches(res, ctx->bs) &&
+                       !zink_resource_usage_check_completion_fast(zink_screen(ctx->base.screen), res,
+                                                                  ZINK_RESOURCE_ACCESS_READ);
+   if (valid_read || earlier_read || zink_screen(ctx->base.screen)->driver_workarounds.broken_cache_semantics || zink_check_unordered_transfer_access(res, 0, &box)) {
       zink_screen(ctx->base.screen)->buffer_barrier(ctx, res, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
       unordered = res->obj->unordered_write;
    } else {
@@ -567,6 +572,10 @@ zink_resource_buffer_transfer_dst_barrier(struct zink_context *ctx, struct zink_
          res->obj->access = VK_ACCESS_TRANSFER_WRITE_BIT;
          res->obj->access_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
          res->obj->ordered_access_is_copied = true;
+         /* this batch's reads of the bound buffer are ordered by the reordered cmdbuf's final barrier, but they must
+          * still reach obj->access for the next batch's barrier (earlier_read) */
+         if (!unsync)
+            resource_check_defer_buffer_barrier(ctx, res, VK_PIPELINE_STAGE_TRANSFER_BIT);
       }
    }
    zink_resource_copy_box_add(ctx, res, 0, &box);
@@ -630,6 +639,14 @@ zink_resource_memory_barrier(struct zink_context *ctx, struct zink_resource *res
    }
    if (!resource_needs_barrier(res, flags, pipeline, unordered))
       return;
+
+   /* An unfinished earlier batch's unordered accesses are still pending: keep them
+    * as ordered history before this batch's first barrier resets them, ordered or not. */
+   if (!usage_matches && !completed) {
+      res->obj->access |= res->obj->unordered_access;
+      res->obj->access_stage |= res->obj->unordered_access_stage;
+   }
+
    if (completed) {
       /* reset access on complete */
       res->obj->access = VK_ACCESS_NONE;
