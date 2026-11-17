@@ -246,6 +246,7 @@ struct gctx {
    bool eager_vout; /* VS temps retry: each output written as soon as its value is final */
    bool compact_vs; /* last retry: compact movable bank1 values between instructions */
    bool vs_bank0;   /* VS pressure retry: temps in bank 0, outputs in bank 1 (vs-two-bank-allocator.md) */
+   bool vs_evict;   /* last VS retry: held bank-1 values move to bank 0 to keep room for bank-1-only forms */
    nir_intrinsic_instr *vend_store; /* eager: the output component written by the final vend */
    unsigned vend_comp;
    /* common store */
@@ -2490,6 +2491,18 @@ static unsigned scratch_imm(struct gctx *c, uint32_t value)
    return reg;
 }
 
+/* A scratch immediate in vertex bank 1, also when the program allocates its
+ * temps in bank 0 (alloc_bank1_run()). */
+static unsigned scratch_imm_bank1(struct gctx *c, uint32_t value)
+{
+   bool bank0 = c->vs_bank0, tex_bank0 = c->tex_bank0;
+   c->vs_bank0 = c->tex_bank0 = false;
+   unsigned reg = scratch_imm(c, value);
+   c->vs_bank0 = bank0;
+   c->tex_bank0 = tex_bank0;
+   return reg;
+}
+
 static unsigned one_reg(struct gctx *c)
 {
    if (c->remat || c->cf_depth > 0)
@@ -4362,7 +4375,10 @@ static void emit_memory_ubo(struct gctx *c, nir_intrinsic_instr *in,
    if (in->def.bit_size != 32 || !n || n > 4)
       refuse(c, "memory UBO load: only 1..4 aligned 32-bit components");
 
-   const unsigned dst = alloc_run(c, n, "memory UBO load");
+   /* A vertex load writes bank 1, the witnessed form, also when the program
+    * allocates its temps in bank 0 (control flow, or the bank-0 pressure
+    * retry), as a vertex storage-buffer load does (emit_address_ssbo_load). */
+   const unsigned dst = c->vs ? alloc_bank1_run(c, n, "memory UBO load") : alloc_run(c, n, "memory UBO load");
    if (c->vs)
       vs_bank1_only(c, "vertex memory UBO load", dst, -1, -1, -1);
    const unsigned first = off - r->lo;
@@ -4373,7 +4389,10 @@ static void emit_memory_ubo(struct gctx *c, nir_intrinsic_instr *in,
    for (unsigned i = 0; i < loads; i++) {
       const unsigned bytes = vector ? 16 : 4;
       const unsigned at = first + (vector ? 0 : 4 * i);
-      const unsigned index = scratch_imm(c, at);
+      /* the vertex addr.add_shift reads its offset from bank 1 only (vs_bank1_index()) */
+      const unsigned index = c->vs ? scratch_imm_bank1(c, at) : scratch_imm(c, at);
+      if (c->vs)
+         vs_bank1_only(c, "vertex constant UBO address offset", index, -1, -1, -1);
       unsigned pair;
 
       for (pair = 0; pair + 2 <= NUM_DWORDS; pair += 2)
@@ -7496,6 +7515,88 @@ static void compact_vertex_bank1(struct gctx *c)
    }
 }
 
+/* Last vertex pressure retry (vs_evict). The forms that must use bank 1 (the
+ * addressed UBO/SSBO loads: data, offset and address pair; the vertex math
+ * bridge; an output's bank-1 copy) found no room there when the fetched
+ * attributes fill r0..r31 until their first reads, which come after a UBO
+ * load (a translated D3D9-style skinning shader: eight vec4 attributes, every
+ * one masked by a UBO word). Apple's vertex programs hold their temps in
+ * bank 0 and read each attribute once into one (Apple's offline compiler on
+ * this shape, 12 float4 attributes and a 4 KiB constant buffer, does the
+ * same). Before each instruction, keep one
+ * aligned run of eight bank-1 registers free, which holds every bank-1 demand
+ * of one instruction in its first-fit order (a memory UBO load's data, offset
+ * and aligned pair; a register-indexed load's offset, pair and aligned vec4),
+ * by moving held values into bank 0, the run needing the fewest moves, with the
+ * class-98 move whose destination is bank 0 and source A bank 1, the move
+ * cf_operand() and the vertex texture park already emit. */
+static bool evict_movable(struct gctx *c, unsigned r)
+{
+   if ((c->reserved | c->scratch | c->tex_pending | c->tex_coord_pending) & BITFIELD64_BIT(r))
+      return false;
+   if (!(c->busy & BITFIELD64_BIT(r)))
+      return true;
+   bool owned = false;
+   for (unsigned i = 0; i < c->nvals; i++)
+      if (c->vals[i].held && c->vals[i].reg == r) {
+         if (c->vals[i].last <= c->now)
+            return false; /* an operand of this instruction stays where it is */
+         owned = true;
+      }
+   return owned; /* a busy register with no value (a pair, a persistent constant) stays */
+}
+
+static int evict_last(struct gctx *c, unsigned r)
+{
+   int last = -1;
+   for (unsigned i = 0; i < c->nvals; i++)
+      if (c->vals[i].held && c->vals[i].reg == r)
+         last = MAX2(last, c->vals[i].last);
+   return last;
+}
+
+/* The aligned run of n bank-1 registers that is cheapest to free (fewest
+ * moves, then the latest nearest read), or -1. */
+static int evict_run(struct gctx *c, unsigned n)
+{
+   int best = -1, best_cost = INT_MAX, best_near = -1;
+   for (unsigned r = 0; r + n <= NUM_DWORDS; r += n) {
+      int cost = 0, near = INT_MAX;
+      bool ok = true;
+      for (unsigned k = r; k < r + n && ok; k++) {
+         ok = evict_movable(c, k);
+         if (ok && (c->busy & BITFIELD64_BIT(k))) {
+            cost++;
+            near = MIN2(near, evict_last(c, k));
+         }
+      }
+      if (ok && (cost < best_cost || (cost == best_cost && near > best_near))) {
+         best = r;
+         best_cost = cost;
+         best_near = near;
+      }
+   }
+   return best;
+}
+
+static void evict_vertex_bank1(struct gctx *c)
+{
+   int run = evict_run(c, 8);
+   if (run < 0)
+      return;
+   uint8_t raw[G5P_USC_MAX];
+   u_foreach_bit64(src, BITFIELD64_RANGE(run, 8) & c->busy) {
+      int dst = alloc_bank0(c);
+      if (dst < 0)
+         return; /* bank 0 is full too: the instruction refuses as before */
+      put(c, raw, g5p_usc_move(raw, H(c, dst), H(c, src), 0, 1, 0x21), "attribute bank value into bank 0");
+      for (unsigned i = 0; i < c->nvals; i++)
+         if (c->vals[i].held && c->vals[i].reg == src)
+            c->vals[i].reg = dst;
+      c->busy &= ~BITFIELD64_BIT(src);
+   }
+}
+
 static void emit_block(struct gctx *c, nir_block *block)
 {
    nir_foreach_instr(ins, block) {
@@ -7506,6 +7607,8 @@ static void emit_block(struct gctx *c, nir_block *block)
          decl_alloc(c, c->now);
       if (c->vs && c->vs_bank0 && c->compact_vs && !c->cf)
          compact_vertex_bank1(c);
+      if (c->vs && c->vs_bank0 && c->vs_evict && !c->cf)
+         evict_vertex_bank1(c);
       switch (ins->type) {
       case nir_instr_type_alu:
          emit_alu(c, nir_instr_as_alu(ins));
@@ -8147,7 +8250,7 @@ bool pco_g5p_compile_general_key(nir_shader *nir, bool half_output, const uint8_
 
 static bool compile_general_link(nir_shader *nir, bool half_output, const uint8_t *attrib_components,
                                   const struct pco_g5p_fs_key *key, const struct pco_g5p_vs_link *link,
-                                  struct pco_g5p_program *out, bool preserve_cf)
+                                  struct pco_g5p_program *out, bool preserve_cf, bool evict)
 {
    static const struct pco_g5p_fs_key default_key = {.write_mask = 0xf};
    memset(out, 0, sizeof(*out));
@@ -8270,6 +8373,16 @@ static bool compile_general_link(nir_shader *nir, bool half_output, const uint8_
       refuse(c, "out of memory");
    memset(c->home, -1, c->impl->ssa_alloc * 4);
    schedule_texture_batches(c);
+   if (evict) {
+      /* pco_g5p_compile_general_link()'s last vertex retry: the program's own order, temps in bank 0, attributes
+       * moved out of bank 1 where a bank-1-only form needs room (evict_vertex_bank1()) */
+      /* as the other between-instruction mover (compact_vs): straight-line programs without stores */
+      if (!c->vs || c->cf || impl_has_side_effects(c->impl))
+         refuse(c, "register pressure: bank-1 eviction is a straight-line vertex retry without stores");
+      c->vs_bank0 = c->remat = c->eager_vout = c->vs_evict = true;
+      ok = two_pass(c);
+      goto done;
+   }
    ok = two_pass(c);
    if (!ok && !c->vs && strstr(out->refusal, "register pressure")) {
       /* Retry: constants and uniforms re-read per use (round 19). */
@@ -8402,11 +8515,22 @@ bool pco_g5p_compile_general_link(nir_shader *nir, bool half_output, const uint8
     * together. Retry the original fragment control flow only on pressure;
     * the existing scalar register/mask-stack lowering handles the branches.
     * Keep all phis scalar in that retry, including texture-result phis. */
-   nir_shader *original = nir->info.stage == MESA_SHADER_FRAGMENT && cf_left(nir)
+   /* A vertex program every pressure retry refused is compiled once more
+    * from its own order, before the scheduling retries reordered it, with the
+    * attributes moved out of bank 1 where a bank-1-only form needs room
+    * (evict_vertex_bank1()). Programs that compile today never get there. */
+   nir_shader *original = (nir->info.stage == MESA_SHADER_FRAGMENT && cf_left(nir)) ||
+                                nir->info.stage == MESA_SHADER_VERTEX
                              ? nir_shader_clone(NULL, nir) : NULL;
-   bool ok = compile_general_link(nir, half_output, attrib_components, key, link, out, false);
-   if (!ok && original && strstr(out->refusal, "register pressure"))
-      ok = compile_general_link(original, half_output, attrib_components, key, link, out, true);
+   bool ok = compile_general_link(nir, half_output, attrib_components, key, link, out, false, false);
+   if (!ok && original && strstr(out->refusal, "register pressure")) {
+      char first[sizeof(out->refusal)];
+      memcpy(first, out->refusal, sizeof(first));
+      const bool vs = nir->info.stage == MESA_SHADER_VERTEX;
+      ok = compile_general_link(original, half_output, attrib_components, key, link, out, !vs, vs);
+      if (!ok && vs) /* the ladder's own reason stays the one reported */
+         memcpy(out->refusal, first, sizeof(first));
+   }
    ralloc_free(original);
    return ok;
 }
