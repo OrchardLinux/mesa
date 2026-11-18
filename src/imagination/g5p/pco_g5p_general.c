@@ -3919,7 +3919,7 @@ static void vs_bitwise(struct gctx *c, nir_alu_instr *a)
  * bank 1, header 0x31 (m_imin_rr, m_isub_rr); a literal in A with header 0x11
  * (m_imin_lit, m_imax_neg, m_isub_lit, m_isub_big; ineg is 0 - x, m_ineg);
  * a common-store operand in A (m_imin_u; m_isub_u is u - x, m_isub_u2 x - u
- * by routing 0x70). The fragment form (bank 0, header 1) in a vertex program
+ * by routing 0x70), with either register in bank 0. The fragment form (bank 0, header 1) in a vertex program
  * reads other registers (the vertex shift, device run 1). x - k is an iadd of
  * -k (Apple's v_iadd_lit form). */
 static void vs_minsub(struct gctx *c, nir_alu_instr *a)
@@ -3969,7 +3969,11 @@ static void vs_minsub(struct gctx *c, nir_alu_instr *a)
       unsigned xr = reg_of(c, x, name);
       unsigned g = vgrp(c, x);
       unsigned dst = vs_dst(c, &x, 1);
-      vs_bank1_only(c, sub ? "vertex shared isub" : "vertex shared min/max", dst, xr, -1, -1);
+      /* Either register may be in bank 0: the instruction's bank is the
+       * destination's and header bit 0x10 marks B in bank 1, the same
+       * fields as the register forms. Apple's compiler emits this form with
+       * every destination and B bank pair (eight values clamped by eight
+       * uniforms under attribute pressure), byte-equal to these encoders. */
       unsigned n = sub ? g5p_usc_alu_shared(raw, G5P_BIN_ISUB, H(c, dst), sd, H(c, xr), vbank(c, dst), g,
                                             vhdr(c, 0x11, -1, xr, -1), 0, 0, false,
                                             i ? 0x70 : -1, 1)
