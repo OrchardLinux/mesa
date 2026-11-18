@@ -1,7 +1,7 @@
 name: Build
 # Compiles the drivers OrchardLinux ships from this fork, the way its package
 # builds them: the build() and package() of OrchardLinux/packages'
-# packages/mesa/pacman/PKGBUILD, run on this checkout instead of the commit the
+# packages/mesa/arch/PKGBUILD, run on this checkout instead of the commit the
 # package pins, in the same Arch Linux ARM container the package is built in.
 # That is the Imagination PowerVR Vulkan driver (Wayland) and OpenGL through
 # Zink, llvmpipe and softpipe (X11 and Wayland), with exactly the package's
@@ -46,7 +46,7 @@ jobs:
           bash packages/ci/prepare-pacman
           pacman -S --noconfirm --needed git ccache
           # shellcheck disable=SC1091
-          source packages/packages/mesa/pacman/PKGBUILD
+          source packages/packages/mesa/arch/PKGBUILD
           pacman -S --noconfirm --needed --asdeps "${depends[@]}" "${makedepends[@]}"
       - uses: actions/checkout@v4
         with:
@@ -72,7 +72,7 @@ jobs:
           source /etc/makepkg.conf
           export CFLAGS CXXFLAGS LDFLAGS
           # shellcheck disable=SC1091
-          source packages/packages/mesa/pacman/PKGBUILD
+          source packages/packages/mesa/arch/PKGBUILD
           # The recipe builds the source directory mesa-$_commit: this checkout.
           work=$PWD/work
           mkdir -p "$work"
