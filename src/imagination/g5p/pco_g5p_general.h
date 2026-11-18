@@ -164,6 +164,17 @@ enum pco_g5p_upload_kind {
 #define PCO_G5P_SSBO_SIZE_OFFSET 0xfffcu
 #define PCO_G5P_UPLOAD_IMAGE_AS_2D 1u
 #define PCO_G5P_UPLOAD_IMAGE_ARRAY 2u
+/* ONE_LAYER: an array sample at any layer of a one-layer view, drawn as a 2D
+ * sample. Vulkan's layer is clamp(RNE(z), 0, layers - 1), so with one layer
+ * every z reads the base layer. Only the driver's one-layer program variant
+ * has such samples (pvr_g5p_nir.c one_layer_as_2d()), and the draw selects
+ * that variant only when every array view it samples has one layer. The
+ * driver uploads a 2D state of that layer, and refuses a multi-layer view by
+ * name (pvr_g5p_tex_state_for()). */
+#define PCO_G5P_UPLOAD_IMAGE_ONE_LAYER 4u
+/* nir_tex_instr.backend_flags, set by the driver's one-layer lowering: this
+ * former array sample reads PCO_G5P_UPLOAD_IMAGE_ONE_LAYER state */
+#define PCO_G5P_TEX_ONE_LAYER_AS_2D (1u << 29)
 
 
 /* Varyings (docs/gpu/experiments/varyings.md). Apple's A9 compiler takes at

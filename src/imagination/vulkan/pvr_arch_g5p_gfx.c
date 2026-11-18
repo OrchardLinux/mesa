@@ -583,6 +583,7 @@ g5p_pipeline_free(struct pvr_device *device, struct pvr_g5p_pipeline *g)
    }
    g5p_pipeline_free(device, g->xfb);
    g5p_pipeline_free(device, g->punch);
+   g5p_pipeline_free(device, g->one_layer);
    vk_free(&device->vk.alloc, g);
 }
 
@@ -738,6 +739,19 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
    }
    g->fs_num_uploads = fs->num_uploads;
    g->fs_common_dwords = fs->common_dwords;
+   /* the array-sampled views the draw classifies for the one-layer variant (g5p_one_layer_select()) */
+   g->num_array_tex = 0;
+   for (unsigned st = 0; st < 2; st++) {
+      const struct pco_g5p_program *p = st ? vs : fs;
+      for (unsigned i = 0; i < p->num_uploads; i++) {
+         const struct pco_g5p_upload *u = &p->uploads[i];
+         if (u->kind != PCO_G5P_UPLOAD_IMAGE || !(u->offset & PCO_G5P_UPLOAD_IMAGE_ARRAY))
+            continue;
+         if (g->num_array_tex < ARRAY_SIZE(g->array_tex))
+            g->array_tex[g->num_array_tex] = (__typeof__(g->array_tex[0])){ u->set, u->binding, u->element };
+         g->num_array_tex++;
+      }
+   }
    /* PDS has 128 constant dwords, four per transfer. Coalesce copied
     * descriptor intervals when the original upload list exceeds twelve.
     * GPU-written UBOs and push snapshots retain their own source addresses. */
@@ -1020,6 +1034,89 @@ g5p_pipeline_build_punch(struct pvr_device *device,
    return result;
 }
 
+static VkResult g5p_pipeline_check_draw_variants(struct pvr_device *device,
+                                                 const struct vk_graphics_pipeline_state *state,
+                                                 const struct pvr_g5p_pipeline *g);
+
+/* The one-layer variant (pvr_g5p.h): built only for a pipeline with array samples, as a full linked
+ * pipeline (its fragment program may read fewer varying components, so its vertex program is its own),
+ * with its own punch child. The base programs are unchanged. A refused variant leaves the pipeline as it
+ * was: a draw that needs it refuses by name. */
+static VkResult
+g5p_pipeline_build_one_layer(struct pvr_device *device,
+                             const VkGraphicsPipelineCreateInfo *create_info,
+                             const struct vk_graphics_pipeline_state *state,
+                             struct pvr_g5p_pipeline *g)
+{
+   if (!g->num_array_tex)
+      return VK_SUCCESS;
+   if (g->num_array_tex > ARRAY_SIZE(g->array_tex)) {
+      g->one_layer_why = "more than 16 array-sampled views";
+      return VK_SUCCESS;
+   }
+   struct pvr_g5p_pipeline *p =
+      vk_zalloc(&device->vk.alloc, sizeof(*p), 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   if (!p)
+      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+   p->one_layer_variant = true;
+   p->xfb_variant = g->xfb_variant;
+   struct pco_g5p_program vs = { 0 }, fs = { 0 };
+   const bool was = pvr_g5p_one_layer_compile;
+   pvr_g5p_one_layer_compile = true;
+   VkResult result = g5p_pipeline_build(device, create_info, state, p, &vs, &fs);
+   free(vs.code);
+   free(fs.code);
+   if (result == VK_SUCCESS)
+      result = g5p_pipeline_build_punch(device, create_info, state, p);
+   pvr_g5p_one_layer_compile = was;
+   if (result == VK_SUCCESS)
+      result = g5p_pipeline_check_draw_variants(device, state, p);
+   if (result == VK_SUCCESS) {
+      g->one_layer = p;
+      return VK_SUCCESS;
+   }
+   g5p_pipeline_free(device, p);
+   if (result == VK_ERROR_FEATURE_NOT_PRESENT) {
+      g->one_layer_why = "the variant's compile was refused (see the refusal above)";
+      return VK_SUCCESS;
+   }
+   return result;
+}
+
+/* A draw's program for its bound views: the one-layer variant when an array sample's view has no array
+ * state (a one-layer view of a linear image), else the pipeline itself. The variant's uploads refuse a
+ * multi-layer view among the others by name; a view without texture state is the uploads' to refuse. */
+static VkResult
+g5p_one_layer_select(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_pipeline **gp)
+{
+   const struct pvr_g5p_pipeline *g = *gp;
+   if (!g->num_array_tex || g->num_array_tex > ARRAY_SIZE(g->array_tex))
+      return VK_SUCCESS;
+   const struct pvr_descriptor_state *ds = &cmd_buffer->state.gfx_desc_state;
+   for (unsigned i = 0; i < g->num_array_tex; i++) {
+      const unsigned set_index = g->array_tex[i].set, binding = g->array_tex[i].binding;
+      const struct pvr_descriptor_set *set = set_index < PVR_MAX_DESCRIPTOR_SETS ? ds->sets[set_index] : NULL;
+      if (!set || !set->layout || binding >= set->layout->binding_count)
+         continue;
+      const struct pvr_descriptor_set_layout_binding *lb = &set->layout->bindings[binding];
+      if (lb->type != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && lb->type != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE)
+         continue;
+      if (g->array_tex[i].element >= MAX2(lb->descriptor_count, 1))
+         continue;
+      const uint32_t *desc = (const uint32_t *)((const uint8_t *)set->mapping + lb->offset +
+                                                (size_t)g->array_tex[i].element * lb->stride);
+      if (!pvr_g5p_tex_state_valid(desc) || (desc[0] & 7) == PVR_G5P_TEX_LAYOUT_2D_ARRAY)
+         continue;
+      if (!g->one_layer)
+         return G5P_REFUSE(cmd_buffer, "set %u binding %u: an array sample at a non-constant layer of a view "
+                           "without array state, and no one-layer variant: %s", set_index, binding,
+                           g->one_layer_why ? g->one_layer_why : "none built");
+      *gp = g->one_layer;
+      return VK_SUCCESS;
+   }
+   return VK_SUCCESS;
+}
+
 /* Program variants are checked at creation under the selected refusal
  * policy. The draw selects its punch variant from dynamic depth/stencil
  * state (g5p_draw()); this takes every state the pipeline allows: a dynamic enable may be on, a
@@ -1097,6 +1194,8 @@ PVR_PER_ARCH(g5p_graphics_pipeline_compile)(struct pvr_device *device,
    result = g5p_pipeline_build_punch(device, create_info, vk_state, g);
    if (result == VK_SUCCESS)
       result = g5p_pipeline_check_draw_variants(device, vk_state, g);
+   if (result == VK_SUCCESS)
+      result = g5p_pipeline_build_one_layer(device, create_info, vk_state, g);
    if (result != VK_SUCCESS) {
       g5p_pipeline_free(device, g);
       return pvr_refusal_to_api(result);
@@ -1123,6 +1222,8 @@ PVR_PER_ARCH(g5p_graphics_pipeline_compile)(struct pvr_device *device,
          result = g5p_pipeline_build_punch(device, create_info, vk_state, x);
       if (result == VK_SUCCESS && x->xfb_layout.buffers)
          result = g5p_pipeline_check_draw_variants(device, vk_state, x);
+      if (result == VK_SUCCESS && x->xfb_layout.buffers)
+         result = g5p_pipeline_build_one_layer(device, create_info, vk_state, x);
       if (result == VK_SUCCESS && x->xfb_layout.buffers) {
          g->xfb = x;
       } else {
@@ -1821,6 +1922,12 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
    }
    if (!draw->count || !draw->instances)
       return VK_SUCCESS;
+   /* a one-layer view of a linear image under an array sample: the one-layer variant (pvr_g5p.h) */
+   {
+      VkResult lr = g5p_one_layer_select(cmd_buffer, &g);
+      if (lr != VK_SUCCESS)
+         return lr;
+   }
    if (!g5p_topology(dyn->ia.primitive_topology, &hw_topology, &split, &lines))
       return G5P_REFUSE(cmd_buffer, "topology %d", dyn->ia.primitive_topology);
    VkResult result;

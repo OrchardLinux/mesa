@@ -2059,7 +2059,8 @@ static void tex_bindings(struct gctx *c, nir_tex_instr *t, struct tex_bind *b)
                           sv->data.binding, element, selement};
    b->needs_sampler = t->op != nir_texop_txf;
    b->needs_fetch_sampler = t->op == nir_texop_txf;
-   b->image_flags = (t->backend_flags & G5P_TEX_LAYER0_AS_2D) ? PCO_G5P_UPLOAD_IMAGE_AS_2D :
+   b->image_flags = (t->backend_flags & PCO_G5P_TEX_ONE_LAYER_AS_2D) ? PCO_G5P_UPLOAD_IMAGE_ONE_LAYER :
+                    (t->backend_flags & G5P_TEX_LAYER0_AS_2D) ? PCO_G5P_UPLOAD_IMAGE_AS_2D :
                     t->is_array ? PCO_G5P_UPLOAD_IMAGE_ARRAY : 0;
 }
 

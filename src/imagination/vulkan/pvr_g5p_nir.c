@@ -29,6 +29,7 @@
 #include "pco/pco.h"
 #include "pco_g5p_general.h"
 #include "pvr_g5p.h"
+#include "pvr_g5p_shader_dump.h"
 #include "pvr_g5p_vertex.h"
 
 /* nir->options must outlive the shader (the general backend runs NIR passes
@@ -974,6 +975,60 @@ meta_blit_2d(nir_shader *nir)
    nir_shader_instructions_pass(nir, meta_tex_2d, nir_metadata_control_flow, NULL);
 }
 
+/*
+ * The one-layer program variant (pvr_g5p_pipeline::one_layer): every 2D
+ * array sample the backend would draw as an array sample (all but the
+ * constant layer-0 ones, layer0_as_2d() in pco_g5p_general.c) becomes a 2D
+ * sample of the view's base layer. With one layer that is exact: Vulkan's
+ * layer is clamp(RNE(z), 0, layers - 1) for filtered samples, and a texel
+ * fetch at any other layer is out of bounds (undefined: robustImageAccess is
+ * not exposed). The A9 has no array state for a linear image (AGXMetalA9
+ * ImageStateEncoderGen2::ImageStateFields: a linear 2D array encodes no
+ * texture type), so a one-layer view of a linear image (every single-level
+ * 2D colour image on G5P) needs this form when a program samples it at a
+ * layer it computes (Dolphin's EFB copy, restore and palette programs). Apple
+ * never meets the case: Metal types its textures at creation and makes every
+ * array twiddled. The draw selects this variant (g5p_cmd_draw()) only when an
+ * array sample's view has no array state, and its uploads refuse a
+ * multi-layer view by name (PCO_G5P_UPLOAD_IMAGE_ONE_LAYER).
+ */
+thread_local bool pvr_g5p_one_layer_compile;
+
+static bool
+one_layer_as_2d(nir_builder *b, nir_instr *instr, void *data)
+{
+   if (instr->type != nir_instr_type_tex)
+      return false;
+   nir_tex_instr *t = nir_instr_as_tex(instr);
+   if (!t->is_array || t->sampler_dim != GLSL_SAMPLER_DIM_2D || t->coord_components != 3 ||
+       (t->op != nir_texop_tex && t->op != nir_texop_txb && t->op != nir_texop_txl &&
+        t->op != nir_texop_txd && t->op != nir_texop_txf && t->op != nir_texop_tg4))
+      return false;
+   const int ci = nir_tex_instr_src_index(t, nir_tex_src_coord);
+   if (ci < 0)
+      return false;
+   /* layer0_as_2d()'s own samples keep their form (and their bytes) */
+   nir_scalar z = nir_scalar_chase_movs(nir_get_scalar(t->src[ci].src.ssa, 2));
+   if (nir_scalar_is_const(z) &&
+       (t->op == nir_texop_txf ? nir_scalar_as_int(z) == 0 : nir_scalar_as_float(z) <= 0.5))
+      return false;
+   b->cursor = nir_before_instr(instr);
+   nir_src_rewrite(&t->src[ci].src, nir_trim_vector(b, t->src[ci].src.ssa, 2));
+   t->coord_components = 2;
+   t->is_array = false;
+   t->backend_flags |= PCO_G5P_TEX_ONE_LAYER_AS_2D;
+   return true;
+}
+
+static void
+one_layer_lower(nir_shader *nir)
+{
+   if (nir_shader_instructions_pass(nir, one_layer_as_2d, nir_metadata_control_flow, NULL)) {
+      nir_opt_dce(nir);
+      nir_index_ssa_defs(nir_shader_get_entrypoint(nir));
+   }
+}
+
 /* The graphics lowerings of a prepared stage (the ICD's graphics_nir()) */
 static nir_shader *
 graphics_lower(nir_shader *nir, unsigned color_targets, bool *sample_mask, bool point_size, bool *psize_dropped)
@@ -982,6 +1037,8 @@ graphics_lower(nir_shader *nir, unsigned color_targets, bool *sample_mask, bool 
 
    if (nir)
       meta_blit_2d(nir);
+   if (nir && pvr_g5p_one_layer_compile)
+      one_layer_lower(nir);
    if (nir && nir_shader_intrinsics_pass(nir, lower_layer_0, nir_metadata_control_flow, NULL)) {
       nir->info.outputs_written &= ~BITFIELD64_BIT(VARYING_SLOT_LAYER);
       BITSET_CLEAR(nir->info.system_values_read, SYSTEM_VALUE_LAYER_ID);

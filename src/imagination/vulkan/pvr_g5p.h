@@ -323,6 +323,16 @@ struct pvr_g5p_pipeline {
    struct pvr_g5p_pipeline *xfb;
    bool xfb_variant;
    struct g5p_xfb_layout xfb_layout;
+   /* The one-layer variant (pvr_g5p_nir.c one_layer_as_2d()): the same pipeline with its array samples drawn
+    * as 2D samples of a one-layer view, a full linked variant with its own punch child. Draws use it when an
+    * array sample's view has no array state (a one-layer view of a linear image). array_tex: the
+    * (set, binding, element) of every array-sampled image (PCO_G5P_UPLOAD_IMAGE_ARRAY), vertex and
+    * fragment, that the draw classifies; NULL one_layer: none, or its compile was refused (one_layer_why). */
+   struct pvr_g5p_pipeline *one_layer;
+   bool one_layer_variant;
+   const char *one_layer_why;
+   unsigned num_array_tex;
+   struct { uint8_t set, binding; uint16_t element; } array_tex[16];
 };
 
 struct pvr_buffer;
