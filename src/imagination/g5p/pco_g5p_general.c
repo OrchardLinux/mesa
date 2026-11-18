@@ -1194,6 +1194,10 @@ static void scan_cf(struct gctx *c, struct exec_list *list, struct unsupported *
             case nir_intrinsic_load_ubo:
                ok = true;
                break;
+            case nir_intrinsic_load_smp_meta_pco:
+               /* the LOD-bias variant's sampler bias (fragment only) */
+               ok = !c->vs && in->def.bit_size == 32 && nir_src_is_const(in->src[0]);
+               break;
             case nir_intrinsic_get_ssbo_size:
                ok = in->def.bit_size == 32 && in->def.num_components == 1;
                break;
@@ -2085,6 +2089,35 @@ static struct tex_bind *tex_for(struct gctx *c, nir_tex_instr *t)
    return &c->tex[c->ntex++];
 }
 
+/* A sample that uses its sampler's LOD (pco_g5p_program::lod_samplers): the draw selects the LOD-bias
+ * variant when such a sampler's mipLodBias is not zero, and refuses by name where no program adds it. */
+static void record_lod_sampler(struct gctx *c, nir_tex_instr *t)
+{
+   if (t->op != nir_texop_tex && t->op != nir_texop_txb && t->op != nir_texop_txl && t->op != nir_texop_txd)
+      return;
+   if (t->sampler_dim == GLSL_SAMPLER_DIM_BUF)
+      return;
+   struct tex_bind b;
+   tex_bindings(c, t, &b);
+   const bool biased = (t->backend_flags & PCO_G5P_TEX_SAMPLER_BIAS) != 0;
+   struct pco_g5p_program *p = c->p;
+   for (unsigned i = 0; i < p->num_lod_samplers; i++) {
+      struct pco_g5p_lod_sampler *l = &p->lod_samplers[i];
+      if (l->set == b.sset && l->binding == b.sbinding && l->element == b.selement) {
+         /* one unbiased sample of the sampler leaves it unbiased */
+         l->biased &= biased;
+         return;
+      }
+   }
+   if (p->num_lod_samplers == PCO_G5P_MAX_LOD_SAMPLERS || b.sset > UINT8_MAX || b.sbinding > UINT8_MAX ||
+       b.selement > UINT16_MAX) {
+      p->lod_samplers_overflow = true;
+      return;
+   }
+   p->lod_samplers[p->num_lod_samplers++] =
+      (struct pco_g5p_lod_sampler){ (uint8_t)b.sset, (uint8_t)b.sbinding, (uint16_t)b.selement, biased };
+}
+
 /* textypes: the size block of a texture binding at a constant level. */
 static unsigned size_level(nir_tex_instr *t)
 {
@@ -2127,10 +2160,12 @@ static void plan_common(struct gctx *c)
    foreach_instr_all(ins, c) {
       if (ins->type == nir_instr_type_tex) {
          nir_tex_instr *t = nir_instr_as_tex(ins);
-         if (size_query(t))
+         if (size_query(t)) {
             size_for(c, t);
-         else
+         } else {
             tex_for(c, t);
+            record_lod_sampler(c, t);
+         }
          continue;
       }
       if (ins->type != nir_instr_type_intrinsic)
@@ -2145,7 +2180,16 @@ static void plan_common(struct gctx *c)
          if (xfb_address(in->src[1].ssa, &b, &off, &k))
             c->p->xfb_buffers |= 1u << b;
       }
-      if (in->intrinsic == nir_intrinsic_load_push_constant) {
+      if (in->intrinsic == nir_intrinsic_load_smp_meta_pco) {
+         /* the LOD-bias variant's per-binding bias: a sampler metadata dword, preloaded as a uniform */
+         if (!nir_src_is_const(in->src[0]))
+            refuse(c, "load_smp_meta_pco: a non-constant array element");
+         struct range *r = range_for(c, PCO_G5P_UPLOAD_SAMPLER_META, nir_intrinsic_desc_set(in),
+                                     nir_intrinsic_binding(in), nir_src_as_uint(in->src[0]));
+         const unsigned off = 4 * nir_intrinsic_component(in);
+         r->lo = MIN2(r->lo, off);
+         r->hi = MAX2(r->hi, off + 4 * in->def.num_components);
+      } else if (in->intrinsic == nir_intrinsic_load_push_constant) {
          unsigned off = load_offset(c, in, 0, nir_intrinsic_base(in));
          struct range *r = range_for(c, PCO_G5P_UPLOAD_PUSH, 0, 0, 0);
          r->lo = MIN2(r->lo, off);
@@ -4666,6 +4710,17 @@ static void emit_intrinsic(struct gctx *c, nir_intrinsic_instr *in)
       }
       break;
    }
+   case nir_intrinsic_load_smp_meta_pco: {
+      /* a preloaded sampler metadata dword (plan_common()) */
+      struct range *r = range_for(c, PCO_G5P_UPLOAD_SAMPLER_META, nir_intrinsic_desc_set(in),
+                                  nir_intrinsic_binding(in), nir_src_as_uint(in->src[0]));
+      for (unsigned k = 0; k < in->def.num_components; k++) {
+         struct val *v = V(c, &in->def, k);
+         v->state = VAL_SHARED;
+         v->imm = r->common + (4 * nir_intrinsic_component(in) - r->lo) / 4 + k;
+      }
+      break;
+   }
    case nir_intrinsic_get_ssbo_size: {
       unsigned set, binding, element;
       if (!block_binding_element(in->src[0].ssa, &set, &binding, &element))
@@ -7135,6 +7190,7 @@ static bool speculable(nir_instr *i)
       case nir_intrinsic_store_reg:
       case nir_intrinsic_load_push_constant:
       case nir_intrinsic_load_ubo:
+      case nir_intrinsic_load_smp_meta_pco:
       case nir_intrinsic_load_frag_coord:
          return true;
       default:

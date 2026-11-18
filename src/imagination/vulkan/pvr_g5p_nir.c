@@ -1029,6 +1029,98 @@ one_layer_lower(nir_shader *nir)
    }
 }
 
+/*
+ * The LOD-bias program variant (pvr_g5p_pipeline::lod_bias): every fragment sample that uses its
+ * sampler's LOD adds the bound sampler's mipLodBias, read per binding from the sampler descriptor
+ * (load_smp_meta_pco of PVR_G5P_SAMPLER_META_LOD_BIAS, a preloaded uniform: PCO_G5P_UPLOAD_SAMPLER_META).
+ * The A9 sampler word has no bias field: AGXMetalA9 builds it from MTLSamplerDescriptor's filters,
+ * address modes, compare, anisotropy and LOD clamps only (-[AGXA9FamilyDevice
+ * newSamplerStateWithDescriptor:] 0x207ccd0bc reads no lodBias; AGX::SamplerStateEncoderGen2<>::
+ * SamplerStateFields 0x207d80720 packs min/max LOD x 64), and Metal's LOD bias is the shader's sample
+ * argument (bias(b)), the biased sample form. Vulkan's LOD operation:
+ *    lambda' = lambda_base + clamp(sampler bias + shader bias, -maxSamplerLodBias, maxSamplerLodBias),
+ * lambda_base the implicit LOD, or the explicit one (txl), then clamped to [minLod, maxLod] (the sampler
+ * word's clamps, applied after the bias as Metal's are). So:
+ *  - tex: the biased sample (txb) by the sampler's bias (clamped when the sampler was made);
+ *  - txb: by clamp(shader bias + sampler bias);
+ *  - txl: at lod + sampler bias;
+ *  - txd: gradients scaled by exp2(sampler bias): lambda_base = log2(rho), rho linear in the
+ *    gradients, so log2(rho * 2^b) = lambda_base + b (anisotropic: the ratio is unchanged).
+ * txf, size queries and gathers do not use the sampler's LOD. The draw selects this variant only when a
+ * bound sampler of such a sample has a non-zero bias; base programs are unchanged.
+ */
+thread_local bool pvr_g5p_lod_bias_compile;
+
+static bool
+lod_bias_tex(nir_builder *b, nir_instr *instr, void *data)
+{
+   if (instr->type != nir_instr_type_tex)
+      return false;
+   nir_tex_instr *t = nir_instr_as_tex(instr);
+   if (t->op != nir_texop_tex && t->op != nir_texop_txb && t->op != nir_texop_txl && t->op != nir_texop_txd)
+      return false;
+   if (t->sampler_dim == GLSL_SAMPLER_DIM_BUF || (t->backend_flags & PCO_G5P_TEX_SAMPLER_BIAS))
+      return false;
+   nir_deref_instr *d = nir_get_tex_deref(t, nir_tex_src_sampler_deref);
+   if (!d)
+      d = nir_get_tex_deref(t, nir_tex_src_texture_deref);
+   unsigned element = 0;
+   if (d && d->deref_type == nir_deref_type_array) {
+      nir_deref_instr *parent = nir_deref_instr_parent(d);
+      /* the backend refuses these by name (tex_deref()) */
+      if (!parent || parent->deref_type != nir_deref_type_var || !nir_src_is_const(d->arr.index))
+         return false;
+      element = nir_src_as_uint(d->arr.index);
+   } else if (!d || d->deref_type != nir_deref_type_var) {
+      return false;
+   }
+   const nir_variable *var = nir_deref_instr_get_variable(d);
+   if (!var)
+      return false;
+   b->cursor = nir_before_instr(instr);
+   nir_def *bias = nir_load_smp_meta_pco(b, 1, nir_imm_int(b, element), .desc_set = var->data.descriptor_set,
+                                         .binding = var->data.binding,
+                                         .component = PVR_G5P_SAMPLER_META_LOD_BIAS);
+   switch (t->op) {
+   case nir_texop_tex:
+      nir_tex_instr_add_src(t, nir_tex_src_bias, bias);
+      t->op = nir_texop_txb;
+      break;
+   case nir_texop_txb: {
+      const int i = nir_tex_instr_src_index(t, nir_tex_src_bias);
+      nir_def *sum = nir_fadd(b, t->src[i].src.ssa, bias);
+      sum = nir_fmin(b, nir_fmax(b, sum, nir_imm_float(b, -PVR_G5P_MAX_SAMPLER_LOD_BIAS)),
+                     nir_imm_float(b, PVR_G5P_MAX_SAMPLER_LOD_BIAS));
+      nir_src_rewrite(&t->src[i].src, sum);
+      break;
+   }
+   case nir_texop_txl: {
+      const int i = nir_tex_instr_src_index(t, nir_tex_src_lod);
+      nir_src_rewrite(&t->src[i].src, nir_fadd(b, t->src[i].src.ssa, bias));
+      break;
+   }
+   case nir_texop_txd: {
+      nir_def *scale = nir_fexp2(b, bias);
+      const int x = nir_tex_instr_src_index(t, nir_tex_src_ddx), y = nir_tex_instr_src_index(t, nir_tex_src_ddy);
+      nir_src_rewrite(&t->src[x].src, nir_fmul(b, t->src[x].src.ssa, scale));
+      nir_src_rewrite(&t->src[y].src, nir_fmul(b, t->src[y].src.ssa, scale));
+      break;
+   }
+   default:
+      UNREACHABLE("filtered above");
+   }
+   t->backend_flags |= PCO_G5P_TEX_SAMPLER_BIAS;
+   return true;
+}
+
+static void
+lod_bias_lower(nir_shader *nir)
+{
+   if (nir->info.stage == MESA_SHADER_FRAGMENT &&
+       nir_shader_instructions_pass(nir, lod_bias_tex, nir_metadata_control_flow, NULL))
+      nir_index_ssa_defs(nir_shader_get_entrypoint(nir));
+}
+
 /* The graphics lowerings of a prepared stage (the ICD's graphics_nir()) */
 static nir_shader *
 graphics_lower(nir_shader *nir, unsigned color_targets, bool *sample_mask, bool point_size, bool *psize_dropped)
@@ -1046,6 +1138,8 @@ graphics_lower(nir_shader *nir, unsigned color_targets, bool *sample_mask, bool 
       nir_opt_dce(nir);
       nir_index_ssa_defs(nir_shader_get_entrypoint(nir));
    }
+   if (nir && pvr_g5p_lod_bias_compile)
+      lod_bias_lower(nir);
    if (nir && stage == MESA_SHADER_VERTEX && !point_size && !xfb_captures(nir, VARYING_SLOT_PSIZ) &&
        nir_shader_intrinsics_pass(nir, drop_point_size, nir_metadata_control_flow, NULL)) {
       /* polygon mode POINT needs to know (pco_g5p_program::psize_dropped) */

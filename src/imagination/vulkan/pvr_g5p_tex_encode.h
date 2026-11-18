@@ -243,8 +243,8 @@ pvr_g5p_sampler_encode(const VkSamplerCreateInfo *ci, bool extension, bool mip_n
       return "compare op";
    if (ci->unnormalizedCoordinates)
       return "unnormalized coordinates";
-   if (ci->mipLodBias != 0.0f)
-      return "LOD bias (no field in the sampler word)";
+   /* mipLodBias: no field in the sampler word (AGXMetalA9's SamplerStateFields has none). The descriptor
+    * carries it (PVR_G5P_SAMPLER_META_LOD_BIAS) and the LOD-bias program variant adds it in the shader. */
    if (extension)
       return "YCbCr conversion, reduction mode or custom border colour";
    addr[0] = pvr_g5p_smp_address(ci->addressModeU, ci->borderColor);

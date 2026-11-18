@@ -152,7 +152,15 @@ enum pco_g5p_upload_kind {
    PCO_G5P_UPLOAD_XFB,       /* per-draw driver block, PCO_G5P_XFB_* dwords */
    PCO_G5P_UPLOAD_BLEND_CONSTANTS, /* 4 dwords: the dynamic blend constants (f32) */
    PCO_G5P_UPLOAD_FETCH_SAMPLER, /* two generated samplerless-read policy words */
+   /* sampler metadata dwords [offset / 4, offset / 4 + dwords) of the sampler at (set, binding, element):
+    * pvr_sampler_descriptor::meta (load_smp_meta_pco; the LOD-bias variant reads the sampler's mipLodBias,
+    * PVR_G5P_SAMPLER_META_LOD_BIAS) */
+   PCO_G5P_UPLOAD_SAMPLER_META,
 };
+/* nir_tex_instr.backend_flags, set by the driver's LOD-bias lowering (pvr_g5p_nir.c lod_bias_lower()): the
+ * sample adds its sampler's mipLodBias (pco_g5p_program::lod_samplers[].biased) */
+#define PCO_G5P_TEX_SAMPLER_BIAS (1u << 28)
+#define PCO_G5P_MAX_LOD_SAMPLERS 16
 /* PCO_G5P_UPLOAD_IMAGE's offset (the state is always descriptor +0): how the
  * program samples it. AS_2D: an array sample at the constant layer 0, drawn
  * as a 2D sample, so the driver uploads the view's base layer as a 2D state
@@ -282,6 +290,18 @@ struct pco_g5p_program {
     * (set by pvr_g5p_nir.c after compilation; polygon mode POINT refuses it) */
    bool psize_dropped;
    uint8_t clip_count;  /* VS: user clip distances, the last output dwords (TA user planes 0..n-1) */
+   /* The samplers whose LOD a sample uses (tex, txb, txl, txd; not txf, size queries or gathers): a sampler's
+    * mipLodBias applies to them (Vulkan's LOD operation: lambda' = lambda_base + clamp(sampler bias + shader
+    * bias)). `biased`: the program adds the bound sampler's bias itself (the LOD-bias variant,
+    * PCO_G5P_TEX_SAMPLER_BIAS); the draw selects programs from these (pvr_arch_g5p_gfx.c). More than
+    * PCO_G5P_MAX_LOD_SAMPLERS sets lod_samplers_overflow. */
+   unsigned num_lod_samplers;
+   bool lod_samplers_overflow;
+   struct pco_g5p_lod_sampler {
+      uint8_t set, binding;
+      uint16_t element;
+      bool biased;
+   } lod_samplers[PCO_G5P_MAX_LOD_SAMPLERS];
    char refusal[512];
 };
 

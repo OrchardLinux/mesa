@@ -47,6 +47,14 @@ static inline VkResult pvr_refusal_to_api(VkResult result)
 #include "pvr_common.h"
 #include "pvr_limits.h"
 
+/* A sampler's mipLodBias, clamped to +-maxSamplerLodBias, as an f32 in its descriptor's metadata
+ * (pvr_sampler_descriptor::meta): the A9 sampler word has no bias field, so the LOD-bias program variant adds
+ * it in the shader (pvr_g5p_nir.c lod_bias_lower()). */
+#define PVR_G5P_SAMPLER_META_LOD_BIAS PCO_SAMPLER_META_RSVD2
+#define PVR_G5P_MAX_SAMPLER_LOD_BIAS 16.0f
+#define PVR_G5P_MAX_LOD_SAMPLERS 16 /* PCO_G5P_MAX_LOD_SAMPLERS */
+struct pvr_g5p_lod_bias_src;
+
 /* User clip distances are written to the A9 TA user planes. */
 static inline bool
 pvr_g5p_clip_distance_probe(void)
@@ -333,6 +341,21 @@ struct pvr_g5p_pipeline {
    const char *one_layer_why;
    unsigned num_array_tex;
    struct { uint8_t set, binding; uint16_t element; } array_tex[16];
+   /* The LOD-bias variant (pvr_g5p_nir.c lod_bias_lower()): the samplers whose LOD the programs use
+    * (pco_g5p_program::lod_samplers, [0] fragment, [1] vertex); a draw with a non-zero mipLodBias on one the
+    * program does not bias selects the variant, built at that first draw from the retained stages
+    * (lod_bias_src, owned by the pipeline node, NULL for a node without one) and kept. The variant has its
+    * own punch child. lod_bias_variant: this node is one. */
+   unsigned num_lod_samplers[2];
+   bool lod_samplers_overflow[2];
+   struct pvr_g5p_lod_sampler { uint8_t set, binding; uint16_t element; bool biased; }
+      lod_samplers[2][PVR_G5P_MAX_LOD_SAMPLERS];
+   struct pvr_g5p_lod_bias_src *lod_bias_src;
+   bool lod_bias_src_owner; /* the top-level node frees it; its xfb and one-layer nodes borrow it */
+   bool lod_bias_variant;
+   simple_mtx_t lod_bias_lock; /* the draw-time build of lod_bias */
+   struct pvr_g5p_pipeline *lod_bias;
+   const char *lod_bias_why; /* no variant: why (no retained stages, or its compile was refused) */
 };
 
 struct pvr_buffer;

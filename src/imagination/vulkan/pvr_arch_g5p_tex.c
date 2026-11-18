@@ -27,6 +27,8 @@
 #include "pvr_g5p_formats.h"
 #include "pvr_g5p_tex_encode.h"
 #include "pvr_image.h"
+#include "pvr_g5p.h"
+#include "util/u_math.h"
 
 /* A view format's texture key and sRGB bit: the A9 format table's
  * (pvr_g5p_formats.h, lane f) */
@@ -245,6 +247,10 @@ PVR_PER_ARCH(g5p_pack_sampler)(const VkSamplerCreateInfo *info, struct pvr_sampl
    desc->words[0] = general;
    desc->meta[PCO_SAMPLER_META_RSVD0] = (uint32_t)single;
    desc->meta[PCO_SAMPLER_META_RSVD1] = (uint32_t)(single >> 32);
+   /* the LOD bias the shader adds (the LOD-bias variant), clamped to maxSamplerLodBias as Vulkan's LOD
+    * operation does; -0.0 is no bias */
+   const float bias = CLAMP(info->mipLodBias, -PVR_G5P_MAX_SAMPLER_LOD_BIAS, PVR_G5P_MAX_SAMPLER_LOD_BIAS);
+   desc->meta[PVR_G5P_SAMPLER_META_LOD_BIAS] = bias == 0.0f ? 0u : fui(bias);
    return NULL;
 }
 
