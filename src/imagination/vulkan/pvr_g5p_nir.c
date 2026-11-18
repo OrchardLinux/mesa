@@ -675,7 +675,9 @@ g5p_nir(const uint32_t *spv, size_t words, mesa_shader_stage stage, const char *
    static util_once_flag once = UTIL_ONCE_FLAG_INIT;
    util_call_once(&once, g5p_init_options);
    struct spirv_capabilities caps = { .Shader = true, .Float16 = true, .Int16 = true, .Int8 = true,
-                                      .Int64 = true, .Float64 = true, .TransformFeedback = true };
+                                      .Int64 = true, .Float64 = true, .TransformFeedback = true,
+                                      /* user clip distances: the TA user planes (pvr_g5p_clip_distance_probe()) */
+                                      .ClipDistance = true };
    struct spirv_to_nir_options opts = {
       .environment = NIR_SPIRV_VULKAN,
       .capabilities = &caps,
