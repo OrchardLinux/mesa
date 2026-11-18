@@ -26,6 +26,7 @@
 #include "vk_enum_to_str.h"
 #include "vk_format.h"
 #include "vk_graphics_state.h"
+#include "pvr_g5p_depth_clip.h"
 #include "vk_log.h"
 #include "vk_shader_module.h"
 
@@ -395,6 +396,10 @@ g5p_native_bresenham_line(const struct vk_graphics_pipeline_state *s)
       s->rs->line.mode == VK_LINE_RASTERIZATION_MODE_BRESENHAM;
 }
 
+/* PPP_CTRL clip_mode values pvr_g5p_depth_clip.h names */
+static_assert(ROGUE_TA_CLIP_MODE_FRONT_REAR == PVR_G5P_CLIP_MODE_CLIP, "clip mode 1");
+static_assert(ROGUE_TA_CLIP_MODE_FRONT_REAR_DEPTH == PVR_G5P_CLIP_MODE_CLAMP, "clip mode 2");
+
 /* What initial triangle path draws: refused by name otherwise (the ICD's validate_state()
  * with initial triangle path's limits) */
 static VkResult
@@ -434,9 +439,18 @@ g5p_check_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo *c
 
    if (s->shader_stages != (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT) || s->ts)
       return G5P_REFUSE(device, "shader stages %#x (a vertex and a fragment shader)", s->shader_stages);
-   if (s->rs && (s->rs->depth_clamp_enable ||
-                 (s->rs->polygon_mode != VK_POLYGON_MODE_FILL && !pvr_g5p_polygon_mode_enabled())))
-      return G5P_REFUSE(device, "depth clamp or polygon mode %d", s->rs->polygon_mode);
+   if (s->rs && s->rs->polygon_mode != VK_POLYGON_MODE_FILL && !pvr_g5p_polygon_mode_enabled())
+      return G5P_REFUSE(device, "polygon mode %d", s->rs->polygon_mode);
+   /* depth clip and clamp: the draw judges them with its viewport and bias
+    * (pvr_g5p_depth_clip.h); a static state no viewport admits fails here */
+   if (s->rs && !BITSET_TEST(s->dynamic, MESA_VK_DYNAMIC_RS_DEPTH_CLAMP_ENABLE) &&
+       !BITSET_TEST(s->dynamic, MESA_VK_DYNAMIC_RS_DEPTH_CLIP_ENABLE)) {
+      unsigned mode;
+      const char *why = pvr_g5p_depth_clip_mode(vk_rasterization_state_depth_clip_enable(s->rs),
+                                                s->rs->depth_clamp_enable, false, 0.0f, 1.0f, false, &mode);
+      if (why)
+         return G5P_REFUSE(device, "%s", why);
+   }
    /* line and point fill: the qualified scope only */
    if (s->rs && s->rs->polygon_mode != VK_POLYGON_MODE_FILL) {
       if (s->rs->polygon_mode != VK_POLYGON_MODE_LINE && s->rs->polygon_mode != VK_POLYGON_MODE_POINT)
@@ -1948,6 +1962,17 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
                       (dyn->rs.depth_bias.constant_factor != 0.0f || dyn->rs.depth_bias.slope_factor != 0.0f);
    if (g->fs_depth_feedback && dbias)
       return G5P_REFUSE(cmd_buffer, "fragment depth export with depth bias is not qualified");
+   unsigned clip_mode = PVR_G5P_CLIP_MODE_CLIP;
+   if (!discard) {
+      const VkViewport *vp0 = &dyn->vp.viewports[0];
+      const char *why = pvr_g5p_depth_clip_mode(vk_rasterization_state_depth_clip_enable(&dyn->rs),
+                                                dyn->rs.depth_clamp_enable, true, vp0->minDepth, vp0->maxDepth,
+                                                dbias, &clip_mode);
+      if (!why && clip_mode != PVR_G5P_CLIP_MODE_CLIP && g->fs_depth_feedback)
+         why = "fragment depth export with depth clipping disabled is not qualified";
+      if (why)
+         return G5P_REFUSE(cmd_buffer, "%s", why);
+   }
    uint32_t dbias_index = 0;
    /* Real single-token feedback defers depth/stencil writes until the kill
     * result is known (g5p-punch-ds@8150a8195df); preserve all DS test/ops. */
@@ -2200,7 +2225,8 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
       }
       w[1] = G5P_WCLAMP;
       pvr_csb_pack (&w[2], TA_STATE_PPP_CTRL, c) {
-         c.clip_mode = ROGUE_TA_CLIP_MODE_FRONT_REAR;
+         /* 1 clips at near/far, 2 keeps that geometry and clamps its depth (pvr_g5p_depth_clip.h) */
+         c.clip_mode = (enum ROGUE_TA_CLIP_MODE)clip_mode;
          c.flatshade_vtx = ROGUE_TA_FLATSHADE_VTX_VERTEX_0;
          c.wclampen = true;
          if (dyn->rs.cull_mode == VK_CULL_MODE_BACK_BIT || dyn->rs.cull_mode == VK_CULL_MODE_FRONT_BIT) {
