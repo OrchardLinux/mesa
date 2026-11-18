@@ -883,6 +883,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_load_texture_scale:
    case nir_intrinsic_load_inline_data_intel:
    case nir_intrinsic_resource_intel:
+   case nir_intrinsic_load_smp_meta_pco:
    case nir_intrinsic_load_push_constant: {
       unsigned num_srcs = nir_intrinsic_infos[instr->intrinsic].num_srcs;
       for (unsigned i = 0; i < num_srcs; i++) {
