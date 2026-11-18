@@ -31,8 +31,11 @@
 #include <errno.h>
 #include <string.h>
 #include <poll.h>
+#include <stddef.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/un.h>
 
 #include "drm-uapi/drm_fourcc.h"
 
@@ -107,6 +110,30 @@ struct wsi_wl_output {
    enum wl_output_transform transform;
 };
 
+/* The outputs of the application's compositor, tracked on a private
+ * connection to it.
+ *
+ * The WSI must not bind wl_output on the application's own connection: the
+ * compositor sends wl_surface.enter/leave for every wl_output resource the
+ * client owns, so the application's surfaces would receive enter events that
+ * name outputs the application never bound (or NULL, once the WSI releases
+ * them). Toolkits map these events to their own output objects; GTK emits
+ * GdkSurface::enter-monitor with a NULL monitor, which aborts WebKitGTK.
+ *
+ * One watch per compositor endpoint, kept until the WSI is finished. A watch
+ * whose connection failed stays in the list with display == NULL, so the
+ * surface reports IDENTITY without reconnecting on every query.
+ */
+struct wsi_wl_output_watch {
+   struct wl_list link;
+   struct sockaddr_un addr;
+   socklen_t addr_len;
+   mtx_t lock; /* protects everything below */
+   struct wl_display *display;
+   struct wl_registry *registry;
+   struct wl_list outputs;
+};
+
 /* Vulkan VkSurfaceTransformFlagBitsKHR defines clockwise rotations, while
  * wayland.xml wl_output.transform defines counter-clockwise rotations. Both
  * VkSwapchainCreateInfoKHR.preTransform and wl_surface.set_buffer_transform
@@ -170,8 +197,6 @@ struct wsi_wl_display {
    /* Actually a proxy wrapper around the event queue */
    struct wl_display *wl_display_wrapper;
    struct wl_event_queue *queue;
-   struct wl_registry *registry;
-   struct wl_list outputs;
    struct wl_fixes *wl_fixes;
 
    struct wl_shm *wl_shm;
@@ -223,6 +248,9 @@ struct wsi_wayland {
 
    const VkAllocationCallbacks *alloc;
    VkPhysicalDevice physical_device;
+
+   mtx_t output_watches_lock;
+   struct wl_list output_watches;
 };
 
 struct wsi_wl_image {
@@ -1624,21 +1652,186 @@ wsi_wl_output_destroy(struct wsi_wl_output *output)
 }
 
 static void
+output_watch_handle_global(void *data, struct wl_registry *registry,
+                           uint32_t name, const char *interface,
+                           uint32_t version)
+{
+   struct wsi_wl_output_watch *watch = data;
+
+   if (strcmp(interface, wl_output_interface.name) != 0 || version < 2)
+      return;
+
+   struct wsi_wl_output *output = calloc(1, sizeof(*output));
+   if (!output)
+      return;
+   output->name = name;
+   output->transform = WL_OUTPUT_TRANSFORM_NORMAL;
+   output->output = wl_registry_bind(registry, name, &wl_output_interface,
+                                     MIN2(version, 4));
+   if (!output->output) {
+      free(output);
+      return;
+   }
+   wl_output_add_listener(output->output, &output_listener, output);
+   wl_list_insert(&watch->outputs, &output->link);
+}
+
+static void
+output_watch_handle_global_remove(void *data, struct wl_registry *registry,
+                                  uint32_t name)
+{
+   struct wsi_wl_output_watch *watch = data;
+   struct wsi_wl_output *output, *tmp;
+   wl_list_for_each_safe(output, tmp, &watch->outputs, link) {
+      if (output->name == name)
+         wsi_wl_output_destroy(output);
+   }
+}
+
+static const struct wl_registry_listener output_watch_registry_listener = {
+   output_watch_handle_global,
+   output_watch_handle_global_remove,
+};
+
+static void
+wsi_wl_output_watch_destroy(struct wsi_wl_output_watch *watch)
+{
+   struct wsi_wl_output *output, *tmp;
+   wl_list_for_each_safe(output, tmp, &watch->outputs, link)
+      wsi_wl_output_destroy(output);
+   if (watch->registry)
+      wl_registry_destroy(watch->registry);
+   if (watch->display)
+      wl_display_disconnect(watch->display);
+   mtx_destroy(&watch->lock);
+   free(watch);
+}
+
+static struct wl_display *
+output_watch_connect(const struct sockaddr_un *addr, socklen_t addr_len)
+{
+   int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+   if (fd < 0)
+      return NULL;
+   if (connect(fd, (const struct sockaddr *)addr, addr_len) < 0) {
+      close(fd);
+      return NULL;
+   }
+   /* Takes the fd, and closes it if it fails. */
+   return wl_display_connect_to_fd(fd);
+}
+
+/* The output watch for the compositor that wl_display is connected to: the
+ * endpoint is the peer address of the application's socket, so this also
+ * works when WAYLAND_DISPLAY does not name it. Returns NULL when that is not
+ * a named AF_UNIX socket (e.g. a socket pair passed through WAYLAND_SOCKET).
+ */
+static struct wsi_wl_output_watch *
+wsi_wl_get_output_watch(struct wsi_wayland *wsi, struct wl_display *wl_display)
+{
+   struct sockaddr_un addr;
+   socklen_t addr_len = sizeof(addr);
+   memset(&addr, 0, sizeof(addr));
+   if (getpeername(wl_display_get_fd(wl_display), (struct sockaddr *)&addr,
+                   &addr_len) < 0 ||
+       addr.sun_family != AF_UNIX ||
+       addr_len <= offsetof(struct sockaddr_un, sun_path) ||
+       addr_len > sizeof(addr))
+      return NULL;
+
+   struct wsi_wl_output_watch *watch;
+   mtx_lock(&wsi->output_watches_lock);
+   wl_list_for_each(watch, &wsi->output_watches, link) {
+      if (watch->addr_len == addr_len &&
+          memcmp(&watch->addr, &addr, addr_len) == 0)
+         goto out;
+   }
+
+   watch = calloc(1, sizeof(*watch));
+   if (!watch)
+      goto out;
+   if (mtx_init(&watch->lock, mtx_plain) != thrd_success) {
+      free(watch);
+      watch = NULL;
+      goto out;
+   }
+   watch->addr = addr;
+   watch->addr_len = addr_len;
+   wl_list_init(&watch->outputs);
+
+   watch->display = output_watch_connect(&addr, addr_len);
+   if (watch->display) {
+      watch->registry = wl_display_get_registry(watch->display);
+      if (watch->registry) {
+         wl_registry_add_listener(watch->registry,
+                                  &output_watch_registry_listener, watch);
+         /* The globals, then the initial events of the bound outputs. */
+         if (wl_display_roundtrip(watch->display) >= 0)
+            wl_display_roundtrip(watch->display);
+      } else {
+         wl_display_disconnect(watch->display);
+         watch->display = NULL;
+      }
+   }
+   wl_list_insert(&wsi->output_watches, &watch->link);
+
+out:
+   mtx_unlock(&wsi->output_watches_lock);
+   return watch;
+}
+
+/* The transform of the only output, or -1 without exactly one output: with
+ * several, the output a surface is on is known only from the application's
+ * wl_surface.enter/leave events, which the WSI does not receive.
+ */
+static int32_t
+wsi_wl_output_watch_single_transform(struct wsi_wl_output_watch *watch)
+{
+   int32_t transform = -1;
+
+   if (!watch)
+      return -1;
+
+   mtx_lock(&watch->lock);
+   struct wl_display *d = watch->display;
+   if (!d || wl_display_get_error(d))
+      goto out;
+
+   /* Pick up output changes (e.g. a rotation) without blocking. */
+   while (wl_display_prepare_read(d) != 0) {
+      if (wl_display_dispatch_pending(d) < 0)
+         goto out;
+   }
+   if (wl_display_flush(d) < 0 && errno != EAGAIN) {
+      wl_display_cancel_read(d);
+      goto out;
+   }
+   struct pollfd pfd = { .fd = wl_display_get_fd(d), .events = POLLIN };
+   if (poll(&pfd, 1, 0) > 0) {
+      if (wl_display_read_events(d) < 0)
+         goto out;
+   } else {
+      wl_display_cancel_read(d);
+   }
+   if (wl_display_dispatch_pending(d) < 0)
+      goto out;
+
+   if (wl_list_length(&watch->outputs) == 1) {
+      struct wsi_wl_output *output =
+         wl_container_of(watch->outputs.next, output, link);
+      transform = output->transform;
+   }
+
+out:
+   mtx_unlock(&watch->lock);
+   return transform;
+}
+
+static void
 registry_handle_global(void *data, struct wl_registry *registry,
                        uint32_t name, const char *interface, uint32_t version)
 {
    struct wsi_wl_display *display = data;
-
-   if (strcmp(interface, wl_output_interface.name) == 0 && version >= 2) {
-      struct wsi_wl_output *output = calloc(1, sizeof(*output));
-      if (!output)
-         return;
-      output->name = name;
-      output->output = wl_registry_bind(registry, name, &wl_output_interface,
-                                        MIN2(version, 4));
-      wl_output_add_listener(output->output, &output_listener, output);
-      wl_list_insert(&display->outputs, &output->link);
-   }
 
    if (display->sw) {
       if (strcmp(interface, wl_shm_interface.name) == 0) {
@@ -1701,14 +1894,9 @@ static void
 registry_handle_global_remove(void *data, struct wl_registry *registry,
                               uint32_t name)
 {
-   struct wsi_wl_display *display = data;
-   struct wsi_wl_output *output, *tmp;
-   wl_list_for_each_safe(output, tmp, &display->outputs, link) {
-      if (output->name == name)
-         wsi_wl_output_destroy(output);
-   }
-
 #ifdef WL_FIXES_ACK_GLOBAL_REMOVE
+   struct wsi_wl_display *display = data;
+
    if (display->wl_fixes && wl_fixes_get_version(display->wl_fixes) >= WL_FIXES_ACK_GLOBAL_REMOVE_SINCE_VERSION) {
       wl_fixes_ack_global_remove(display->wl_fixes, registry, name);
    }
@@ -1723,18 +1911,6 @@ static const struct wl_registry_listener registry_listener = {
 static void
 wsi_wl_display_finish(struct wsi_wl_display *display)
 {
-   struct wsi_wl_output *output, *tmp;
-   wl_list_for_each_safe(output, tmp, &display->outputs, link)
-      wsi_wl_output_destroy(output);
-
-   if (display->registry) {
-#ifdef WL_FIXES_INTERFACE
-      if (display->wl_fixes)
-         wl_fixes_destroy_registry(display->wl_fixes, display->registry);
-#endif
-      wl_registry_destroy(display->registry);
-   }
-
    struct wsi_wl_format *f;
    u_vector_foreach(f, &display->formats)
       u_vector_finish(&f->modifiers);
@@ -1778,7 +1954,6 @@ wsi_wl_display_init(struct wsi_wayland *wsi_wl,
 {
    VkResult result = VK_SUCCESS;
    memset(display, 0, sizeof(*display));
-   wl_list_init(&display->outputs);
 
    if (!u_vector_init(&display->formats, 8, sizeof(struct wsi_wl_format)))
       return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -1812,7 +1987,6 @@ wsi_wl_display_init(struct wsi_wayland *wsi_wl,
       goto fail;
    }
 
-   display->registry = registry;
    wl_registry_add_listener(registry, &registry_listener, display);
 
    /* Round-trip to get wl_shm and zwp_linux_dmabuf_v1 globals */
@@ -1892,11 +2066,16 @@ wsi_wl_display_init(struct wsi_wayland *wsi_wl,
 
    if (wsi_wl_display_determine_colorspaces(display) < 0) {
       result = VK_ERROR_OUT_OF_HOST_MEMORY;
-      goto fail;
+      goto fail_registry;
    }
 
 out:
-   /* Keep the registry alive to track output additions and removals. */
+   /* We don't need this anymore */
+#ifdef WL_FIXES_INTERFACE
+   if (display->wl_fixes)
+      wl_fixes_destroy_registry(display->wl_fixes, registry);
+#endif
+   wl_registry_destroy(registry);
 
    /* Destroy default dma-buf feedback object and format table */
    if (display->wl_dmabuf_feedback) {
@@ -1908,6 +2087,12 @@ out:
    return VK_SUCCESS;
 
 fail_registry:
+#ifdef WL_FIXES_INTERFACE
+   if (display->wl_fixes)
+      wl_fixes_destroy_registry(display->wl_fixes, registry);
+#endif
+   wl_registry_destroy(registry);
+
 fail:
    wsi_wl_display_finish(display);
    return result;
@@ -2066,12 +2251,12 @@ wsi_wl_surface_get_capabilities(VkIcdSurfaceBase *icd_surface,
       /* Without the application's surface enter/leave events, only a single
        * output tells us which transform applies. Otherwise prefer identity.
        */
-      if (wl_list_length(&display->outputs) == 1) {
-         struct wsi_wl_output *output =
-            wl_container_of(display->outputs.next, output, link);
+      int32_t transform = wsi_wl_output_watch_single_transform(
+         wsi_wl_get_output_watch(wsi, surface->display));
+      if (transform >= WL_OUTPUT_TRANSFORM_NORMAL &&
+          transform <= WL_OUTPUT_TRANSFORM_FLIPPED_270)
          caps->surfaceCapabilities.currentTransform =
-            wl_transform_to_vk(output->transform);
-      }
+            wl_transform_to_vk(transform);
    }
 
    if (!wsi_wl_surface->display)
@@ -4378,6 +4563,12 @@ wsi_wl_init_wsi(struct wsi_device *wsi_device,
    wsi->physical_device = physical_device;
    wsi->alloc = alloc;
    wsi->wsi = wsi_device;
+   wl_list_init(&wsi->output_watches);
+   if (mtx_init(&wsi->output_watches_lock, mtx_plain) != thrd_success) {
+      vk_free(alloc, wsi);
+      result = VK_ERROR_OUT_OF_HOST_MEMORY;
+      goto fail;
+   }
 
    wsi->base.get_support = wsi_wl_surface_get_support;
    wsi->base.get_capabilities2 = wsi_wl_surface_get_capabilities2;
@@ -4405,6 +4596,11 @@ wsi_wl_finish_wsi(struct wsi_device *wsi_device,
       (struct wsi_wayland *)wsi_device->wsi[VK_ICD_WSI_PLATFORM_WAYLAND];
    if (!wsi)
       return;
+
+   struct wsi_wl_output_watch *watch, *tmp;
+   wl_list_for_each_safe(watch, tmp, &wsi->output_watches, link)
+      wsi_wl_output_watch_destroy(watch);
+   mtx_destroy(&wsi->output_watches_lock);
 
    vk_free(alloc, wsi);
 }
