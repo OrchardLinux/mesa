@@ -350,7 +350,7 @@ unsigned g5p_usc_cond_select(uint8_t *out, unsigned dst_half, struct g5p_src con
                              struct g5p_src f, unsigned bank, unsigned source_extension, unsigned header);
 /* Raster position, tile access and native-f16 blend arithmetic. */
 unsigned g5p_usc_position_xy(uint8_t *out, unsigned dst_half, unsigned words, unsigned source_half);
-unsigned g5p_usc_position_zw(uint8_t *out, unsigned dst_half, bool z, bool both, int long_form);
+unsigned g5p_usc_position_zw(uint8_t *out, unsigned dst_half, bool set1, bool both, int long_form);
 unsigned g5p_usc_tile_read(uint8_t *out, unsigned dst_half, unsigned words);
 unsigned g5p_usc_half_binary(uint8_t *out, bool mul, unsigned dst_half, struct g5p_src a, struct g5p_src b,
                              struct g5p_ctl k, int source_control);

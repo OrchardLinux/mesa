@@ -197,6 +197,8 @@ enum pco_g5p_upload_kind {
  * included). Before: 16 vec4, 64 components. */
 #define PCO_G5P_MAX_FS_VARYINGS 28
 #define PCO_G5P_VARYING_SLOTS 32 /* VARYING_SLOT_VAR0..VAR31 */
+/* pco_g5p_program::z_set: fragment position Z; host tests check for it */
+#define PCO_G5P_HAVE_Z_SET 1
 
 enum pco_g5p_interp {
    PCO_G5P_INTERP_UNREAD = 0, /* VS link: the fragment program does not read it */
@@ -269,6 +271,10 @@ struct pco_g5p_program {
    unsigned num_varyings;
    struct pco_g5p_varying vary[PCO_G5P_MAX_FS_VARYINGS];
    bool w_set; /* coefficient set 0 is W (some varying is perspective-correct) */
+   /* gl_FragCoord.z is read: the next coefficient set (1 after W, else 0) is the
+    * TSP's unclamped Z, which TA_OUTPUT_SEL tsp_unclamped_z_pres puts right after
+    * the RHW (AGXMetalA9 FragmentProgramVariant 0x207d28be0, varying item type 6) */
+   bool z_set;
    /* VS: first output dword of each VARn (0 = not written) and its
     * interpolation; outputs are grouped linear, flat, npc (STATE_VARYING0). */
    uint8_t vout_dword[PCO_G5P_VARYING_SLOTS];

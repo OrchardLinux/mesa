@@ -1192,22 +1192,14 @@ static void scan_cf(struct gctx *c, struct exec_list *list, struct unsupported *
                ok = !c->vs;
                break;
             case nir_intrinsic_load_frag_coord:
+               /* x/y: the raster position; z: the TSP's unclamped Z (plan_varyings());
+                * w: the RHW. The backend binds components, which only ALU reads use. */
                ok = !c->vs;
-               nir_foreach_use(use, &in->def) {
-                  nir_instr *ui = nir_src_use_instr(use);
-                  if (ui->type == nir_instr_type_alu) {
-                     nir_alu_instr *ua = nir_instr_as_alu(ui);
-                     for (unsigned k = 0; k < nir_op_infos[ua->op].num_inputs; k++)
-                        if (&ua->src[k].src == use)
-                           for (unsigned j = 0; j < nir_ssa_alu_instr_src_components(ua, k); j++)
-                              if (ua->src[k].swizzle[j] == 2)
-                                 ok = false;
-                  } else {
+               nir_foreach_use(use, &in->def)
+                  if (nir_src_use_instr(use)->type != nir_instr_type_alu)
                      ok = false;
-                  }
-               }
                if (!ok && !c->vs) {
-                  note(u, "load_frag_coord .z (Z coefficient layout is not qualified)");
+                  note(u, "load_frag_coord read by a non-ALU instruction");
                   continue;
                }
                break;
@@ -1578,14 +1570,16 @@ static void plan_varyings(struct gctx *c)
    uint8_t interp[PCO_G5P_VARYING_SLOTS] = {0}, mask[PCO_G5P_VARYING_SLOTS] = {0};
    bool centroid[PCO_G5P_VARYING_SLOTS] = {0};
    uint32_t read = 0;
-   bool position_w = false;
+   bool position_w = false, position_z = false;
    memset(c->vary_idx, -1, sizeof(c->vary_idx));
    foreach_instr_all(ins, c) {
       if (ins->type != nir_instr_type_intrinsic)
          continue;
       nir_intrinsic_instr *in = nir_instr_as_intrinsic(ins);
-      if (in->intrinsic == nir_intrinsic_load_frag_coord)
+      if (in->intrinsic == nir_intrinsic_load_frag_coord) {
          position_w |= nir_def_components_read(&in->def) & BITFIELD_BIT(3);
+         position_z |= nir_def_components_read(&in->def) & BITFIELD_BIT(2);
+      }
       if (in->intrinsic != nir_intrinsic_load_interpolated_input && in->intrinsic != nir_intrinsic_load_input)
          continue;
       unsigned loc = nir_intrinsic_io_semantics(in).location;
@@ -1618,17 +1612,22 @@ static void plan_varyings(struct gctx *c)
     * only after this plan. Reading V(...)->uses here left W-only programs
     * without a coefficient DOUTI despite emitting the native W iterator. */
    bool w = position_w || smooth;
+   /* Apple's A9 coefficient layout (Apple's compiles f_raster_pos_z/w):
+    * W at set 0 when present, then position Z when the program reads it, then the read
+    * locations, 4 sets each. Z without W is set 0 (f_z_only, f_z_f, f_z_n). */
+   const unsigned base = (w ? 1 : 0) + (position_z ? 1 : 0);
    /* the last location's last component must fit the u7 iterator slot */
-   if ((w ? 1 : 0) + 4 * util_bitcount(read) > 128)
-      refuse(c, "%u varying locations with W exceed the u7 iterator slot", util_bitcount(read));
+   if (base + 4 * util_bitcount(read) > 128)
+      refuse(c, "%u varying locations with W/Z exceed the u7 iterator slot", util_bitcount(read));
    unsigned i = 0;
    u_foreach_bit(n, read) {
-      c->p->vary[i] = (struct pco_g5p_varying){.location = n, .set = (w ? 1 : 0) + 4 * i, .interp = interp[n],
+      c->p->vary[i] = (struct pco_g5p_varying){.location = n, .set = base + 4 * i, .interp = interp[n],
                                                .centroid = centroid[n], .mask = mask[n]};
       c->vary_idx[n] = i++;
    }
    c->p->num_varyings = i;
    c->p->w_set = w;
+   c->p->z_set = position_z;
 }
 
 static const struct pco_g5p_varying *vary_of(struct gctx *c, nir_intrinsic_instr *in)
@@ -5568,15 +5567,20 @@ static void hoist_iterators(struct gctx *c)
          fc = nir_instr_as_intrinsic(ins);
    bool fc_used = fc && (V(c, &fc->def, 0)->uses || V(c, &fc->def, 1)->uses);
    bool fc_w = fc && V(c, &fc->def, 3)->uses;
-   if (fc_w) {
-      /* f_raster_pos_w: native position W reads coefficient set zero,
-       * followed by WDF. plan_varyings reserves W even for a shader with
-       * no smooth user input. Z has a different layout and stays refused.
-       * The token has no counter-1 form, so issue it first. */
+   bool fc_z = fc && V(c, &fc->def, 2)->uses;
+   /* Apple's compiles f_raster_pos_w / f_raster_pos_z: the
+    * native position iterator reads one screen-linear coefficient set: W at
+    * set 0, Z at the set after it (set 0 without W; plan_varyings()). The
+    * token has no counter-1 form, so these are issued first. */
+   for (unsigned k = 3; k >= 2; k--) {
+      if (!(k == 3 ? fc_w : fc_z))
+         continue;
+      assert(k == 3 ? c->p->w_set : c->p->z_set);
+      const bool set1 = k == 2 && c->p->w_set;
       drc_take(c, &d);
       unsigned r = alloc_reg(c, -1);
-      put(c, raw, g5p_usc_position_zw(raw, 2 * r, false, false, -1), "raster position W");
-      struct val *v = V(c, &fc->def, 3);
+      put(c, raw, g5p_usc_position_zw(raw, 2 * r, set1, false, -1), k == 3 ? "raster position W" : "raster position Z");
+      struct val *v = V(c, &fc->def, k);
       v->state = VAL_REG;
       v->reg = r;
       v->held = true;
@@ -5589,7 +5593,7 @@ static void hoist_iterators(struct gctx *c)
          reads += varying_reads(c, nir_instr_as_intrinsic(ins));
    /* The raster position read has no witnessed counter-1 form: it goes
     * first when the batch spills onto counter 1, else last (round 18). */
-   bool fc_first = fc_used && reads + 1 + fc_w > 8;
+   bool fc_first = fc_used && reads + 1 + fc_w + fc_z > 8;
    if (fc_first) {
       drc_take(c, &d);
       c->fragcoord = alloc_run(c, 2, "gl_FragCoord");

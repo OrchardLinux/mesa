@@ -327,11 +327,16 @@ launch_program(uint32_t *dest)
  * The coefficient (varying) program, as Apple's PDSEncoderGen1<G5>::
  * EncodeFragmentVaryingsPDSProgram builds it: one DOUTI per item, item i's
  * source in c(2i), the data first and padded to 16 bytes (the code starts
- * at VARYINGBASE + 16 * PDS_VARYINGSIZE). Items: W at coefficient set 0
- * when some varying is perspective-correct, then every varying the fragment
- * program reads (dest: its first set; offset: its vertex output dword in
- * the TA vertex, which drops x, y, z: dword d is TA dword d - 3, in 16-bit
- * units). Returns the data dwords; *code_dwords the code's.
+ * at VARYINGBASE + 16 * PDS_VARYINGSIZE). Items: position Z when the
+ * fragment program reads it (coefficient set 1 after W, else 0), W at set 0
+ * when some varying is perspective-correct, then every varying it reads
+ * (dest: its first set; offset: its vertex output dword in the TSP vertex,
+ * in 16-bit units). The TSP vertex is the RHW, then the unclamped Z when
+ * TA_OUTPUT_SEL tsp_unclamped_z_pres is set, then the varyings: vertex
+ * output dword d (x, y, z dropped, w kept as the RHW) is TSP dword d - 3,
+ * one dword later with Z. Apple's Z item (FragmentProgramVariant 0x207d28be0,
+ * varying type 6): f32/f16 offset 2, Gouraud, not perspective, and every
+ * other item's offsets + 2. Returns the data dwords; *code_dwords the code's.
  */
 /* pvr_physical_device.c reports what the fragment compiler admits */
 static_assert(4 * PCO_G5P_MAX_FS_VARYINGS == 112, "G5P varying components");
@@ -342,13 +347,23 @@ varying_program(const struct pco_g5p_program *fs, const struct pco_g5p_program *
 {
    pdsc_init();
    pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-varying");
-   struct pdsc_douti_src0 item[1 + PCO_G5P_MAX_FS_VARYINGS];
+   struct pdsc_douti_src0 item[2 + PCO_G5P_MAX_FS_VARYINGS];
    unsigned items = 0;
+   /* Apple's item order: position Z, then W, then the varyings (the A9
+    * compiler's reflection lists the type-6 item first: f_z_s, f_xyz_s);
+    * the sets stay W 0, Z 1 */
+   if (fs->z_set)
+      item[items++] = (struct pdsc_douti_src0){
+         .dest = fs->w_set ? 1 : 0,
+         .shademodel = PDSC_DOUTI_SHADEMODEL_GOURAUD,
+         .f32_offset = 2,
+         .f16_offset = 2,
+      };
    if (fs->w_set)
       item[items++] = (struct pdsc_douti_src0){ .shademodel = PDSC_DOUTI_SHADEMODEL_GOURAUD };
    for (unsigned i = 0; i < fs->num_varyings; i++) {
       const struct pco_g5p_varying *v = &fs->vary[i];
-      const unsigned off = 2 * (vs->vout_dword[v->location] - 3);
+      const unsigned off = 2 * (vs->vout_dword[v->location] - 3) + (fs->z_set ? 2 : 0);
       const bool flat = v->interp == PCO_G5P_INTERP_FLAT;
       item[items++] = (struct pdsc_douti_src0){
          .dest = v->set,
@@ -909,6 +924,7 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
    g->fs_side_effects = fs->side_effects;
    g->vs_side_effects = vs->side_effects;
    g->fs_depth_feedback = fs->depth_feedback;
+   g->fs_position_z = fs->z_set;
    if (g->fs_depth_feedback && g->samples != 1)
       return G5P_REFUSE(device, "multisample fragment depth export is not qualified");
    g->fs_blend_mode = fs->blend_mode;
@@ -986,7 +1002,7 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
 
    /* PDS: the coefficient program (the device HALT without varyings) */
    unsigned varying_data_dwords = 0;
-   if (fs->num_varyings || fs->w_set) {
+   if (fs->num_varyings || fs->w_set || fs->z_set) {
       unsigned code_dwords;
       varying_data_dwords = varying_program(fs, vs, data, code, &code_dwords, 0);
       result = pvr_gpu_upload_pds(device, data, varying_data_dwords, 16, code, code_dwords, 16, 64, &g->varying);
@@ -1056,10 +1072,11 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
          s1.pds_uniformsize = g->fs_num_uploads ? DIV_ROUND_UP(4 * g->fs_num_dmas,
                                                                ROGUE_TA_STATE_PDS_SIZEINFO1_PDS_UNIFORMSIZE_UNIT_SIZE)
                                                 : 1;
-         if (fs->num_varyings || fs->w_set) {
+         if (fs->num_varyings || fs->w_set || fs->z_set) {
             s1.pds_varyingsize = DIV_ROUND_UP(varying_data_dwords, 4);
-            /* coefficient sets: W, then four per varying (4 dwords each) */
-            s1.usc_varyingsize = DIV_ROUND_UP(4 * ((fs->w_set ? 1 : 0) + 4 * fs->num_varyings), 16);
+            /* coefficient sets: W, Z, then four per varying (4 dwords each) */
+            s1.usc_varyingsize =
+               DIV_ROUND_UP(4 * ((fs->w_set ? 1 : 0) + (fs->z_set ? 1 : 0) + 4 * fs->num_varyings), 16);
          }
       }
       /* A discarding program runs punch-through with triangle merging off
@@ -1071,13 +1088,14 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
                                              ROGUE_TA_STATE_PDS_SIZEINFO2_USC_SHAREDSIZE_UNIT_SIZE);
       }
       pvr_csb_pack (&w[5], TA_STATE_PDS_VARYINGBASE, vb) {
-         vb.addr = PVR_DEV_ADDR(fs->num_varyings || fs->w_set ? g->varying.data_offset : dp->halt.code_offset);
+         vb.addr = PVR_DEV_ADDR(fs->num_varyings || fs->w_set || fs->z_set ? g->varying.data_offset
+                                                                            : dp->halt.code_offset);
       }
       result = pvr_gpu_upload(device, device->heaps.general_heap, w, 24, 16, &g->static_frag);
       if (result != VK_SUCCESS)
          return result;
       /* the same pointers naming the flat programs of vertices 1 and 2 */
-      for (unsigned pv = 1; g->fs_flat && (fs->num_varyings || fs->w_set) && pv <= 2; pv++) {
+      for (unsigned pv = 1; g->fs_flat && (fs->num_varyings || fs->w_set || fs->z_set) && pv <= 2; pv++) {
          uint32_t *v = g->static_frag_pv_words[pv - 1];
          memcpy(v, w, sizeof(g->static_frag_words));
          pvr_csb_pack (&v[5], TA_STATE_PDS_VARYINGBASE, vb) {
@@ -1334,6 +1352,7 @@ g5p_lod_bias_build(struct pvr_device *device, struct pvr_g5p_pipeline *n)
    if (result == VK_SUCCESS &&
        (p->samples != n->samples || p->color_targets != n->color_targets || p->fs_write_mask != n->fs_write_mask ||
         p->fs_blend_mode != n->fs_blend_mode || p->vs_outputs != n->vs_outputs ||
+        p->fs_position_z != n->fs_position_z ||
         p->fs_discard != n->fs_discard || p->xfb_layout.buffers != n->xfb_layout.buffers)) {
       g5p_pipeline_free(device, p);
       n->lod_bias_why = "the variant's state differs from the pipeline's";
@@ -2541,6 +2560,11 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
    pvr_csb_pack (&w[1], TA_OUTPUT_SEL, os) {
       os.vtxsize = g->vs_outputs;
       os.rhw_pres = true;
+      /* the fragment program reads gl_FragCoord.z: the TSP vertex carries the
+       * unclamped Z after the RHW (AGXMetalA9: FragmentProgramVariant
+       * 0x207d28be0 sets 0x210000 for a type-6 varying, else 0x10000, and
+       * setRenderPipelineStateCommon 0x207d65d74 merges it under 0x210000) */
+      os.tsp_unclamped_z_pres = g->fs_position_z;
       /* points: the size follows the position (g3b-points) */
       os.psprite_size_pres = g->vs_point_size;
       /* user planes 0..n-1 from the declared clip distances, the vertex's

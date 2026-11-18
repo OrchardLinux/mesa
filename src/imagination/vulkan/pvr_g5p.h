@@ -281,6 +281,8 @@ struct pvr_g5p_pipeline {
    /* the fragment program discards (punch-through, no triangle merging);
     * it reads a flat varying */
    bool fs_discard, fs_flat;
+   /* it reads gl_FragCoord.z (TA_OUTPUT_SEL tsp_unclamped_z_pres) */
+   bool fs_position_z;
    unsigned fs_discard_tokens;
    bool fs_discard_select;
    /* Full linked variant: its uploads/varyings may differ after retaining a kill.

@@ -1720,15 +1720,19 @@ unsigned g5p_usc_position_xy(uint8_t *out, unsigned dst_half, unsigned words, un
    return finish(out, raw, source_half ? 6 : 4);
 }
 
-unsigned g5p_usc_position_zw(uint8_t *out, unsigned dst_half, bool z, bool both, int long_form)
+/* The screen-linear position iterator: one coefficient set (set 0, or set 1
+ * with set1), or sets 0 and 1 together (both). The last byte is the set << 1,
+ * as in the varying iterator: Apple puts W at set 0 and Z at set 1, or Z at
+ * set 0 when no W is iterated (Apple's compiles f_raster_pos_z/w). */
+unsigned g5p_usc_position_zw(uint8_t *out, unsigned dst_half, bool set1, bool both, int long_form)
 {
-   CHECK(!(both && z), "invalid position iterator");
+   CHECK(!(both && set1), "invalid position iterator");
    CHECK(!(dst_half & 1), "position iterator needs a dword-aligned destination");
    CHECK(dst_half < 256, "position destination must be u8");
-   bool minimum = dst_half || z || both;
+   bool minimum = dst_half || set1 || both;
    bool wide = long_form < 0 ? minimum : long_form;
    CHECK(!(minimum && !wide), "short position iterator omits nonzero fields");
-   uint8_t raw[4] = {8, (both ? 0x10 : 8) | wide, dst_half, z ? 2 : 0};
+   uint8_t raw[4] = {8, (both ? 0x10 : 8) | wide, dst_half, set1 ? 2 : 0};
    return finish(out, raw, wide ? 4 : 2);
 }
 
