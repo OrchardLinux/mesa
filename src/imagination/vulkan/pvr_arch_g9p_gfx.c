@@ -3639,6 +3639,14 @@ PVR_PER_ARCH(g9p_job_init)(struct pvr_cmd_buffer *cmd_buffer,
          job->g9p.height = iview->vk.extent.height;
       } else {
          memset(image, 0, sizeof(image));
+         /*
+          * No colour attachment (a depth/stencil-only pass): the render's own
+          * extent, as its render target dataset's. Left at 0, the region
+          * array was sized for 32x32 and a larger pass hung its fragment job
+          * (glmark2 [shadow], a 1600x1200 depth-only pass; orchard#183).
+          */
+         job->g9p.width = info->rstate->width;
+         job->g9p.height = info->rstate->height;
       }
       const unsigned eot_dwords = 8 * MAX2(eot_targets, 1) - 1;
 
