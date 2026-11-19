@@ -1036,6 +1036,37 @@ PVR_PER_ARCH(g9p_meta_blit)(struct pvr_cmd_buffer *cmd_buffer, const VkBlitImage
    return true;
 }
 
+/*
+ * vkCmdClearColorImage drawn by the GPU: a render pass per level whose background is the
+ * colour. The CPU filled every texel through the GPU's mapping after waiting for the GPU:
+ * an 800x600 swapchain image took 1.1 ms (vkmark's clear scene, 856 fps against 2062 for
+ * its cube). Levels under 4x4 stay on the CPU, as for blits.
+ */
+bool
+PVR_PER_ARCH(g9p_meta_clear_color)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_image *image,
+                                   VkImageLayout layout, const VkClearColorValue *color,
+                                   uint32_t range_count, const VkImageSubresourceRange *ranges)
+{
+   struct pvr_device *device = cmd_buffer->device;
+   struct g9p_meta_save save;
+
+   if (!device->meta_ready || !g9p_meta_image_ok(device, image, image->vk.format, true))
+      return false;
+   for (uint32_t i = 0; i < range_count; i++) {
+      const uint32_t levels = vk_image_subresource_level_count(&image->vk, &ranges[i]);
+      const uint32_t last = ranges[i].baseMipLevel + levels - 1;
+
+      if (ranges[i].aspectMask != VK_IMAGE_ASPECT_COLOR_BIT ||
+          u_minify(image->vk.extent.width, last) < 4 || u_minify(image->vk.extent.height, last) < 4)
+         return false;
+   }
+   g9p_meta_begin(cmd_buffer, &save);
+   vk_meta_clear_color_image(&cmd_buffer->vk, &device->meta, &image->vk, layout, image->vk.format,
+                             color, range_count, ranges);
+   g9p_meta_end(cmd_buffer, &save);
+   return true;
+}
+
 bool
 PVR_PER_ARCH(g9p_meta_copy)(struct pvr_cmd_buffer *cmd_buffer, const VkCopyImageInfo2 *info)
 {

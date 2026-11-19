@@ -177,6 +177,9 @@ void PVR_PER_ARCH(g9p_meta_finish)(struct pvr_device *device);
 struct pvr_cmd_buffer;
 bool PVR_PER_ARCH(g9p_meta_blit)(struct pvr_cmd_buffer *cmd_buffer, const VkBlitImageInfo2 *info);
 bool PVR_PER_ARCH(g9p_meta_copy)(struct pvr_cmd_buffer *cmd_buffer, const VkCopyImageInfo2 *info);
+bool PVR_PER_ARCH(g9p_meta_clear_color)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_image *image,
+                                        VkImageLayout layout, const VkClearColorValue *color,
+                                        uint32_t range_count, const VkImageSubresourceRange *ranges);
 bool PVR_PER_ARCH(g9p_meta_upload)(struct pvr_cmd_buffer *cmd_buffer, const VkCopyBufferToImageInfo2 *info);
 
 #   define pvr_arch_g9p_transfer_submit PVR_PER_ARCH(g9p_transfer_submit)
@@ -184,6 +187,7 @@ bool PVR_PER_ARCH(g9p_meta_upload)(struct pvr_cmd_buffer *cmd_buffer, const VkCo
 #   define pvr_arch_g9p_meta_finish PVR_PER_ARCH(g9p_meta_finish)
 #   define pvr_arch_g9p_meta_blit PVR_PER_ARCH(g9p_meta_blit)
 #   define pvr_arch_g9p_meta_copy PVR_PER_ARCH(g9p_meta_copy)
+#   define pvr_arch_g9p_meta_clear_color PVR_PER_ARCH(g9p_meta_clear_color)
 #   define pvr_arch_g9p_meta_upload PVR_PER_ARCH(g9p_meta_upload)
 #   define pvr_arch_g9p_pack_image_view PVR_PER_ARCH(g9p_pack_image_view)
 #   define pvr_arch_g9p_pack_sampler PVR_PER_ARCH(g9p_pack_sampler)

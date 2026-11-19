@@ -1433,6 +1433,11 @@ void pvr_rogue_CmdClearColorImage(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(pvr_cmd_buffer, cmd_buffer, commandBuffer);
    VK_FROM_HANDLE(pvr_image, image, _image);
 
+   /* G9P: drawn by the GPU where it can (pvr_arch_g9p_transfer.c) */
+   if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g9p) &&
+       pvr_arch_g9p_meta_clear_color(cmd_buffer, image, imageLayout, pColor, rangeCount, pRanges))
+      return;
+
    for (uint32_t i = 0; i < rangeCount; i++) {
       const VkResult result =
          pvr_clear_image_range(cmd_buffer, image, pColor, &pRanges[i], 0);
