@@ -335,7 +335,7 @@ copy(const struct pvr_rect_mapping *m, const struct surface *src, const struct s
 
 /* A scaled blit with linear filtering; texels past the source's edges clamp */
 static void
-copy_linear(const struct pvr_rect_mapping *m, const struct surface *src, const struct surface *dst)
+copy_linear_texels(const struct pvr_rect_mapping *m, const struct surface *src, const struct surface *dst)
 {
    const unsigned dw = m->dst_rect.extent.width, dh = m->dst_rect.extent.height;
    const unsigned sw = m->src_rect.extent.width, sh = m->src_rect.extent.height;
@@ -383,6 +383,134 @@ copy_linear(const struct pvr_rect_mapping *m, const struct surface *src, const s
                                sum, 1);
       }
    }
+}
+
+/*
+ * copy_linear_texels() a row at a time, with its arithmetic unchanged. Texel by texel it
+ * read four source texels per output texel from the GPU's mapping (slow to read) and
+ * recomputed each twiddled offset: an 800x600 level's mipmap took 33 ms, and glmark2's
+ * terrain and refract spent most of their frames there. Here the source the mapping reads
+ * is copied out once, the offsets are computed once per column and row, and the formats
+ * are converted a row at a time.
+ */
+static void
+copy_linear(const struct pvr_rect_mapping *m, const struct surface *src, const struct surface *dst)
+{
+   const unsigned dw = m->dst_rect.extent.width, dh = m->dst_rect.extent.height;
+   const unsigned sw = m->src_rect.extent.width, sh = m->src_rect.extent.height;
+   const unsigned sbpp = src->bpp, dbpp = dst->bpp;
+   size_t *src_cols = malloc(sizeof(size_t) * 2 * dw);
+   size_t *dst_cols = malloc(sizeof(size_t) * dw);
+   float *fxs = malloc(sizeof(float) * dw);
+   uint8_t *gathered = malloc((size_t)sbpp * dw);
+   uint8_t *packed = malloc((size_t)dbpp * dw);
+   float *texels = malloc(sizeof(float) * 4 * dw);
+   float *sums = malloc(sizeof(float) * 4 * dw);
+   uint8_t *copy = NULL;
+
+   if (!dw || !dh || !src_cols || !dst_cols || !fxs || !gathered || !packed || !texels || !sums)
+      goto fallback;
+
+   size_t col_lo = SIZE_MAX, col_hi = 0, row_lo = SIZE_MAX, row_hi = 0;
+
+   for (unsigned x = 0; x < dw; x++) {
+      float u = (x + 0.5f) * sw / dw;
+
+      if (m->flip_x)
+         u = sw - u;
+      u += m->src_rect.offset.x - 0.5f;
+
+      const int x0 = floorf(u);
+
+      fxs[x] = u - x0;
+      for (unsigned i = 0; i < 2; i++) {
+         const size_t o = column_offset(src, CLAMP(x0 + (int)i, 0, (int)src->width - 1));
+
+         src_cols[2 * x + i] = o;
+         col_lo = MIN2(col_lo, o);
+         col_hi = MAX2(col_hi, o);
+      }
+      dst_cols[x] = column_offset(dst, m->dst_rect.offset.x + x);
+   }
+   for (unsigned y = 0; y < dh; y++) {
+      float v = (y + 0.5f) * sh / dh;
+
+      if (m->flip_y)
+         v = sh - v;
+      v += m->src_rect.offset.y - 0.5f;
+
+      const int y0 = floorf(v);
+
+      for (unsigned j = 0; j < 2; j++) {
+         const size_t o = row_offset(src, CLAMP(y0 + (int)j, 0, (int)src->height - 1));
+
+         row_lo = MIN2(row_lo, o);
+         row_hi = MAX2(row_hi, o);
+      }
+   }
+
+   /* the bytes the reads span (row and column offsets add: disjoint bits when twiddled) */
+   const size_t lo = row_lo + col_lo, span = row_hi + col_hi + sbpp - lo;
+
+   copy = malloc(span);
+   if (!copy)
+      goto fallback;
+   memcpy(copy, src->base + lo, span);
+
+   /* a linear destination row in one piece */
+   const bool dst_contiguous = !dst->twiddled && dw > 0 && dst_cols[dw - 1] == dst_cols[0] + (size_t)(dw - 1) * dbpp;
+
+   for (unsigned y = 0; y < dh; y++) {
+      float v = (y + 0.5f) * sh / dh;
+
+      if (m->flip_y)
+         v = sh - v;
+      v += m->src_rect.offset.y - 0.5f;
+
+      const int y0 = floorf(v);
+      const float fy = v - y0;
+      const size_t rows[2] = { row_offset(src, CLAMP(y0, 0, (int)src->height - 1)) - lo,
+                               row_offset(src, CLAMP(y0 + 1, 0, (int)src->height - 1)) - lo };
+
+      memset(sums, 0, sizeof(float) * 4 * dw);
+      for (unsigned j = 0; j < 2; j++) {
+         for (unsigned i = 0; i < 2; i++) {
+            for (unsigned x = 0; x < dw; x++)
+               memcpy(gathered + (size_t)x * sbpp, copy + rows[j] + src_cols[2 * x + i], sbpp);
+            util_format_unpack_rgba(src->format, texels, gathered, dw);
+            for (unsigned x = 0; x < dw; x++) {
+               const float fx = fxs[x];
+               const float weight = (j ? fy : 1 - fy) * (i ? fx : 1 - fx);
+
+               for (unsigned c = 0; c < 4; c++)
+                  sums[4 * x + c] += weight * texels[4 * x + c];
+            }
+         }
+      }
+      util_format_pack_rgba(dst->format, packed, sums, dw);
+
+      uint8_t *dst_row = dst->base + row_offset(dst, m->dst_rect.offset.y + y);
+
+      if (dst_contiguous) {
+         memcpy(dst_row + dst_cols[0], packed, (size_t)dw * dbpp);
+      } else {
+         for (unsigned x = 0; x < dw; x++)
+            memcpy(dst_row + dst_cols[x], packed + (size_t)x * dbpp, dbpp);
+      }
+   }
+   goto done;
+
+fallback:
+   copy_linear_texels(m, src, dst);
+done:
+   free(copy);
+   free(sums);
+   free(texels);
+   free(packed);
+   free(gathered);
+   free(fxs);
+   free(dst_cols);
+   free(src_cols);
 }
 
 /* A rectangle in a four-sample surface's texels (2x2 per pixel) */
