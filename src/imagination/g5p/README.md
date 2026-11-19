@@ -21,6 +21,28 @@ its A9 mode (`g9p/g9p_a9*.h`).
 None of this is proposed upstream. It was written by AI agents (every commit
 carries `Generated-by: LLM`).
 
+## The A8
+
+The Apple A8's GPU (T7000, BVNC 3.10.4.5, `common/device_info/apple-a8.h`)
+takes these paths too: its entry sets `apple_g5p` and `apple_g4p`. The
+evidence for sharing them:
+
+- Apple's LLVM backend for these GPUs (`libLLVM.dylib`, iOS 16) has one
+  processor table with `g4p-b1` (A8), `g5p-b0` (A9) and `g9p-a0`/`g9p-b0`
+  (A10), and the features "Enable G4 instructions", "Enable G5
+  instructions" and "Enable G9 instructions". The A8 is the base set; the
+  A9 adds to it. The A8 has its own scheduling model, the A9 and A10 share
+  one.
+- On an A8 (iPadOS 15) Metal's compute kernels end the A10 way (`0x8000` at
+  a 64-byte boundary after `0xc000` padding), its empty kernel is the A10's,
+  and its CDM control stream has the seven-word records this driver writes
+  for the A9 (`g5p_cdm.h`).
+
+Where the A8 is known to differ and this driver has no A8 form yet, it
+refuses by name: compute pipelines, until Apple's residency limits for the
+A8 are known (`pvr_arch_g5p_compute.c`). Which A9 instructions are G5-only
+is not known yet; the A8 notes list the captures that settle it.
+
 ## Origin
 
 The A9 driver is Berkay Kösebay's: the shader backend, the state packing, the

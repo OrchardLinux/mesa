@@ -97,6 +97,17 @@ PVR_PER_ARCH(g5p_compute_pipeline_compile)(
    } else {
       pvr_g5p_shader_dump(&create_info->stage, create_info->layout, "comp", NULL, 0, "ADMIT", NULL);
    }
+   if (!PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_compute_dispatch)) {
+      /* The A8: its residency parameters (AGXMetalA8) are not established,
+       * and a workgroup above them does not run.
+       */
+      mesa_logw("G5P refuses: compute on %s, whose workgroup residency limits are not established",
+                device->pdevice->dev_info.ident.public_name);
+      result = vk_errorf(device, VK_ERROR_FEATURE_NOT_PRESENT,
+                         "G5P compute: no workgroup residency limits for %s",
+                         device->pdevice->dev_info.ident.public_name);
+      goto out;
+   }
    {
       const unsigned threads = shader.local_size[0] * shader.local_size[1] * shader.local_size[2];
       unsigned max;

@@ -376,6 +376,12 @@ struct pvr_device_features {
     */
    bool has_apple_g5p : 1;
 
+   /*
+    * Apple A8 GPU (G4P): set together with has_apple_g5p by the A8 entry,
+    * which takes the A9's paths; marks where the A8 differs from the A9.
+    */
+   bool has_apple_g4p : 1;
+
    /* Only set where Apple's compute residency parameters are established. */
    bool has_apple_compute_dispatch : 1;
    struct pvr_apple_compute_dispatch_limits apple_compute_dispatch;
