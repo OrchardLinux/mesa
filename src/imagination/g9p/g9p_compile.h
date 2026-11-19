@@ -235,10 +235,16 @@ struct g9p_shader {
    uint8_t native_blend_kind;  /* enum g9p_blend */
    bool native_keep_alpha;     /* the write mask leaves alpha: the tile's stays */
 
-   /* Fragment: the combined image samplers sampled, by common-store slot */
+   /*
+    * Fragment: the textures sampled, by common-store slot: combined image
+    * samplers, or a sampled image with its separate sampler (sampler_binding
+    * -1 for a combined one, whose sampler follows its image)
+    */
    unsigned num_textures;
    struct {
       unsigned set, binding, index;
+      int sampler_set, sampler_binding;
+      unsigned sampler_index;
    } textures[G9P_MAX_TEXTURES];
 };
 

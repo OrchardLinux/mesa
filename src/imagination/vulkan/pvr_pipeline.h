@@ -186,6 +186,8 @@ struct pvr_g9p_graphics_state {
    unsigned num_textures;
    struct {
       unsigned set, binding, index;
+      int sampler_set, sampler_binding; /* a separate sampler, binding -1 if none */
+      unsigned sampler_index;
    } textures[16]; /* G9P_MAX_TEXTURES */
    /* the vertex shader's, and the size of its common store in dwords */
    unsigned vs_num_textures, vs_common_dwords;
@@ -209,6 +211,8 @@ struct pvr_g9p_graphics_state {
    bool vs_point_size;
    struct {
       unsigned set, binding, index;
+      int sampler_set, sampler_binding; /* a separate sampler, binding -1 if none */
+      unsigned sampler_index;
    } vs_textures[16]; /* G9P_MAX_TEXTURES */
 };
 

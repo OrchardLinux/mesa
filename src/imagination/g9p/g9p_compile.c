@@ -2565,6 +2565,33 @@ emit_fb_fetch(struct g9p_ctx *ctx, nir_intrinsic_instr *intr)
    return true;
 }
 
+/* A separate sampler's binding (a sampler deref of another variable than the texture's), or false */
+static bool
+sampler_key(nir_tex_instr *tex, int *set, int *binding, unsigned *index)
+{
+   const int t = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
+   const int s = nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref);
+
+   *set = *binding = -1;
+   *index = 0;
+   if (s < 0 || t < 0)
+      return false;
+
+   nir_deref_instr *deref = nir_src_as_deref(tex->src[s].src);
+   nir_variable *var = nir_deref_instr_get_variable(deref);
+
+   if (!var || var == nir_deref_instr_get_variable(nir_src_as_deref(tex->src[t].src)))
+      return false;
+   if (deref->deref_type == nir_deref_type_array) {
+      if (!nir_src_is_const(deref->arr.index))
+         return false;
+      *index = nir_src_as_uint(deref->arr.index);
+   }
+   *set = var->data.descriptor_set;
+   *binding = var->data.binding;
+   return true;
+}
+
 /* The texture slot of a combined image sampler deref, added if new */
 static bool
 texture_key(nir_tex_instr *tex, unsigned *set, unsigned *binding, unsigned *index)
@@ -2593,13 +2620,17 @@ texture_key(nir_tex_instr *tex, unsigned *set, unsigned *binding, unsigned *inde
 static int
 texture_slot(struct g9p_ctx *ctx, nir_tex_instr *tex)
 {
-   unsigned set, binding, index, k;
+   unsigned set, binding, index, sindex, k;
+   int sset, sbinding;
 
    if (!texture_key(tex, &set, &binding, &index))
       return -1;
+   sampler_key(tex, &sset, &sbinding, &sindex);
    for (k = 0; k < ctx->out->num_textures; k++) {
       if (ctx->out->textures[k].set == set && ctx->out->textures[k].binding == binding &&
-          ctx->out->textures[k].index == index)
+          ctx->out->textures[k].index == index && ctx->out->textures[k].sampler_set == sset &&
+          ctx->out->textures[k].sampler_binding == sbinding &&
+          ctx->out->textures[k].sampler_index == sindex)
          return k;
    }
    if (k == G9P_MAX_TEXTURES) {
@@ -2609,6 +2640,9 @@ texture_slot(struct g9p_ctx *ctx, nir_tex_instr *tex)
    ctx->out->textures[k].set = set;
    ctx->out->textures[k].binding = binding;
    ctx->out->textures[k].index = index;
+   ctx->out->textures[k].sampler_set = sset;
+   ctx->out->textures[k].sampler_binding = sbinding;
+   ctx->out->textures[k].sampler_index = sindex;
    ctx->out->num_textures++;
    return k;
 }
@@ -2617,22 +2651,26 @@ texture_slot(struct g9p_ctx *ctx, nir_tex_instr *tex)
 static unsigned
 count_textures(nir_function_impl *impl)
 {
-   struct { unsigned set, binding, index; } seen[G9P_MAX_TEXTURES];
+   struct { unsigned set, binding, index, sindex; int sset, sbinding; } seen[G9P_MAX_TEXTURES];
    unsigned n = 0;
 
    nir_foreach_block(block, impl) {
       nir_foreach_instr(instr, block) {
-         unsigned set, binding, index, k;
+         unsigned set, binding, index, sindex, k;
+         int sset, sbinding;
 
          if (instr->type != nir_instr_type_tex ||
              !texture_key(nir_instr_as_tex(instr), &set, &binding, &index))
             continue;
+         sampler_key(nir_instr_as_tex(instr), &sset, &sbinding, &sindex);
          for (k = 0; k < n; k++) {
-            if (seen[k].set == set && seen[k].binding == binding && seen[k].index == index)
+            if (seen[k].set == set && seen[k].binding == binding && seen[k].index == index &&
+                seen[k].sset == sset && seen[k].sbinding == sbinding && seen[k].sindex == sindex)
                break;
          }
          if (k == n && n < G9P_MAX_TEXTURES) {
             seen[n].set = set, seen[n].binding = binding, seen[n].index = index;
+            seen[n].sset = sset, seen[n].sbinding = sbinding, seen[n].sindex = sindex;
             n++;
          }
       }

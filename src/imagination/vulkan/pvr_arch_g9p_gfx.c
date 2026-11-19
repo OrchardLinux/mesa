@@ -1110,6 +1110,9 @@ g9p_compile_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo 
       state->textures[i].set = fs.textures[i].set;
       state->textures[i].binding = fs.textures[i].binding;
       state->textures[i].index = fs.textures[i].index;
+      state->textures[i].sampler_set = fs.textures[i].sampler_set;
+      state->textures[i].sampler_binding = fs.textures[i].sampler_binding;
+      state->textures[i].sampler_index = fs.textures[i].sampler_index;
    }
    state->vs_num_textures = vs.num_textures;
    {
@@ -1159,6 +1162,9 @@ g9p_compile_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo 
       state->vs_textures[i].set = vs.textures[i].set;
       state->vs_textures[i].binding = vs.textures[i].binding;
       state->vs_textures[i].index = vs.textures[i].index;
+      state->vs_textures[i].sampler_set = vs.textures[i].sampler_set;
+      state->vs_textures[i].sampler_binding = vs.textures[i].sampler_binding;
+      state->vs_textures[i].sampler_index = vs.textures[i].sampler_index;
    }
 
    result = pvr_gpu_upload_usc(device, vs.code, vs.code_size, 64, &state->vs_bo);
@@ -1397,20 +1403,49 @@ seamful_tex_state(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_descriptor
 /* Bit 63 of the sampler word, which the hardware ignores: g9p_pack_sampler() */
 #define G9P_SAMPLER_SEAMFUL BITFIELD64_BIT(63)
 
+/*
+ * The set and byte offset of a texture slot's sampler word: after the image in a combined
+ * image sampler's descriptor, or at the start of a separate sampler's (vk_meta's blits
+ * sample a sampled image with one; read after the image, a linear blit sampled nearest)
+ */
+static const struct pvr_descriptor_set *
+tex_sampler_at(const struct pvr_descriptor_state *desc, unsigned set_idx, unsigned binding,
+               unsigned index, int sampler_set, int sampler_binding, unsigned sampler_index,
+               unsigned *offset)
+{
+   const bool separate = sampler_binding >= 0;
+   const struct pvr_descriptor_set *set = desc->sets[separate ? (unsigned)sampler_set : set_idx];
+
+   if (!set)
+      return NULL;
+
+   const struct pvr_descriptor_set_layout_binding *b =
+      &set->layout->bindings[separate ? (unsigned)sampler_binding : binding];
+
+   *offset = separate ? b->offset + sampler_index * b->stride
+                      : b->offset + index * b->stride + sizeof(struct pvr_image_descriptor);
+   return set;
+}
+
+#define TEX_SAMPLER_AT(desc, tex, offset)                                                  \
+   tex_sampler_at(desc, (tex).set, (tex).binding, (tex).index, (tex).sampler_set,         \
+                  (tex).sampler_binding, (tex).sampler_index, offset)
+
 static bool
 tex_wants_seamful(const struct pvr_descriptor_state *desc, unsigned set_idx, unsigned binding,
-                  unsigned index, bool *mag_at_half)
+                  unsigned index, const struct pvr_descriptor_set *sampler_set,
+                  unsigned sampler_offset, bool *mag_at_half)
 {
    const struct pvr_descriptor_set *set = desc->sets[set_idx];
 
-   if (!set || !set->mapping)
+   if (!set || !set->mapping || !sampler_set || !sampler_set->mapping)
       return false;
 
    const struct pvr_descriptor_set_layout_binding *b = &set->layout->bindings[binding];
    const uint8_t *d = (const uint8_t *)set->mapping + b->offset + index * b->stride;
    uint64_t sampler;
 
-   memcpy(&sampler, d + sizeof(struct pvr_image_descriptor), sizeof(sampler));
+   memcpy(&sampler, (const uint8_t *)sampler_set->mapping + sampler_offset, sizeof(sampler));
    if ((*(const uint32_t *)d & 7) != 6 || !(sampler & G9P_SAMPLER_SEAMFUL))
       return false;
    /*
@@ -1432,12 +1467,18 @@ draw_state(const struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphic
    if (!state->seamful)
       return state;
    for (unsigned t = 0; t < state->num_textures; t++) {
+      unsigned so = 0;
+      const struct pvr_descriptor_set *ss = TEX_SAMPLER_AT(desc, state->textures[t], &so);
+
       seamful |= tex_wants_seamful(desc, state->textures[t].set, state->textures[t].binding,
-                                   state->textures[t].index, NULL);
+                                   state->textures[t].index, ss, so, NULL);
    }
    for (unsigned t = 0; t < state->vs_num_textures; t++) {
+      unsigned so = 0;
+      const struct pvr_descriptor_set *ss = TEX_SAMPLER_AT(desc, state->vs_textures[t], &so);
+
       seamful |= tex_wants_seamful(desc, state->vs_textures[t].set, state->vs_textures[t].binding,
-                                   state->vs_textures[t].index, &mag);
+                                   state->vs_textures[t].index, ss, so, &mag);
    }
    return !seamful ? state : mag && state->seamful_mag ? state->seamful_mag : state->seamful;
 }
@@ -1539,9 +1580,13 @@ upload_textures(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics
                &set->layout->bindings[state->textures[t].binding];
             const uint8_t *d = (const uint8_t *)set->mapping + b->offset + state->textures[t].index * b->stride;
 
+            unsigned so = 0;
+            const struct pvr_descriptor_set *ss = TEX_SAMPLER_AT(desc, state->textures[t], &so);
+
             memcpy(&table[g9p_tex_state(0, t)], d, 4 * 4);
-            memcpy(&table[g9p_tex_sampler(0, state->num_textures, t)], d + sizeof(struct pvr_image_descriptor),
-                   2 * 4);
+            if (ss && ss->mapping)
+               memcpy(&table[g9p_tex_sampler(0, state->num_textures, t)],
+                      (const uint8_t *)ss->mapping + so, 2 * 4);
             /* a seamful draw's cube state: a 2D array of six layers (seamful_tex_state()) */
             if (state_addr != addr) {
                table[g9p_tex_state(0, t)] = (table[g9p_tex_state(0, t)] & ~7u) | 3;
@@ -1550,9 +1595,15 @@ upload_textures(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g9p_graphics
          }
          continue;
       }
+      unsigned sampler_offset = 0;
+      const struct pvr_descriptor_set *sampler_set =
+         TEX_SAMPLER_AT(desc, state->textures[t], &sampler_offset);
+      /* no set bound: the zeros, as the image's state comes from address 0 then */
+      const uint64_t sampler_addr = sampler_set ? sampler_set->dev_addr.addr + sampler_offset
+                                                : p->zeros->dev_addr.addr;
+
       for (unsigned k = 0; k < 3; k++) {
-         src[n] = k == 0 ? state_addr : k == 1 ? p->zeros->dev_addr.addr
-                                               : addr + sizeof(struct pvr_image_descriptor);
+         src[n] = k == 0 ? state_addr : k == 1 ? p->zeros->dev_addr.addr : sampler_addr;
          ctrl[n++] = doutd_ctrl(k == 2 ? g9p_tex_sampler(0, state->num_textures, t)
                                        : g9p_tex_state(0, t) + 4 * k,
                                 k == 2 ? 2 : 4, false);
@@ -1928,8 +1979,12 @@ upload_vs_uniforms(struct pvr_cmd_buffer *cmd_buffer,
                   (block[g9p_tex_state(G9P_VS_TEX_BASE, t)] & ~7u) | 3;
                block[g9p_tex_state(G9P_VS_TEX_BASE, t) + 3] |= 5u << 15;
             }
-            memcpy(&block[g9p_tex_sampler(G9P_VS_TEX_BASE, state->vs_num_textures, t)],
-                   d + sizeof(struct pvr_image_descriptor), 8);
+            unsigned so = 0;
+            const struct pvr_descriptor_set *ss = TEX_SAMPLER_AT(desc, state->vs_textures[t], &so);
+
+            if (ss && ss->mapping)
+               memcpy(&block[g9p_tex_sampler(G9P_VS_TEX_BASE, state->vs_num_textures, t)],
+                      (const uint8_t *)ss->mapping + so, 8);
          }
       }
       result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, block,
