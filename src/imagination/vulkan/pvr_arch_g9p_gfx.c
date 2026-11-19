@@ -3784,6 +3784,29 @@ PVR_PER_ARCH(g9p_job_init)(struct pvr_cmd_buffer *cmd_buffer,
 
       PVR_PER_ARCH(g9p_pack_image_view)(iview, tex);
       memcpy(bg, tex, sizeof(tex));
+      {
+         /*
+          * A level above 0 of a twiddled chain: the level as the end of tile stores it, a
+          * single-level texture of its own size at its own address. Through the chain's
+          * state (level 0's size, the base level field) the load read other texels: copies
+          * into level 2 left the rest of their edge tiles green.
+          */
+         const struct pvr_image *img = pvr_image_view_get_image(iview);
+         const struct pvr_image_plane *pl = pvr_single_plane_const(img);
+
+         if (iview->vk.base_mip_level && img->memlayout == PVR_MEMLAYOUT_TWIDDLED &&
+             img->vk.samples == VK_SAMPLE_COUNT_1_BIT) {
+            const uint64_t level_addr = img->dev_addr.addr + pl->offset +
+                                        pl->mip_levels[iview->vk.base_mip_level].offset +
+                                        iview->vk.base_array_layer * pl->layer_size;
+            const uint32_t lw = iview->vk.extent.width, lh = iview->vk.extent.height;
+
+            bg[0] = (bg[0] & ~(0x1fu << 27) & ~7u) | 2u | (lw - 1) << 27;
+            bg[1] = (lw - 1) >> 5 | (lh - 1) << 9;
+            bg[2] = (uint32_t)(level_addr >> 1);
+            bg[3] = (uint32_t)(level_addr >> 33);
+         }
+      }
       bg[8] = 0x000e0000;
       bg[9] = 0x00c00780;
       bg[12] = fui(1.0f / (16 * iview->vk.extent.width));

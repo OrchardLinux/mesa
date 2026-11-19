@@ -4532,10 +4532,16 @@ static VkResult pvr_dynamic_rendering_output_attachments_setup(
       image = pvr_image_view_get_image(iview);
 
       state->render_pass_info.attachments[cur_attach_idx] = iview;
+      /*
+       * The view's extent, its level's: the image's (level 0's) gave a render into a
+       * mip level a render target dataset of the whole image, larger than the region
+       * array the render's own size sets up, and its fragment job hung (G9P mipmaps
+       * drawn by the GPU)
+       */
       state->render_pass_info.rstate->height =
-         MIN2(state->render_pass_info.rstate->height, image->vk.extent.height);
+         MIN2(state->render_pass_info.rstate->height, iview->vk.extent.height);
       state->render_pass_info.rstate->width =
-         MIN2(state->render_pass_info.rstate->width, image->vk.extent.width);
+         MIN2(state->render_pass_info.rstate->width, iview->vk.extent.width);
 
       mrt_attachment_map[i] = mrt_count;
       attachment_formats[mrt_count++] = iview->vk.view_format;
@@ -5005,10 +5011,16 @@ pvr_dynamic_render_info_create(struct pvr_cmd_buffer *cmd_buffer,
       ds_attach->resolve_target = VK_ATTACHMENT_UNUSED;
 
       state->render_pass_info.attachments[attach_idx] = iview;
+      /*
+       * The view's extent, its level's: the image's (level 0's) gave a render into a
+       * mip level a render target dataset of the whole image, larger than the region
+       * array the render's own size sets up, and its fragment job hung (G9P mipmaps
+       * drawn by the GPU)
+       */
       state->render_pass_info.rstate->height =
-         MIN2(state->render_pass_info.rstate->height, image->vk.extent.height);
+         MIN2(state->render_pass_info.rstate->height, iview->vk.extent.height);
       state->render_pass_info.rstate->width =
-         MIN2(state->render_pass_info.rstate->width, image->vk.extent.width);
+         MIN2(state->render_pass_info.rstate->width, iview->vk.extent.width);
 
       dr_info->hw_render.ds_attach_idx = attach_idx;
       dr_info->hw_render.depth_init = ds_attach->load_op;

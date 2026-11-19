@@ -1016,19 +1016,18 @@ PVR_PER_ARCH(g9p_meta_blit)(struct pvr_cmd_buffer *cmd_buffer, const VkBlitImage
        (info->filter == VK_FILTER_LINEAR && util_format_is_pure_integer(vk_format_to_pipe_format(src->vk.format))))
       return false;
    /*
-    * Scaled with linear filtering: 11 dEQP fbo.blit cases off by a filter step on the GPU.
-    * Into a mip level above 0: dEQP basic_copyteximage2d/copytexsubimage2d 2D cases wrong.
+    * Destinations under 4x4 stay on the CPU: the GPU's mipmap levels of 2x2, 4x1, 2x4 and
+    * smaller came out wrong (the end of tile writing past such a small level, probably),
+    * and the CPU does them in microseconds. Scaled linear blits and blits into levels above
+    * 0 used to stay there too: their samplers came from the wrong place, their loads read
+    * the chain and their render target dataset was level 0's, fixed in the render state,
+    * upload_textures() and g9p_job_init().
     */
    for (uint32_t i = 0; i < info->regionCount; i++) {
       const VkImageBlit2 *r = &info->pRegions[i];
 
-      if (r->dstSubresource.mipLevel)
-         return false;
-      if (info->filter != VK_FILTER_LINEAR)
-         continue;
-
-      if (abs(r->srcOffsets[1].x - r->srcOffsets[0].x) != abs(r->dstOffsets[1].x - r->dstOffsets[0].x) ||
-          abs(r->srcOffsets[1].y - r->srcOffsets[0].y) != abs(r->dstOffsets[1].y - r->dstOffsets[0].y))
+      if (abs(r->dstOffsets[1].x - r->dstOffsets[0].x) < 4 ||
+          abs(r->dstOffsets[1].y - r->dstOffsets[0].y) < 4)
          return false;
    }
    g9p_meta_begin(cmd_buffer, &save);
