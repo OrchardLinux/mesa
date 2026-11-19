@@ -152,7 +152,15 @@ enum pco_g5p_upload_kind {
    PCO_G5P_UPLOAD_XFB,       /* per-draw driver block, PCO_G5P_XFB_* dwords */
    PCO_G5P_UPLOAD_BLEND_CONSTANTS, /* 4 dwords: the dynamic blend constants (f32) */
    PCO_G5P_UPLOAD_FETCH_SAMPLER, /* two generated samplerless-read policy words */
+   /* sampler metadata dwords [offset / 4, offset / 4 + dwords) of the sampler at (set, binding, element):
+    * pvr_sampler_descriptor::meta (load_smp_meta_pco; the LOD-bias variant reads the sampler's mipLodBias,
+    * PVR_G5P_SAMPLER_META_LOD_BIAS) */
+   PCO_G5P_UPLOAD_SAMPLER_META,
 };
+/* nir_tex_instr.backend_flags, set by the driver's LOD-bias lowering (pvr_g5p_nir.c lod_bias_lower()): the
+ * sample adds its sampler's mipLodBias (pco_g5p_program::lod_samplers[].biased) */
+#define PCO_G5P_TEX_SAMPLER_BIAS (1u << 28)
+#define PCO_G5P_MAX_LOD_SAMPLERS 16
 /* PCO_G5P_UPLOAD_IMAGE's offset (the state is always descriptor +0): how the
  * program samples it. AS_2D: an array sample at the constant layer 0, drawn
  * as a 2D sample, so the driver uploads the view's base layer as a 2D state
@@ -164,6 +172,17 @@ enum pco_g5p_upload_kind {
 #define PCO_G5P_SSBO_SIZE_OFFSET 0xfffcu
 #define PCO_G5P_UPLOAD_IMAGE_AS_2D 1u
 #define PCO_G5P_UPLOAD_IMAGE_ARRAY 2u
+/* ONE_LAYER: an array sample at any layer of a one-layer view, drawn as a 2D
+ * sample. Vulkan's layer is clamp(RNE(z), 0, layers - 1), so with one layer
+ * every z reads the base layer. Only the driver's one-layer program variant
+ * has such samples (pvr_g5p_nir.c one_layer_as_2d()), and the draw selects
+ * that variant only when every array view it samples has one layer. The
+ * driver uploads a 2D state of that layer, and refuses a multi-layer view by
+ * name (pvr_g5p_tex_state_for()). */
+#define PCO_G5P_UPLOAD_IMAGE_ONE_LAYER 4u
+/* nir_tex_instr.backend_flags, set by the driver's one-layer lowering: this
+ * former array sample reads PCO_G5P_UPLOAD_IMAGE_ONE_LAYER state */
+#define PCO_G5P_TEX_ONE_LAYER_AS_2D (1u << 29)
 
 
 /* Varyings (docs/gpu/experiments/varyings.md). Apple's A9 compiler takes at
@@ -178,6 +197,8 @@ enum pco_g5p_upload_kind {
  * included). Before: 16 vec4, 64 components. */
 #define PCO_G5P_MAX_FS_VARYINGS 28
 #define PCO_G5P_VARYING_SLOTS 32 /* VARYING_SLOT_VAR0..VAR31 */
+/* pco_g5p_program::z_set: fragment position Z; host tests check for it */
+#define PCO_G5P_HAVE_Z_SET 1
 
 enum pco_g5p_interp {
    PCO_G5P_INTERP_UNREAD = 0, /* VS link: the fragment program does not read it */
@@ -250,6 +271,10 @@ struct pco_g5p_program {
    unsigned num_varyings;
    struct pco_g5p_varying vary[PCO_G5P_MAX_FS_VARYINGS];
    bool w_set; /* coefficient set 0 is W (some varying is perspective-correct) */
+   /* gl_FragCoord.z is read: the next coefficient set (1 after W, else 0) is the
+    * TSP's unclamped Z, which TA_OUTPUT_SEL tsp_unclamped_z_pres puts right after
+    * the RHW (AGXMetalA9 FragmentProgramVariant 0x207d28be0, varying item type 6) */
+   bool z_set;
    /* VS: first output dword of each VARn (0 = not written) and its
     * interpolation; outputs are grouped linear, flat, npc (STATE_VARYING0). */
    uint8_t vout_dword[PCO_G5P_VARYING_SLOTS];
@@ -271,6 +296,18 @@ struct pco_g5p_program {
     * (set by pvr_g5p_nir.c after compilation; polygon mode POINT refuses it) */
    bool psize_dropped;
    uint8_t clip_count;  /* VS: user clip distances, the last output dwords (TA user planes 0..n-1) */
+   /* The samplers whose LOD a sample uses (tex, txb, txl, txd; not txf, size queries or gathers): a sampler's
+    * mipLodBias applies to them (Vulkan's LOD operation: lambda' = lambda_base + clamp(sampler bias + shader
+    * bias)). `biased`: the program adds the bound sampler's bias itself (the LOD-bias variant,
+    * PCO_G5P_TEX_SAMPLER_BIAS); the draw selects programs from these (pvr_arch_g5p_gfx.c). More than
+    * PCO_G5P_MAX_LOD_SAMPLERS sets lod_samplers_overflow. */
+   unsigned num_lod_samplers;
+   bool lod_samplers_overflow;
+   struct pco_g5p_lod_sampler {
+      uint8_t set, binding;
+      uint16_t element;
+      bool biased;
+   } lod_samplers[PCO_G5P_MAX_LOD_SAMPLERS];
    char refusal[512];
 };
 

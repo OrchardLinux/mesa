@@ -26,6 +26,7 @@
 #include "vk_enum_to_str.h"
 #include "vk_format.h"
 #include "vk_graphics_state.h"
+#include "pvr_g5p_depth_clip.h"
 #include "vk_log.h"
 #include "vk_shader_module.h"
 
@@ -326,11 +327,16 @@ launch_program(uint32_t *dest)
  * The coefficient (varying) program, as Apple's PDSEncoderGen1<G5>::
  * EncodeFragmentVaryingsPDSProgram builds it: one DOUTI per item, item i's
  * source in c(2i), the data first and padded to 16 bytes (the code starts
- * at VARYINGBASE + 16 * PDS_VARYINGSIZE). Items: W at coefficient set 0
- * when some varying is perspective-correct, then every varying the fragment
- * program reads (dest: its first set; offset: its vertex output dword in
- * the TA vertex, which drops x, y, z: dword d is TA dword d - 3, in 16-bit
- * units). Returns the data dwords; *code_dwords the code's.
+ * at VARYINGBASE + 16 * PDS_VARYINGSIZE). Items: position Z when the
+ * fragment program reads it (coefficient set 1 after W, else 0), W at set 0
+ * when some varying is perspective-correct, then every varying it reads
+ * (dest: its first set; offset: its vertex output dword in the TSP vertex,
+ * in 16-bit units). The TSP vertex is the RHW, then the unclamped Z when
+ * TA_OUTPUT_SEL tsp_unclamped_z_pres is set, then the varyings: vertex
+ * output dword d (x, y, z dropped, w kept as the RHW) is TSP dword d - 3,
+ * one dword later with Z. Apple's Z item (FragmentProgramVariant 0x207d28be0,
+ * varying type 6): f32/f16 offset 2, Gouraud, not perspective, and every
+ * other item's offsets + 2. Returns the data dwords; *code_dwords the code's.
  */
 /* pvr_physical_device.c reports what the fragment compiler admits */
 static_assert(4 * PCO_G5P_MAX_FS_VARYINGS == 112, "G5P varying components");
@@ -341,13 +347,23 @@ varying_program(const struct pco_g5p_program *fs, const struct pco_g5p_program *
 {
    pdsc_init();
    pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-varying");
-   struct pdsc_douti_src0 item[1 + PCO_G5P_MAX_FS_VARYINGS];
+   struct pdsc_douti_src0 item[2 + PCO_G5P_MAX_FS_VARYINGS];
    unsigned items = 0;
+   /* Apple's item order: position Z, then W, then the varyings (the A9
+    * compiler's reflection lists the type-6 item first: f_z_s, f_xyz_s);
+    * the sets stay W 0, Z 1 */
+   if (fs->z_set)
+      item[items++] = (struct pdsc_douti_src0){
+         .dest = fs->w_set ? 1 : 0,
+         .shademodel = PDSC_DOUTI_SHADEMODEL_GOURAUD,
+         .f32_offset = 2,
+         .f16_offset = 2,
+      };
    if (fs->w_set)
       item[items++] = (struct pdsc_douti_src0){ .shademodel = PDSC_DOUTI_SHADEMODEL_GOURAUD };
    for (unsigned i = 0; i < fs->num_varyings; i++) {
       const struct pco_g5p_varying *v = &fs->vary[i];
-      const unsigned off = 2 * (vs->vout_dword[v->location] - 3);
+      const unsigned off = 2 * (vs->vout_dword[v->location] - 3) + (fs->z_set ? 2 : 0);
       const bool flat = v->interp == PCO_G5P_INTERP_FLAT;
       item[items++] = (struct pdsc_douti_src0){
          .dest = v->set,
@@ -395,6 +411,21 @@ g5p_native_bresenham_line(const struct vk_graphics_pipeline_state *s)
       s->rs->line.mode == VK_LINE_RASTERIZATION_MODE_BRESENHAM;
 }
 
+/* PPP_CTRL clip_mode values pvr_g5p_depth_clip.h names */
+static_assert(ROGUE_TA_CLIP_MODE_FRONT_REAR == PVR_G5P_CLIP_MODE_CLIP, "clip mode 1");
+static_assert(ROGUE_TA_CLIP_MODE_FRONT_REAR_DEPTH == PVR_G5P_CLIP_MODE_CLAMP, "clip mode 2");
+
+/* The attachments g5p_check_state() judges: from the render pass object or the rendering state at creation,
+ * kept for a variant built at a later draw (the render pass may be gone by then) */
+struct g5p_rp_summary {
+   unsigned colors;
+   VkFormat cf;
+   VkFormat cfs[PVR_G5P_MRT_MAX_COLORS];
+   bool ds;
+};
+static thread_local const struct g5p_rp_summary *g5p_rp_override;
+static thread_local struct g5p_rp_summary *g5p_rp_record;
+
 /* What initial triangle path draws: refused by name otherwise (the ICD's validate_state()
  * with initial triangle path's limits) */
 static VkResult
@@ -407,7 +438,13 @@ g5p_check_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo *c
    VkFormat cf;
    VkFormat cfs[PVR_G5P_MRT_MAX_COLORS] = { VK_FORMAT_UNDEFINED };
    bool ds;
-   if (create_info->renderPass) {
+   if (g5p_rp_override) {
+      /* a variant built after creation (the LOD-bias variant): the attachments the pipeline was made for */
+      colors = g5p_rp_override->colors;
+      cf = g5p_rp_override->cf;
+      memcpy(cfs, g5p_rp_override->cfs, sizeof(cfs));
+      ds = g5p_rp_override->ds;
+   } else if (create_info->renderPass) {
       VK_FROM_HANDLE(pvr_render_pass, pass, create_info->renderPass);
       const struct pvr_render_subpass *sub = &pass->subpasses[create_info->subpass];
       colors = 0;
@@ -431,12 +468,25 @@ g5p_check_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo *c
    } else {
       return G5P_REFUSE(device, "no render pass state");
    }
+   if (g5p_rp_record) {
+      *g5p_rp_record = (struct g5p_rp_summary){ .colors = colors, .cf = cf, .ds = ds };
+      memcpy(g5p_rp_record->cfs, cfs, sizeof(cfs));
+   }
 
    if (s->shader_stages != (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT) || s->ts)
       return G5P_REFUSE(device, "shader stages %#x (a vertex and a fragment shader)", s->shader_stages);
-   if (s->rs && (s->rs->depth_clamp_enable ||
-                 (s->rs->polygon_mode != VK_POLYGON_MODE_FILL && !pvr_g5p_polygon_mode_enabled())))
-      return G5P_REFUSE(device, "depth clamp or polygon mode %d", s->rs->polygon_mode);
+   if (s->rs && s->rs->polygon_mode != VK_POLYGON_MODE_FILL && !pvr_g5p_polygon_mode_enabled())
+      return G5P_REFUSE(device, "polygon mode %d", s->rs->polygon_mode);
+   /* depth clip and clamp: the draw judges them with its viewport and bias
+    * (pvr_g5p_depth_clip.h); a static state no viewport admits fails here */
+   if (s->rs && !BITSET_TEST(s->dynamic, MESA_VK_DYNAMIC_RS_DEPTH_CLAMP_ENABLE) &&
+       !BITSET_TEST(s->dynamic, MESA_VK_DYNAMIC_RS_DEPTH_CLIP_ENABLE)) {
+      unsigned mode;
+      const char *why = pvr_g5p_depth_clip_mode(vk_rasterization_state_depth_clip_enable(s->rs),
+                                                s->rs->depth_clamp_enable, false, 0.0f, 1.0f, false, &mode);
+      if (why)
+         return G5P_REFUSE(device, "%s", why);
+   }
    /* line and point fill: the qualified scope only */
    if (s->rs && s->rs->polygon_mode != VK_POLYGON_MODE_FILL) {
       if (s->rs->polygon_mode != VK_POLYGON_MODE_LINE && s->rs->polygon_mode != VK_POLYGON_MODE_POINT)
@@ -547,6 +597,60 @@ g5p_check_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo *c
    return VK_SUCCESS;
 }
 
+/* A pipeline node (the pipeline, or one of its variants) */
+static struct pvr_g5p_pipeline *
+g5p_node_alloc(struct pvr_device *device)
+{
+   struct pvr_g5p_pipeline *g =
+      vk_zalloc(&device->vk.alloc, sizeof(*g), 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   if (g)
+      simple_mtx_init(&g->lod_bias_lock, mtx_plain);
+   return g;
+}
+
+/* The sampler words and metadata of a bound sampler or combined image/sampler descriptor (a standalone
+ * sampler at +0, a combined descriptor's sampler after its image, at +32), or NULL for another type */
+static const uint32_t *
+g5p_bound_sampler(const struct pvr_descriptor_set_layout_binding *lb, const uint32_t *desc)
+{
+   static_assert(offsetof(struct pvr_combined_image_sampler_descriptor, sampler) == 32, "combined sampler");
+   static_assert(offsetof(struct pvr_sampler_descriptor, meta) == 8 * ROGUE_NUM_TEXSTATE_SAMPLER_WORDS,
+                 "sampler metadata");
+   if (lb->type == VK_DESCRIPTOR_TYPE_SAMPLER)
+      return desc;
+   if (lb->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+      return desc + offsetof(struct pvr_combined_image_sampler_descriptor, sampler) / 4;
+   return NULL;
+}
+
+/*
+ * What a pipeline keeps to build its LOD-bias variant at a later draw (pvr_g5p_nir.c lod_bias_lower()): its
+ * two stages' SPIR-V and entry points, the graphics state and the attachments it was made for. Kept only by
+ * a pipeline whose fragment program samples with a sampler's LOD; its xfb and one-layer nodes share it. A
+ * pipeline created from the driver's own NIR (internal pipelines, which use the driver's samplers) keeps
+ * none: a biased draw of it refuses by name.
+ */
+struct pvr_g5p_lod_bias_src {
+   VkPipelineShaderStageCreateInfo stage[2];
+   VkShaderModuleCreateInfo module[2];
+   struct vk_graphics_pipeline_state state;
+   void *state_mem;
+   struct g5p_rp_summary rp;
+};
+
+static void
+g5p_lod_bias_src_free(struct pvr_device *device, struct pvr_g5p_lod_bias_src *src)
+{
+   if (!src)
+      return;
+   for (unsigned i = 0; i < 2; i++) {
+      vk_free(&device->vk.alloc, (void *)src->module[i].pCode);
+      vk_free(&device->vk.alloc, (void *)src->stage[i].pName);
+   }
+   vk_free(&device->vk.alloc, src->state_mem);
+   vk_free(&device->vk.alloc, src);
+}
+
 static void
 g5p_pipeline_free(struct pvr_device *device, struct pvr_g5p_pipeline *g)
 {
@@ -569,6 +673,11 @@ g5p_pipeline_free(struct pvr_device *device, struct pvr_g5p_pipeline *g)
    }
    g5p_pipeline_free(device, g->xfb);
    g5p_pipeline_free(device, g->punch);
+   g5p_pipeline_free(device, g->one_layer);
+   g5p_pipeline_free(device, g->lod_bias);
+   if (g->lod_bias_src_owner)
+      g5p_lod_bias_src_free(device, g->lod_bias_src);
+   simple_mtx_destroy(&g->lod_bias_lock);
    vk_free(&device->vk.alloc, g);
 }
 
@@ -701,6 +810,10 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
       case PCO_G5P_UPLOAD_SAMPLER:
       case PCO_G5P_UPLOAD_IMAGE_SIZE:
       case PCO_G5P_UPLOAD_BLEND_CONSTANTS:
+      case PCO_G5P_UPLOAD_SAMPLER_META:
+         if (u->kind == PCO_G5P_UPLOAD_SAMPLER_META && u->offset + 4 * u->dwords > 4 * PCO_SAMPLER_META_COUNT)
+            return G5P_REFUSE(device, "fragment upload %u: sampler metadata [%u, %u) bytes", i, u->offset,
+                              u->offset + 4 * u->dwords);
          if (u->dwords > 8)
             return G5P_REFUSE(device, "fragment upload %u: %u dwords of descriptor words", i, u->dwords);
          break;
@@ -724,6 +837,30 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
    }
    g->fs_num_uploads = fs->num_uploads;
    g->fs_common_dwords = fs->common_dwords;
+   /* the array-sampled views the draw classifies for the one-layer variant (g5p_one_layer_select()) */
+   g->num_array_tex = 0;
+   for (unsigned st = 0; st < 2; st++) {
+      const struct pco_g5p_program *p = st ? vs : fs;
+      for (unsigned i = 0; i < p->num_uploads; i++) {
+         const struct pco_g5p_upload *u = &p->uploads[i];
+         if (u->kind != PCO_G5P_UPLOAD_IMAGE || !(u->offset & PCO_G5P_UPLOAD_IMAGE_ARRAY))
+            continue;
+         if (g->num_array_tex < ARRAY_SIZE(g->array_tex))
+            g->array_tex[g->num_array_tex] = (__typeof__(g->array_tex[0])){ u->set, u->binding, u->element };
+         g->num_array_tex++;
+      }
+   }
+   /* the samplers whose LOD the programs use, for the LOD-bias variant (g5p_lod_bias_select()) */
+   static_assert(PVR_G5P_MAX_LOD_SAMPLERS == PCO_G5P_MAX_LOD_SAMPLERS, "LOD sampler list");
+   for (unsigned st = 0; st < 2; st++) {
+      const struct pco_g5p_program *p = st ? vs : fs;
+      g->num_lod_samplers[st] = p->num_lod_samplers;
+      g->lod_samplers_overflow[st] = p->lod_samplers_overflow;
+      for (unsigned i = 0; i < p->num_lod_samplers; i++)
+         g->lod_samplers[st][i] = (struct pvr_g5p_lod_sampler){ p->lod_samplers[i].set, p->lod_samplers[i].binding,
+                                                                p->lod_samplers[i].element,
+                                                                p->lod_samplers[i].biased };
+   }
    /* PDS has 128 constant dwords, four per transfer. Coalesce copied
     * descriptor intervals when the original upload list exceeds twelve.
     * GPU-written UBOs and push snapshots retain their own source addresses. */
@@ -732,7 +869,8 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
       const struct pco_g5p_upload *u = &fs->uploads[i];
       bool copy = fs->num_uploads > 12 &&
                   (u->kind == PCO_G5P_UPLOAD_IMAGE || u->kind == PCO_G5P_UPLOAD_SAMPLER ||
-                   u->kind == PCO_G5P_UPLOAD_IMAGE_SIZE || u->kind == PCO_G5P_UPLOAD_BLEND_CONSTANTS);
+                   u->kind == PCO_G5P_UPLOAD_IMAGE_SIZE || u->kind == PCO_G5P_UPLOAD_BLEND_CONSTANTS ||
+                   u->kind == PCO_G5P_UPLOAD_SAMPLER_META);
       if (u->common + u->dwords > ARRAY_SIZE(cpu))
          return G5P_REFUSE(device, "fragment upload outside common store");
       if (copy) {
@@ -786,6 +924,7 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
    g->fs_side_effects = fs->side_effects;
    g->vs_side_effects = vs->side_effects;
    g->fs_depth_feedback = fs->depth_feedback;
+   g->fs_position_z = fs->z_set;
    if (g->fs_depth_feedback && g->samples != 1)
       return G5P_REFUSE(device, "multisample fragment depth export is not qualified");
    g->fs_blend_mode = fs->blend_mode;
@@ -863,7 +1002,7 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
 
    /* PDS: the coefficient program (the device HALT without varyings) */
    unsigned varying_data_dwords = 0;
-   if (fs->num_varyings || fs->w_set) {
+   if (fs->num_varyings || fs->w_set || fs->z_set) {
       unsigned code_dwords;
       varying_data_dwords = varying_program(fs, vs, data, code, &code_dwords, 0);
       result = pvr_gpu_upload_pds(device, data, varying_data_dwords, 16, code, code_dwords, 16, 64, &g->varying);
@@ -933,10 +1072,11 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
          s1.pds_uniformsize = g->fs_num_uploads ? DIV_ROUND_UP(4 * g->fs_num_dmas,
                                                                ROGUE_TA_STATE_PDS_SIZEINFO1_PDS_UNIFORMSIZE_UNIT_SIZE)
                                                 : 1;
-         if (fs->num_varyings || fs->w_set) {
+         if (fs->num_varyings || fs->w_set || fs->z_set) {
             s1.pds_varyingsize = DIV_ROUND_UP(varying_data_dwords, 4);
-            /* coefficient sets: W, then four per varying (4 dwords each) */
-            s1.usc_varyingsize = DIV_ROUND_UP(4 * ((fs->w_set ? 1 : 0) + 4 * fs->num_varyings), 16);
+            /* coefficient sets: W, Z, then four per varying (4 dwords each) */
+            s1.usc_varyingsize =
+               DIV_ROUND_UP(4 * ((fs->w_set ? 1 : 0) + (fs->z_set ? 1 : 0) + 4 * fs->num_varyings), 16);
          }
       }
       /* A discarding program runs punch-through with triangle merging off
@@ -948,13 +1088,14 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
                                              ROGUE_TA_STATE_PDS_SIZEINFO2_USC_SHAREDSIZE_UNIT_SIZE);
       }
       pvr_csb_pack (&w[5], TA_STATE_PDS_VARYINGBASE, vb) {
-         vb.addr = PVR_DEV_ADDR(fs->num_varyings || fs->w_set ? g->varying.data_offset : dp->halt.code_offset);
+         vb.addr = PVR_DEV_ADDR(fs->num_varyings || fs->w_set || fs->z_set ? g->varying.data_offset
+                                                                            : dp->halt.code_offset);
       }
       result = pvr_gpu_upload(device, device->heaps.general_heap, w, 24, 16, &g->static_frag);
       if (result != VK_SUCCESS)
          return result;
       /* the same pointers naming the flat programs of vertices 1 and 2 */
-      for (unsigned pv = 1; g->fs_flat && (fs->num_varyings || fs->w_set) && pv <= 2; pv++) {
+      for (unsigned pv = 1; g->fs_flat && (fs->num_varyings || fs->w_set || fs->z_set) && pv <= 2; pv++) {
          uint32_t *v = g->static_frag_pv_words[pv - 1];
          memcpy(v, w, sizeof(g->static_frag_words));
          pvr_csb_pack (&v[5], TA_STATE_PDS_VARYINGBASE, vb) {
@@ -983,7 +1124,7 @@ g5p_pipeline_build_punch(struct pvr_device *device,
       return VK_SUCCESS;
    /* General-blend punch variants use Apple's tile-read-before-kill order. */
    struct pvr_g5p_pipeline *p =
-      vk_zalloc(&device->vk.alloc, sizeof(*p), 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+      g5p_node_alloc(device);
    if (!p)
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
    p->punch_variant = true;
@@ -1004,6 +1145,318 @@ g5p_pipeline_build_punch(struct pvr_device *device,
       }
    }
    return result;
+}
+
+static VkResult g5p_pipeline_check_draw_variants(struct pvr_device *device,
+                                                 const struct vk_graphics_pipeline_state *state,
+                                                 const struct pvr_g5p_pipeline *g);
+
+/* The one-layer variant (pvr_g5p.h): built only for a pipeline with array samples, as a full linked
+ * pipeline (its fragment program may read fewer varying components, so its vertex program is its own),
+ * with its own punch child. The base programs are unchanged. A refused variant leaves the pipeline as it
+ * was: a draw that needs it refuses by name. */
+static VkResult
+g5p_pipeline_build_one_layer(struct pvr_device *device,
+                             const VkGraphicsPipelineCreateInfo *create_info,
+                             const struct vk_graphics_pipeline_state *state,
+                             struct pvr_g5p_pipeline *g)
+{
+   if (!g->num_array_tex)
+      return VK_SUCCESS;
+   if (g->num_array_tex > ARRAY_SIZE(g->array_tex)) {
+      g->one_layer_why = "more than 16 array-sampled views";
+      return VK_SUCCESS;
+   }
+   struct pvr_g5p_pipeline *p =
+      g5p_node_alloc(device);
+   if (!p)
+      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+   p->one_layer_variant = true;
+   p->xfb_variant = g->xfb_variant;
+   struct pco_g5p_program vs = { 0 }, fs = { 0 };
+   const bool was = pvr_g5p_one_layer_compile;
+   pvr_g5p_one_layer_compile = true;
+   VkResult result = g5p_pipeline_build(device, create_info, state, p, &vs, &fs);
+   free(vs.code);
+   free(fs.code);
+   if (result == VK_SUCCESS)
+      result = g5p_pipeline_build_punch(device, create_info, state, p);
+   pvr_g5p_one_layer_compile = was;
+   if (result == VK_SUCCESS)
+      result = g5p_pipeline_check_draw_variants(device, state, p);
+   if (result == VK_SUCCESS) {
+      g->one_layer = p;
+      return VK_SUCCESS;
+   }
+   g5p_pipeline_free(device, p);
+   if (result == VK_ERROR_FEATURE_NOT_PRESENT) {
+      g->one_layer_why = "the variant's compile was refused (see the refusal above)";
+      return VK_SUCCESS;
+   }
+   return result;
+}
+
+/* A draw's program for its bound views: the one-layer variant when an array sample's view has no array
+ * state (a one-layer view of a linear image), else the pipeline itself. The variant's uploads refuse a
+ * multi-layer view among the others by name; a view without texture state is the uploads' to refuse. */
+static VkResult
+g5p_one_layer_select(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_pipeline **gp)
+{
+   const struct pvr_g5p_pipeline *g = *gp;
+   if (!g->num_array_tex || g->num_array_tex > ARRAY_SIZE(g->array_tex))
+      return VK_SUCCESS;
+   const struct pvr_descriptor_state *ds = &cmd_buffer->state.gfx_desc_state;
+   for (unsigned i = 0; i < g->num_array_tex; i++) {
+      const unsigned set_index = g->array_tex[i].set, binding = g->array_tex[i].binding;
+      const struct pvr_descriptor_set *set = set_index < PVR_MAX_DESCRIPTOR_SETS ? ds->sets[set_index] : NULL;
+      if (!set || !set->layout || binding >= set->layout->binding_count)
+         continue;
+      const struct pvr_descriptor_set_layout_binding *lb = &set->layout->bindings[binding];
+      if (lb->type != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && lb->type != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE)
+         continue;
+      if (g->array_tex[i].element >= MAX2(lb->descriptor_count, 1))
+         continue;
+      const uint32_t *desc = (const uint32_t *)((const uint8_t *)set->mapping + lb->offset +
+                                                (size_t)g->array_tex[i].element * lb->stride);
+      if (!pvr_g5p_tex_state_valid(desc) || (desc[0] & 7) == PVR_G5P_TEX_LAYOUT_2D_ARRAY)
+         continue;
+      if (!g->one_layer)
+         return G5P_REFUSE(cmd_buffer, "set %u binding %u: an array sample at a non-constant layer of a view "
+                           "without array state, and no one-layer variant: %s", set_index, binding,
+                           g->one_layer_why ? g->one_layer_why : "none built");
+      *gp = g->one_layer;
+      return VK_SUCCESS;
+   }
+   return VK_SUCCESS;
+}
+
+/* Keep what the LOD-bias variant is built from (struct pvr_g5p_lod_bias_src). *why names a pipeline that
+ * keeps none (its stages are the driver's NIR); OOM fails creation. */
+static VkResult
+g5p_lod_bias_capture(struct pvr_device *device, const VkGraphicsPipelineCreateInfo *create_info,
+                     const struct vk_graphics_pipeline_state *state, const struct g5p_rp_summary *rp,
+                     struct pvr_g5p_lod_bias_src **out, const char **why)
+{
+   *out = NULL;
+   *why = NULL;
+   const VkPipelineShaderStageCreateInfo *st[2] = { NULL, NULL };
+   for (uint32_t i = 0; i < create_info->stageCount; i++) {
+      const unsigned k = create_info->pStages[i].stage == VK_SHADER_STAGE_FRAGMENT_BIT ? 1 : 0;
+      if (!st[k])
+         st[k] = &create_info->pStages[i];
+   }
+   const uint32_t *code[2] = { NULL, NULL };
+   size_t size[2] = { 0, 0 };
+   for (unsigned k = 0; k < 2; k++) {
+      if (!st[k]) {
+         *why = "a stage is missing";
+         return VK_SUCCESS;
+      }
+      VK_FROM_HANDLE(vk_shader_module, module, st[k]->module);
+      const VkShaderModuleCreateInfo *inline_ci = vk_find_struct_const(st[k]->pNext, SHADER_MODULE_CREATE_INFO);
+      if (module && !module->nir) {
+         code[k] = (const uint32_t *)module->data;
+         size[k] = module->size;
+      } else if (!module && inline_ci && !vk_find_struct_const(st[k]->pNext, PIPELINE_SHADER_STAGE_NIR_CREATE_INFO_MESA)) {
+         code[k] = inline_ci->pCode;
+         size[k] = inline_ci->codeSize;
+      } else {
+         *why = "the pipeline's stages are the driver's NIR (no SPIR-V kept)";
+         return VK_SUCCESS;
+      }
+   }
+   struct pvr_g5p_lod_bias_src *src =
+      vk_zalloc(&device->vk.alloc, sizeof(*src), 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   if (!src)
+      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+   for (unsigned k = 0; k < 2; k++) {
+      const char *entry = st[k]->pName ? st[k]->pName : "main";
+      uint32_t *words = vk_alloc(&device->vk.alloc, size[k], 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+      char *name = vk_alloc(&device->vk.alloc, strlen(entry) + 1, 1, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+      if (words)
+         memcpy(words, code[k], size[k]);
+      if (name)
+         memcpy(name, entry, strlen(entry) + 1);
+      src->module[k] = (VkShaderModuleCreateInfo){ .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+                                                   .codeSize = size[k], .pCode = words };
+      src->stage[k] = (VkPipelineShaderStageCreateInfo){ .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                                         .pNext = &src->module[k], .stage = st[k]->stage,
+                                                         .pName = name,
+                                                         /* specialization constants are refused at creation */
+                                                         .pSpecializationInfo = NULL };
+      if (!words || !name) {
+         g5p_lod_bias_src_free(device, src);
+         return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+      }
+   }
+   VkResult result = vk_graphics_pipeline_state_copy(&device->vk, &src->state, state, &device->vk.alloc,
+                                                     VK_SYSTEM_ALLOCATION_SCOPE_OBJECT, &src->state_mem);
+   if (result != VK_SUCCESS) {
+      g5p_lod_bias_src_free(device, src);
+      return result;
+   }
+   src->rp = *rp;
+   *out = src;
+   return VK_SUCCESS;
+}
+
+/* Hand a pipeline's retained stages (or why it has none) to its nodes the draw may bias: the pipeline, its xfb
+ * node and their one-layer nodes (punch children are selected after the LOD-bias variant) */
+static void
+g5p_lod_bias_share(struct pvr_g5p_pipeline *g, struct pvr_g5p_lod_bias_src *src, const char *why, bool owner)
+{
+   if (!g)
+      return;
+   g->lod_bias_src = src;
+   g->lod_bias_src_owner = owner;
+   g->lod_bias_why = src ? NULL : why;
+   g5p_lod_bias_share(g->one_layer, src, why, false);
+}
+
+static VkResult g5p_pipeline_check_draw_variants(struct pvr_device *device,
+                                                 const struct vk_graphics_pipeline_state *state,
+                                                 const struct pvr_g5p_pipeline *g);
+
+/* Build node n's LOD-bias variant (at the first draw that needs it, under n->lod_bias_lock): the same
+ * pipeline compiled from the retained stages with pvr_g5p_lod_bias_compile, n's xfb and one-layer forms,
+ * and its own punch child. A refused compile leaves n->lod_bias_why; the draw refuses by name. */
+static VkResult
+g5p_lod_bias_build(struct pvr_device *device, struct pvr_g5p_pipeline *n)
+{
+   struct pvr_g5p_lod_bias_src *src = n->lod_bias_src;
+   const VkGraphicsPipelineCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+                                             .stageCount = 2, .pStages = src->stage };
+   struct pvr_g5p_pipeline *p = g5p_node_alloc(device);
+   if (!p)
+      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+   p->lod_bias_variant = true;
+   p->xfb_variant = n->xfb_variant;
+   p->one_layer_variant = n->one_layer_variant;
+   const bool was_one_layer = pvr_g5p_one_layer_compile, was_lod_bias = pvr_g5p_lod_bias_compile;
+   const struct g5p_rp_summary *was_rp = g5p_rp_override;
+   pvr_g5p_one_layer_compile = n->one_layer_variant;
+   pvr_g5p_lod_bias_compile = true;
+   g5p_rp_override = &src->rp;
+   struct pco_g5p_program vs = { 0 }, fs = { 0 };
+   VkResult result = g5p_pipeline_build(device, &ci, &src->state, p, &vs, &fs);
+   free(vs.code);
+   free(fs.code);
+   if (result == VK_SUCCESS)
+      result = g5p_pipeline_build_punch(device, &ci, &src->state, p);
+   pvr_g5p_one_layer_compile = was_one_layer;
+   pvr_g5p_lod_bias_compile = was_lod_bias;
+   g5p_rp_override = was_rp;
+   if (result == VK_SUCCESS)
+      result = g5p_pipeline_check_draw_variants(device, &src->state, p);
+   /* the same pipeline: what the draw already judged from n must hold for the variant */
+   if (result == VK_SUCCESS &&
+       (p->samples != n->samples || p->color_targets != n->color_targets || p->fs_write_mask != n->fs_write_mask ||
+        p->fs_blend_mode != n->fs_blend_mode || p->vs_outputs != n->vs_outputs ||
+        p->fs_position_z != n->fs_position_z ||
+        p->fs_discard != n->fs_discard || p->xfb_layout.buffers != n->xfb_layout.buffers)) {
+      g5p_pipeline_free(device, p);
+      n->lod_bias_why = "the variant's state differs from the pipeline's";
+      return VK_SUCCESS;
+   }
+   if (result == VK_SUCCESS) {
+      n->lod_bias = p;
+      return VK_SUCCESS;
+   }
+   g5p_pipeline_free(device, p);
+   if (result == VK_ERROR_FEATURE_NOT_PRESENT) {
+      n->lod_bias_why = "the variant's compile was refused (see the refusal above)";
+      return VK_SUCCESS;
+   }
+   return result;
+}
+
+/* The mipLodBias of the sampler bound at a LOD sampler's (set, binding, element); 0 when the binding holds
+ * no sampler (the uploads refuse that by name) */
+static float
+g5p_bound_lod_bias(const struct pvr_descriptor_state *ds, const struct pvr_g5p_lod_sampler *l)
+{
+   const struct pvr_descriptor_set *set = l->set < PVR_MAX_DESCRIPTOR_SETS ? ds->sets[l->set] : NULL;
+   if (!set || !set->layout || l->binding >= set->layout->binding_count)
+      return 0.0f;
+   const struct pvr_descriptor_set_layout_binding *lb = &set->layout->bindings[l->binding];
+   if (l->element >= MAX2(lb->descriptor_count, 1))
+      return 0.0f;
+   const uint32_t *smp = g5p_bound_sampler(lb, (const uint32_t *)((const uint8_t *)set->mapping + lb->offset +
+                                                                  (size_t)l->element * lb->stride));
+   return smp ? uif(smp[2 * ROGUE_NUM_TEXSTATE_SAMPLER_WORDS + PVR_G5P_SAMPLER_META_LOD_BIAS]) : 0.0f;
+}
+
+/* A draw's program for its bound samplers' LOD biases: the LOD-bias variant (pvr_g5p_nir.c lod_bias_lower())
+ * when a sampler that a sample of the fragment program reads the LOD of has a non-zero mipLodBias, else the
+ * pipeline itself. The A9 sampler word has no bias, so a program that does not add it would draw the
+ * unbiased LOD: a vertex-stage one (no vertex variant), or a missing variant, refuses by name. */
+static VkResult
+g5p_lod_bias_select(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_pipeline **gp)
+{
+   const struct pvr_g5p_pipeline *g = *gp;
+   if (!g->num_lod_samplers[0] && !g->num_lod_samplers[1] && !g->lod_samplers_overflow[0] &&
+       !g->lod_samplers_overflow[1])
+      return VK_SUCCESS;
+   const struct pvr_descriptor_state *ds = &cmd_buffer->state.gfx_desc_state;
+   const struct pvr_g5p_lod_sampler *need = NULL;
+   float need_bias = 0.0f;
+   for (unsigned st = 0; st < 2; st++) {
+      if (g->lod_samplers_overflow[st])
+         return G5P_REFUSE(cmd_buffer, "%s samples at more than %u samplers, or at a binding past 255: their LOD "
+                           "biases are not checked", st ? "vertex" : "fragment", PVR_G5P_MAX_LOD_SAMPLERS);
+      for (unsigned i = 0; i < g->num_lod_samplers[st]; i++) {
+         const struct pvr_g5p_lod_sampler *l = &g->lod_samplers[st][i];
+         const float bias = g5p_bound_lod_bias(ds, l);
+         if (bias == 0.0f || l->biased)
+            continue;
+         if (st)
+            return G5P_REFUSE(cmd_buffer, "set %u binding %u: a sampler LOD bias of %g under a vertex-stage sample "
+                              "(no LOD-bias vertex program)", l->set, l->binding, bias);
+         if (!need) {
+            need = l;
+            need_bias = bias;
+         }
+      }
+   }
+   if (!need)
+      return VK_SUCCESS;
+   if (g->lod_bias_variant)
+      return G5P_REFUSE(cmd_buffer, "set %u binding %u: the LOD-bias variant leaves a sample of it unbiased",
+                        need->set, need->binding);
+   struct pvr_g5p_pipeline *m = (struct pvr_g5p_pipeline *)g; /* the variant is built at its first use */
+   VkResult result = VK_SUCCESS;
+   simple_mtx_lock(&m->lod_bias_lock);
+   if (!m->lod_bias && !m->lod_bias_why) {
+      if (m->lod_bias_src)
+         result = g5p_lod_bias_build(cmd_buffer->device, m);
+      else
+         m->lod_bias_why = "no retained stages";
+   }
+   const struct pvr_g5p_pipeline *v = m->lod_bias;
+   const char *why = m->lod_bias_why;
+   simple_mtx_unlock(&m->lod_bias_lock);
+   if (result != VK_SUCCESS)
+      return vk_command_buffer_set_error(&cmd_buffer->vk, result);
+   if (!v)
+      return G5P_REFUSE(cmd_buffer, "set %u binding %u: a sampler LOD bias of %g and no LOD-bias variant: %s",
+                        need->set, need->binding, need_bias, why ? why : "none built");
+   /* every biased sampler is one the variant biases */
+   for (unsigned i = 0; i < g->num_lod_samplers[0]; i++) {
+      const struct pvr_g5p_lod_sampler *l = &g->lod_samplers[0][i];
+      if (g5p_bound_lod_bias(ds, l) == 0.0f)
+         continue;
+      bool biased = false;
+      for (unsigned j = 0; j < v->num_lod_samplers[0]; j++) {
+         const struct pvr_g5p_lod_sampler *w = &v->lod_samplers[0][j];
+         if (w->set == l->set && w->binding == l->binding && w->element == l->element)
+            biased = w->biased;
+      }
+      if (!biased)
+         return G5P_REFUSE(cmd_buffer, "set %u binding %u: the LOD-bias variant leaves a sample of it unbiased",
+                           l->set, l->binding);
+   }
+   *gp = v;
+   return VK_SUCCESS;
 }
 
 /* Program variants are checked at creation under the selected refusal
@@ -1060,11 +1513,14 @@ PVR_PER_ARCH(g5p_graphics_pipeline_compile)(struct pvr_device *device,
 {
    struct pco_g5p_program vs = { 0 }, fs = { 0 };
    struct pvr_g5p_pipeline *g =
-      vk_zalloc(&device->vk.alloc, sizeof(*g), 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+      g5p_node_alloc(device);
    if (!g)
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
 
+   struct g5p_rp_summary rp = { 0 };
+   g5p_rp_record = &rp;
    VkResult result = g5p_pipeline_build(device, create_info, vk_state, g, &vs, &fs);
+   g5p_rp_record = NULL;
    /* the program bytes are the backend's (malloc'd); uploaded or refused */
    free(vs.code);
    free(fs.code);
@@ -1083,10 +1539,18 @@ PVR_PER_ARCH(g5p_graphics_pipeline_compile)(struct pvr_device *device,
    result = g5p_pipeline_build_punch(device, create_info, vk_state, g);
    if (result == VK_SUCCESS)
       result = g5p_pipeline_check_draw_variants(device, vk_state, g);
+   if (result == VK_SUCCESS)
+      result = g5p_pipeline_build_one_layer(device, create_info, vk_state, g);
+   /* a fragment program that samples with a sampler's LOD: keep its stages for the LOD-bias variant */
+   struct pvr_g5p_lod_bias_src *lod_bias_src = NULL;
+   const char *lod_bias_why = NULL;
+   if (result == VK_SUCCESS && (g->num_lod_samplers[0] || g->lod_samplers_overflow[0]))
+      result = g5p_lod_bias_capture(device, create_info, vk_state, &rp, &lod_bias_src, &lod_bias_why);
    if (result != VK_SUCCESS) {
       g5p_pipeline_free(device, g);
       return pvr_refusal_to_api(result);
    }
+   g5p_lod_bias_share(g, lod_bias_src, lod_bias_why, true);
    pipeline->g5p = g;
 
    /* transform feedback: the same pipeline with the capturing vertex
@@ -1098,7 +1562,7 @@ PVR_PER_ARCH(g5p_graphics_pipeline_compile)(struct pvr_device *device,
    if (vs_info && pvr_g5p_stage_has_xfb(vs_info)) {
       struct pco_g5p_program xvs = { 0 }, xfs = { 0 };
       struct pvr_g5p_pipeline *x =
-         vk_zalloc(&device->vk.alloc, sizeof(*x), 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+         g5p_node_alloc(device);
       if (!x)
          return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
       x->xfb_variant = true;
@@ -1109,8 +1573,11 @@ PVR_PER_ARCH(g5p_graphics_pipeline_compile)(struct pvr_device *device,
          result = g5p_pipeline_build_punch(device, create_info, vk_state, x);
       if (result == VK_SUCCESS && x->xfb_layout.buffers)
          result = g5p_pipeline_check_draw_variants(device, vk_state, x);
+      if (result == VK_SUCCESS && x->xfb_layout.buffers)
+         result = g5p_pipeline_build_one_layer(device, create_info, vk_state, x);
       if (result == VK_SUCCESS && x->xfb_layout.buffers) {
          g->xfb = x;
+         g5p_lod_bias_share(x, lod_bias_src, lod_bias_why, false);
       } else {
          g5p_pipeline_free(device, x);
          if (result != VK_SUCCESS) {
@@ -1607,6 +2074,16 @@ fs_uploads(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_pipeline *g, 
             return G5P_REFUSE(cmd_buffer, "set %u binding %u: an image size without A9 texture state", u->set,
                               u->binding);
          break;
+      case PCO_G5P_UPLOAD_SAMPLER_META: {
+         /* the sampler's metadata dwords (the LOD-bias variant's bias): a standalone sampler's at +16, a
+          * combined descriptor's sampler at +32 */
+         const uint32_t *smp = g5p_bound_sampler(lb, desc);
+         if (!smp || !pvr_g5p_sampler_valid(smp))
+            return G5P_REFUSE(cmd_buffer, "set %u binding %u: sampler metadata of a binding without an A9 sampler",
+                              u->set, u->binding);
+         memcpy(out, smp + 2 * ROGUE_NUM_TEXSTATE_SAMPLER_WORDS + u->offset / 4, 4 * u->dwords);
+         break;
+      }
       default:
          return G5P_REFUSE(cmd_buffer, "fragment upload kind %u", u->kind);
       }
@@ -1807,6 +2284,18 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
    }
    if (!draw->count || !draw->instances)
       return VK_SUCCESS;
+   /* a one-layer view of a linear image under an array sample: the one-layer variant (pvr_g5p.h) */
+   {
+      VkResult lr = g5p_one_layer_select(cmd_buffer, &g);
+      if (lr != VK_SUCCESS)
+         return lr;
+   }
+   /* a sampler with a non-zero mipLodBias under a fragment sample: the LOD-bias variant (pvr_g5p.h) */
+   {
+      VkResult br = g5p_lod_bias_select(cmd_buffer, &g);
+      if (br != VK_SUCCESS)
+         return br;
+   }
    if (!g5p_topology(dyn->ia.primitive_topology, &hw_topology, &split, &lines))
       return G5P_REFUSE(cmd_buffer, "topology %d", dyn->ia.primitive_topology);
    VkResult result;
@@ -1948,6 +2437,17 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
                       (dyn->rs.depth_bias.constant_factor != 0.0f || dyn->rs.depth_bias.slope_factor != 0.0f);
    if (g->fs_depth_feedback && dbias)
       return G5P_REFUSE(cmd_buffer, "fragment depth export with depth bias is not qualified");
+   unsigned clip_mode = PVR_G5P_CLIP_MODE_CLIP;
+   if (!discard) {
+      const VkViewport *vp0 = &dyn->vp.viewports[0];
+      const char *why = pvr_g5p_depth_clip_mode(vk_rasterization_state_depth_clip_enable(&dyn->rs),
+                                                dyn->rs.depth_clamp_enable, true, vp0->minDepth, vp0->maxDepth,
+                                                dbias, &clip_mode);
+      if (!why && clip_mode != PVR_G5P_CLIP_MODE_CLIP && g->fs_depth_feedback)
+         why = "fragment depth export with depth clipping disabled is not qualified";
+      if (why)
+         return G5P_REFUSE(cmd_buffer, "%s", why);
+   }
    uint32_t dbias_index = 0;
    /* Real single-token feedback defers depth/stencil writes until the kill
     * result is known (g5p-punch-ds@8150a8195df); preserve all DS test/ops. */
@@ -2060,6 +2560,11 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
    pvr_csb_pack (&w[1], TA_OUTPUT_SEL, os) {
       os.vtxsize = g->vs_outputs;
       os.rhw_pres = true;
+      /* the fragment program reads gl_FragCoord.z: the TSP vertex carries the
+       * unclamped Z after the RHW (AGXMetalA9: FragmentProgramVariant
+       * 0x207d28be0 sets 0x210000 for a type-6 varying, else 0x10000, and
+       * setRenderPipelineStateCommon 0x207d65d74 merges it under 0x210000) */
+      os.tsp_unclamped_z_pres = g->fs_position_z;
       /* points: the size follows the position (g3b-points) */
       os.psprite_size_pres = g->vs_point_size;
       /* user planes 0..n-1 from the declared clip distances, the vertex's
@@ -2200,7 +2705,8 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
       }
       w[1] = G5P_WCLAMP;
       pvr_csb_pack (&w[2], TA_STATE_PPP_CTRL, c) {
-         c.clip_mode = ROGUE_TA_CLIP_MODE_FRONT_REAR;
+         /* 1 clips at near/far, 2 keeps that geometry and clamps its depth (pvr_g5p_depth_clip.h) */
+         c.clip_mode = (enum ROGUE_TA_CLIP_MODE)clip_mode;
          c.flatshade_vtx = ROGUE_TA_FLATSHADE_VTX_VERTEX_0;
          c.wclampen = true;
          if (dyn->rs.cull_mode == VK_CULL_MODE_BACK_BIT || dyn->rs.cull_mode == VK_CULL_MODE_FRONT_BIT) {

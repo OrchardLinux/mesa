@@ -62,6 +62,10 @@
  * buffer starts at CODE_INITIAL and doubles. */
 #define CODE_INITIAL 16384
 #define NUM_DWORDS 32
+/* Fragment registers above r31 (homes): r32..r127, the destination field's reach */
+#define G5P_MAX_HOMES 96
+/* home_reuse: values parked above r31 over a program's length (each attempt is one more compile) */
+#define G5P_MAX_VICTIMS 1024
 /* Vertex input dwords: the PDS fetches up to this many into bank 1. Those above r31 are read through a move
  * (g5p_usc_vs_or_wide(), Apple's vertex form for attributes above r31), as the fragment homes are. */
 #define VS_INPUT_DWORDS 64
@@ -82,6 +86,7 @@ struct val {
    int last;      /* last reading instruction (-1: unread) */
    unsigned uses; /* consumer references */
    bool body;     /* defined by an instruction of the body: may get a home */
+   bool decl;     /* a NIR register (out of SSA): may get a home in the home_reuse retry */
 };
 
 struct ref {
@@ -300,6 +305,14 @@ struct gctx {
     * codegen_reset(). */
    int8_t *home;
    unsigned nhomes;
+   /* The last fragment retry (home_reuse): a value marked in home[] gets the
+    * first register above r31 that is free when it is defined, and frees it
+    * at its last read, as r0..r31 are allocated. Kept by codegen_reset();
+    * hbusy and hmax are per codegen pass. */
+   bool home_reuse;
+   uint64_t hbusy[2]; /* bit i: r(32 + i) holds a live value */
+   unsigned hmax;     /* registers above r31 used: r32..r(31 + hmax) */
+   unsigned need;     /* dwords the last register-pressure refusal asked for */
 };
 
 static _Noreturn void PRINTFLIKE(2, 3) refuse(struct gctx *c, const char *fmt, ...)
@@ -465,6 +478,7 @@ static unsigned alloc_run(struct gctx *c, unsigned n, const char *why)
       tex_flush(c);
       return alloc_run(c, n, why);
    }
+   c->need = n;
    refuse(c, "register pressure: %s needs %u dword(s), %u of %u in use", why, n,
           util_bitcount64((c->busy | c->reserved | c->tex_coord_pending | c->tex_pending) & BITFIELD64_MASK(NUM_DWORDS)), NUM_DWORDS);
 }
@@ -549,9 +563,19 @@ static void free_scratch(struct gctx *c)
 
 static void release(struct gctx *c, int idx)
 {
-   for (unsigned i = 0; i < c->nvals; i++)
-      if (c->vals[i].held && c->vals[i].last <= idx)
-         drop(c, &c->vals[i]);
+   for (unsigned i = 0; i < c->nvals; i++) {
+      struct val *v = &c->vals[i];
+      if (v->held && v->last <= idx) {
+         drop(c, v);
+      } else if (c->home_reuse && v->state == VAL_HOME && v->last <= idx) {
+         /* past its last read (a loop's end for a value read in a loop it is defined outside of, mark()): the
+          * register above r31 takes a later value. The value has no register any more: a read now would be
+          * refused by name (reg_of()), never served from a register another value took over. */
+         assert(!c->vs && v->reg >= 32 && v->reg < 32 + G5P_MAX_HOMES);
+         c->hbusy[(v->reg - 32) / 64] &= ~BITFIELD64_BIT((v->reg - 32) % 64);
+         v->state = VAL_NONE;
+      }
+   }
    free_scratch(c);
 }
 
@@ -1168,22 +1192,14 @@ static void scan_cf(struct gctx *c, struct exec_list *list, struct unsupported *
                ok = !c->vs;
                break;
             case nir_intrinsic_load_frag_coord:
+               /* x/y: the raster position; z: the TSP's unclamped Z (plan_varyings());
+                * w: the RHW. The backend binds components, which only ALU reads use. */
                ok = !c->vs;
-               nir_foreach_use(use, &in->def) {
-                  nir_instr *ui = nir_src_use_instr(use);
-                  if (ui->type == nir_instr_type_alu) {
-                     nir_alu_instr *ua = nir_instr_as_alu(ui);
-                     for (unsigned k = 0; k < nir_op_infos[ua->op].num_inputs; k++)
-                        if (&ua->src[k].src == use)
-                           for (unsigned j = 0; j < nir_ssa_alu_instr_src_components(ua, k); j++)
-                              if (ua->src[k].swizzle[j] == 2)
-                                 ok = false;
-                  } else {
+               nir_foreach_use(use, &in->def)
+                  if (nir_src_use_instr(use)->type != nir_instr_type_alu)
                      ok = false;
-                  }
-               }
                if (!ok && !c->vs) {
-                  note(u, "load_frag_coord .z (Z coefficient layout is not qualified)");
+                  note(u, "load_frag_coord read by a non-ALU instruction");
                   continue;
                }
                break;
@@ -1193,6 +1209,10 @@ static void scan_cf(struct gctx *c, struct exec_list *list, struct unsupported *
             case nir_intrinsic_load_push_constant:
             case nir_intrinsic_load_ubo:
                ok = true;
+               break;
+            case nir_intrinsic_load_smp_meta_pco:
+               /* the LOD-bias variant's sampler bias (fragment only) */
+               ok = !c->vs && in->def.bit_size == 32 && nir_src_is_const(in->src[0]);
                break;
             case nir_intrinsic_get_ssbo_size:
                ok = in->def.bit_size == 32 && in->def.num_components == 1;
@@ -1550,14 +1570,16 @@ static void plan_varyings(struct gctx *c)
    uint8_t interp[PCO_G5P_VARYING_SLOTS] = {0}, mask[PCO_G5P_VARYING_SLOTS] = {0};
    bool centroid[PCO_G5P_VARYING_SLOTS] = {0};
    uint32_t read = 0;
-   bool position_w = false;
+   bool position_w = false, position_z = false;
    memset(c->vary_idx, -1, sizeof(c->vary_idx));
    foreach_instr_all(ins, c) {
       if (ins->type != nir_instr_type_intrinsic)
          continue;
       nir_intrinsic_instr *in = nir_instr_as_intrinsic(ins);
-      if (in->intrinsic == nir_intrinsic_load_frag_coord)
+      if (in->intrinsic == nir_intrinsic_load_frag_coord) {
          position_w |= nir_def_components_read(&in->def) & BITFIELD_BIT(3);
+         position_z |= nir_def_components_read(&in->def) & BITFIELD_BIT(2);
+      }
       if (in->intrinsic != nir_intrinsic_load_interpolated_input && in->intrinsic != nir_intrinsic_load_input)
          continue;
       unsigned loc = nir_intrinsic_io_semantics(in).location;
@@ -1590,17 +1612,22 @@ static void plan_varyings(struct gctx *c)
     * only after this plan. Reading V(...)->uses here left W-only programs
     * without a coefficient DOUTI despite emitting the native W iterator. */
    bool w = position_w || smooth;
+   /* Apple's A9 coefficient layout (Apple's compiles f_raster_pos_z/w):
+    * W at set 0 when present, then position Z when the program reads it, then the read
+    * locations, 4 sets each. Z without W is set 0 (f_z_only, f_z_f, f_z_n). */
+   const unsigned base = (w ? 1 : 0) + (position_z ? 1 : 0);
    /* the last location's last component must fit the u7 iterator slot */
-   if ((w ? 1 : 0) + 4 * util_bitcount(read) > 128)
-      refuse(c, "%u varying locations with W exceed the u7 iterator slot", util_bitcount(read));
+   if (base + 4 * util_bitcount(read) > 128)
+      refuse(c, "%u varying locations with W/Z exceed the u7 iterator slot", util_bitcount(read));
    unsigned i = 0;
    u_foreach_bit(n, read) {
-      c->p->vary[i] = (struct pco_g5p_varying){.location = n, .set = (w ? 1 : 0) + 4 * i, .interp = interp[n],
+      c->p->vary[i] = (struct pco_g5p_varying){.location = n, .set = base + 4 * i, .interp = interp[n],
                                                .centroid = centroid[n], .mask = mask[n]};
       c->vary_idx[n] = i++;
    }
    c->p->num_varyings = i;
    c->p->w_set = w;
+   c->p->z_set = position_z;
 }
 
 static const struct pco_g5p_varying *vary_of(struct gctx *c, nir_intrinsic_instr *in)
@@ -2059,7 +2086,8 @@ static void tex_bindings(struct gctx *c, nir_tex_instr *t, struct tex_bind *b)
                           sv->data.binding, element, selement};
    b->needs_sampler = t->op != nir_texop_txf;
    b->needs_fetch_sampler = t->op == nir_texop_txf;
-   b->image_flags = (t->backend_flags & G5P_TEX_LAYER0_AS_2D) ? PCO_G5P_UPLOAD_IMAGE_AS_2D :
+   b->image_flags = (t->backend_flags & PCO_G5P_TEX_ONE_LAYER_AS_2D) ? PCO_G5P_UPLOAD_IMAGE_ONE_LAYER :
+                    (t->backend_flags & G5P_TEX_LAYER0_AS_2D) ? PCO_G5P_UPLOAD_IMAGE_AS_2D :
                     t->is_array ? PCO_G5P_UPLOAD_IMAGE_ARRAY : 0;
 }
 
@@ -2082,6 +2110,35 @@ static struct tex_bind *tex_for(struct gctx *c, nir_tex_instr *t)
       refuse(c, "more than %u textures", max);
    c->tex[c->ntex] = b;
    return &c->tex[c->ntex++];
+}
+
+/* A sample that uses its sampler's LOD (pco_g5p_program::lod_samplers): the draw selects the LOD-bias
+ * variant when such a sampler's mipLodBias is not zero, and refuses by name where no program adds it. */
+static void record_lod_sampler(struct gctx *c, nir_tex_instr *t)
+{
+   if (t->op != nir_texop_tex && t->op != nir_texop_txb && t->op != nir_texop_txl && t->op != nir_texop_txd)
+      return;
+   if (t->sampler_dim == GLSL_SAMPLER_DIM_BUF)
+      return;
+   struct tex_bind b;
+   tex_bindings(c, t, &b);
+   const bool biased = (t->backend_flags & PCO_G5P_TEX_SAMPLER_BIAS) != 0;
+   struct pco_g5p_program *p = c->p;
+   for (unsigned i = 0; i < p->num_lod_samplers; i++) {
+      struct pco_g5p_lod_sampler *l = &p->lod_samplers[i];
+      if (l->set == b.sset && l->binding == b.sbinding && l->element == b.selement) {
+         /* one unbiased sample of the sampler leaves it unbiased */
+         l->biased &= biased;
+         return;
+      }
+   }
+   if (p->num_lod_samplers == PCO_G5P_MAX_LOD_SAMPLERS || b.sset > UINT8_MAX || b.sbinding > UINT8_MAX ||
+       b.selement > UINT16_MAX) {
+      p->lod_samplers_overflow = true;
+      return;
+   }
+   p->lod_samplers[p->num_lod_samplers++] =
+      (struct pco_g5p_lod_sampler){ (uint8_t)b.sset, (uint8_t)b.sbinding, (uint16_t)b.selement, biased };
 }
 
 /* textypes: the size block of a texture binding at a constant level. */
@@ -2126,10 +2183,12 @@ static void plan_common(struct gctx *c)
    foreach_instr_all(ins, c) {
       if (ins->type == nir_instr_type_tex) {
          nir_tex_instr *t = nir_instr_as_tex(ins);
-         if (size_query(t))
+         if (size_query(t)) {
             size_for(c, t);
-         else
+         } else {
             tex_for(c, t);
+            record_lod_sampler(c, t);
+         }
          continue;
       }
       if (ins->type != nir_instr_type_intrinsic)
@@ -2144,7 +2203,16 @@ static void plan_common(struct gctx *c)
          if (xfb_address(in->src[1].ssa, &b, &off, &k))
             c->p->xfb_buffers |= 1u << b;
       }
-      if (in->intrinsic == nir_intrinsic_load_push_constant) {
+      if (in->intrinsic == nir_intrinsic_load_smp_meta_pco) {
+         /* the LOD-bias variant's per-binding bias: a sampler metadata dword, preloaded as a uniform */
+         if (!nir_src_is_const(in->src[0]))
+            refuse(c, "load_smp_meta_pco: a non-constant array element");
+         struct range *r = range_for(c, PCO_G5P_UPLOAD_SAMPLER_META, nir_intrinsic_desc_set(in),
+                                     nir_intrinsic_binding(in), nir_src_as_uint(in->src[0]));
+         const unsigned off = 4 * nir_intrinsic_component(in);
+         r->lo = MIN2(r->lo, off);
+         r->hi = MAX2(r->hi, off + 4 * in->def.num_components);
+      } else if (in->intrinsic == nir_intrinsic_load_push_constant) {
          unsigned off = load_offset(c, in, 0, nir_intrinsic_base(in));
          struct range *r = range_for(c, PCO_G5P_UPLOAD_PUSH, 0, 0, 0);
          r->lo = MIN2(r->lo, off);
@@ -2379,7 +2447,18 @@ static void plan_common(struct gctx *c)
  * for r32..r69 (control-flow.md §2.3). Apple allocates r32 and up for
  * every form; this keeps every other encoder on r0..r31. */
 #define G5P_OP_OR 0xce
-#define G5P_MAX_HOMES 96
+
+/* home_reuse: the first register above r31 no live value holds */
+static unsigned alloc_home(struct gctx *c)
+{
+   for (unsigned i = 0; i < G5P_MAX_HOMES; i++)
+      if (!(c->hbusy[i / 64] & BITFIELD64_BIT(i % 64))) {
+         c->hbusy[i / 64] |= BITFIELD64_BIT(i % 64);
+         c->hmax = MAX2(c->hmax, i + 1);
+         return 32 + i;
+      }
+   refuse(c, "register pressure: all %u registers above r31 hold live values", G5P_MAX_HOMES);
+}
 
 static void park(struct gctx *c, nir_instr *ins)
 {
@@ -2394,6 +2473,8 @@ static void park(struct gctx *c, nir_instr *ins)
       int h = c->home ? c->home[d->index * 4 + k] : -1;
       if (h < 0)
          continue;
+      if (c->home_reuse)
+         h = alloc_home(c);
       if (c->tex_pending & BITFIELD64_BIT(v->reg))
          tex_flush(c);
       uint8_t raw[G5P_USC_MAX];
@@ -2412,7 +2493,8 @@ static int pick_home(struct gctx *c)
    int best = -1;
    for (unsigned i = 0; i < c->nvals; i++) {
       struct val *v = &c->vals[i];
-      if (!v->held || v->state != VAL_REG || !v->body || v->last <= c->now || c->home[i] >= 0 ||
+      if (!v->held || v->state != VAL_REG || !(v->body || (c->home_reuse && v->decl)) || v->last <= c->now ||
+          c->home[i] >= 0 ||
           (c->reserved & BITFIELD64_BIT(v->reg)))
          continue;
       if (best < 0 || v->last > c->vals[best].last)
@@ -3919,7 +4001,7 @@ static void vs_bitwise(struct gctx *c, nir_alu_instr *a)
  * bank 1, header 0x31 (m_imin_rr, m_isub_rr); a literal in A with header 0x11
  * (m_imin_lit, m_imax_neg, m_isub_lit, m_isub_big; ineg is 0 - x, m_ineg);
  * a common-store operand in A (m_imin_u; m_isub_u is u - x, m_isub_u2 x - u
- * by routing 0x70). The fragment form (bank 0, header 1) in a vertex program
+ * by routing 0x70), with either register in bank 0. The fragment form (bank 0, header 1) in a vertex program
  * reads other registers (the vertex shift, device run 1). x - k is an iadd of
  * -k (Apple's v_iadd_lit form). */
 static void vs_minsub(struct gctx *c, nir_alu_instr *a)
@@ -3969,7 +4051,11 @@ static void vs_minsub(struct gctx *c, nir_alu_instr *a)
       unsigned xr = reg_of(c, x, name);
       unsigned g = vgrp(c, x);
       unsigned dst = vs_dst(c, &x, 1);
-      vs_bank1_only(c, sub ? "vertex shared isub" : "vertex shared min/max", dst, xr, -1, -1);
+      /* Either register may be in bank 0: the instruction's bank is the
+       * destination's and header bit 0x10 marks B in bank 1, the same
+       * fields as the register forms. Apple's compiler emits this form with
+       * every destination and B bank pair (eight values clamped by eight
+       * uniforms under attribute pressure), byte-equal to these encoders. */
       unsigned n = sub ? g5p_usc_alu_shared(raw, G5P_BIN_ISUB, H(c, dst), sd, H(c, xr), vbank(c, dst), g,
                                             vhdr(c, 0x11, -1, xr, -1), 0, 0, false,
                                             i ? 0x70 : -1, 1)
@@ -4661,6 +4747,17 @@ static void emit_intrinsic(struct gctx *c, nir_intrinsic_instr *in)
       }
       break;
    }
+   case nir_intrinsic_load_smp_meta_pco: {
+      /* a preloaded sampler metadata dword (plan_common()) */
+      struct range *r = range_for(c, PCO_G5P_UPLOAD_SAMPLER_META, nir_intrinsic_desc_set(in),
+                                  nir_intrinsic_binding(in), nir_src_as_uint(in->src[0]));
+      for (unsigned k = 0; k < in->def.num_components; k++) {
+         struct val *v = V(c, &in->def, k);
+         v->state = VAL_SHARED;
+         v->imm = r->common + (4 * nir_intrinsic_component(in) - r->lo) / 4 + k;
+      }
+      break;
+   }
    case nir_intrinsic_get_ssbo_size: {
       unsigned set, binding, element;
       if (!block_binding_element(in->src[0].ssa, &set, &binding, &element))
@@ -4703,6 +4800,16 @@ static void emit_intrinsic(struct gctx *c, nir_intrinsic_instr *in)
    case nir_intrinsic_load_reg: { /* a copy: nir_trivialize_registers adds movs, which are register maps here */
       nir_def *decl = in->src[0].ssa;
       struct val *dv = V(c, decl, 0);
+      if (dv->state == VAL_HOME && !c->vs) {
+         /* home_reuse: the register's home above r31, G9P's move back (park()) */
+         if (!V(c, &in->def, 0)->uses)
+            break;
+         unsigned dst = alloc_reg(c, -1);
+         put(c, raw, g5p_usc_alu2_wide(raw, G5P_OP_OR, dst, dv->reg, 0, dv->reg, 0),
+             "register read from a home above r31");
+         define(c, &in->def, dst);
+         break;
+      }
       if (!dv->held)
          refuse(c, "load_reg: NIR register without a register");
       if (!V(c, &in->def, 0)->uses)
@@ -4719,6 +4826,17 @@ static void emit_intrinsic(struct gctx *c, nir_intrinsic_instr *in)
    }
    case nir_intrinsic_store_reg: {
       struct val *dv = V(c, in->src[1].ssa, 0);
+      if (dv->state == VAL_HOME && !c->vs) {
+         /* home_reuse: the value into the register's home above r31 (park()'s move). The read is counted
+          * (vgrp()) so no earlier read of the value takes the last-read group; this one keeps group 0. */
+         struct ref r = resolve_value(c, in->src[0].ssa, 0);
+         unsigned src = reg_of(c, r, "store_reg");
+         (void)vgrp(c, r);
+         put(c, raw, g5p_usc_alu2_wide(raw, G5P_OP_OR, dv->reg, src, 0, src, 0),
+             "register write to a home above r31");
+         free_scratch(c);
+         break;
+      }
       if (!dv->held)
          refuse(c, "store_reg: NIR register without a register");
       struct ref r = resolve_value(c, in->src[0].ssa, 0);
@@ -5449,15 +5567,20 @@ static void hoist_iterators(struct gctx *c)
          fc = nir_instr_as_intrinsic(ins);
    bool fc_used = fc && (V(c, &fc->def, 0)->uses || V(c, &fc->def, 1)->uses);
    bool fc_w = fc && V(c, &fc->def, 3)->uses;
-   if (fc_w) {
-      /* f_raster_pos_w: native position W reads coefficient set zero,
-       * followed by WDF. plan_varyings reserves W even for a shader with
-       * no smooth user input. Z has a different layout and stays refused.
-       * The token has no counter-1 form, so issue it first. */
+   bool fc_z = fc && V(c, &fc->def, 2)->uses;
+   /* Apple's compiles f_raster_pos_w / f_raster_pos_z: the
+    * native position iterator reads one screen-linear coefficient set: W at
+    * set 0, Z at the set after it (set 0 without W; plan_varyings()). The
+    * token has no counter-1 form, so these are issued first. */
+   for (unsigned k = 3; k >= 2; k--) {
+      if (!(k == 3 ? fc_w : fc_z))
+         continue;
+      assert(k == 3 ? c->p->w_set : c->p->z_set);
+      const bool set1 = k == 2 && c->p->w_set;
       drc_take(c, &d);
       unsigned r = alloc_reg(c, -1);
-      put(c, raw, g5p_usc_position_zw(raw, 2 * r, false, false, -1), "raster position W");
-      struct val *v = V(c, &fc->def, 3);
+      put(c, raw, g5p_usc_position_zw(raw, 2 * r, set1, false, -1), k == 3 ? "raster position W" : "raster position Z");
+      struct val *v = V(c, &fc->def, k);
       v->state = VAL_REG;
       v->reg = r;
       v->held = true;
@@ -5470,7 +5593,7 @@ static void hoist_iterators(struct gctx *c)
          reads += varying_reads(c, nir_instr_as_intrinsic(ins));
    /* The raster position read has no witnessed counter-1 form: it goes
     * first when the batch spills onto counter 1, else last (round 18). */
-   bool fc_first = fc_used && reads + 1 + fc_w > 8;
+   bool fc_first = fc_used && reads + 1 + fc_w + fc_z > 8;
    if (fc_first) {
       drc_take(c, &d);
       c->fragcoord = alloc_run(c, 2, "gl_FragCoord");
@@ -7130,6 +7253,7 @@ static bool speculable(nir_instr *i)
       case nir_intrinsic_store_reg:
       case nir_intrinsic_load_push_constant:
       case nir_intrinsic_load_ubo:
+      case nir_intrinsic_load_smp_meta_pco:
       case nir_intrinsic_load_frag_coord:
          return true;
       default:
@@ -7313,6 +7437,15 @@ static void decl_alloc(struct gctx *c, int ip)
       if (c->decl_held[i] || c->decl_first[i] > ip)
          continue;
       c->decl_held[i] = true;
+      v->decl = true;
+      if (c->home_reuse && c->home[c->decls[i]->index * 4] >= 0) {
+         /* home_reuse: a loop-carried register lives above r31 from its first
+          * access to its last (released by release()); each load_reg moves it
+          * into a register, each store_reg moves the value there. */
+         v->state = VAL_HOME;
+         v->reg = alloc_home(c);
+         continue;
+      }
       v->state = VAL_REG;
       const bool out = c->alloc_out;
       c->alloc_out = c->vs && c->vs_bank0 && c->decl_out[i];
@@ -7679,6 +7812,8 @@ static bool codegen(struct gctx *c)
       c->vals[i].last = -1;
    for (unsigned i = 0; i < c->impl->ssa_alloc; i++)
       c->rh_half[i] = -1;
+   c->hbusy[0] = c->hbusy[1] = 0;
+   c->hmax = 0;
    if (c->ndecls)
       memset(c->decl_held, 0, c->ndecls * sizeof(*c->decl_held));
    c->stack_used = false;
@@ -7758,8 +7893,8 @@ static bool codegen(struct gctx *c)
       c->max_dword = MAX2(c->max_dword, c->st + 1);
    out->temps = c->vs && c->vs_bank0 ? MAX2(8, align(c->max_dword, 4)) :
                 MAX3(8, align(c->max_dword, 4), align(c->max_bank0, 4));
-   if (c->nhomes) {
-      out->temps = MAX2(out->temps, align(32 + c->nhomes, 4));
+   if (c->home_reuse ? c->hmax : c->nhomes) {
+      out->temps = MAX2(out->temps, align(32 + (c->home_reuse ? c->hmax : c->nhomes), 4));
       out->evidence |= PCO_G5P_EV_HIGH_REGS;
    }
    out->written_temps = c->vs ? (c->vs_bank0 ? MAX2(8, align(c->max_written, 4)) :
@@ -8250,7 +8385,7 @@ bool pco_g5p_compile_general_key(nir_shader *nir, bool half_output, const uint8_
 
 static bool compile_general_link(nir_shader *nir, bool half_output, const uint8_t *attrib_components,
                                   const struct pco_g5p_fs_key *key, const struct pco_g5p_vs_link *link,
-                                  struct pco_g5p_program *out, bool preserve_cf, bool evict)
+                                  struct pco_g5p_program *out, bool preserve_cf, bool evict, bool last)
 {
    static const struct pco_g5p_fs_key default_key = {.write_mask = 0xf};
    memset(out, 0, sizeof(*out));
@@ -8349,6 +8484,15 @@ static bool compile_general_link(nir_shader *nir, bool half_output, const uint8_
       out->evidence |= PCO_G5P_EV_CF;
       if (preserve_cf)
          NIR_PASS(_, nir, nir_lower_all_phis_to_scalar);
+      /* The last fragment attempt: a phi whose value is another phi's (an
+       * if/else chain's result passed out level by level) reads it through
+       * the scalarized vec4 and its movs, so out-of-SSA gives every level its
+       * own register, all held across the whole chain. Copy propagation makes
+       * the outer phi read the inner one, and they become one register web. */
+      if (last && c->cf && !c->vs) {
+         NIR_PASS(_, nir, nir_opt_copy_prop);
+         NIR_PASS(_, nir, nir_opt_dce);
+      }
       cf_out_of_ssa(nir);
       /* Vertex control flow (Apple's v_loop, v_brk, v_ifelse, v_nested): the
        * loop state, the compares and the mask stack in bank 0, the values of
@@ -8467,6 +8611,41 @@ homes_retry:
       ok = two_pass(c);
       goto homes_retry;
    }
+   /* Last fragment retry, only for a program every step above refused: the
+    * homes as an allocator. G9P's homes give each parked value its own
+    * register above r31 for the whole program, so a program that parks more
+    * than 96 values over its length runs out (Dolphin's output resampling:
+    * four 16-tap bicubic paths, each 16 vec4 samples live at once). Here a
+    * register above r31 is taken when its value is defined and free again
+    * after the value's last read (release()), as Apple's A9 programs use
+    * r32..r69 as ordinary temporaries. Each attempt
+    * parks as many more values as the failing allocation asked dwords for.
+    * The moves are the same G9P OR moves; only the register numbers are
+    * reused, and the temps count the highest register used. */
+   if (!ok && last && !c->vs && strstr(out->refusal, "register pressure")) {
+      memset(c->home, -1, c->impl->ssa_alloc * 4);
+      c->nhomes = 0;
+      c->home_reuse = c->remat = c->lazy_iter = true;
+      c->need = 1;
+      codegen_reset(c);
+      ok = two_pass(c);
+      while (!ok && strstr(out->refusal, "register pressure") && !strstr(out->refusal, "above r31") &&
+             c->nhomes < G5P_MAX_VICTIMS) {
+         unsigned picked = 0;
+         for (; picked < MAX2(c->need, 1); picked++) {
+            const int victim = pick_home(c);
+            if (victim < 0)
+               break;
+            c->home[victim] = 1; /* home_reuse: a flag; park() picks the register */
+            c->nhomes++;
+         }
+         if (!picked)
+            break;
+         c->need = 1;
+         codegen_reset(c);
+         ok = two_pass(c);
+      }
+   }
    for (unsigned split = 0; !ok && c->vs && !c->cf && split < 16 &&
                              strstr(out->refusal, "register pressure") &&
                              !impl_has_side_effects(c->impl); split++) {
@@ -8519,18 +8698,30 @@ bool pco_g5p_compile_general_link(nir_shader *nir, bool half_output, const uint8
     * from its own order, before the scheduling retries reordered it, with the
     * attributes moved out of bank 1 where a bank-1-only form needs room
     * (evict_vertex_bank1()). Programs that compile today never get there. */
-   nir_shader *original = (nir->info.stage == MESA_SHADER_FRAGMENT && cf_left(nir)) ||
-                                nir->info.stage == MESA_SHADER_VERTEX
-                             ? nir_shader_clone(NULL, nir) : NULL;
-   bool ok = compile_general_link(nir, half_output, attrib_components, key, link, out, false, false);
+   /* A fragment program every attempt below refused for pressure is compiled
+    * a last time (compile_general_link()'s last): its own control flow with
+    * the if/else chains' phi webs coalesced, and the registers above r31
+    * reused after each value's last read (home_reuse). Without control flow
+    * left the first attempt is the last. Programs that compile today never
+    * get there, so their bytes are unchanged. */
+   const bool fs = nir->info.stage == MESA_SHADER_FRAGMENT;
+   const bool fs_cf = fs && cf_left(nir);
+   nir_shader *original = fs_cf || nir->info.stage == MESA_SHADER_VERTEX ? nir_shader_clone(NULL, nir) : NULL;
+   bool ok = compile_general_link(nir, half_output, attrib_components, key, link, out, false, false, fs && !fs_cf);
+   nir_shader *final = NULL;
+   if (!ok && fs_cf && strstr(out->refusal, "register pressure"))
+      final = nir_shader_clone(NULL, original);
    if (!ok && original && strstr(out->refusal, "register pressure")) {
       char first[sizeof(out->refusal)];
       memcpy(first, out->refusal, sizeof(first));
       const bool vs = nir->info.stage == MESA_SHADER_VERTEX;
-      ok = compile_general_link(original, half_output, attrib_components, key, link, out, !vs, vs);
+      ok = compile_general_link(original, half_output, attrib_components, key, link, out, !vs, vs, false);
       if (!ok && vs) /* the ladder's own reason stays the one reported */
          memcpy(out->refusal, first, sizeof(first));
    }
+   if (!ok && final && strstr(out->refusal, "register pressure"))
+      ok = compile_general_link(final, half_output, attrib_components, key, link, out, true, false, true);
+   ralloc_free(final);
    ralloc_free(original);
    return ok;
 }

@@ -29,6 +29,7 @@
 #include "pco/pco.h"
 #include "pco_g5p_general.h"
 #include "pvr_g5p.h"
+#include "pvr_g5p_shader_dump.h"
 #include "pvr_g5p_vertex.h"
 
 /* nir->options must outlive the shader (the general backend runs NIR passes
@@ -228,6 +229,308 @@ ubo_block_bytes(nir_shader *nir, nir_def *d, unsigned *bytes)
    return false;
 }
 
+/* A constant term of a UBO offset as the backend evaluates it
+ * (pco_g5p_general.c eval_offset): ubo_offset_const() or a sum of them. */
+static bool
+ubo_offset_eval(nir_scalar s, uint32_t *v)
+{
+   s = nir_scalar_chase_movs(s);
+   if (ubo_offset_const(s, v))
+      return true;
+   uint32_t x, y;
+   if (nir_scalar_is_alu(s) && nir_scalar_alu_op(s) == nir_op_iadd &&
+       ubo_offset_eval(nir_scalar_chase_alu_src(s, 0), &x) && ubo_offset_eval(nir_scalar_chase_alu_src(s, 1), &y)) {
+      *v = x + y;
+      return true;
+   }
+   return false;
+}
+
+/*
+ * A register-indexed UBO load the backend's direct form does not take:
+ * offset = (x << s) + C with s from ishl or a multiply by a power of two
+ * (pco_g5p_general.c dyn_ubo_offset), read as a scalar at s != 1 or as a
+ * vec4 at s == 4, s <= 4 and C a multiple of the load. Anything else with a
+ * non-constant offset (a sum of two dynamic terms, a non-power-of-two
+ * stride, a larger or smaller shift) is general and goes through
+ * general_dyn_ubo(). A shift by a non-constant amount is neither.
+ */
+static bool
+dyn_ubo_general(nir_intrinsic_instr *in)
+{
+   if (in->intrinsic != nir_intrinsic_load_ubo || in->def.bit_size != 32)
+      return false;
+   uint32_t c = 0, v;
+   nir_scalar s = nir_scalar_chase_movs(nir_get_scalar(in->src[1].ssa, 0));
+   if (ubo_offset_eval(s, &v))
+      return false; /* a constant offset: preloaded */
+   for (unsigned guard = 0; guard < 8 && nir_scalar_is_alu(s) && nir_scalar_alu_op(s) == nir_op_iadd; guard++) {
+      nir_scalar a = nir_scalar_chase_alu_src(s, 0), b = nir_scalar_chase_alu_src(s, 1);
+      if (ubo_offset_eval(a, &v))
+         s = nir_scalar_chase_movs(b);
+      else if (ubo_offset_eval(b, &v))
+         s = nir_scalar_chase_movs(a);
+      else
+         return true; /* two dynamic terms */
+      c += v;
+   }
+   unsigned shift = 0;
+   if (nir_scalar_is_alu(s) && (nir_scalar_alu_op(s) == nir_op_ishl || nir_scalar_alu_op(s) == nir_op_imul)) {
+      if (!ubo_offset_eval(nir_scalar_chase_alu_src(s, 1), &v))
+         return false;
+      if (nir_scalar_alu_op(s) == nir_op_imul) {
+         if (!util_is_power_of_two_nonzero(v))
+            return true; /* a non-power-of-two stride */
+         v = util_logbase2(v);
+      }
+      shift = v;
+   }
+   /* the backend sees the load after its trailing unread components are trimmed */
+   const unsigned n = MAX2(util_last_bit(nir_def_components_read(&in->def)), 1);
+   const unsigned loaded = (n == 2 || n == 3) && shift == 4 && !(c % 16) ? 4 : n;
+   return !((loaded == 4 && shift == 4) || (n == 1 && shift != 1)) || shift > 4 || c % (4 * loaded);
+}
+
+/* s / 2^k for an offset term built from constants, iadd, a multiply by a
+ * constant and a shift by a constant, when each part divides exactly (the
+ * element index Apple's compiler computes); NULL otherwise. */
+static nir_def *
+dyn_ubo_div(nir_builder *b, nir_scalar s, unsigned k, unsigned depth)
+{
+   const uint32_t mask = (1u << k) - 1;
+   uint32_t v;
+   s = nir_scalar_chase_movs(s);
+   if (ubo_offset_eval(s, &v))
+      return v & mask ? NULL : nir_imm_int(b, (int32_t)v >> k);
+   if (!nir_scalar_is_alu(s) || depth > 8)
+      return NULL;
+   nir_scalar x = nir_scalar_chase_alu_src(s, 0), y = nir_scalar_chase_alu_src(s, 1);
+   switch (nir_scalar_alu_op(s)) {
+   case nir_op_iadd: {
+      nir_def *p = dyn_ubo_div(b, x, k, depth + 1);
+      nir_def *q = p ? dyn_ubo_div(b, y, k, depth + 1) : NULL;
+      if (!q)
+         return NULL;
+      if (nir_scalar_is_const(nir_get_scalar(q, 0)))
+         return nir_iadd_imm(b, p, nir_scalar_as_uint(nir_get_scalar(q, 0)));
+      if (nir_scalar_is_const(nir_get_scalar(p, 0)))
+         return nir_iadd_imm(b, q, nir_scalar_as_uint(nir_get_scalar(p, 0)));
+      return nir_iadd(b, p, q);
+   }
+   case nir_op_imul: {
+      if (!nir_scalar_is_const(y)) {
+         nir_scalar t = x;
+         x = y;
+         y = t;
+      }
+      if (!nir_scalar_is_const(y))
+         return NULL;
+      const int32_t m = (int32_t)nir_scalar_as_uint(y);
+      if (!(m & mask))
+         return nir_imul_imm(b, nir_channel(b, x.def, x.comp), (uint32_t)(m >> k));
+      nir_def *p = dyn_ubo_div(b, x, k, depth + 1);
+      return p ? nir_imul_imm(b, p, (uint32_t)m) : NULL;
+   }
+   case nir_op_ishl: {
+      if (!nir_scalar_is_const(y))
+         return NULL;
+      const unsigned n = nir_scalar_as_uint(y) & 31;
+      if (n >= k)
+         return nir_ishl_imm(b, nir_channel(b, x.def, x.comp), n - k);
+      return dyn_ubo_div(b, x, k - n, depth + 1); /* (x << n) / 2^k = x / 2^(k - n) */
+   }
+   default:
+      return NULL;
+   }
+}
+
+/* dyn_ubo_div() would succeed (nothing is built) */
+static bool
+dyn_ubo_divides(nir_scalar s, unsigned k, unsigned depth)
+{
+   const uint32_t mask = (1u << k) - 1;
+   uint32_t v;
+   s = nir_scalar_chase_movs(s);
+   if (ubo_offset_eval(s, &v))
+      return !(v & mask);
+   if (!nir_scalar_is_alu(s) || depth > 8)
+      return false;
+   nir_scalar x = nir_scalar_chase_alu_src(s, 0), y = nir_scalar_chase_alu_src(s, 1);
+   switch (nir_scalar_alu_op(s)) {
+   case nir_op_iadd:
+      return dyn_ubo_divides(x, k, depth + 1) && dyn_ubo_divides(y, k, depth + 1);
+   case nir_op_imul:
+      if (!nir_scalar_is_const(y)) {
+         nir_scalar t = x;
+         x = y;
+         y = t;
+      }
+      return nir_scalar_is_const(y) &&
+             (!(nir_scalar_as_uint(y) & mask) || dyn_ubo_divides(x, k, depth + 1));
+   case nir_op_ishl: {
+      if (!nir_scalar_is_const(y))
+         return false;
+      const unsigned n = nir_scalar_as_uint(y) & 31;
+      return n >= k || dyn_ubo_divides(x, k - n, depth + 1);
+   }
+   default:
+      return false;
+   }
+}
+
+/* offset = d + c: the dynamic part and the sum of the constant terms */
+static nir_scalar
+dyn_ubo_peel(nir_intrinsic_instr *in, uint32_t *c)
+{
+   nir_scalar s = nir_scalar_chase_movs(nir_get_scalar(in->src[1].ssa, 0));
+   uint32_t v;
+   *c = 0;
+   for (unsigned guard = 0; guard < 8 && nir_scalar_is_alu(s) && nir_scalar_alu_op(s) == nir_op_iadd; guard++) {
+      nir_scalar a = nir_scalar_chase_alu_src(s, 0), b = nir_scalar_chase_alu_src(s, 1);
+      if (ubo_offset_eval(a, &v))
+         s = nir_scalar_chase_movs(b);
+      else if (ubo_offset_eval(b, &v))
+         s = nir_scalar_chase_movs(a);
+      else
+         break;
+      *c += v;
+   }
+   return s;
+}
+
+/*
+ * Zink reads a GL uniform block as an array of uints, so a vec4 at a general
+ * offset arrives as four scalar loads at d + c, c + 4, c + 8, c + 12. When
+ * d + c is a multiple of 16 by construction (k*48 + 32), the four are one
+ * vec4 load, which general_dyn_ubo() reads with one 16-byte load at shift 4
+ * (as Apple's compiler reads a float4 at p[k*3 + 1]). Only complete quads of general loads are merged, as
+ * vec4_dyn_ubo() does for the direct form.
+ */
+static bool
+vec4_general_dyn_ubo(nir_shader *nir)
+{
+   bool progress = false;
+   nir_foreach_function_impl (impl, nir) {
+      nir_builder b = nir_builder_create(impl);
+      nir_foreach_block (block, impl) {
+         bool again;
+         do {
+            again = false;
+            nir_foreach_instr (instr, block) {
+               if (instr->type != nir_instr_type_intrinsic)
+                  continue;
+               nir_intrinsic_instr *lo = nir_instr_as_intrinsic(instr), *q[4] = { lo };
+               uint32_t c, e;
+               if (lo->def.num_components != 1 || !dyn_ubo_general(lo))
+                  continue;
+               nir_scalar d = dyn_ubo_peel(lo, &c);
+               if (c % 16 || !dyn_ubo_divides(d, 4, 0))
+                  continue;
+               unsigned found = 1;
+               for (nir_instr *i = nir_instr_next(instr); i && found < 4; i = nir_instr_next(i)) {
+                  if (i->type != nir_instr_type_intrinsic)
+                     continue;
+                  nir_intrinsic_instr *in = nir_instr_as_intrinsic(i);
+                  if (in->def.num_components != 1 || !dyn_ubo_general(in) || in->src[0].ssa != lo->src[0].ssa)
+                     continue;
+                  nir_scalar y = dyn_ubo_peel(in, &e);
+                  if (!nir_scalar_equal(d, y) || e < c + 4 || e > c + 12 || (e - c) % 4 || q[(e - c) / 4])
+                     continue;
+                  q[(e - c) / 4] = in;
+                  found++;
+               }
+               if (found < 4)
+                  continue;
+               /* the range that covers all four (the bound when the block size is unknown) */
+               uint64_t end = 0;
+               for (unsigned j = 0; j < 4; j++)
+                  end = MAX2(end, nir_intrinsic_range(q[j]) == ~0u ? UINT64_MAX
+                                  : (uint64_t)nir_intrinsic_range_base(q[j]) + nir_intrinsic_range(q[j]));
+               b.cursor = nir_before_instr(instr);
+               nir_def *v = nir_load_ubo(&b, 4, 32, lo->src[0].ssa, lo->src[1].ssa,
+                                         .access = nir_intrinsic_access(lo), .align_mul = 16, .align_offset = 0,
+                                         .range_base = 0, .range = end >= UINT32_MAX ? ~0u : (uint32_t)end);
+               for (unsigned j = 0; j < 4; j++) {
+                  nir_def_rewrite_uses(&q[j]->def, nir_channel(&b, v, j));
+                  if (j)
+                     nir_instr_remove(&q[j]->instr);
+               }
+               nir_instr_remove(instr);
+               progress = again = true;
+               break; /* the block changed under the iterator */
+            }
+         } while (again);
+      }
+      nir_progress(progress, impl, nir_metadata_control_flow);
+   }
+   return progress;
+}
+
+/*
+ * The general register-indexed UBO load, as Apple's A9 compiler reads a
+ * constant buffer at a computed offset (Metal, constant float *p:
+ * p[k*3 + j + 2] is imul, iadd, iadd and addr.add_shift at shift 2; a
+ * constant float4 *p read at p[k*3 + 1] is the same at shift 4, one 16-byte
+ * load): the element index is computed with integer
+ * ALU, then the pointer pair = buffer + (index << s) and one 4- or 16-byte
+ * load. Here offset' = umin(offset >> s, last) << s, the backend's direct
+ * form with a clamped index (robust access; the pair add does not
+ * sign-extend), with offset >> s built term by term where it divides
+ * exactly (k*12 + j*4 + 8 at s = 2 is k*3 + j + 2) and a ushr otherwise.
+ * s is 4 for a vec4 whose alignment is 16, else 2 per 32-bit component; a
+ * vec4 below 16-byte alignment becomes four scalar loads. A load whose
+ * block size is unknown, or below 4-byte alignment, keeps its shape (and
+ * stays refused by name).
+ */
+static void
+dyn_ubo_rewrite(nir_builder *b, nir_intrinsic_instr *in, unsigned shift, unsigned size)
+{
+   const unsigned bytes = shift == 4 ? 16 : 4;
+   b->cursor = nir_before_instr(&in->instr);
+   nir_scalar off = nir_get_scalar(in->src[1].ssa, 0);
+   nir_def *index = dyn_ubo_div(b, off, shift, 0);
+   if (!index)
+      index = nir_ushr_imm(b, nir_channel(b, off.def, off.comp), shift);
+   index = nir_umin(b, index, nir_imm_int(b, (size - bytes) >> shift));
+   nir_src_rewrite(&in->src[1], nir_ishl_imm(b, index, shift));
+}
+
+static bool
+general_dyn_ubo(nir_builder *b, nir_intrinsic_instr *in, void *data)
+{
+   nir_shader *nir = data;
+   if (!dyn_ubo_general(in) || nir_intrinsic_align(in) < 4)
+      return false;
+   const unsigned n = in->def.num_components;
+   const unsigned shift = n == 4 && (nir_intrinsic_align(in) >= 16 ||
+                                     dyn_ubo_divides(nir_get_scalar(in->src[1].ssa, 0), 4, 0)) ? 4 : 2;
+   /* the block's size; else the bytes the load's deref chain can reach
+    * (nir_lower_explicit_io's range, e.g. Zink's ubos[n] with n > 1) */
+   unsigned size;
+   if (!ubo_block_bytes(nir, in->src[0].ssa, &size)) {
+      if (nir_intrinsic_range(in) == ~0u || nir_intrinsic_range_base(in) + (uint64_t)nir_intrinsic_range(in) > UINT32_MAX)
+         return false;
+      size = nir_intrinsic_range_base(in) + nir_intrinsic_range(in);
+   }
+   if (size < (shift == 4 ? 16 : 4))
+      return false;
+   if (shift == 4 || n == 1) {
+      dyn_ubo_rewrite(b, in, shift, size);
+      return true;
+   }
+   b->cursor = nir_before_instr(&in->instr);
+   nir_def *comp[NIR_MAX_VEC_COMPONENTS];
+   for (unsigned k = 0; k < n; k++) {
+      comp[k] = nir_load_ubo(b, 1, 32, in->src[0].ssa, nir_iadd_imm(b, in->src[1].ssa, 4 * k),
+                             .access = nir_intrinsic_access(in), .align_mul = 4, .align_offset = 0,
+                             .range_base = 0, .range = ~0u);
+      dyn_ubo_rewrite(b, nir_def_as_intrinsic(comp[k]), 2, size);
+      b->cursor = nir_after_instr(nir_def_instr(comp[k]));
+   }
+   nir_def_replace(&in->def, nir_vec(b, comp, n));
+   return true;
+}
+
 static bool
 clamp_dyn_ubo(nir_shader *nir)
 {
@@ -239,7 +542,7 @@ clamp_dyn_ubo(nir_shader *nir)
             if (instr->type != nir_instr_type_intrinsic)
                continue;
             nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
-            if (in->intrinsic != nir_intrinsic_load_ubo || in->def.bit_size != 32)
+            if (in->intrinsic != nir_intrinsic_load_ubo || in->def.bit_size != 32 || dyn_ubo_general(in))
                continue;
             /* offset = shift(x) + c, the shape the backend folds */
             nir_scalar s = nir_scalar_chase_movs(nir_get_scalar(in->src[1].ssa, 0));
@@ -372,7 +675,9 @@ g5p_nir(const uint32_t *spv, size_t words, mesa_shader_stage stage, const char *
    static util_once_flag once = UTIL_ONCE_FLAG_INIT;
    util_call_once(&once, g5p_init_options);
    struct spirv_capabilities caps = { .Shader = true, .Float16 = true, .Int16 = true, .Int8 = true,
-                                      .Int64 = true, .Float64 = true, .TransformFeedback = true };
+                                      .Int64 = true, .Float64 = true, .TransformFeedback = true,
+                                      /* user clip distances: the TA user planes (pvr_g5p_clip_distance_probe()) */
+                                      .ClipDistance = true };
    struct spirv_to_nir_options opts = {
       .environment = NIR_SPIRV_VULKAN,
       .capabilities = &caps,
@@ -444,6 +749,13 @@ g5p_nir_prepare(nir_shader *nir)
    NIR_PASS(progress, nir, vec4_dyn_ubo);
    if (stage == MESA_SHADER_FRAGMENT && pco_g5p_fs_dyn_ubo())
       NIR_PASS(progress, nir, clamp_dyn_ubo);
+   /* after the clamp, which leaves these loads alone: their index is clamped here */
+   NIR_PASS(_, nir, vec4_general_dyn_ubo);
+   if (nir_shader_intrinsics_pass(nir, general_dyn_ubo, nir_metadata_control_flow, nir)) {
+      NIR_PASS(_, nir, nir_opt_constant_folding);
+      NIR_PASS(_, nir, nir_opt_cse);
+      progress = true;
+   }
    if (progress) {
       NIR_PASS(_, nir, nir_opt_copy_prop);
       NIR_PASS(_, nir, nir_opt_dce);
@@ -665,6 +977,152 @@ meta_blit_2d(nir_shader *nir)
    nir_shader_instructions_pass(nir, meta_tex_2d, nir_metadata_control_flow, NULL);
 }
 
+/*
+ * The one-layer program variant (pvr_g5p_pipeline::one_layer): every 2D
+ * array sample the backend would draw as an array sample (all but the
+ * constant layer-0 ones, layer0_as_2d() in pco_g5p_general.c) becomes a 2D
+ * sample of the view's base layer. With one layer that is exact: Vulkan's
+ * layer is clamp(RNE(z), 0, layers - 1) for filtered samples, and a texel
+ * fetch at any other layer is out of bounds (undefined: robustImageAccess is
+ * not exposed). The A9 has no array state for a linear image (AGXMetalA9
+ * ImageStateEncoderGen2::ImageStateFields: a linear 2D array encodes no
+ * texture type), so a one-layer view of a linear image (every single-level
+ * 2D colour image on G5P) needs this form when a program samples it at a
+ * layer it computes (Dolphin's EFB copy, restore and palette programs). Apple
+ * never meets the case: Metal types its textures at creation and makes every
+ * array twiddled. The draw selects this variant (g5p_cmd_draw()) only when an
+ * array sample's view has no array state, and its uploads refuse a
+ * multi-layer view by name (PCO_G5P_UPLOAD_IMAGE_ONE_LAYER).
+ */
+thread_local bool pvr_g5p_one_layer_compile;
+
+static bool
+one_layer_as_2d(nir_builder *b, nir_instr *instr, void *data)
+{
+   if (instr->type != nir_instr_type_tex)
+      return false;
+   nir_tex_instr *t = nir_instr_as_tex(instr);
+   if (!t->is_array || t->sampler_dim != GLSL_SAMPLER_DIM_2D || t->coord_components != 3 ||
+       (t->op != nir_texop_tex && t->op != nir_texop_txb && t->op != nir_texop_txl &&
+        t->op != nir_texop_txd && t->op != nir_texop_txf && t->op != nir_texop_tg4))
+      return false;
+   const int ci = nir_tex_instr_src_index(t, nir_tex_src_coord);
+   if (ci < 0)
+      return false;
+   /* layer0_as_2d()'s own samples keep their form (and their bytes) */
+   nir_scalar z = nir_scalar_chase_movs(nir_get_scalar(t->src[ci].src.ssa, 2));
+   if (nir_scalar_is_const(z) &&
+       (t->op == nir_texop_txf ? nir_scalar_as_int(z) == 0 : nir_scalar_as_float(z) <= 0.5))
+      return false;
+   b->cursor = nir_before_instr(instr);
+   nir_src_rewrite(&t->src[ci].src, nir_trim_vector(b, t->src[ci].src.ssa, 2));
+   t->coord_components = 2;
+   t->is_array = false;
+   t->backend_flags |= PCO_G5P_TEX_ONE_LAYER_AS_2D;
+   return true;
+}
+
+static void
+one_layer_lower(nir_shader *nir)
+{
+   if (nir_shader_instructions_pass(nir, one_layer_as_2d, nir_metadata_control_flow, NULL)) {
+      nir_opt_dce(nir);
+      nir_index_ssa_defs(nir_shader_get_entrypoint(nir));
+   }
+}
+
+/*
+ * The LOD-bias program variant (pvr_g5p_pipeline::lod_bias): every fragment sample that uses its
+ * sampler's LOD adds the bound sampler's mipLodBias, read per binding from the sampler descriptor
+ * (load_smp_meta_pco of PVR_G5P_SAMPLER_META_LOD_BIAS, a preloaded uniform: PCO_G5P_UPLOAD_SAMPLER_META).
+ * The A9 sampler word has no bias field: AGXMetalA9 builds it from MTLSamplerDescriptor's filters,
+ * address modes, compare, anisotropy and LOD clamps only (-[AGXA9FamilyDevice
+ * newSamplerStateWithDescriptor:] 0x207ccd0bc reads no lodBias; AGX::SamplerStateEncoderGen2<>::
+ * SamplerStateFields 0x207d80720 packs min/max LOD x 64), and Metal's LOD bias is the shader's sample
+ * argument (bias(b)), the biased sample form. Vulkan's LOD operation:
+ *    lambda' = lambda_base + clamp(sampler bias + shader bias, -maxSamplerLodBias, maxSamplerLodBias),
+ * lambda_base the implicit LOD, or the explicit one (txl), then clamped to [minLod, maxLod] (the sampler
+ * word's clamps, applied after the bias as Metal's are). So:
+ *  - tex: the biased sample (txb) by the sampler's bias (clamped when the sampler was made);
+ *  - txb: by clamp(shader bias + sampler bias);
+ *  - txl: at lod + sampler bias;
+ *  - txd: gradients scaled by exp2(sampler bias): lambda_base = log2(rho), rho linear in the
+ *    gradients, so log2(rho * 2^b) = lambda_base + b (anisotropic: the ratio is unchanged).
+ * txf, size queries and gathers do not use the sampler's LOD. The draw selects this variant only when a
+ * bound sampler of such a sample has a non-zero bias; base programs are unchanged.
+ */
+thread_local bool pvr_g5p_lod_bias_compile;
+
+static bool
+lod_bias_tex(nir_builder *b, nir_instr *instr, void *data)
+{
+   if (instr->type != nir_instr_type_tex)
+      return false;
+   nir_tex_instr *t = nir_instr_as_tex(instr);
+   if (t->op != nir_texop_tex && t->op != nir_texop_txb && t->op != nir_texop_txl && t->op != nir_texop_txd)
+      return false;
+   if (t->sampler_dim == GLSL_SAMPLER_DIM_BUF || (t->backend_flags & PCO_G5P_TEX_SAMPLER_BIAS))
+      return false;
+   nir_deref_instr *d = nir_get_tex_deref(t, nir_tex_src_sampler_deref);
+   if (!d)
+      d = nir_get_tex_deref(t, nir_tex_src_texture_deref);
+   unsigned element = 0;
+   if (d && d->deref_type == nir_deref_type_array) {
+      nir_deref_instr *parent = nir_deref_instr_parent(d);
+      /* the backend refuses these by name (tex_deref()) */
+      if (!parent || parent->deref_type != nir_deref_type_var || !nir_src_is_const(d->arr.index))
+         return false;
+      element = nir_src_as_uint(d->arr.index);
+   } else if (!d || d->deref_type != nir_deref_type_var) {
+      return false;
+   }
+   const nir_variable *var = nir_deref_instr_get_variable(d);
+   if (!var)
+      return false;
+   b->cursor = nir_before_instr(instr);
+   nir_def *bias = nir_load_smp_meta_pco(b, 1, nir_imm_int(b, element), .desc_set = var->data.descriptor_set,
+                                         .binding = var->data.binding,
+                                         .component = PVR_G5P_SAMPLER_META_LOD_BIAS);
+   switch (t->op) {
+   case nir_texop_tex:
+      nir_tex_instr_add_src(t, nir_tex_src_bias, bias);
+      t->op = nir_texop_txb;
+      break;
+   case nir_texop_txb: {
+      const int i = nir_tex_instr_src_index(t, nir_tex_src_bias);
+      nir_def *sum = nir_fadd(b, t->src[i].src.ssa, bias);
+      sum = nir_fmin(b, nir_fmax(b, sum, nir_imm_float(b, -PVR_G5P_MAX_SAMPLER_LOD_BIAS)),
+                     nir_imm_float(b, PVR_G5P_MAX_SAMPLER_LOD_BIAS));
+      nir_src_rewrite(&t->src[i].src, sum);
+      break;
+   }
+   case nir_texop_txl: {
+      const int i = nir_tex_instr_src_index(t, nir_tex_src_lod);
+      nir_src_rewrite(&t->src[i].src, nir_fadd(b, t->src[i].src.ssa, bias));
+      break;
+   }
+   case nir_texop_txd: {
+      nir_def *scale = nir_fexp2(b, bias);
+      const int x = nir_tex_instr_src_index(t, nir_tex_src_ddx), y = nir_tex_instr_src_index(t, nir_tex_src_ddy);
+      nir_src_rewrite(&t->src[x].src, nir_fmul(b, t->src[x].src.ssa, scale));
+      nir_src_rewrite(&t->src[y].src, nir_fmul(b, t->src[y].src.ssa, scale));
+      break;
+   }
+   default:
+      UNREACHABLE("filtered above");
+   }
+   t->backend_flags |= PCO_G5P_TEX_SAMPLER_BIAS;
+   return true;
+}
+
+static void
+lod_bias_lower(nir_shader *nir)
+{
+   if (nir->info.stage == MESA_SHADER_FRAGMENT &&
+       nir_shader_instructions_pass(nir, lod_bias_tex, nir_metadata_control_flow, NULL))
+      nir_index_ssa_defs(nir_shader_get_entrypoint(nir));
+}
+
 /* The graphics lowerings of a prepared stage (the ICD's graphics_nir()) */
 static nir_shader *
 graphics_lower(nir_shader *nir, unsigned color_targets, bool *sample_mask, bool point_size, bool *psize_dropped)
@@ -673,6 +1131,8 @@ graphics_lower(nir_shader *nir, unsigned color_targets, bool *sample_mask, bool 
 
    if (nir)
       meta_blit_2d(nir);
+   if (nir && pvr_g5p_one_layer_compile)
+      one_layer_lower(nir);
    if (nir && nir_shader_intrinsics_pass(nir, lower_layer_0, nir_metadata_control_flow, NULL)) {
       nir->info.outputs_written &= ~BITFIELD64_BIT(VARYING_SLOT_LAYER);
       BITSET_CLEAR(nir->info.system_values_read, SYSTEM_VALUE_LAYER_ID);
@@ -680,6 +1140,8 @@ graphics_lower(nir_shader *nir, unsigned color_targets, bool *sample_mask, bool 
       nir_opt_dce(nir);
       nir_index_ssa_defs(nir_shader_get_entrypoint(nir));
    }
+   if (nir && pvr_g5p_lod_bias_compile)
+      lod_bias_lower(nir);
    if (nir && stage == MESA_SHADER_VERTEX && !point_size && !xfb_captures(nir, VARYING_SLOT_PSIZ) &&
        nir_shader_intrinsics_pass(nir, drop_point_size, nir_metadata_control_flow, NULL)) {
       /* polygon mode POINT needs to know (pco_g5p_program::psize_dropped) */

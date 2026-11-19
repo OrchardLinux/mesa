@@ -243,8 +243,8 @@ pvr_g5p_sampler_encode(const VkSamplerCreateInfo *ci, bool extension, bool mip_n
       return "compare op";
    if (ci->unnormalizedCoordinates)
       return "unnormalized coordinates";
-   if (ci->mipLodBias != 0.0f)
-      return "LOD bias (no field in the sampler word)";
+   /* mipLodBias: no field in the sampler word (AGXMetalA9's SamplerStateFields has none). The descriptor
+    * carries it (PVR_G5P_SAMPLER_META_LOD_BIAS) and the LOD-bias program variant adds it in the shader. */
    if (extension)
       return "YCbCr conversion, reduction mode or custom border colour";
    addr[0] = pvr_g5p_smp_address(ci->addressModeU, ci->borderColor);
@@ -336,11 +336,31 @@ pvr_g5p_tex_size(const uint32_t state[4], unsigned level, uint32_t out[4])
  *  - ARRAY: the state must be an array's (a single-layer array view of a
  *    linear image has only its 2D state: sampled at a non-constant layer).
  */
+/*
+ *  - ONE_LAYER (an array sample at any layer of a one-layer view, drawn as 2D:
+ *    the one-layer program variant): as AS_2D, but only for one layer. A
+ *    2D_ARRAY state of more layers would read its base layer where the
+ *    application asked for another, so it is refused by name.
+ */
+static inline bool
+pvr_g5p_tex_state_one_layer(const uint32_t dw[4])
+{
+   const unsigned layout = dw[0] & 7;
+   const uint64_t q1 = dw[2] | (uint64_t)dw[3] << 32;
+   return layout == PVR_G5P_TEX_LAYOUT_2D || (layout == PVR_G5P_TEX_LAYOUT_2D_ARRAY &&
+                                              !((q1 >> PVR_G5P_TEX_DEPTH_SHIFT) & 0x3fff));
+}
+
 static inline const char *
 pvr_g5p_tex_state_for(uint32_t dw[8], unsigned flags)
 {
    const unsigned layout = dw[0] & 7;
-   if (flags & 1u /* PCO_G5P_UPLOAD_IMAGE_AS_2D */) {
+   if ((flags & 4u /* PCO_G5P_UPLOAD_IMAGE_ONE_LAYER */) && !pvr_g5p_tex_state_one_layer(dw))
+      return layout == PVR_G5P_TEX_LAYOUT_2D_ARRAY
+                ? "a multi-layer array view where the one-layer program variant samples (a program samples a "
+                  "one-layer view of a linear image and a multi-layer array view at non-constant layers)"
+                : "a one-layer array sample of a 3D or cube view";
+   if (flags & 5u /* PCO_G5P_UPLOAD_IMAGE_AS_2D, _ONE_LAYER */) {
       if (layout == PVR_G5P_TEX_LAYOUT_2D_ARRAY) {
          uint64_t q0 = dw[0] | (uint64_t)dw[1] << 32, q1 = dw[2] | (uint64_t)dw[3] << 32;
          q0 = (q0 & ~UINT64_C(7)) | PVR_G5P_TEX_LAYOUT_2D;

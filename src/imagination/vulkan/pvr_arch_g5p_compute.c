@@ -456,6 +456,14 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
             mesa_logw("G5P refuses: compute set %u binding %u: a sampler without A9 words",u->set,u->binding);
             return vk_errorf(cmd_buffer,VK_ERROR_OUT_OF_HOST_MEMORY,"G5P compute: a sampler without A9 words");
          }
+         /* the A9 sampler word has no LOD bias: graphics adds it in the LOD-bias fragment variant
+          * (pvr_g5p_nir.c lod_bias_lower()); compute samples at a shared constant level and has no such
+          * program, so a biased sampler is refused rather than sampled at the unbiased level */
+         if(d[2*ROGUE_NUM_TEXSTATE_SAMPLER_WORDS+PVR_G5P_SAMPLER_META_LOD_BIAS]) {
+            mesa_logw("G5P refuses: compute set %u binding %u: a sampler LOD bias of %g (no LOD-bias compute program)",
+                      u->set,u->binding,uif(d[2*ROGUE_NUM_TEXSTATE_SAMPLER_WORDS+PVR_G5P_SAMPLER_META_LOD_BIAS]));
+            return vk_errorf(cmd_buffer,VK_ERROR_OUT_OF_HOST_MEMORY,"G5P compute: a sampler LOD bias");
+         }
          memcpy(out,d,4*2);
          break;
       case G9P_A9_UP_SIZE:

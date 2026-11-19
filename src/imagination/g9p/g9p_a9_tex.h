@@ -147,6 +147,12 @@ a9_txs(struct g9p_ctx *ctx, nir_tex_instr *tex)
       a9_tex_refuse(ctx, "texture size query of a texture without a constant binding");
       return false;
    }
+   /* a buffer view's size is its element count (pvr_g5p_tbo_upload()), which
+    * the compute uploads do not carry; texel-buffer fetches are refused too */
+   if (tex->sampler_dim == GLSL_SAMPLER_DIM_BUF) {
+      a9_tex_refuse(ctx, "texel-buffer size query in a compute shader");
+      return false;
+   }
    if (tex->op == nir_texop_txs && li >= 0) {
       if (!nir_src_is_const(tex->src[li].src)) {
          a9_tex_refuse(ctx, "textureDimensions at a non-constant level in a compute shader");

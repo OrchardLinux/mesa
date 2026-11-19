@@ -60,4 +60,12 @@ const VkPipelineShaderStageCreateInfo *pvr_g5p_stub_stage(VkShaderStageFlagBits 
  * raised: a refused one fails as before instead of being admitted without programs */
 extern thread_local unsigned pvr_g5p_internal_pipeline;
 
+/* Set while the driver compiles a pipeline's one-layer variant: its stages' array samples are drawn as 2D
+ * samples of a one-layer view (pvr_g5p_nir.c one_layer_as_2d()) */
+extern thread_local bool pvr_g5p_one_layer_compile;
+
+/* Set while the driver compiles a pipeline's LOD-bias variant: its fragment samples add their sampler's
+ * mipLodBias (pvr_g5p_nir.c lod_bias_lower()) */
+extern thread_local bool pvr_g5p_lod_bias_compile;
+
 #endif

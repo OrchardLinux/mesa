@@ -500,16 +500,15 @@ pvr_get_buffer_format_features2(struct pvr_physical_device *pdevice,
    }
 
    if (vk_format_is_scaled(vk_format))
-      /*
+      return flags;
+
+   /*
     * G9P: no texel buffers yet. Mesa's PBO path samples one when it is offered, and
-    * its fallback works; ES 3.0 does not have them.
+    * its fallback works; ES 3.0 does not have them. (This returned for every
+    * architecture once the scaled-format return above lost its statement.)
     */
    if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g9p))
-      flags &= ~(VK_FORMAT_FEATURE_2_UNIFORM_TEXEL_BUFFER_BIT |
-                 VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_BIT |
-                 VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_ATOMIC_BIT);
-
-   return flags;
+      return flags;
 
    flags |= VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT |
             VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT;
@@ -564,12 +563,16 @@ pvr_get_buffer_format_features2(struct pvr_physical_device *pdevice,
       break;
    }
 
-   /* no texel buffers on G5P: the backend refuses buffer textures
-    * (tex_shape_refusal()), so neither uniform nor storage texel buffers
-    * (nor the storage bits derived from them below) are claimed */
+   /* G5P: Rogue's texel-buffer bits are not the A9's. Its uniform texel
+    * buffers are the qualified formats of pvr_g5p_tbo_features(); storage
+    * texel buffers (and the storage bits derived from them below) are not
+    * claimed */
    if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g5p))
       flags &= ~(VK_FORMAT_FEATURE_2_UNIFORM_TEXEL_BUFFER_BIT | VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_BIT |
-                 VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_ATOMIC_BIT);
+                 VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_ATOMIC_BIT |
+                 /* image features (Rogue lists them for buffers too): the A9's buffer features are its
+                  * vertex formats and the texel buffers below */
+                 VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT);
    PVR_G5P_HOOK(texel_features, pdevice, vk_format, flags)
    if (flags & VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_BIT) {
       flags |= VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |
