@@ -682,6 +682,34 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
       assert(k <= ARRAY_SIZE(kernel_code));
       kernel_code_dwords = k;
    }
+   /* The A8's plain launches, AGXMetalA8's words (iPod touch 6 capture, all 25 kernels):
+    * one data unit, no fence. A kernel that reads neither the
+    * workgroup ID nor threadgroup memory gets no IF1 part and no common store (k_store_one: KERNEL0 0x2106,
+    * c2c00002 d3000000 f0024001 fc000002 d3000000, data USC, temps, 0x80000000). One that reads the ID gets
+    * Apple's layout, the ID's control word at c2 and the local ID's at c3 (c2c00003 f0024001 d3000000 f0034001
+    * fc000002 d3000000, KERNEL0 0x42106); Apple writes 32 bits (0x90000000, its kernels read x only), we keep
+    * 64 (x and y, the form tested on the device, which completes). Barrier and z launches keep the form above. */
+   /* a9_local_dwords is 4 threadgroup words + the shared memory (g9p_a9_compute.h) */
+   const bool g4p_if1 = state->uses_workgroup_id || state->a9_local_dwords > 4;
+   const bool g4p_plain = g4p && !state->a9_has_barriers && !state->a9_wgid_z;
+   if (g4p_plain) {
+      unsigned k = 0;
+      memset(&kernel_data[2], 0, sizeof(kernel_data) - 2 * sizeof(kernel_data[0]));
+      kernel_code[k++] = g9p_pds_bra_not_if1(g4p_if1 ? 3 : 2);
+      if (g4p_if1) {
+         kernel_data[2] = PVR_ROGUE_PDSINST_DOUT_FIELDS_DOUTW_SRC1_LAST_EN |
+                          PVR_ROGUE_PDSINST_DOUT_FIELDS_DOUTW_SRC1_DEST_COMMON_STORE |
+                          PVR_ROGUE_PDSINST_DOUT_FIELDS_DOUTW_SRC1_BSIZE_ALL64;
+         kernel_code[k++] = G5P_PDS_DOUT(g4p, G9P_DOUTW, 0, G9P_PDS_TEMPS, 2, 0);
+      }
+      kernel_code[k++] = g9p_pds_halt();
+      kernel_data[g4p_if1 ? 3 : 2] = 0x80000000;
+      kernel_code[k++] = G5P_PDS_DOUT(g4p, G9P_DOUTW, 0, G9P_PDS_TEMPS, g4p_if1 ? 3 : 2, 0);
+      kernel_code[k++] = G5P_PDS_DOUT(g4p, G9P_DOUTU, 0, G9P_PDS_DATA, 0, G9P_PDS_END | G9P_PDS_CC);
+      kernel_code[k++] = g9p_pds_halt();
+      kernel_code_dwords = k;
+      kernel_dwords = 4;
+   }
    result = pvr_arch_cmd_buffer_upload_pds(cmd_buffer, kernel_data,
                                            kernel_dwords,
                                            ROGUE_CDMCTRL_KERNEL1_DATA_ADDR_ALIGNMENT,
@@ -695,14 +723,17 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
    {
       struct pvr_csb *csb = &sub_cmd->control_stream;
       const struct g5p_cdm_record bind_rec =
-         g5p_cdm_dma_task(G9P_CDM_DATA_BLOCKS(bind_dwords / 4), bind.data_offset,
+         g5p_cdm_dma_task(G5P_CDM_DATA_UNITS(g4p, bind_dwords / 4), bind.data_offset,
                           bind.code_offset, (state->a9_device_fence || images || nup) ? 4 : DIV_ROUND_UP(2 * n + 1, 16));
       struct g5p_cdm_record kernel_rec = g5p_cdm_kernel(
          G9P_CDM_KERNEL_REGS(bank1) | G9P_CDM_ANY_CLUSTER |
-            G9P_CDM_FENCE |
-            G9P_CDM_DATA_BLOCKS(kernel_dwords / 4),
+            /* the A8: no fence on a kernel (Apple's 25 records; the fence bit locks the job up) */
+            (g4p ? 0 : G9P_CDM_FENCE) |
+            G5P_CDM_DATA_UNITS(g4p, kernel_dwords / 4),
          kernel.data_offset, kernel.code_offset, group_count[0], group_count[1],
-         group_count[2], hw_threads, DIV_ROUND_UP(state->a9_local_dwords, 16));
+         group_count[2], hw_threads,
+         /* the A8's no-IF1 launch has no common store (k_store_one's 0x2106) */
+         (g4p_plain && !g4p_if1) ? 0 : DIV_ROUND_UP(state->a9_local_dwords, 16));
       /* KERNEL8 max_instances: the A8 sets it the way AGXMetalA8 does (g5p_cdm_max_instances_g4p());
        * the A9 leaves it 0 (32 instances per task) */
       const uint32_t max_instances =
@@ -834,12 +865,69 @@ upload_end_barrier(struct pvr_cmd_buffer *cmd, struct pvr_pds_upload *out)
    return pvr_arch_cmd_buffer_upload_pds(cmd, data, 8, 16, code, 3, 32, 64, out);
 }
 
+/*
+ * The A8's end of a compute pass, AGXMetalA8's last two records after each encoder (iPod touch 6 capture,
+ * dispatch 0's K3 and K4): a task on all clusters that kicks an empty USC program (KERNEL0 0x4, one data unit;
+ * PDS c2c00002 d3000000 fc000002 d3000000, data {USC, 0x10}), then a fenced PDS-only task (KERNEL0 0x7, PDS
+ * c2c00002 d3000000 f0000005 d3000000: DOUTC, data zero). No type-3 fence blocks: Mesa's A9 tail (barrier task,
+ * fence blocks, the USC fence-ack task) locks the A8 up. Apple's K2 before them (a DMA of
+ * 12 dwords from a driver buffer at 0x1_00000000 and a USC program) is left out: K0 + K4 alone completes on
+ * the A8, and what K2's source holds on iOS is not known.
+ */
+static VkResult
+g5p_compute_end_pass_g4p(struct pvr_cmd_buffer *cmd, struct pvr_sub_cmd_compute *sub)
+{
+   struct pvr_pds_upload kick, fence;
+   sub->g5p_kernel_since_end = false;
+   /* the empty USC program: a branch to END, padded to 64 bytes (upload_cdm_task) */
+   uint8_t usc[128] = {0};
+   unsigned at = g5p_usc_branch(usc, 64, false);
+   while (at < 64)
+      at += g5p_usc_special(usc + at, false);
+   at += g5p_usc_special(usc + at, true);
+   struct pvr_suballoc_bo *bo;
+   VkResult r = pvr_gpu_upload_usc(cmd->device, usc, ALIGN_POT(at, 64), 64, &bo);
+   if (r != VK_SUCCESS) return r;
+   list_add(&bo->link, &cmd->bo_list);
+   uint32_t kdata[4] = {usc_offset(cmd->device, bo), 0x10, 0, 0};
+   uint32_t kcode[4] = {
+      g9p_pds_bra_not_if1(2),
+      g9p_pds_halt(),
+      G5P_PDS_DOUT(true, G9P_DOUTU, 0, G9P_PDS_DATA, 0, G9P_PDS_END | G9P_PDS_CC),
+      g9p_pds_halt(),
+   };
+   r = pvr_arch_cmd_buffer_upload_pds(cmd, kdata, 4, 16, kcode, 4, 32, 64, &kick);
+   if (r != VK_SUCCESS) return r;
+   uint32_t fdata[4] = {0};
+   uint32_t fcode[4] = {
+      g9p_pds_bra_not_if1(2),
+      g9p_pds_halt(),
+      G5P_PDS_DOUT(true, G9P_DOUTC, 0, G9P_PDS_DATA, 0, 0),
+      g9p_pds_halt(),
+   };
+   r = pvr_arch_cmd_buffer_upload_pds(cmd, fdata, 4, 16, fcode, 4, 16, 16, &fence);
+   if (r != VK_SUCCESS) return r;
+   struct g5p_cdm_record rec;
+   pvr_csb_set_relocation_mark(&sub->control_stream);
+   /* K3: KERNEL1 0x8 | DMA (Apple's 0xa: usc_common_shared and the DMA kind) */
+   rec = g5p_cdm_task(G5P_CDM_DATA_UNITS(true, 1), kick.data_offset, G9P_CDM_K1_DMA | 0x8u, kick.code_offset);
+   emit_record(&sub->control_stream, &rec);
+   /* K4: fence, any cluster, one unit = 0x7 */
+   rec = g5p_cdm_task(G9P_CDM_FENCE | G9P_CDM_ANY_CLUSTER | G5P_CDM_DATA_UNITS(true, 1), fence.data_offset,
+                      G9P_CDM_K1_FENCE, fence.code_offset);
+   emit_record(&sub->control_stream, &rec);
+   pvr_csb_clear_relocation_mark(&sub->control_stream);
+   return pvr_csb_get_status(&sub->control_stream);
+}
+
 VkResult
 PVR_PER_ARCH(g5p_compute_end_pass)(struct pvr_cmd_buffer *cmd,
                                   struct pvr_sub_cmd_compute *sub)
 {
    uint32_t data[4] = {0}, code[4];
    struct pvr_pds_upload fence, fenced, kick, barrier;
+   if (PVR_HAS_FEATURE(&cmd->device->pdevice->dev_info, apple_g4p))
+      return g5p_compute_end_pass_g4p(cmd, sub);
    /* after a dispatch only, as iOS: a pass whose dispatches were all
     * bodyless (omitted) keeps the plain tail */
    const bool end_barrier = sub->g5p_kernel_since_end;

@@ -62,6 +62,10 @@ static inline uint32_t g5p_pds_dout_g4p(uint32_t type, uint32_t src64, uint32_t 
 /* A DOUT for the chip: Rogue's layout on the A8 (g4p), Apple's extended one otherwise */
 #define G5P_PDS_DOUT(g4p, ...) ((g4p) ? g5p_pds_dout_g4p(__VA_ARGS__) : g9p_pds_dout(__VA_ARGS__))
 
+/* KERNEL0's PDS data size in 16-byte units: the A8 counts them directly (every captured A8 record: one unit
+ * = 1, k_store_one's 0x2106, its binding DMA's two = 2, 0x00040008), G9P/A9 minus one */
+#define G5P_CDM_DATA_UNITS(g4p, n) ((g4p) ? (uint32_t)(n) << 2 : G9P_CDM_DATA_BLOCKS(n))
+
 /*
  * The A8's CDM KERNEL8 max_instances (bits 27-31; 32 wraps to 0), as
  * AGXMetalA8 computes it (iOS 12.4, 0x1a1428938): a workgroup of 32 or more

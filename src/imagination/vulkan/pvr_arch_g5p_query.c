@@ -463,14 +463,15 @@ emit_query_dispatch(struct pvr_cmd_buffer *cmd_buffer,
       return result;
 
    const struct g5p_cdm_record bind_record =
-      g5p_cdm_dma_task(G9P_CDM_DATA_BLOCKS(bind_dwords / 4),
+      g5p_cdm_dma_task(G5P_CDM_DATA_UNITS(g4p, bind_dwords / 4),
                        bind.data_offset,
                        bind.code_offset,
                        DIV_ROUND_UP(2 * num_buffers + 1, 16));
    const uint32_t groups = DIV_ROUND_UP(params->count, G5P_QUERY_LOCAL_SIZE);
    struct g5p_cdm_record kernel_record = g5p_cdm_kernel(
       G9P_CDM_KERNEL_REGS(program->g5p_num_regs) | G9P_CDM_ANY_CLUSTER |
-         G9P_CDM_FENCE | G9P_CDM_DATA_BLOCKS(G5P_QUERY_KERNEL_DATA_DWORDS / 4),
+         /* the A8: no fence on a kernel, data units counted directly (pvr_arch_g5p_compute.c) */
+         (g4p ? 0 : G9P_CDM_FENCE) | G5P_CDM_DATA_UNITS(g4p, G5P_QUERY_KERNEL_DATA_DWORDS / 4),
       kernel.data_offset,
       kernel.code_offset,
       groups,
