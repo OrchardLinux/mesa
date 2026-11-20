@@ -790,10 +790,28 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
          return G5P_REFUSE(cmd_buffer, "colour target format %s", vk_Format_to_str(iview->vk.format));
       if (!t && PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p)) {
          /* The A8's PBE words for target 0 (the kernel's 3D record W+0x118): the formats captured on the A8 */
+         /*
+          * The formats whose A8 encoding the iPod captures prove:
+          * the end of tile's state word is the PBE packmode << 16 | the conversion (2 normalised, 0 float), the
+          * fragment program, clear and end-of-tile USC are BGRA8's for every 4-channel single target, and the
+          * PBE swizzle is BGRA8's or the identity
+          */
          const VkFormat f = iview->vk.format;
-         if (f != VK_FORMAT_B8G8R8A8_UNORM && f != VK_FORMAT_R8G8B8A8_UNORM)
-            return G5P_REFUSE(cmd_buffer, "A8 colour target format %s (RGBA8 and BGRA8 UNORM are captured)",
+         switch (f) {
+         case VK_FORMAT_B8G8R8A8_UNORM:
+         case VK_FORMAT_R8G8B8A8_UNORM:
+            g->a8_eot_format = ROGUE_PBESTATE_PACKMODE_U8U8U8U8 << 16 | 2;
+            break;
+         case VK_FORMAT_R16G16B16A16_SFLOAT:
+            g->a8_eot_format = ROGUE_PBESTATE_PACKMODE_F16F16F16F16 << 16 | 0; /* Apple: 0x000a0000 */
+            break;
+         case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+            g->a8_eot_format = ROGUE_PBESTATE_PACKMODE_A2R10B10G10 << 16 | 2; /* Apple: 0x000e0002 */
+            break;
+         default:
+            return G5P_REFUSE(cmd_buffer, "A8 colour target format %s (captured: BGRA8/RGBA8 UNORM, RGBA16F, RGB10A2)",
                               vk_Format_to_str(f));
+         }
          g5p_pbe_a8_reg_words(g->a8_pbe, iview->vk.extent.width, iview->vk.extent.height,
                               f == VK_FORMAT_B8G8R8A8_UNORM ? G5P_PBE_A8_SWIZZLE_BGRA : G5P_PBE_A8_SWIZZLE_RGBA,
                               twiddled, level->pitch / 4);
@@ -999,7 +1017,7 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
                            "colour target is captured", nt, g->samples, raw ? ", integer" : "");
       pbe_words[0] = (uint32_t)target0_addr;
       pbe_words[1] = (uint32_t)(target0_addr >> 32);
-      pbe_words[2] = 2;
+      pbe_words[2] = g->a8_eot_format; /* packmode << 16 | conversion */
       pbe_words[3] = 0;
       pbe_dwords = 4;
    }
