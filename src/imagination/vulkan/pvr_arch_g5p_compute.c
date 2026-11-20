@@ -346,6 +346,12 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
 
    if (base_group[0] || base_group[1] || base_group[2])
       return vk_errorf(cmd_buffer, VK_ERROR_OUT_OF_HOST_MEMORY, "G5P: base dispatch not implemented yet");
+   /* Apple's A8 driver has no indirect dispatch: AGXMetalA8's
+    * dispatchThreadgroupsWithIndirectBuffer:indirectBufferOffset:threadsPerThreadgroup: is a bare return
+    * (0x1a14458d4; the sampled encoder's 0x1a1447638 only books statistics) */
+   if (indirect_va && g4p)
+      return vk_errorf(cmd_buffer, VK_ERROR_FEATURE_NOT_PRESENT,
+                       "G5P: an indirect dispatch on the A8 (Apple's A8 driver has none; not hardware-proven)");
    if (indirect_va && ((indirect_va & 3) || indirect_va >> 40))
       return vk_error(cmd_buffer, VK_ERROR_OUT_OF_HOST_MEMORY);
    if (!indirect_va && (!group_count[0] || !group_count[1] || !group_count[2]))
