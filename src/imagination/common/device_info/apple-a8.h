@@ -41,7 +41,6 @@ static const struct pvr_device_features pvr_device_features_3_V_4_5 = {
     * AGXMetalA8 and are not established yet, so compute pipelines are
     * refused by name (pvr_arch_g5p_compute.c).
     */
-   .has_astc = true,                    /* A8: ASTC from the A8 on (Metal GPU family 2) */
    .has_num_clusters = true,            /* A8 */
 
    /* A9 placeholders (apple-a9.h) */
