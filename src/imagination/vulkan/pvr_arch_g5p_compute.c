@@ -535,6 +535,18 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
                                                &uniforms_bo);
    if (result != VK_SUCCESS)
       return result;
+   /* The A8: the thread count in a block of its own, as AGXMetalA8's K0 reads it (iPod touch 6 capture: the
+    * address table at 0x1_00014100, the count at 0x1_00014140, each on a 64-byte line) rather than 8 bytes into
+    * the uniforms (8-byte aligned for an odd buffer count) */
+   uint64_t count_va = 0;
+   if (g4p) {
+      const uint32_t count_block[4] = { count, 0, 0, 0 };
+      struct pvr_suballoc_bo *count_bo;
+      result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, count_block, sizeof(count_block), &count_bo);
+      if (result != VK_SUCCESS)
+         return result;
+      count_va = count_bo->dev_addr.addr;
+   }
 
    /*
     * Binding task data: the source addresses (64-bit each), then one DOUTD
@@ -584,8 +596,11 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
          dest=31;dwords=1;
       } else {
          src = uniforms_bo->dev_addr.addr + 8 * k;
-         if (k == n)
+         if (k == n) {
             dwords = 1;
+            if (g4p)
+               src = count_va;
+         }
       }
       bind_data[2 * k] = src;
       bind_data[2 * k + 1] = src >> 32;
