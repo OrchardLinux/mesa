@@ -425,27 +425,30 @@ g9p_addr(struct g9p_code *c, unsigned dst, unsigned base_dword, unsigned idx,
 {
    if (g5p_usc_g4p && !c->fragment && !shift) {
       /*
-       * The A8 has no 64-bit add of a uniform pair: AGXMetalA8 (k_store_tid, k_store_const, k_iadd) forms
-       * base + offset from 32-bit adds, the carry of the low add (119d, op a5) added to the high uniform:
-       *   119d 0304 0101 4100 00a5   r2 = carry(s0 + r0)
-       *   1199 0302 8585 4100 00a1   r1 = s1 + r1
-       *   1199 0300 8181 4100 00a1   r0 = s0 + r0
-       * Our offset is a 32-bit byte offset, so the high half is the high uniform plus the carry. The carry goes
-       * to r[dst + 1] first unless that is the offset register (then the low add goes first). The A9 form
-       * below (1189 .. 01a1 0600) faults on the A8 (boot 8: a caught fault where Apple's job stores).
+       * The A8 has no 64-bit add of a uniform pair: AGXMetalA8 (k_store_tid, iPod touch 6 capture, USC heap 0x1ec0;
+       * also 0x1700) forms base + offset from 32-bit adds:
+       *   9911 0203 8585 4100 00a1   r1 = s1 + r1            (the offset's high word; ours is 32-bit: s1 alone)
+       *   9d11 0403 0101 4100 00a5   r2 = carry(s0 + r0)     the carry is the result's HIGH half, r2.hi
+       *   9931 0203 8b84 08a1        r1 = r1 + r2.hi         register A and B (header 0x31), B = half 2t + 1
+       *   9911 0003 8181 4100 00a1   r0 = s0 + r0
+       * Our offset is a 32-bit byte offset, so the high word starts as s1 alone, moved with Apple's common-store
+       * move (98 01 DD 03 85 01 00 41 54 01 38 00, the base-only address of the same capture). Order: the carry
+       * into r[dst + 1], s1 into r[dst], r[dst + 1] = r[dst] + r[dst + 1].hi, then the low add, which reads the
+       * offset last. Adding the carry's low half (half 2t, the previous form) put s0[31:16] into the high word: on
+       * the device, stores landed at 0x11_00100000 for 0x1_00100000. The A9 form below
+       * (1189 .. 01a1 0600) faults on the A8.
        */
       const unsigned u = base_dword, hi = dst + 1;
       const uint16_t u_ext = 0x4100 | ((u >> 5) & 7) << 1, u1_ext = 0x4100 | (((u + 1) >> 5) & 7) << 1;
-      const uint16_t lo_w2 = 0x0181 | (u & 31) << 2 | idx << 10 | (kill ? 0x8000 : 0);
-      if (idx == hi) {
-         G9P_EMIT(c, 0x1199, g9p_dst(c, dst), 0x0181 | (u & 31) << 2 | idx << 10, u_ext, G9P_IADD);
-         G9P_EMIT(c, 0x119d, g9p_dst(c, hi), 0x0101 | (u & 31) << 2 | idx << 10, u_ext, 0x00a5);
-         G9P_EMIT(c, 0x1199, g9p_dst(c, hi), 0x0181 | ((u + 1) & 31) << 2 | hi << 10, u1_ext, G9P_IADD);
+      if (idx == dst || idx == hi) {
+         c->error = "A8 address build: the offset register is in the destination pair";
          return;
       }
       G9P_EMIT(c, 0x119d, g9p_dst(c, hi), 0x0101 | (u & 31) << 2 | idx << 10, u_ext, 0x00a5);
-      G9P_EMIT(c, 0x1199, g9p_dst(c, hi), 0x0181 | ((u + 1) & 31) << 2 | hi << 10, u1_ext, G9P_IADD);
-      G9P_EMIT(c, 0x1199, g9p_dst(c, dst), lo_w2, u_ext, G9P_IADD);
+      G9P_EMIT(c, 0x0198, g9p_dst(c, dst), 0x0181 | ((u + 1) & 31) << 2, u1_ext, 0x0154, 0x0038);
+      G9P_EMIT(c, 0x3199, g9p_dst(c, hi), (0x81 | (2 * hi + 1) << 1) << 8 | 0x80 | (2 * dst) << 1, 0x08a1);
+      G9P_EMIT(c, 0x1199, g9p_dst(c, dst), 0x0181 | (u & 31) << 2 | idx << 10 | (kill ? 0x8000 : 0), u_ext,
+               G9P_IADD);
       return;
    }
    G9P_EMIT(c, g9p_w0(c, 0x1189), g9p_dst(c, dst),

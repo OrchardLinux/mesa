@@ -1456,6 +1456,13 @@ unsigned g5p_usc_address_load(uint8_t *out, unsigned dst_half, unsigned byte_cou
    return finish(out, raw, length);
 }
 
+/* The A8 has no 64-bit address add: AGXMetalA8 never emits class 0x89 (none in the iPod touch 6 shader and pass
+ * captures), the A10/A9 form faults in A8 compute, and Apple's A8 builds base + offset from 32-bit adds
+ * with the carry's high half (g9p_addr()). That build needs a scratch register the fragment/vertex allocator does
+ * not provide here yet, so graphics programs that index a buffer are refused on the A8. */
+#define G5P_A8_NO_ADDR_ADD "the A8 has no 64-bit address add (Apple's 32-bit carry build is not ported to " \
+                           "graphics programs)"
+
 /* `89 11` (vertex) / `89 01` (fragment): pair = pointer pair at common dword
  * `base` + (index << shift). Bytes from Apple's own compiles of a constant
  * buffer indexed by a register (tools/mesa-a9-gles3tex/dynubo.metal: v_cexpr,
@@ -1471,6 +1478,7 @@ unsigned g5p_usc_address_add_shift(uint8_t *out, unsigned pair_half, unsigned ba
    CHECK(half_register(index_half, "index_half requires a measured 32-bit register"), g5p_usc_error);
    CHECK(base_common_dword < 256 && !(base_common_dword & 1), "pointer base must be an even common dword below 256");
    CHECK(shift <= 4, "only shifts 0-4 are corpus-verified");
+   CHECK(!g5p_usc_g4p, G5P_A8_NO_ADDR_ADD);
    /* The layout of g5p_usc_alu_shared(): alu_header() (vertex code: destination bank 1, and B's bank bit in
     * the header), A = the pointer base (shared_src(), group 1; above dword 31 its high bits are the field that
     * the vertex XFB record's address add and every shared ALU operand use), B = the index with its last read,
@@ -2228,6 +2236,7 @@ unsigned g5p_usc_address_add(uint8_t *out, unsigned dst_half, unsigned ptr_dword
    CHECK(!(ptr_dword & 1), "64-bit pointer base must be pair aligned");
    CHECK(off_group <= 1, "off_group must be an integer in [0,1]");
    CHECK(shift <= 4, "address shifts 0..4 (uchar..uint4) are witnessed");
+   CHECK(!g5p_usc_g4p, G5P_A8_NO_ADDR_ADD);
    uint8_t raw[G5P_USC_MAX], a[4];
    if (!alu_header(raw, 0x89, dst_half, 1, 0x11, 0, 0) || !shared_src(a, ptr_dword, ptr_group))
       return 0;
