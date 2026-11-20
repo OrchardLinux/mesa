@@ -512,13 +512,23 @@ pvr_rt_rgn_headers_data_init(struct pvr_device *device,
 static VkResult pvr_rt_a8_rgn_ring_init(struct pvr_device *device,
                                         struct pvr_rt_dataset *rt_dataset,
                                         const struct pvr_rt_mtile_info *mtile_info,
+                                        uint32_t width,
+                                        uint32_t height,
+                                        uint32_t samples,
                                         uint32_t layers)
 {
    uint64_t rgn_headers_size;
 
    pvr_rt_get_region_headers_stride_size(device, mtile_info, layers, &rt_dataset->rgn_headers_stride,
                                          &rgn_headers_size);
-   const uint64_t frame = ALIGN_POT(rgn_headers_size, 0x1000);
+   /* The region headers of Apple's record (the A8/A9 kernel's s8003_rt_derive(), which refuses a smaller ring):
+    * five bytes per tile of the padded tile grid, 32x32 tiles in macrotiles of 4, the grid in multiples of 4
+    * macrotiles, twice as wide and high at 4 samples */
+   const uint32_t mx = ALIGN_POT((DIV_ROUND_UP(width, 32) + 3) >> 2, 4);
+   const uint32_t my = ALIGN_POT((DIV_ROUND_UP(height, 32) + 3) >> 2, 4);
+   const uint32_t s = samples == 4 ? 2 : 1;
+   const uint64_t apple_headers = (uint64_t)(mx * s * 4) * (my * s * 4) * 5 * layers;
+   const uint64_t frame = ALIGN_POT(MAX2(rgn_headers_size, apple_headers), 0x1000);
    const uint64_t ring = util_next_power_of_two64(16 * frame);
 
    VkResult result = pvr_bo_alloc_mirrored(device, device->heaps.general_heap, ring,
@@ -735,7 +745,7 @@ VkResult pvr_arch_render_target_dataset_create(
       goto err_pvr_free_list_destroy;
 
    if (PVR_HAS_FEATURE(dev_info, apple_g4p)) {
-      result = pvr_rt_a8_rgn_ring_init(device, rt_dataset, &mtile_info, layers);
+      result = pvr_rt_a8_rgn_ring_init(device, rt_dataset, &mtile_info, width, height, samples, layers);
       if (result != VK_SUCCESS)
          goto err_pvr_rt_vheap_rtc_data_fini;
    }
