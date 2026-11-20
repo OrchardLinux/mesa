@@ -114,6 +114,9 @@ struct pvr_g5p_programs {
    struct pvr_suballoc_bo *eot_usc[PVR_G5P_MRT_VARIANTS];
    /* PDS kicks of the clear programs (PDS_BGRND0's shader) */
    struct pvr_pds_upload clear_kick[PVR_G5P_MRT_VARIANTS];
+   /* the A8's background programs for one R8 [0] or RG8 [1] target (g5p_mrt_clear_usc_g4p_narrow()) */
+   struct pvr_suballoc_bo *clear_usc_narrow[2];
+   struct pvr_pds_upload clear_kick_narrow[2];
    /* PDS code: the clear colour's DOUTD (PDS_BGRND0's texunicode; its data,
     * {floats, control}, is per render) and the end of tile, DOUTD of the PBE
     * words then DOUTU of the end-of-tile program (data per render) */
@@ -198,6 +201,7 @@ struct pvr_g5p_job {
    uint32_t eot[4];             /* EVENT_PIXEL_PDS data, code, info */
    uint64_t a8_pbe[2];          /* the A8: target 0's PBESTATE_REG_WORD0/1 (g5p_pbe_a8_reg_words()) */
    uint32_t a8_eot_format;      /* the A8: the EOT state's format word, PBE packmode << 16 | conversion */
+   uint8_t a8_narrow_halves;    /* the A8: one R8 (1) or RG8 (2) target: one-word output (Apple's 111c) */
    uint32_t vdm_bytes;          /* through STREAM_TERMINATE */
    uint32_t width, height;
    unsigned targets;            /* colour targets, 1, 2 or 4 */

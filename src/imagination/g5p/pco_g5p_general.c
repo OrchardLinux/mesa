@@ -5701,6 +5701,12 @@ static void plan_fs_output(struct gctx *c)
    enum g5p_mrt_refusal mr = g5p_mrt_check_writes(&c->mrt, c->slot_written);
    if (mr != G5P_MRT_OK)
       refuse(c, "%s", g5p_mrt_refusal_str(mr));
+   if (c->key->a8_narrow_halves) {
+      /* the A8's R8/RG8: one output word (emitpix 111c), no narrow tex/iterator form */
+      c->mrt.words = 1;
+      c->mrt.emit_field = g5p_mrt_emit_field(1);
+      return;
+   }
    /* The narrow tex/iterator forms write output halves 0..3 directly: one target only. */
    bool all = c->mrt.targets == 1 && c->out_written[0] && c->out_written[1] && c->out_written[2] &&
               c->out_written[3];
@@ -5772,6 +5778,11 @@ static void fs_prologue(struct gctx *c)
    for (unsigned d = 0; d < c->mrt.words; d++) {
       uint16_t h0 = 0, h1 = 0;
       bool c0 = out_const(c, 2 * d, &h0), c1 = out_const(c, 2 * d + 1, &h1);
+      /* the A8's R8 output: half 1 is zero whatever the shader writes (Apple's 7130 literal) */
+      if (c->key->a8_narrow_halves == 1 && d == 0) {
+         c1 = true;
+         h1 = 0;
+      }
       if (!c0 && !c1)
          continue;
       if (!c0)

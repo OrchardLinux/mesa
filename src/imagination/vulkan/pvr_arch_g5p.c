@@ -225,6 +225,10 @@ g5p_free_programs(struct pvr_device *device, struct pvr_g5p_programs *p)
       pvr_bo_suballoc_free(p->clear_usc[i]);
       pvr_bo_suballoc_free(p->clear_kick[i].pvr_bo);
    }
+   for (unsigned i = 0; i < 2; i++) {
+      pvr_bo_suballoc_free(p->clear_usc_narrow[i]);
+      pvr_bo_suballoc_free(p->clear_kick_narrow[i].pvr_bo);
+   }
    for (unsigned i = 0; i < ARRAY_SIZE(p->raw_load); i++) {
       if (p->raw_load[i]) {
          g5p_free_programs(device, p->raw_load[i]);
@@ -436,6 +440,19 @@ g5p_upload_programs(struct pvr_device *device, struct pvr_g5p_programs *p)
       if (result != VK_SUCCESS)
          return result;
       result = g5p_upload_kick(device, p->clear_usc[i], 1, &p->clear_kick[i]);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+   /* the A8's R8 and RG8 background programs */
+   for (unsigned i = 0; g4p && i < 2; i++) {
+      uint8_t code[G5P_MRT_CLEAR_USC_MAX];
+      const unsigned size = g5p_mrt_clear_usc_g4p_narrow(code, i + 1);
+      if (!size)
+         return vk_errorf(device, VK_ERROR_UNKNOWN, "G5P: A8 narrow clear: %s", g5p_usc_error);
+      result = pvr_gpu_upload_usc(device, code, size, 64, &p->clear_usc_narrow[i]);
+      if (result != VK_SUCCESS)
+         return result;
+      result = g5p_upload_kick(device, p->clear_usc_narrow[i], 1, &p->clear_kick_narrow[i]);
       if (result != VK_SUCCESS)
          return result;
    }
@@ -797,6 +814,7 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
           * PBE swizzle is BGRA8's or the identity
           */
          const VkFormat f = iview->vk.format;
+         g->a8_narrow_halves = 0;
          switch (f) {
          case VK_FORMAT_B8G8R8A8_UNORM:
          case VK_FORMAT_R8G8B8A8_UNORM:
@@ -808,12 +826,23 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
          case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
             g->a8_eot_format = ROGUE_PBESTATE_PACKMODE_A2R10B10G10 << 16 | 2; /* Apple: 0x000e0002 */
             break;
+         case VK_FORMAT_R8_UNORM:
+            g->a8_eot_format = ROGUE_PBESTATE_PACKMODE_U8 << 16 | 2; /* Apple: 0x002f0002 */
+            g->a8_narrow_halves = 1;
+            break;
+         case VK_FORMAT_R8G8_UNORM:
+            g->a8_eot_format = ROGUE_PBESTATE_PACKMODE_U8U8 << 16 | 2; /* Apple: 0x00230002 */
+            g->a8_narrow_halves = 2;
+            break;
          default:
             return G5P_REFUSE(cmd_buffer, "A8 colour target format %s (captured: BGRA8/RGBA8 UNORM, RGBA16F, RGB10A2)",
                               vk_Format_to_str(f));
          }
          g5p_pbe_a8_reg_words(g->a8_pbe, iview->vk.extent.width, iview->vk.extent.height,
-                              f == VK_FORMAT_B8G8R8A8_UNORM ? G5P_PBE_A8_SWIZZLE_BGRA : G5P_PBE_A8_SWIZZLE_RGBA,
+                              f == VK_FORMAT_B8G8R8A8_UNORM ? G5P_PBE_A8_SWIZZLE_BGRA
+                              : f == VK_FORMAT_R8G8_UNORM  ? 04510u /* Apple's RG8 swizzle 0x948 */
+                              : f == VK_FORMAT_R8_UNORM    ? 04550u /* Apple's R8 swizzle 0x968 */
+                                                           : G5P_PBE_A8_SWIZZLE_RGBA,
                               twiddled, level->pitch / 4);
       }
       if ((level->pitch % 16 && !ms_store && !twiddled) || addr % 64)
@@ -1062,6 +1091,7 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
    } else {
       pvr_csb_pack (&bgnd[0], CR_PDS_BGRND0_BASE, b0) {
          b0.shader_addr = PVR_DEV_ADDR(raw ? p->raw_clear_kick[g5p_raw_variant(raw_total)].data_offset : g->samples == 4 ? p->clear_kick_ms.data_offset
+                                                     : g->a8_narrow_halves ? p->clear_kick_narrow[g->a8_narrow_halves - 1].data_offset
                                                      : p->clear_kick[v].data_offset);
          b0.texunicode_addr = PVR_DEV_ADDR(p->clear_dma.code_offset);
       }

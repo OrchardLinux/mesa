@@ -648,15 +648,15 @@ unsigned g5p_usc_coord_iterator(uint8_t *out, unsigned dst_half, unsigned slot, 
 
 unsigned g5p_usc_emit(uint8_t *out, unsigned words, unsigned source_half)
 {
-   CHECK(words == 2 || words == 4, "only two/four output words characterized");
    CHECK(source_half < 256, "output source half must be u8");
    if (g5p_usc_g4p) {
       /* A8: byte 3 bit 0 and the extension halfword 0x8200 (Apple's 1c 21 00 09 00 82 in every captured
        * fragment program; the A9's 1c 21 00 08) */
-      CHECK(words == 2, "A8 emitpix captured for two words only");
+      CHECK(words == 1 || words == 2, "A8 emitpix captured for one and two words only (111c, 211c)");
       const uint8_t g4[6] = {0x1c, (uint8_t)((words << 4) | 1), (uint8_t)source_half, 9, 0x00, 0x82};
       return finish_g4p(out, g4, 6);
    }
+   CHECK(words == 2 || words == 4, "only two/four output words characterized");
    uint8_t raw[4] = {0x1c, (words << 4) | 1, source_half, 8};
    return finish(out, raw, 4);
 }

@@ -120,6 +120,9 @@ struct pco_g5p_fs_key {
    bool packed_sint; /* saturate signed channels, then preserve low bits */
    bool packed_scalar8; /* R8: one scalar source; never pack unused G/B/A */
    uint8_t packed_uint_bits; /* 8/10/16: packed output, scalar8 is one word; full mask only */
+   /* The A8, one R8 (1) or RG8 (2) UNORM target: the f16 output is one word, halves 0..1, R8's half 1 zero
+    * (AGXMetalA8's 111c fragment programs, a8-passcap) */
+   uint8_t a8_narrow_halves;
    /* Apple's masked form (enabled): no blending, write mask RGB, one 4-byte UNORM8 target, one
     * sample. AGXMetalA9 runs it OPAQUE (FAST_PUNCH_THROUGH with a discard) with ISPCTL upass 7, the program
     * keeping the destination alpha from a tile read issued before its kill. 1: the program may discard;

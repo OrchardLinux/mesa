@@ -135,6 +135,32 @@ static inline unsigned g5p_mrt_clear_compact(uint8_t *out, unsigned n, bool bgra
 }
 
 /* The clear program. Returns its size, 16 * 4N + 6. */
+/*
+ * The A8's background program for one R8 (halves 1) or RG8 (halves 2) target: AGXMetalA8's (iOS 12.4, a8-passcap):
+ * the clear colour's low channels converted as for four (g5p_mrt_clear_usc()), for R8 a zero into half 1
+ * (0188 0101 0101 0120 0128 0039), then the one-word emitpix 111c 0900 8200 and END
+ */
+static inline unsigned g5p_mrt_clear_usc_g4p_narrow(uint8_t *out, unsigned halves)
+{
+   unsigned o = 0;
+   for (int c = (int)halves - 1; c >= 0; c--) {
+      const uint8_t h = (uint8_t)c;
+      const uint8_t ins[16] = {0x8a, 0x01, h, 0x01, 0x01, 0x01, 0xa0, 0x01,
+                               (uint8_t)(4 * h + 1), 0x01, 0x40, 0x41, 0x04, 0x01, 0xb0, 0x00};
+      memcpy(out + o, ins, sizeof(ins));
+      o += sizeof(ins);
+   }
+   if (halves == 1) {
+      static const uint8_t zero_g[12] = {0x88, 0x01, 0x01, 0x01, 0x01, 0x01, 0x20, 0x01, 0x28, 0x01, 0x39, 0x00};
+      memcpy(out + o, zero_g, sizeof(zero_g));
+      o += sizeof(zero_g);
+   }
+   const unsigned len = g5p_usc_emit(out + o, 1, 0);
+   if (!len)
+      return 0;
+   return o + len + g5p_usc_special(out + o + len, true);
+}
+
 static inline unsigned g5p_mrt_clear_usc(uint8_t *out, unsigned n)
 {
    if (n > 4)
