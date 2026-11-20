@@ -187,6 +187,7 @@ struct pvr_g5p_job {
    uint64_t vdm_va;             /* the control stream, one block */
    uint32_t background[8];      /* PDS_BGRND0..3 (64-bit registers: 8-byte aligned) */
    uint32_t eot[4];             /* EVENT_PIXEL_PDS data, code, info */
+   uint64_t a8_pbe[2];          /* the A8: target 0's PBESTATE_REG_WORD0/1 (g5p_pbe_a8_reg_words()) */
    uint32_t vdm_bytes;          /* through STREAM_TERMINATE */
    uint32_t width, height;
    unsigned targets;            /* colour targets, 1, 2 or 4 */

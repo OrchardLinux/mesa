@@ -788,6 +788,16 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
       }
       if (!g5p_pbe_key(iview->vk.format, &key, &srgb))
          return G5P_REFUSE(cmd_buffer, "colour target format %s", vk_Format_to_str(iview->vk.format));
+      if (!t && PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p)) {
+         /* The A8's PBE words for target 0 (the kernel's 3D record W+0x118): the formats captured on the A8 */
+         const VkFormat f = iview->vk.format;
+         if (f != VK_FORMAT_B8G8R8A8_UNORM && f != VK_FORMAT_R8G8B8A8_UNORM)
+            return G5P_REFUSE(cmd_buffer, "A8 colour target format %s (RGBA8 and BGRA8 UNORM are captured)",
+                              vk_Format_to_str(f));
+         g5p_pbe_a8_reg_words(g->a8_pbe, iview->vk.extent.width, iview->vk.extent.height,
+                              f == VK_FORMAT_B8G8R8A8_UNORM ? G5P_PBE_A8_SWIZZLE_BGRA : G5P_PBE_A8_SWIZZLE_RGBA,
+                              twiddled, level->pitch / 4);
+      }
       if ((level->pitch % 16 && !ms_store && !twiddled) || addr % 64)
          return G5P_REFUSE(cmd_buffer, "a colour target at %#" PRIx64 " with pitch %u (64-byte base, 16-byte rows)",
                            addr, level->pitch);
@@ -1191,8 +1201,18 @@ PVR_PER_ARCH(g5p_frag_stream)(const struct pvr_device *device, const struct pvr_
    g5p_put64(&s, 0); /* ZLSCTL and the load/store bases: in the extension */
    g5p_put64(&s, 0);
    g5p_put64(&s, 0);
-   for (unsigned i = 0; i < 8 * 3; i++)
-      g5p_put64(&s, 0); /* PBE words: in the end-of-tile program's data */
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p)) {
+      /* The A8's PBE words, Rogue's pbe_word[8][3]: target 0's REG_WORD0/1, then the empty pair Apple writes for
+       * every unused target; word 2 is 0 (the kernel copies words 0-1 to W+0x118 + 16 i) */
+      for (unsigned i = 0; i < 8; i++) {
+         g5p_put64(&s, i ? G5P_PBE_A8_EMPTY0 : g->a8_pbe[0]);
+         g5p_put64(&s, i ? G5P_PBE_A8_EMPTY1 : g->a8_pbe[1]);
+         g5p_put64(&s, 0);
+      }
+   } else {
+      for (unsigned i = 0; i < 8 * 3; i++)
+         g5p_put64(&s, 0); /* PBE words: in the end-of-tile program's data */
+   }
    g5p_put64(&s, 0);    /* border colour table */
    for (unsigned i = 0; i < 6; i++)
       g5p_put64(&s, 0); /* Rogue background words: in the extension */
