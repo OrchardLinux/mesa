@@ -86,6 +86,9 @@ enum pco_g5p_color_output {
     * bytes B,G,R,A), stored through a physical R32UI PBE */
    PCO_G5P_COLOR_PACKED_BGRA8,
    PCO_G5P_COLOR_PACKED_RGBA8,
+   /* The A8's R32F target: the red channel's 32-bit float bits as the only output word (emitpix 111c,
+    * AGXMetalA8's r32f fragment program, a8-passcap) */
+   PCO_G5P_COLOR_F32,
 };
 
 struct pco_g5p_rt_blend {

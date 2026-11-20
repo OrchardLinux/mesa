@@ -191,6 +191,19 @@ static inline unsigned g5p_mrt_clear_usc_g4p_rgba8ui(uint8_t *out)
    return o + len + g5p_usc_special(out + o + len, true);
 }
 
+/* The A8's R32F background program (AGXMetalA8, a8-passcap r32f): the clear colour's red f32 (common-store
+ * dword 0) moved into output word 0, emitpix one word. */
+static inline unsigned g5p_mrt_clear_usc_g4p_r32f(uint8_t *out)
+{
+   unsigned o = g5p_usc_mov_shared(out, 0, 0, 0), len;
+   if (!o)
+      return 0;
+   len = g5p_usc_emit(out + o, 1, 0);
+   if (!len)
+      return 0;
+   return o + len + g5p_usc_special(out + o + len, true);
+}
+
 static inline unsigned g5p_mrt_clear_usc(uint8_t *out, unsigned n)
 {
    if (n > 4)

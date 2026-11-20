@@ -5693,8 +5693,9 @@ static void plan_fs_output(struct gctx *c)
          if (mr != G5P_MRT_OK)
             refuse(c, "%s", g5p_mrt_refusal_str(mr));
       }
-      c->mrt.words = (c->key->packed_scalar8 || c->key->a8_packed_word ? 1 : c->key->packed_uint_bits ? 2 : 4) *
-                     c->mrt.targets;
+      const bool one_word = c->key->packed_scalar8 || c->key->a8_packed_word ||
+                            c->key->color_output == PCO_G5P_COLOR_F32;
+      c->mrt.words = (one_word ? 1 : c->key->packed_uint_bits ? 2 : 4) * c->mrt.targets;
       c->mrt.pixel_output_width = c->key->packed_scalar8 ? 2 : c->mrt.words;
       c->mrt.emit_field = g5p_mrt_emit_field(c->mrt.words);
       return; /* No narrow f16 loads, output ALU fusion, or f16 constants. */
@@ -8446,7 +8447,7 @@ static bool compile_general_link(nir_shader *nir, bool half_output, const uint8_
          if (c->key->mrt_blend_state)
             refuse(c, "raw32 MRT blend or masks are not qualified");
          if (c->key->color_output != PCO_G5P_COLOR_UINT32 &&
-             c->key->color_output != PCO_G5P_COLOR_SINT32)
+             c->key->color_output != PCO_G5P_COLOR_SINT32 && c->key->color_output != PCO_G5P_COLOR_F32)
             refuse(c, "unknown colour output format");
          if (c->key->packed_scalar8 && c->key->packed_uint_bits != 8)
             refuse(c, "scalar R8 output requires eight-bit channels");

@@ -585,6 +585,8 @@ g5p_check_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo *c
       key->a8_narrow_halves = cf == VK_FORMAT_R8_UNORM ? 1 : 2;
    if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p) && colors == 1 && cf == VK_FORMAT_R8G8B8A8_UINT)
       key->a8_packed_word = true;
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p) && colors == 1 && cf == VK_FORMAT_R32_SFLOAT)
+      key->color_output = PCO_G5P_COLOR_F32;
    /* no colour attachment: the program writes no colour (the no-colour ISP form: depth/stencil only, a
     * discarding program still runs for its feedback) */
    if (!colors)
