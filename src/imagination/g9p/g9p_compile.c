@@ -1654,7 +1654,11 @@ emit_alu_op(struct g9p_ctx *ctx, nir_alu_instr *alu, const int *r, int dst)
 
       if (a < 0)
          return false;
-      g9p_shift(ctx->c, dst, a, r[1], false);
+      /* the A8: a constant amount in Apple's literal form (g9p_shift_imm()) */
+      if (g5p_usc_g4p && !ctx->c->fragment && nir_src_is_const(alu->src[1].src))
+         g9p_shift_imm(ctx->c, dst, a, nir_alu_src_as_uint(alu->src[1]) & 31, false);
+      else
+         g9p_shift(ctx->c, dst, a, r[1], false);
       return true;
    }
    case nir_op_ushr: {
@@ -1662,7 +1666,11 @@ emit_alu_op(struct g9p_ctx *ctx, nir_alu_instr *alu, const int *r, int dst)
 
       if (a < 0)
          return false;
-      g9p_shift(ctx->c, dst, a, r[1], true);
+      /* the A8: a constant amount in Apple's literal form (g9p_shift_imm()) */
+      if (g5p_usc_g4p && !ctx->c->fragment && nir_src_is_const(alu->src[1].src))
+         g9p_shift_imm(ctx->c, dst, a, nir_alu_src_as_uint(alu->src[1]) & 31, true);
+      else
+         g9p_shift(ctx->c, dst, a, r[1], true);
       return true;
    }
    case nir_op_ishr:

@@ -325,6 +325,20 @@ g9p_add_imm(struct g9p_code *c, unsigned dst, unsigned src, unsigned imm)
 static inline void
 g9p_tg_load(struct g9p_code *c, unsigned dst, unsigned word)
 {
+   if (g5p_usc_g4p && !c->fragment) {
+      /*
+       * The A8's load of threadgroup word 0, where the kernel task's PDS writes the workgroup ID: AGXMetalA8's
+       * every ID-reading kernel starts with it (k_store_const/tid 1516 0004 into r2, k_threadgroup 1516 0002
+       * into r1; then 004d). Only offset 0 has a captured form; a read of y or z is refused by name.
+       */
+      if (word) {
+         if (!c->error)
+            c->error = "A8: a workgroup-ID y/z read (only the threadgroup word-0 load is captured)";
+         return;
+      }
+      G9P_EMIT(c, 0x1516, 2 * dst);
+      return;
+   }
    G9P_EMIT(c, 0x2314, 0x0100 | 2 * dst, 0x8100 | (word & 0xff),
             0x0200 | (word >> 8));
 }
@@ -555,6 +569,18 @@ g9p_convert(struct g9p_code *c, unsigned dst, unsigned src, unsigned op)
 {
    G9P_EMIT(c, g9p_w0(c, 0x1199), g9p_dst(c, dst), 0x0101 | op | src << 10, 0x0120,
             (op & 4) ? 0x0468 : 0x0460);
+}
+
+/*
+ * dst = a << n (left) or a >> n (logical), n a literal: the A8's shifts (AGXMetalA8 k_store_const/tid,
+ * k_threadgroup, k_iadd: 119a 8300 8101 0120 0105 0120 14f0 is r0 = r0 << 2, 519e 0302 0101 0120 013d 0120
+ * 14f4 is r1 = r0 >> 30). Apple never shifts by a register on the A8; its left shift sets W1 bit 15.
+ */
+static inline void
+g9p_shift_imm(struct g9p_code *c, unsigned dst, unsigned a, unsigned n, bool right)
+{
+   G9P_EMIT(c, right ? 0x519e : 0x119a, (right ? 0 : 0x8000) | g9p_dst(c, dst), 0x0101 | a << 10, 0x0120,
+            0x0101 | (n & 31) << 1, 0x0120, right ? 0x14f4 : 0x14f0);
 }
 
 /* dst = a << b (left) or a >> b (logical), b a register */
