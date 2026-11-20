@@ -317,7 +317,7 @@ void PVR_PER_ARCH(g5p_query_programs_destroy)(struct pvr_device *device)
 static uint32_t usc_offset(const struct pvr_device *device,
                            const struct pvr_suballoc_bo *bo)
 {
-   return bo->dev_addr.addr - device->heaps.usc_heap->base_addr.addr;
+   return bo->dev_addr.addr - PVR_G5P_USC_EXEC_BASE(device);
 }
 
 static void emit_record(struct pvr_csb *csb,

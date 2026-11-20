@@ -398,7 +398,7 @@ varying_program(const struct pco_g5p_program *fs, const struct pco_g5p_program *
 static uint32_t
 usc_off(const struct pvr_device *device, const struct pvr_suballoc_bo *bo)
 {
-   return (uint32_t)(bo->dev_addr.addr - device->heaps.usc_heap->base_addr.addr);
+   return (uint32_t)(bo->dev_addr.addr - PVR_G5P_USC_EXEC_BASE(device));
 }
 
 /* ---- pipelines ---- */

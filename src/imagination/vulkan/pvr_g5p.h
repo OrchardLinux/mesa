@@ -54,6 +54,15 @@ static inline VkResult pvr_refusal_to_api(VkResult result)
  * with the control in data dword 2 is 0xf0024001 there, 0xf0000a01 on the A10.
  * Data words (DOUTU/DOUTD/DOUTW sources and controls) are the same in both.
  * For files that include pdsc.h. */
+/* The base DOUTU's USC offsets count from. The A9's firmware has a PDS and a USC execution base (PLATFORM
+ * +0x10/+0x18, powervr's two heap bases). The A8's has one: Apple writes 0x3_00000000 to both of its pair
+ * (PLATFORM +0x20/+0x28; Apple's code runs there and faults at 0x1_ on the device), so its USC code
+ * counts from the PDS heap's base: the kernel puts the PDS heap at that base and the USC heap above it in the
+ * same 4 GiB window. For files that include pvr_device.h. */
+#define PVR_G5P_USC_EXEC_BASE(device) \
+   (PVR_HAS_FEATURE(&(device)->pdevice->dev_info, apple_g4p) ? (device)->heaps.pds_heap->base_addr.addr \
+                                                             : (device)->heaps.usc_heap->base_addr.addr)
+
 #define PVR_G5P_PDS_FEATURES(dev_info) \
    (PVR_HAS_FEATURE(dev_info, apple_g4p) ? (enum pdsc_feature)0 : PDSC_FEATURE_DOUT_EXT)
 

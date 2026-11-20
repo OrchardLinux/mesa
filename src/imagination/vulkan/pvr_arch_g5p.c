@@ -188,7 +188,7 @@ g5p_doutd_control(unsigned dwords)
 static uint32_t
 g5p_usc_off(const struct pvr_device *device, const struct pvr_suballoc_bo *bo)
 {
-   return (uint32_t)(bo->dev_addr.addr - device->heaps.usc_heap->base_addr.addr);
+   return (uint32_t)(bo->dev_addr.addr - PVR_G5P_USC_EXEC_BASE(device));
 }
 
 /* A kick of a USC program, its code at data + 0x20 as the registers expect;

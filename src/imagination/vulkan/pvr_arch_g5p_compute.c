@@ -36,7 +36,7 @@
 #include "pvr_winsys.h"
 #define G9P_KERNEL_DATA_DWORDS 8
 static uint32_t usc_offset(const struct pvr_device *d, const struct pvr_suballoc_bo *bo)
-{ return bo->dev_addr.addr - d->heaps.usc_heap->base_addr.addr; }
+{ return bo->dev_addr.addr - PVR_G5P_USC_EXEC_BASE(d); }
 /* The kernel does atomics on device memory: the A8 runs one workgroup per task for it (g5p_cdm_max_instances_g4p()) */
 static bool
 g5p_nir_has_device_atomics(nir_shader *nir)
