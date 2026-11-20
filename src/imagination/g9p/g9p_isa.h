@@ -409,6 +409,31 @@ static inline void
 g9p_addr(struct g9p_code *c, unsigned dst, unsigned base_dword, unsigned idx,
          unsigned shift, bool kill)
 {
+   if (g5p_usc_g4p && !c->fragment && !shift) {
+      /*
+       * The A8 has no 64-bit add of a uniform pair: AGXMetalA8 (k_store_tid, k_store_const, k_iadd) forms
+       * base + offset from 32-bit adds, the carry of the low add (119d, op a5) added to the high uniform:
+       *   119d 0304 0101 4100 00a5   r2 = carry(s0 + r0)
+       *   1199 0302 8585 4100 00a1   r1 = s1 + r1
+       *   1199 0300 8181 4100 00a1   r0 = s0 + r0
+       * Our offset is a 32-bit byte offset, so the high half is the high uniform plus the carry. The carry goes
+       * to r[dst + 1] first unless that is the offset register (then the low add goes first). The A9 form
+       * below (1189 .. 01a1 0600) faults on the A8 (boot 8: a caught fault where Apple's job stores).
+       */
+      const unsigned u = base_dword, hi = dst + 1;
+      const uint16_t u_ext = 0x4100 | ((u >> 5) & 7) << 1, u1_ext = 0x4100 | (((u + 1) >> 5) & 7) << 1;
+      const uint16_t lo_w2 = 0x0181 | (u & 31) << 2 | idx << 10 | (kill ? 0x8000 : 0);
+      if (idx == hi) {
+         G9P_EMIT(c, 0x1199, g9p_dst(c, dst), 0x0181 | (u & 31) << 2 | idx << 10, u_ext, G9P_IADD);
+         G9P_EMIT(c, 0x119d, g9p_dst(c, hi), 0x0101 | (u & 31) << 2 | idx << 10, u_ext, 0x00a5);
+         G9P_EMIT(c, 0x1199, g9p_dst(c, hi), 0x0181 | ((u + 1) & 31) << 2 | hi << 10, u1_ext, G9P_IADD);
+         return;
+      }
+      G9P_EMIT(c, 0x119d, g9p_dst(c, hi), 0x0101 | (u & 31) << 2 | idx << 10, u_ext, 0x00a5);
+      G9P_EMIT(c, 0x1199, g9p_dst(c, hi), 0x0181 | ((u + 1) & 31) << 2 | hi << 10, u1_ext, G9P_IADD);
+      G9P_EMIT(c, 0x1199, g9p_dst(c, dst), lo_w2, u_ext, G9P_IADD);
+      return;
+   }
    G9P_EMIT(c, g9p_w0(c, 0x1189), g9p_dst(c, dst),
             (kill ? 0x8000 : 0) | (1 | idx << 2) << 8 | 0x81 | 4 * (base_dword & 31),
             0x4100 | (base_dword >> 5) << 1, 0x01a1, 0x0600 | shift << 13);
