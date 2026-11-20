@@ -888,6 +888,67 @@ unsigned g5p_usc_unorm8_byte(uint8_t *out, unsigned dst_half, unsigned byte, uns
    return finish(out, raw, n);
 }
 
+/* Integer min/max of a short literal A and a common-store dword C, the 32-bit result in bank 0: AGXMetalA8's
+ * RGBA8UI clear (iPod touch 6, iOS 12.4, a8-passcap rgba8u) clamps each clear channel with
+ *   9a 01 DD CC 7f 01 26 01 SS 01 00 41 b2 21 b0 00      (umin(255, common dword SS))
+ * laid out as g5p_usc_fma_literal(): literal_prefix() in the three-source class 0x9a, B unused (selector 0),
+ * then C = the common-store dword (shared_src(), group 1), the min/max code (minmax_code[], as
+ * g5p_usc_minmax_literal()), control 0x21 and the routing byte 0xb0 (literal A, common-store C; the register
+ * forms route 0x08 and 0x7c), no source control. CC carries the destination control: Apple sets 0x80 on one of
+ * its four clamps (the second), on a register its next clamp writes again. Only the short literal is witnessed. */
+#define G5P_MINMAX_CTL 0x21
+#define G5P_ROUTING_LITERAL_A_SHARED_C 0xb0
+unsigned g5p_usc_minmax_literal_shared(uint8_t *out, enum g5p_minmax op, unsigned dst_half, unsigned dst_control,
+                                       uint32_t value, unsigned c_dword)
+{
+   CHECK(op < G5P_MINMAX_COUNT, "unsupported integer min/max");
+   CHECK(value <= 0xffff, "only the short literal is witnessed");
+   CHECK(half_register(dst_half, "dst_half requires a measured 32-bit aligned half index"), g5p_usc_error);
+   uint8_t raw[G5P_USC_MAX];
+   unsigned n = literal_prefix(raw, 0x9a, dst_half, 0, value, 0, 0, G5P_HEADER_FRAGMENT, 0);
+   if (!n)
+      return 0;
+   if (!cdestination(raw + 2, dst_half, 0, dst_control))
+      return 0;
+   if (!shared_src(raw + n, c_dword, 1))
+      return 0;
+   n += 4;
+   raw[n++] = minmax_code[op];
+   raw[n++] = G5P_MINMAX_CTL;
+   raw[n++] = G5P_ROUTING_LITERAL_A_SHARED_C;
+   raw[n++] = G5P_SOURCE_CONTROL_NONE;
+   return finish(out, raw, n);
+}
+
+/* Two bytes into one 16-bit half of bank 0, dst = B | C << shift: AGXMetalA8's RGBA8UI clear (a8-passcap rgba8u)
+ * packs its clamped channels (each 0..255) pairwise with
+ *   8a 01 DH 01 11 BB 20 01 CC 01 f1 1f 58 00            (dst half DH = half BB | half CC << 8)
+ * literal_prefix() in the three-source class with the 16-bit result (0x8a) and the shift as A's short literal,
+ * B and C register halves of group 1 (C's selector without the continuation, then the 0x01 parcel byte, as
+ * g5p_usc_fma_literal()), opcode 0xf1, control 0x1f, routing 0x58, no source control. The captured operands are
+ * 0..255, so whether the opcode ors, adds or inserts the shifted C is not distinguished; only shift 8 is witnessed. */
+#define G5P_PACK_BYTE_OP 0xf1
+#define G5P_PACK_BYTE_CTL 0x1f
+#define G5P_PACK_BYTE_ROUTING 0x58
+unsigned g5p_usc_pack_byte_half(uint8_t *out, unsigned dst_half, unsigned b_half, unsigned c_half,
+                                unsigned shift)
+{
+   CHECK(shift == 8, "only the byte pack (shift 8) is witnessed");
+   uint8_t raw[G5P_USC_MAX];
+   unsigned n = literal_prefix(raw, G5P_CLASS_TERNARY_RESULT_HALF, dst_half, 0, shift, b_half, 1,
+                               G5P_HEADER_FRAGMENT, 0);
+   if (!n)
+      return 0;
+   SEL(c, c_half, 1, 0);
+   raw[n++] = c;
+   raw[n++] = G5P_PARCEL_CONTINUES;
+   raw[n++] = G5P_PACK_BYTE_OP;
+   raw[n++] = G5P_PACK_BYTE_CTL;
+   raw[n++] = G5P_PACK_BYTE_ROUTING;
+   raw[n++] = G5P_SOURCE_CONTROL_NONE;
+   return finish(out, raw, n);
+}
+
 /* A move of a common-store dword into a 16-bit half of bank 0 (the end-of-tile program's state moves,
  * g5p_mrt_programs.h): alu_header() with the 16-bit move class (G5P_CLASS_MOVE_HALF, as g5p_usc_half_immediate())
  * and the fragment header, A = the common-store dword (shared_src(), group 1), then the half move's opcode and

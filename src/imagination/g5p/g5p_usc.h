@@ -246,6 +246,14 @@ unsigned g5p_usc_f2u16_half(uint8_t *out, unsigned dst_half, unsigned src_half, 
  * end-of-tile program's state moves (g5p_mrt_programs.h). */
 unsigned g5p_usc_mov_shared_half(uint8_t *out, unsigned dst_half, unsigned src_dword);
 unsigned g5p_usc_unorm8_byte(uint8_t *out, unsigned dst_half, unsigned byte, unsigned src_dword);
+/* Integer min/max of a short literal and common-store dword c_dword (group 1) into the 32-bit register at
+ * dst_half, bank 0 (fields at the encoder): the A8's RGBA8UI clear clamps each channel with umin(255, c). */
+unsigned g5p_usc_minmax_literal_shared(uint8_t *out, enum g5p_minmax op, unsigned dst_half, unsigned dst_control,
+                                       uint32_t value, unsigned c_dword);
+/* The 16-bit dst_half of bank 0 = half b_half | half c_half << 8 (fields at the encoder): the A8's RGBA8UI clear
+ * packs two clamped channels into one half with it. */
+unsigned g5p_usc_pack_byte_half(uint8_t *out, unsigned dst_half, unsigned b_half, unsigned c_half,
+                                unsigned shift);
 /* length 0 = minimum */
 unsigned g5p_usc_buffer_load(uint8_t *out, unsigned dst_half, unsigned byte_count,
                              unsigned base_common_dword, unsigned index, unsigned length);

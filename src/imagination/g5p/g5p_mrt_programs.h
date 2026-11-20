@@ -161,6 +161,36 @@ static inline unsigned g5p_mrt_clear_usc_g4p_narrow(uint8_t *out, unsigned halve
    return o + len + g5p_usc_special(out + o + len, true);
 }
 
+/* The A8's RGBA8UI background program (AGXMetalA8, a8-passcap rgba8u): the four clear uints in common-store
+ * dwords 0..3 clamped to 255 and packed into one output word R | G << 8 | B << 16 | A << 24, high half first:
+ * r0 = umin(255, B), r1 = umin(255, A), h1 = h0 | h2 << 8; r1 = umin(255, R), r2 = umin(255, G),
+ * h0 = h2 | h4 << 8; emitpix one word. The second clamp carries Apple's destination control 0x80. */
+static inline unsigned g5p_mrt_clear_usc_g4p_rgba8ui(uint8_t *out)
+{
+   static const struct { uint8_t dst, ctl, dword; } clamp[2][2] = {
+      { { 0, 0, 2 }, { 2, 0x80, 3 } },
+      { { 2, 0, 0 }, { 4, 0, 1 } },
+   };
+   unsigned o = 0, len;
+   for (unsigned i = 0; i < 2; i++) {
+      for (unsigned k = 0; k < 2; k++) {
+         len = g5p_usc_minmax_literal_shared(out + o, G5P_UMIN, clamp[i][k].dst, clamp[i][k].ctl, 255,
+                                             clamp[i][k].dword);
+         if (!len)
+            return 0;
+         o += len;
+      }
+      len = g5p_usc_pack_byte_half(out + o, 1 - i, clamp[i][0].dst, clamp[i][1].dst, 8);
+      if (!len)
+         return 0;
+      o += len;
+   }
+   len = g5p_usc_emit(out + o, 1, 0);
+   if (!len)
+      return 0;
+   return o + len + g5p_usc_special(out + o + len, true);
+}
+
 static inline unsigned g5p_mrt_clear_usc(uint8_t *out, unsigned n)
 {
    if (n > 4)
