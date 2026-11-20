@@ -500,6 +500,40 @@ pvr_rt_rgn_headers_data_init(struct pvr_device *device,
    return VK_SUCCESS;
 }
 
+/*
+ * The A8's region headers (AGXG4P): one ring per render target, not a buffer
+ * per frame. Its size is the power of two >= 16 x the per-frame bytes (the region headers rounded up to 0x1000; the
+ * kext's second per-frame part, RTM +0x30, has no counterpart here and is 0), it lives in the general (0x1_) heap,
+ * and it is mapped twice back to back (kext 0x847d738 maps a flag-0x200000 resource at VA and VA + length), so a
+ * frame's slice may run past the ring's end. The kernel picks each frame's slice (RTM +0x1a0: the first frame at
+ * offset 0, then + per-frame bytes): both render-target datas name the ring's base. Allocated before the TPC, which
+ * Apple's allocation order puts after the ring (P5b: ring 0x1_00460000, TPC 0x1_00484000).
+ */
+static VkResult pvr_rt_a8_rgn_ring_init(struct pvr_device *device,
+                                        struct pvr_rt_dataset *rt_dataset,
+                                        const struct pvr_rt_mtile_info *mtile_info,
+                                        uint32_t layers)
+{
+   uint64_t rgn_headers_size;
+
+   pvr_rt_get_region_headers_stride_size(device, mtile_info, layers, &rt_dataset->rgn_headers_stride,
+                                         &rgn_headers_size);
+   const uint64_t frame = ALIGN_POT(rgn_headers_size, 0x1000);
+   const uint64_t ring = util_next_power_of_two64(16 * frame);
+
+   VkResult result = pvr_bo_alloc_mirrored(device, device->heaps.general_heap, ring,
+                                           MAX2(ROGUE_CR_TE_PSGREGION_ADDR_BASE_ALIGNMENT, 0x1000),
+                                           PVR_BO_ALLOC_FLAG_GPU_UNCACHED, &rt_dataset->rgn_headers_bo);
+   if (result != VK_SUCCESS)
+      return result;
+
+   rt_dataset->a8_rgn_frame_size = frame;
+   rt_dataset->a8_rgn_ring_size = ring;
+   for (uint32_t i = 0; i < ARRAY_SIZE(rt_dataset->rt_datas); i++)
+      rt_dataset->rt_datas[i].rgn_headers_dev_addr = rt_dataset->rgn_headers_bo->vma->dev_addr;
+   return VK_SUCCESS;
+}
+
 static VkResult pvr_rt_datas_init(struct pvr_device *device,
                                   struct pvr_rt_dataset *rt_dataset,
                                   const struct pvr_free_list *global_free_list,
@@ -520,8 +554,9 @@ static VkResult pvr_rt_datas_init(struct pvr_device *device,
    if (result != VK_SUCCESS)
       goto err_pvr_rt_mta_data_fini;
 
-   result =
-      pvr_rt_rgn_headers_data_init(device, rt_dataset, mtile_info, layers);
+   /* the A8's ring is allocated already (pvr_rt_a8_rgn_ring_init()) */
+   result = rt_dataset->rgn_headers_bo ? VK_SUCCESS
+                                       : pvr_rt_rgn_headers_data_init(device, rt_dataset, mtile_info, layers);
    if (result != VK_SUCCESS)
       goto err_pvr_rt_mlist_data_fini;
 
@@ -699,6 +734,12 @@ VkResult pvr_arch_render_target_dataset_create(
    if (result != VK_SUCCESS)
       goto err_pvr_free_list_destroy;
 
+   if (PVR_HAS_FEATURE(dev_info, apple_g4p)) {
+      result = pvr_rt_a8_rgn_ring_init(device, rt_dataset, &mtile_info, layers);
+      if (result != VK_SUCCESS)
+         goto err_pvr_rt_vheap_rtc_data_fini;
+   }
+
    result = pvr_rt_tpc_data_init(device, rt_dataset, &mtile_info, layers);
    if (result != VK_SUCCESS)
       goto err_pvr_rt_vheap_rtc_data_fini;
@@ -744,6 +785,9 @@ err_pvr_rt_tpc_data_fini:
    pvr_rt_tpc_data_fini(rt_dataset);
 
 err_pvr_rt_vheap_rtc_data_fini:
+   /* the A8's ring when the TPC or the render-target datas failed (pvr_rt_datas_fini() clears it otherwise) */
+   pvr_bo_free(device, rt_dataset->rgn_headers_bo);
+   rt_dataset->rgn_headers_bo = NULL;
    pvr_rt_vheap_rtc_data_fini(rt_dataset);
 
 err_pvr_free_list_destroy:

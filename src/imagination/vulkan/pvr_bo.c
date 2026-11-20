@@ -322,6 +322,50 @@ static inline void pvr_bo_free_bo(const struct pvr_device *const device,
    vk_free(&device->vk.alloc, ptr);
 }
 
+VkResult pvr_bo_alloc_mirrored(struct pvr_device *device,
+                               struct pvr_winsys_heap *heap,
+                               uint64_t size,
+                               uint64_t alignment,
+                               uint64_t flags,
+                               struct pvr_bo **const pvr_bo_out)
+{
+   struct pvr_bo *pvr_bo;
+   VkResult result;
+
+   if (!device->ws->ops->vma_map_mirror || (flags & PVR_BO_ALLOC_FLAG_CPU_MAPPED))
+      return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
+
+   pvr_bo = pvr_bo_alloc_bo(device);
+   if (!pvr_bo)
+      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+   pvr_bo->ref_count = 1;
+
+   result = device->ws->ops->buffer_create(device->ws, size, alignment, PVR_WINSYS_BO_TYPE_GPU,
+                                           pvr_bo_alloc_to_winsys_flags(flags), &pvr_bo->bo);
+   if (result != VK_SUCCESS)
+      goto err_free_bo;
+
+   result = device->ws->ops->heap_alloc(heap, 2 * pvr_bo->bo->size, alignment, &pvr_bo->vma);
+   if (result != VK_SUCCESS)
+      goto err_buffer_destroy;
+
+   result = device->ws->ops->vma_map_mirror(pvr_bo->vma, pvr_bo->bo);
+   if (result != VK_SUCCESS)
+      goto err_heap_free;
+
+   pvr_bo_store_insert(device->bo_store, pvr_bo);
+   *pvr_bo_out = pvr_bo;
+   return VK_SUCCESS;
+
+err_heap_free:
+   device->ws->ops->heap_free(pvr_bo->vma);
+err_buffer_destroy:
+   device->ws->ops->buffer_destroy(pvr_bo->bo);
+err_free_bo:
+   pvr_bo_free_bo(device, pvr_bo);
+   return result;
+}
+
 /**
  * \brief Helper interface to allocate a GPU buffer and map it to both host and
  * device virtual memory. Host mapping is conditional and is controlled by

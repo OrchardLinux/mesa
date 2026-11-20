@@ -53,6 +53,8 @@ struct pvr_rt_dataset {
 
    struct pvr_bo *rgn_headers_bo;
    uint64_t rgn_headers_stride;
+   /* The A8's region-header ring (pvr_rt_a8_rgn_ring_init()): its size and each frame's slice; 0 elsewhere */
+   uint64_t a8_rgn_ring_size, a8_rgn_frame_size;
 
    bool need_frag;
 

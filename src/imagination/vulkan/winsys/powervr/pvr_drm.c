@@ -476,6 +476,7 @@ static const struct pvr_winsys_ops drm_winsys_ops = {
    .heap_free = pvr_drm_winsys_heap_free,
    .vma_map = pvr_drm_winsys_vma_map,
    .vma_unmap = pvr_drm_winsys_vma_unmap,
+   .vma_map_mirror = pvr_drm_winsys_vma_map_mirror,
    .free_list_create = pvr_drm_winsys_free_list_create,
    .free_list_destroy = pvr_drm_winsys_free_list_destroy,
    .render_target_dataset_create = pvr_drm_render_target_dataset_create,
