@@ -5693,7 +5693,8 @@ static void plan_fs_output(struct gctx *c)
          if (mr != G5P_MRT_OK)
             refuse(c, "%s", g5p_mrt_refusal_str(mr));
       }
-      c->mrt.words = (c->key->packed_scalar8 ? 1 : c->key->packed_uint_bits ? 2 : 4) * c->mrt.targets;
+      c->mrt.words = (c->key->packed_scalar8 || c->key->a8_packed_word ? 1 : c->key->packed_uint_bits ? 2 : 4) *
+                     c->mrt.targets;
       c->mrt.pixel_output_width = c->key->packed_scalar8 ? 2 : c->mrt.words;
       c->mrt.emit_field = g5p_mrt_emit_field(c->mrt.words);
       return; /* No narrow f16 loads, output ALU fusion, or f16 constants. */

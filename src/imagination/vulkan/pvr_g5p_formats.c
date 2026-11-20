@@ -24,6 +24,7 @@
 
 #include "pvr_g5p_format_table.h"
 #include "pvr_g5p_formats.h"
+#include "g5p/g5p_usc.h"
 
 /* Formats that have not run on the device are not advertised */
 bool
@@ -40,10 +41,19 @@ tex16_row(VkFormat format)
    return f && f->evidence == PVR_G5P_FMT_EV_AGX && f->cpp == 2;
 }
 
+/* The A8 renders RGBA8UI: AGXMetalA8's pass (a8-passcap rgba8u) is the float pass shape with the integer
+ * end-of-tile conversion, and our fragment, clear and end-of-tile programs for it match Apple's byte for byte
+ * (pvr_arch_g5p.c, g5p_mrt_clear_usc_g4p_rgba8ui()). On the A9 the row stays a probe. */
+static bool
+a8_render_row(VkFormat format)
+{
+   return g5p_usc_g4p && format == VK_FORMAT_R8G8B8A8_UINT;
+}
+
 static bool
 row_probe(VkFormat format)
 {
-   return pvr_g5p_formats_probe() || tex16_row(format);
+   return pvr_g5p_formats_probe() || tex16_row(format) || a8_render_row(format);
 }
 
 bool

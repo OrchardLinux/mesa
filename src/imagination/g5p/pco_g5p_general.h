@@ -123,6 +123,9 @@ struct pco_g5p_fs_key {
    /* The A8, one R8 (1) or RG8 (2) UNORM target: the f16 output is one word, halves 0..1, R8's half 1 zero
     * (AGXMetalA8's 111c fragment programs, a8-passcap) */
    uint8_t a8_narrow_halves;
+   /* The A8, one RGBA8UI target: the packed word (R | G << 8 | B << 16 | A << 24) is the only output word,
+    * emitpix 111c (AGXMetalA8's rgba8u fragment program, a8-passcap); the A9 pads it to two */
+   bool a8_packed_word;
    /* Apple's masked form (enabled): no blending, write mask RGB, one 4-byte UNORM8 target, one
     * sample. AGXMetalA9 runs it OPAQUE (FAST_PUNCH_THROUGH with a discard) with ISPCTL upass 7, the program
     * keeping the destination alpha from a tile read issued before its kill. 1: the program may discard;

@@ -229,6 +229,8 @@ g5p_free_programs(struct pvr_device *device, struct pvr_g5p_programs *p)
       pvr_bo_suballoc_free(p->clear_usc_narrow[i]);
       pvr_bo_suballoc_free(p->clear_kick_narrow[i].pvr_bo);
    }
+   pvr_bo_suballoc_free(p->clear_usc_rgba8ui);
+   pvr_bo_suballoc_free(p->clear_kick_rgba8ui.pvr_bo);
    for (unsigned i = 0; i < ARRAY_SIZE(p->raw_load); i++) {
       if (p->raw_load[i]) {
          g5p_free_programs(device, p->raw_load[i]);
@@ -453,6 +455,19 @@ g5p_upload_programs(struct pvr_device *device, struct pvr_g5p_programs *p)
       if (result != VK_SUCCESS)
          return result;
       result = g5p_upload_kick(device, p->clear_usc_narrow[i], 1, &p->clear_kick_narrow[i]);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+   /* the A8's RGBA8UI background program */
+   if (g4p) {
+      uint8_t code[G5P_MRT_CLEAR_USC_MAX];
+      const unsigned size = g5p_mrt_clear_usc_g4p_rgba8ui(code);
+      if (!size)
+         return vk_errorf(device, VK_ERROR_UNKNOWN, "G5P: A8 RGBA8UI clear: %s", g5p_usc_error);
+      result = pvr_gpu_upload_usc(device, code, size, 64, &p->clear_usc_rgba8ui);
+      if (result != VK_SUCCESS)
+         return result;
+      result = g5p_upload_kick(device, p->clear_usc_rgba8ui, 1, &p->clear_kick_rgba8ui);
       if (result != VK_SUCCESS)
          return result;
    }
@@ -734,6 +749,13 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
    const bool byte_source = first_format == VK_FORMAT_R8_UINT || first_format == VK_FORMAT_R8_SINT;
    if (byte_source)
       raw = first_format == VK_FORMAT_R8_SINT ? 11 : 10;
+   /* The A8's RGBA8UI is a float-shaped pass (AGXMetalA8, a8-passcap rgba8u): the one-target end of tile with the
+    * integer conversion in its state word (below), the four clear uints DMA'd as the float colours are and packed
+    * by the A8 integer background program (g5p_mrt_clear_usc_g4p_rgba8ui()) */
+   const bool a8_rgba8ui = PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p) && n == 1 &&
+                           first_format == VK_FORMAT_R8G8B8A8_UINT;
+   if (a8_rgba8ui)
+      raw = 0;
    const bool narrow = raw >= 5 &&
       (byte_source || first_format == VK_FORMAT_R16_UINT || first_format == VK_FORMAT_R16_SINT ||
        first_format == VK_FORMAT_R8G8_UINT || first_format == VK_FORMAT_R8G8_SINT);
@@ -847,12 +869,18 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
             g->a8_eot_format = ROGUE_PBESTATE_PACKMODE_U8U8 << 16 | 2; /* Apple: 0x00230002 */
             g->a8_narrow_halves = 2;
             break;
+         case VK_FORMAT_R8G8B8A8_UINT:
+            g->a8_eot_format = ROGUE_PBESTATE_PACKMODE_U8U8U8U8 << 16 | 8; /* Apple: 0x00000008, integer */
+            break;
          default:
             return G5P_REFUSE(cmd_buffer, "A8 colour target format %s (captured: BGRA8/RGBA8 UNORM, RGBA16F, RGB10A2)",
                               vk_Format_to_str(f));
          }
          g5p_pbe_a8_reg_words(g->a8_pbe, iview->vk.extent.width, iview->vk.extent.height,
                               f == VK_FORMAT_B8G8R8A8_UNORM ? G5P_PBE_A8_SWIZZLE_BGRA
+                              /* Apple's RGBA8UI target (a8-passcap rgba8u) has BGRA8's swizzle, 0x60a: the integer
+                               * conversion's channel order; the packed word holds R in byte 0 */
+                              : f == VK_FORMAT_R8G8B8A8_UINT ? G5P_PBE_A8_SWIZZLE_BGRA
                               : f == VK_FORMAT_R8G8_UNORM  ? 04510u /* Apple's RG8 swizzle 0x948 */
                               : f == VK_FORMAT_R8_UNORM    ? 04550u /* Apple's R8 swizzle 0x968 */
                                                            : G5P_PBE_A8_SWIZZLE_RGBA,
@@ -1118,6 +1146,7 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
       pvr_csb_pack (&bgnd[0], CR_PDS_BGRND0_BASE, b0) {
          b0.shader_addr = PVR_DEV_ADDR(raw ? p->raw_clear_kick[g5p_raw_variant(raw_total)].data_offset : g->samples == 4 ? p->clear_kick_ms.data_offset
                                                      : g->a8_narrow_halves ? p->clear_kick_narrow[g->a8_narrow_halves - 1].data_offset
+                                                     : a8_rgba8ui ? p->clear_kick_rgba8ui.data_offset
                                                      : p->clear_kick[v].data_offset);
          b0.texunicode_addr = PVR_DEV_ADDR(p->clear_dma.code_offset);
       }

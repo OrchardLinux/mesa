@@ -117,6 +117,9 @@ struct pvr_g5p_programs {
    /* the A8's background programs for one R8 [0] or RG8 [1] target (g5p_mrt_clear_usc_g4p_narrow()) */
    struct pvr_suballoc_bo *clear_usc_narrow[2];
    struct pvr_pds_upload clear_kick_narrow[2];
+   /* the A8's background program for one RGBA8UI target (g5p_mrt_clear_usc_g4p_rgba8ui()) */
+   struct pvr_suballoc_bo *clear_usc_rgba8ui;
+   struct pvr_pds_upload clear_kick_rgba8ui;
    /* PDS code: the clear colour's DOUTD (PDS_BGRND0's texunicode; its data,
     * {floats, control}, is per render) and the end of tile, DOUTD of the PBE
     * words then DOUTU of the end-of-tile program (data per render) */
