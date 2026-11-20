@@ -13,6 +13,8 @@
 #include <math.h>
 #include <string.h>
 
+#include "util/u_math.h"
+
 /* addresses are plain integers here: this file never includes pvr_csb.h */
 #define __pvr_address_type uint64_t
 #define __pvr_get_address(addr) (addr)
@@ -136,7 +138,7 @@ pvr_g5p_ds_zls(const struct pvr_g5p_ds_target *t, struct pvr_g5p_zls_words *out)
     * and stencil: ZLSCTL 0xe2004 / 0xaa006 / 0x26002 and ZLS_PIXELS 0x1f803f at 64x64, as at one sample; the
     * stencil plane at depth + 0x10000, four times the one-sample plane) */
 
-   const struct ROGUE_CR_ISP_ZLSCTL ctl = {
+   struct ROGUE_CR_ISP_ZLSCTL ctl = {
       .loadtwiddled = true,
       .storetwiddled = true,
       .zloadformat = f->zls_type,
@@ -149,6 +151,13 @@ pvr_g5p_ds_zls(const struct pvr_g5p_ds_target *t, struct pvr_g5p_zls_words *out)
       .forcezstore = zstore || sstore,
    };
    uint32_t dw[2];
+   if (t->g4p) {
+      /* The A8 (Rogue's form, no ZLS_PIXELS): the extent in 32-pixel tiles minus 1 in ZLSCTL. iPod touch 6,
+       * iOS 12.4, a8-passcap at 64x64: 0x080e200c depth+stencil clear/store, 0x080ee00e loaded, 0x080a200c
+       * depth only (x_z = y_z = 1) */
+      ctl.zlsextent_x_z = DIV_ROUND_UP(t->width, 32) - 1;
+      ctl.zlsextent_y_z = DIV_ROUND_UP(t->height, 32) - 1;
+   }
    ROGUE_CR_ISP_ZLSCTL_pack(dw, &ctl);
    out->zls[0] = g5p_dw64(dw);
 
@@ -174,7 +183,8 @@ pvr_g5p_ds_zls(const struct pvr_g5p_ds_target *t, struct pvr_g5p_zls_words *out)
    const struct ROGUE_CR_ISP_ZLS_PIXELS px = { .x = w - 1, .y = h - 1 };
    uint32_t pixels;
    ROGUE_CR_ISP_ZLS_PIXELS_pack(&pixels, &px);
-   out->zls[5] = pixels;
+   /* the A8's 3D record has no ZLS_PIXELS word (a8-passcap: none set in any depth pass) */
+   out->zls[5] = t->g4p ? 0 : pixels;
 
    for (unsigned i = 1; i <= 4; i++)
       if (out->zls[i])

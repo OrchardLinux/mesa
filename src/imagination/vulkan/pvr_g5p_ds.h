@@ -65,6 +65,7 @@ struct pvr_g5p_ds_target {
    bool zload, zstore, sload, sstore;
    float depth_clear;       /* ISP_BGOBJDEPTH */
    uint8_t stencil_clear;   /* ISP_BGOBJVALS.stencil */
+   bool g4p;                /* the A8: ZLS extent in ZLSCTL, no ZLS_PIXELS */
 };
 
 /* The ZLS words of a render's fragment stream (pvr_arch_g5p.c):
@@ -157,7 +158,7 @@ struct vk_dynamic_graphics_state;
 VkResult PVR_PER_ARCH(g5p_ds_admit)(struct pvr_cmd_buffer *cmd_buffer,
                                     const struct pvr_renderpass_hwsetup_render *hw_render);
 /* frag_stream: the job's ZLS and background words from pvr_render_job::ds */
-void PVR_PER_ARCH(g5p_ds_pass)(const struct pvr_render_job *job, struct pvr_g5p_zls_words *out);
+void PVR_PER_ARCH(g5p_ds_pass)(const struct pvr_render_job *job, bool g4p, struct pvr_g5p_zls_words *out);
 /* the draw: w[0..4] as pvr_g5p_ds_isp(), from the dynamic state */
 void PVR_PER_ARCH(g5p_ds_isp)(const struct vk_dynamic_graphics_state *dyn, VkImageAspectFlags aspects,
                               uint32_t samples, bool lines, uint32_t passtype, bool scissor, bool dbias,

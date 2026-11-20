@@ -1193,7 +1193,7 @@ PVR_PER_ARCH(g5p_frag_stream)(const struct pvr_device *device, const struct pvr_
    /* the depth/stencil attachment's ZLS words and background object
     * (pvr_arch_g5p_ds.c; without one, depth 1.0f and tag | mask) */
    struct pvr_g5p_zls_words zls;
-   pvr_arch_g5p_ds_pass(job, &zls);
+   pvr_arch_g5p_ds_pass(job, PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p), &zls);
 
    g5p_put64(&s, scissor);
    g5p_put64(&s, dbias);

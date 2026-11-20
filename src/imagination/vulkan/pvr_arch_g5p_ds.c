@@ -39,15 +39,18 @@ PVR_PER_ARCH(g5p_ds_admit)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_r
 
    if (hw_render->ds_attach_idx == VK_ATTACHMENT_UNUSED)
       return VK_SUCCESS;
-   /* The A8 3D record's ZLS words are placed only in part (the tail copies at the A9 offsets, from the
-    * AGXG4P kext's 3D filler; the register-block copies are not located): no depth/stencil until an iOS
-    * read of a depth pass's record gives them (docs/gpu/a8/mesa-a8-20261120.md, update 5) */
-   if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g4p))
-      return G5P_REFUSE(cmd_buffer, "a depth/stencil attachment on the A8 (its ZLS record words are not all placed)");
    const struct pvr_image_view *iview = info->attachments[hw_render->ds_attach_idx];
    const struct pvr_image *image = pvr_image_view_get_image(iview);
    const struct pvr_g5p_ds_format *f = pvr_g5p_ds_format(iview->vk.format);
    struct pvr_g5p_ds_plane plane;
+
+   /* The A8: what a8-passcap captured (iPod touch 6, iOS 12.4): D32F
+    * and D32F_S8 at one sample, clear/load and store */
+   if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g4p) &&
+       ((iview->vk.format != VK_FORMAT_D32_SFLOAT && iview->vk.format != VK_FORMAT_D32_SFLOAT_S8_UINT) ||
+        image->vk.samples != 1))
+      return G5P_REFUSE(cmd_buffer, "A8 depth/stencil %s at %u samples (D32F and D32F_S8 at one sample are captured)",
+                        vk_Format_to_str(iview->vk.format), image->vk.samples);
 
    if (!f)
       return G5P_REFUSE(cmd_buffer, "depth/stencil format %s (the ZLS stores D16, D32F, S8, D32F_S8)",
@@ -83,7 +86,7 @@ PVR_PER_ARCH(g5p_ds_admit)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_r
 }
 
 void
-PVR_PER_ARCH(g5p_ds_pass)(const struct pvr_render_job *job, struct pvr_g5p_zls_words *out)
+PVR_PER_ARCH(g5p_ds_pass)(const struct pvr_render_job *job, bool g4p, struct pvr_g5p_zls_words *out)
 {
    if (!job->ds.iview || !(job->has_depth_attachment || job->has_stencil_attachment)) {
       pvr_g5p_ds_zls_none(out);
@@ -108,6 +111,7 @@ PVR_PER_ARCH(g5p_ds_pass)(const struct pvr_render_job *job, struct pvr_g5p_zls_w
       .sstore = job->ds.store.s,
       .depth_clear = job->ds_clear_value.depth,
       .stencil_clear = (uint8_t)job->ds_clear_value.stencil,
+      .g4p = g4p,
    };
    /* g5p_ds_admit() refused what pvr_g5p_ds_zls() cannot build */
    const char *why = pvr_g5p_ds_zls(&t, out);
