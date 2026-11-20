@@ -149,10 +149,10 @@ doutd_control(unsigned common, unsigned dwords, bool last)
  * the UNIFORMDATABASE pointer.
  */
 static unsigned
-loader_program(uint32_t *dest, unsigned n)
+loader_program(uint32_t *dest, unsigned n, enum pdsc_feature features)
 {
    pdsc_init();
-   pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-fs-loader");
+   pdsc_program *p = pdsc_program_create(NULL, features, "g5p-fs-loader");
    for (unsigned i = 0; i < n; i++)
       pdsc_dout(p, pdsc_ref_const64(2 * i), pdsc_ref_const32(2 * n + 2 * i), pdsc_ref_null(),
                 .dstdout = PDSC_DSTDOUT_D, .end = i == n - 1);
@@ -252,7 +252,8 @@ fetch_reads_instance(const struct pvr_g5p_pipeline *g)
 }
 
 static unsigned
-fetch_program(uint32_t *dest, const struct pvr_g5p_pipeline *g, bool base_instance, bool indirect)
+fetch_program(uint32_t *dest, const struct pvr_g5p_pipeline *g, bool base_instance, bool indirect,
+              enum pdsc_feature features)
 {
    const struct pvr_g5p_fetch *list = g->fetch_list;
    const unsigned fetches = g->fetch_count, id_mask = g->vs_id_mask;
@@ -260,7 +261,7 @@ fetch_program(uint32_t *dest, const struct pvr_g5p_pipeline *g, bool base_instan
    unsigned slot[PVR_G5P_MAX_FETCH];
    const unsigned ndiv = fetch_divisors(g, div, slot);
    pdsc_init();
-   pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-vertex-fetch");
+   pdsc_program *p = pdsc_program_create(NULL, features, "g5p-vertex-fetch");
    /* A9's indirect base-instance variant reads persistent temporary 1
     * (encoded selector 0xc1), not a CPU-specialized data constant. */
    const pdsc_ref base = indirect ? pdsc_ref_ptemp32(1) : pdsc_ref_const32(fetch_base_instance(fetches));
@@ -313,10 +314,10 @@ fetch_program(uint32_t *dest, const struct pvr_g5p_pipeline *g, bool base_instan
 /* The fragment launch: one DOUTU.end from c0:1, no CC and no HALT (the
  * captured form) */
 static unsigned
-launch_program(uint32_t *dest)
+launch_program(uint32_t *dest, enum pdsc_feature features)
 {
    pdsc_init();
-   pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-fragment");
+   pdsc_program *p = pdsc_program_create(NULL, features, "g5p-fragment");
    pdsc_dout(p, pdsc_ref_const64(0), pdsc_ref_null(), pdsc_ref_null(), .dstdout = PDSC_DSTDOUT_U, .end = true);
    const unsigned n = pds_pack(p, dest);
    ralloc_free(p);
@@ -343,10 +344,10 @@ static_assert(4 * PCO_G5P_MAX_FS_VARYINGS == 112, "G5P varying components");
 
 static unsigned
 varying_program(const struct pco_g5p_program *fs, const struct pco_g5p_program *vs, uint32_t *data,
-                uint32_t *code, unsigned *code_dwords, unsigned pv)
+                uint32_t *code, unsigned *code_dwords, unsigned pv, enum pdsc_feature features)
 {
    pdsc_init();
-   pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-varying");
+   pdsc_program *p = pdsc_program_create(NULL, features, "g5p-varying");
    struct pdsc_douti_src0 item[2 + PCO_G5P_MAX_FS_VARYINGS];
    unsigned items = 0;
    /* Apple's item order: position Z, then W, then the varyings (the A9
@@ -969,18 +970,18 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
 
    /* PDS: vertex fetch code */
    uint32_t code[96 + 4 * PVR_G5P_MAX_FS_UPLOADS], data[2 * (1 + PCO_G5P_MAX_FS_VARYINGS) + 4];
-   unsigned n = fetch_program(code, g, false, false);
+   unsigned n = fetch_program(code, g, false, false, PVR_G5P_PDS_FEATURES(&device->pdevice->dev_info));
    result = pvr_gpu_upload_pds(device, NULL, 0, 0, code, n, 16, 64, &g->fetch);
    if (result != VK_SUCCESS)
       return result;
    if (fetch_reads_instance(g)) {
-      n = fetch_program(code, g, true, false);
+      n = fetch_program(code, g, true, false, PVR_G5P_PDS_FEATURES(&device->pdevice->dev_info));
       result = pvr_gpu_upload_pds(device, NULL, 0, 0, code, n, 16, 64, &g->fetch_base);
       if (result != VK_SUCCESS)
          return result;
    }
 
-   n = fetch_program(code, g, fetch_reads_instance(g), true);
+   n = fetch_program(code, g, fetch_reads_instance(g), true, PVR_G5P_PDS_FEATURES(&device->pdevice->dev_info));
    result = pvr_gpu_upload_pds(device, NULL, 0, 0, code, n, 16, 64, &g->fetch_indirect);
    if (result != VK_SUCCESS)
       return result;
@@ -990,7 +991,7 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
       /* at 4x the fragment program runs at sample rate (pvr_g5p_msaa_doutu()) */
       const uint64_t doutu = pvr_g5p_msaa_doutu(doutu_src0(usc_off(device, g->fs_usc), g->fs_temps), g->samples);
       const uint32_t launch_data[4] = { (uint32_t)doutu, (uint32_t)(doutu >> 32), 0, 0 };
-      n = launch_program(code);
+      n = launch_program(code, PVR_G5P_PDS_FEATURES(&device->pdevice->dev_info));
       result = pvr_gpu_upload_pds(device, launch_data, ARRAY_SIZE(launch_data), 16, code, n, 0x20, 64,
                                   &g->fs_launch);
       if (result != VK_SUCCESS)
@@ -1004,12 +1005,12 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
    unsigned varying_data_dwords = 0;
    if (fs->num_varyings || fs->w_set || fs->z_set) {
       unsigned code_dwords;
-      varying_data_dwords = varying_program(fs, vs, data, code, &code_dwords, 0);
+      varying_data_dwords = varying_program(fs, vs, data, code, &code_dwords, 0, PVR_G5P_PDS_FEATURES(&device->pdevice->dev_info));
       result = pvr_gpu_upload_pds(device, data, varying_data_dwords, 16, code, code_dwords, 16, 64, &g->varying);
       if (result != VK_SUCCESS)
          return result;
       for (unsigned pv = 1; g->fs_flat && pv <= 2; pv++) {
-         varying_program(fs, vs, data, code, &code_dwords, pv);
+         varying_program(fs, vs, data, code, &code_dwords, pv, PVR_G5P_PDS_FEATURES(&device->pdevice->dev_info));
          result = pvr_gpu_upload_pds(device, data, varying_data_dwords, 16, code, code_dwords, 16, 64,
                                      &g->varying_pv[pv - 1]);
          if (result != VK_SUCCESS)
@@ -1022,7 +1023,7 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
 
    /* PDS: the uniform/texture loader (the device HALT without uploads) */
    if (g->fs_num_uploads) {
-      n = loader_program(code, g->fs_num_dmas);
+      n = loader_program(code, g->fs_num_dmas, PVR_G5P_PDS_FEATURES(&device->pdevice->dev_info));
       result = pvr_gpu_upload_pds(device, NULL, 0, 0, code, n, 16, 64, &g->fs_loader);
       if (result != VK_SUCCESS)
          return result;

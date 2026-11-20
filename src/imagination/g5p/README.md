@@ -38,6 +38,15 @@ evidence for sharing them:
   and its CDM control stream has the seven-word records this driver writes
   for the A9 (`g5p_cdm.h`).
 
+Where the A8 is known to differ, `apple_g4p` selects its form:
+
+- PDS programs encode DOUT the Rogue way, not in Apple's extended form
+  (`PVR_G5P_PDS_FEATURES()`, `vulkan/pvr_g5p.h`): Metal's compute PDS
+  programs on an A8 decode to the A10's operands in Rogue's field layout.
+- The end of tile's EVENT_PIXEL_PDS_INFO counts the USC shared size in
+  Rogue's unit: 0x202 for one target on the A8, 0x402 on the A9
+  (`g5p_mrt_eot_info_g4p()`).
+
 Where the A8 is known to differ and this driver has no A8 form yet, it
 refuses by name: compute pipelines, until Apple's residency limits for the
 A8 are known (`pvr_arch_g5p_compute.c`). Which A9 instructions are G5-only

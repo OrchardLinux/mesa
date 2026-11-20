@@ -47,6 +47,16 @@ static inline VkResult pvr_refusal_to_api(VkResult result)
 #include "pvr_common.h"
 #include "pvr_limits.h"
 
+/* The pdsc features of a PDS program: the A9 encodes DOUT in Apple's extended
+ * form (src0 at bits 3-9, src1 at 10-17), as the A10 does; the A8 in Rogue's
+ * (src0 at 8-14, src1 at 16-23). The A8's form is decoded from Metal's PDS
+ * programs on an A8 (OrchardLinux/gpu a8/M2-IOS-CAPTURE.md): DOUTW of temps q0
+ * with the control in data dword 2 is 0xf0024001 there, 0xf0000a01 on the A10.
+ * Data words (DOUTU/DOUTD/DOUTW sources and controls) are the same in both.
+ * For files that include pdsc.h. */
+#define PVR_G5P_PDS_FEATURES(dev_info) \
+   (PVR_HAS_FEATURE(dev_info, apple_g4p) ? (enum pdsc_feature)0 : PDSC_FEATURE_DOUT_EXT)
+
 /* A sampler's mipLodBias, clamped to +-maxSamplerLodBias, as an f32 in its descriptor's metadata
  * (pvr_sampler_descriptor::meta): the A9 sampler word has no bias field, so the LOD-bias program variant adds
  * it in the shader (pvr_g5p_nir.c lod_bias_lower()). */

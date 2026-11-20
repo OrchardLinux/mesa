@@ -40,6 +40,7 @@
 #include "pvr_cmd_buffer.h"
 #include "pvr_csb.h"
 #include "pvr_device.h"
+#include "pvr_physical_device.h"
 #include "pvr_free_list.h"
 #include "pvr_g5p.h"
 #include "pvr_g5p_dgl.h"
@@ -102,10 +103,10 @@ g5p_pds_pack(pdsc_program *p, uint32_t *dest)
 
 /* DOUTU from data dwords 0-1, then HALT: the code of a kick */
 static unsigned
-g5p_pds_kick_code(uint32_t *code)
+g5p_pds_kick_code(uint32_t *code, enum pdsc_feature features)
 {
    pdsc_init();
-   pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-kick");
+   pdsc_program *p = pdsc_program_create(NULL, features, "g5p-kick");
    pdsc_dout(p, pdsc_ref_const64(0), pdsc_ref_null(), pdsc_ref_null(), .dstdout = PDSC_DSTDOUT_U,
              .end = true);
    pdsc_halt(p);
@@ -117,10 +118,10 @@ g5p_pds_kick_code(uint32_t *code)
 /* DOUTD from data dwords 0-1 with the control in dword 2, then (eot) DOUTU
  * from dwords 4-5; HALT (pdsc's const indices count dwords) */
 static unsigned
-g5p_pds_dma_code(uint32_t *code, bool eot)
+g5p_pds_dma_code(uint32_t *code, bool eot, enum pdsc_feature features)
 {
    pdsc_init();
-   pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, eot ? "g5p-eot" : "g5p-clear-dma");
+   pdsc_program *p = pdsc_program_create(NULL, features, eot ? "g5p-eot" : "g5p-clear-dma");
    pdsc_dout(p, pdsc_ref_const64(0), pdsc_ref_const32(2), pdsc_ref_null(), .dstdout = PDSC_DSTDOUT_D,
              .end = !eot);
    if (eot) /* pdsc's const64 index counts dwords: dwords 4-5 */
@@ -135,10 +136,10 @@ g5p_pds_dma_code(uint32_t *code, bool eot)
 /* n DOUTDs, source i from data dwords 2i..2i+1 and its control in dword
  * 2n + 2i, the last one ending; HALT (the A9 ICD's uniform loader) */
 static unsigned
-g5p_pds_loader_code(uint32_t *code, unsigned n)
+g5p_pds_loader_code(uint32_t *code, unsigned n, enum pdsc_feature features)
 {
    pdsc_init();
-   pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-loader");
+   pdsc_program *p = pdsc_program_create(NULL, features, "g5p-loader");
    for (unsigned i = 0; i < n; i++)
       pdsc_dout(p, pdsc_ref_const64(2 * i), pdsc_ref_const32(2 * n + 2 * i), pdsc_ref_null(),
                 .dstdout = PDSC_DSTDOUT_D, .end = i == n - 1);
@@ -199,7 +200,7 @@ g5p_upload_kick_temps(struct pvr_device *device, const struct pvr_suballoc_bo *u
    const uint64_t doutu = pvr_g5p_msaa_doutu(g5p_doutu_src0(g5p_usc_off(device, usc), temps), samples);
    const uint32_t data[4] = { (uint32_t)doutu, (uint32_t)(doutu >> 32), 0, 0 };
    uint32_t code[8];
-   const unsigned n = g5p_pds_kick_code(code);
+   const unsigned n = g5p_pds_kick_code(code, PVR_G5P_PDS_FEATURES(&device->pdevice->dev_info));
    VkResult result = pvr_gpu_upload_pds(device, data, ARRAY_SIZE(data), 16, code, n, G5P_KICK_CODE,
                                         64, out);
    if (result == VK_SUCCESS && out->code_offset != out->data_offset + G5P_KICK_CODE)
@@ -317,7 +318,7 @@ g5p_upload_load(struct pvr_device *device, struct pvr_g5p_programs *p, unsigned 
    if (result != VK_SUCCESS)
       return result;
    uint32_t code[2 * ARRAY_SIZE(p->load_upload) + 2];
-   const unsigned n = g5p_pds_loader_code(code, p->load_uploads);
+   const unsigned n = g5p_pds_loader_code(code, p->load_uploads, PVR_G5P_PDS_FEATURES(&device->pdevice->dev_info));
    return pvr_gpu_upload_pds(device, NULL, 0, 0, code, n, 16, 64, &p->load_dma);
 }
 
@@ -444,11 +445,11 @@ g5p_upload_programs(struct pvr_device *device, struct pvr_g5p_programs *p)
    }
 
    uint32_t pds[8];
-   unsigned n = g5p_pds_dma_code(pds, false);
+   unsigned n = g5p_pds_dma_code(pds, false, PVR_G5P_PDS_FEATURES(&device->pdevice->dev_info));
    result = pvr_gpu_upload_pds(device, NULL, 0, 0, pds, n, 16, 64, &p->clear_dma);
    if (result != VK_SUCCESS)
       return result;
-   n = g5p_pds_dma_code(pds, true);
+   n = g5p_pds_dma_code(pds, true, PVR_G5P_PDS_FEATURES(&device->pdevice->dev_info));
    result = pvr_gpu_upload_pds(device, NULL, 0, 0, pds, n, 16, 64, &p->eot);
    if (result != VK_SUCCESS)
       return result;
@@ -1017,7 +1018,7 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
    memcpy(g->background, bgnd, sizeof(g->background));
    g->eot[0] = eot_data.data_offset;
    g->eot[1] = p->eot.code_offset;
-   g->eot[2] = g5p_mrt_eot_info(nt);
+   g->eot[2] = PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p) ? g5p_mrt_eot_info_g4p(nt) : g5p_mrt_eot_info(nt);
    g->enabled = true;
    return VK_SUCCESS;
 }

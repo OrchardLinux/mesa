@@ -66,6 +66,15 @@ static inline uint32_t g5p_mrt_eot_info(unsigned n)
    return ((g5p_mrt_pbe_dwords(n) + 15) / 16) * 0x400 | 2;
 }
 
+/* The A8's EVENT_PIXEL_PDS_INFO: usc_sr_size in Rogue's unit, DIV_ROUND_UP(dwords,
+ * 16) at bit 9, not twice that. Captured 0x202 for a one-target 64x64 BGRA8 pass
+ * (iPod touch 6, 3D record +0x3c4, from a live iOS dump),
+ * where the A9 writes 0x402. Two or more targets are not captured on the A8. */
+static inline uint32_t g5p_mrt_eot_info_g4p(unsigned n)
+{
+   return ((g5p_mrt_pbe_dwords(n) + 15) / 16) << 9 | 2;
+}
+
 /* Partial-render restore SIZEINFO (restore[1], record+0x51c): usc_sharedsize
  * of Apple's N-image restore loader, 0x800000 per target (1, 2, 4 units). */
 static inline uint32_t g5p_mrt_restore1(unsigned n)
