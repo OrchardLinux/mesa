@@ -22,6 +22,8 @@
 
 #include "pvr_cmd_buffer.h"
 #include "pvr_csb.h"
+#include "pvr_device.h"
+#include "pvr_physical_device.h"
 #include "pvr_g5p_ds.h"
 #include "pvr_g5p_shader_dump.h"
 #include "pvr_g5p_tex_encode.h"
@@ -37,6 +39,11 @@ PVR_PER_ARCH(g5p_ds_admit)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_r
 
    if (hw_render->ds_attach_idx == VK_ATTACHMENT_UNUSED)
       return VK_SUCCESS;
+   /* The A8 3D record's ZLS words are placed only in part (the tail copies at the A9 offsets, from the
+    * AGXG4P kext's 3D filler; the register-block copies are not located): no depth/stencil until an iOS
+    * read of a depth pass's record gives them (docs/gpu/a8/mesa-a8-20261120.md, update 5) */
+   if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g4p))
+      return G5P_REFUSE(cmd_buffer, "a depth/stencil attachment on the A8 (its ZLS record words are not all placed)");
    const struct pvr_image_view *iview = info->attachments[hw_render->ds_attach_idx];
    const struct pvr_image *image = pvr_image_view_get_image(iview);
    const struct pvr_g5p_ds_format *f = pvr_g5p_ds_format(iview->vk.format);

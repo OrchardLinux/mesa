@@ -2272,6 +2272,11 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
 
    if (!g)
       return G5P_REFUSE(cmd_buffer, "a draw of a pipeline without G5P programs (refused at creation, named there)");
+   /* Apple's A8 driver has no indirect draw: AGXMetalA8's render encoders raise APINotSupported for both
+    * indirect draws (0x1a144b89c, 0x1a144b8dc; the sampled encoder 0x1a145176c, 0x1a14517ac), so there is no
+    * A8 form to follow and the VDM's indirect index list is untested on the A8. */
+   if (draw->indirect_addr && PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p))
+      return G5P_REFUSE(cmd_buffer, "an indirect draw on the A8 (Apple's A8 driver has none; not hardware-proven)");
    /* transform feedback: while capturing, the pipeline's capturing variant
     * (pvr_g5p_xfb.h); a pipeline that captures nothing draws as it is */
    const bool xfb = g->xfb && pvr_arch_g5p_xfb_capturing(cmd_buffer);

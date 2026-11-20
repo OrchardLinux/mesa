@@ -257,8 +257,9 @@ static void pvr_physical_device_get_supported_features(
       .sampleRateShading = true,
       .dualSrcBlend = false,
       .logicOp = true,
-      .multiDrawIndirect = true,
-      .drawIndirectFirstInstance = true,
+      /* the A8: no indirect draw in Apple's driver; vkCmdDraw*Indirect is refused by name (pvr_arch_g5p_gfx.c) */
+      .multiDrawIndirect = !PVR_HAS_FEATURE(dev_info, apple_g4p),
+      .drawIndirectFirstInstance = !PVR_HAS_FEATURE(dev_info, apple_g4p),
       .depthClamp = false,
       .depthBiasClamp = true,
       .fillModeNonSolid = false,
