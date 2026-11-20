@@ -37,6 +37,34 @@
 #define G9P_KERNEL_DATA_DWORDS 8
 static uint32_t usc_offset(const struct pvr_device *d, const struct pvr_suballoc_bo *bo)
 { return bo->dev_addr.addr - d->heaps.usc_heap->base_addr.addr; }
+/* The kernel does atomics on device memory: the A8 runs one workgroup per task for it (g5p_cdm_max_instances_g4p()) */
+static bool
+g5p_nir_has_device_atomics(nir_shader *nir)
+{
+   nir_foreach_function_impl (impl, nir) {
+      nir_foreach_block (block, impl) {
+         nir_foreach_instr (instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            switch (nir_instr_as_intrinsic(instr)->intrinsic) {
+            case nir_intrinsic_ssbo_atomic:
+            case nir_intrinsic_ssbo_atomic_swap:
+            case nir_intrinsic_global_atomic:
+            case nir_intrinsic_global_atomic_swap:
+            case nir_intrinsic_image_atomic:
+            case nir_intrinsic_image_atomic_swap:
+            case nir_intrinsic_image_deref_atomic:
+            case nir_intrinsic_image_deref_atomic_swap:
+               return true;
+            default:
+               break;
+            }
+         }
+      }
+   }
+   return false;
+}
+
 VkResult
 PVR_PER_ARCH(g5p_compute_pipeline_compile)(
    struct pvr_device *device,
@@ -143,6 +171,7 @@ PVR_PER_ARCH(g5p_compute_pipeline_compile)(
    state->a9_local_dwords = shader.a9_local_dwords;
    state->a9_has_barriers = shader.a9_has_barriers;
    state->a9_device_fence = shader.a9_device_fence;
+   state->a8_device_atomics = g5p_nir_has_device_atomics(nir);
    state->a9_num_images=shader.num_textures;
    for(unsigned i=0;i<shader.num_textures;i++) {
       state->a9_images[i].set=shader.textures[i].set;
@@ -671,7 +700,7 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
       /* KERNEL8 max_instances: the A8 sets it the way AGXMetalA8 does (g5p_cdm_max_instances_g4p());
        * the A9 leaves it 0 (32 instances per task) */
       const uint32_t max_instances =
-         g4p ? g5p_cdm_max_instances_g4p(threads, state->a9_has_barriers, 4 * state->a9_local_dwords) << 27 : 0;
+         g4p ? g5p_cdm_max_instances_g4p(threads, state->a8_device_atomics, 4 * state->a9_local_dwords) << 27 : 0;
       kernel_rec.w[6] |= max_instances;
 
       pvr_csb_set_relocation_mark(csb);

@@ -55,7 +55,8 @@ Where the A8 is known to differ, `apple_g4p` selects its form:
   address); the background program is the A9's.
 
 Where the A8 differs and this driver has no A8 form yet, it refuses by
-name: texture samples, several colour targets, integer targets, 4x, LOAD.
+name: texture samples other than the narrow implicit-LOD 2D one (`sample_g4p()`),
+several colour targets, integer targets, 4x, LOAD.
 
 ## Origin
 

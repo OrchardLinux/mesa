@@ -1047,11 +1047,33 @@ static unsigned texture_base(uint8_t *raw, const struct g5p_tex *t)
    return 6;
 }
 
+/*
+ * The A8's 2D sample with an implicit LOD and a packed-f16 (narrow) result, as Apple's A8 compiler writes
+ * f_tex's (iPod touch 6, iOS 12.4, a8-shadercap): 1a 59 00 41 00 01 88 01 00 01 00 80, where the A9 writes
+ * 18 f5 00 01 08 80 for the same source (image qword 0, sampler qword 4, coordinate dword 0 under coordinate
+ * control). Byte 2 is the destination half and byte 8 the coordinate dword << 1 (Metal's blit program has
+ * eight samples, 1a 79 DD 41 00 01 ac 01 CC 01 14 80, with eight destinations and coordinates); byte 6 is
+ * 0x80 | sampler qword << 1 (sampler 4 here, 22 in the blit). Byte 1 bit 5 is a 32-bit result there, which
+ * also carries an operand byte 10 not decoded, so only the narrow form is taken; the image qword is 0 in
+ * every witness (bytes 3-4 41 00), so only image qword 0.
+ */
+static unsigned sample_g4p(uint8_t *out, const struct g5p_tex *t)
+{
+   CHECK(t->dim == G5P_TEX_2D && !t->read && !t->class_variant && t->narrow && t->coord_control &&
+            !t->gradient && !t->lod_control && !t->length,
+         "A8 sample captured only as a narrow 2D sample with an implicit LOD");
+   CHECK(t->image_qword == 0, "A8 sample captured only with the image descriptor at common qword 0");
+   CHECK(t->sampler_qword <= 63, "A8 sample: sampler qword range");
+   CHECK(t->coord_dword <= 31 && !(t->dst_half & 1) && t->dst_half < 64, "A8 sample: coordinate/destination range");
+   const uint8_t raw[12] = {0x1a, 0x59, (uint8_t)t->dst_half, 0x41, 0x00, 0x01, (uint8_t)(0x80 | t->sampler_qword << 1),
+                            0x01, (uint8_t)(t->coord_dword << 1), 0x01, 0x00, 0x80};
+   return finish_g4p(out, raw, sizeof(raw));
+}
+
 unsigned g5p_usc_sample(uint8_t *out, const struct g5p_tex *t)
 {
-   /* The A8's sample is another form (Apple's f_tex: 1a 59 00 41 00 01 88 01 00 01 00 80; the A9's
-    * 18 f5 00 01 08 80), not decoded yet */
-   CHECK(!g5p_usc_g4p, "A8 texture sample form not decoded");
+   if (g5p_usc_g4p)
+      return sample_g4p(out, t);
    CHECK(!t->read, "mode must be sample");
    uint8_t raw[G5P_USC_MAX];
    if (!texture_base(raw, t))
@@ -1105,9 +1127,8 @@ unsigned g5p_usc_ms_own_sample(uint8_t *out, unsigned dst_half)
 
 unsigned g5p_usc_texture_lod(uint8_t *out, const struct g5p_tex *t)
 {
-   /* The A8's sample is another form (Apple's f_tex: 1a 59 00 41 00 01 88 01 00 01 00 80; the A9's
-    * 18 f5 00 01 08 80), not decoded yet */
-   CHECK(!g5p_usc_g4p, "A8 texture sample form not decoded");
+   /* The A8 takes only the narrow implicit-LOD 2D sample (sample_g4p()) */
+   CHECK(!g5p_usc_g4p, "A8 texture sample form not captured");
    CHECK(t->lod_bank == 1 || t->lod_bank == 3, "only LOD source banks 1 (shared) and 3 (temp) are measured");
    CHECK(t->lod_dword <= 95, "lod_dword must be an integer in [0,95]");
    CHECK(!t->narrow, "narrow result is not witnessed with explicit LOD");
@@ -1141,9 +1162,8 @@ unsigned g5p_usc_texture_lod(uint8_t *out, const struct g5p_tex *t)
 
 unsigned g5p_usc_gather(uint8_t *out, const struct g5p_tex *t)
 {
-   /* The A8's sample is another form (Apple's f_tex: 1a 59 00 41 00 01 88 01 00 01 00 80; the A9's
-    * 18 f5 00 01 08 80), not decoded yet */
-   CHECK(!g5p_usc_g4p, "A8 texture sample form not decoded");
+   /* The A8 takes only the narrow implicit-LOD 2D sample (sample_g4p()) */
+   CHECK(!g5p_usc_g4p, "A8 texture sample form not captured");
    CHECK(t->dim == G5P_TEX_2D, "only 2d gather is measured");
    CHECK(!t->read && !t->narrow, "gather is a 2d sample form");
    uint8_t raw[G5P_USC_MAX];
@@ -1157,9 +1177,8 @@ unsigned g5p_usc_gather(uint8_t *out, const struct g5p_tex *t)
 
 unsigned g5p_usc_sample_ext(uint8_t *out, const struct g5p_tex_ext *t)
 {
-   /* The A8's sample is another form (Apple's f_tex: 1a 59 00 41 00 01 88 01 00 01 00 80; the A9's
-    * 18 f5 00 01 08 80), not decoded yet */
-   CHECK(!g5p_usc_g4p, "A8 texture sample form not decoded");
+   /* The A8 takes only the narrow implicit-LOD 2D sample (sample_g4p()) */
+   CHECK(!g5p_usc_g4p, "A8 texture sample form not captured");
    const bool coupled = t->tuple != G5P_TEX_TUPLE_ORDINARY;
    CHECK((unsigned)t->tuple <= G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL_COMPARE_OFFSET, "unqualified texture recipe");
    CHECK(!coupled || t->lod_shared == (t->tuple == G5P_TEX_TUPLE_COUPLED_SHARED_LEVEL),
@@ -1247,9 +1266,8 @@ unsigned g5p_usc_sample_ext(uint8_t *out, const struct g5p_tex_ext *t)
 #define G5P_TEX_COORD_LAST_READ 0x80
 unsigned g5p_usc_sample_register_lod(uint8_t *out, const struct g5p_tex_ext *t)
 {
-   /* The A8's sample is another form (Apple's f_tex: 1a 59 00 41 00 01 88 01 00 01 00 80; the A9's
-    * 18 f5 00 01 08 80), not decoded yet */
-   CHECK(!g5p_usc_g4p, "A8 texture sample form not decoded");
+   /* The A8 takes only the narrow implicit-LOD 2D sample (sample_g4p()) */
+   CHECK(!g5p_usc_g4p, "A8 texture sample form not captured");
    CHECK(t->tuple == G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL && t->lod == G5P_TEX_LOD_LEVEL && !t->lod_shared &&
          (t->dim == G5P_TEX_2D_ARRAY || t->dim == G5P_TEX_CUBE),
          "the register-LOD form is an array or cube sample at a level");

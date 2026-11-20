@@ -66,7 +66,10 @@ static inline uint32_t g5p_pds_dout_g4p(uint32_t type, uint32_t src64, uint32_t 
  * The A8's CDM KERNEL8 max_instances (bits 27-31; 32 wraps to 0), as
  * AGXMetalA8 computes it (iOS 12.4, 0x1a1428938): a workgroup of 32 or more
  * threads gets 32; a smaller one gets one workgroup per task when the kernel
- * asks for it (variant +0x79b, here a kernel with barriers), else 8 workgroups
+ * asks for it (variant +0x79b: its compute metadata's field 30 at vtable
+ * offset 0x40, which Apple's compiler sets, of 25 test kernels, only for the one
+ * with a device atomic and not for the one with a barrier; Mesa passes "the
+ * kernel does device atomics"), else 8 workgroups
  * (under 5 threads) or 32 / threads, at most (m + 319) / (2m - 1) with m the
  * threadgroup memory in 64-byte units; max_instances is workgroups * threads.
  * Apple writes 8 for a 1x1x1 kernel (0x40000000, OrchardLinux/gpu a8/M2).
