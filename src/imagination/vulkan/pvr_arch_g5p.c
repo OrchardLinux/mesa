@@ -426,7 +426,7 @@ g5p_upload_programs(struct pvr_device *device, struct pvr_g5p_programs *p)
    const bool g4p = PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p);
    for (unsigned i = 0; i < PVR_G5P_MRT_VARIANTS; i++) {
       const unsigned n = g5p_mrt_variant_targets[i];
-      if (g4p && (n != 1 || i >= 7))
+      if (g4p && ((n != 1 && n != 2) || i >= 7))
          continue;
       uint8_t code[MAX2(G5P_MRT_CLEAR_USC_MAX, G5P_MRT_EOT_USC_MAX)];
       /* variants 7..10: the RGBA8 byte order of the compact clear */
@@ -805,6 +805,19 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
       }
       if (!g5p_pbe_key(iview->vk.format, &key, &srgb))
          return G5P_REFUSE(cmd_buffer, "colour target format %s", vk_Format_to_str(iview->vk.format));
+      if (t == 1 && PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p)) {
+         /* The A8's second target (a8-passcap mrt2: BGRA8 + RGBA8): its own PBE pair, and the EOT format word
+          * with 0x120 (Apple's 0x122 for RGBA8; its meaning is not decoded, so only this shape is admitted) */
+         const VkFormat f = iview->vk.format;
+         if (f != VK_FORMAT_B8G8R8A8_UNORM && f != VK_FORMAT_R8G8B8A8_UNORM)
+            return G5P_REFUSE(cmd_buffer, "A8 second colour target format %s (RGBA8/BGRA8 UNORM are captured)",
+                              vk_Format_to_str(f));
+         g->a8_eot_format_t1 = ROGUE_PBESTATE_PACKMODE_U8U8U8U8 << 16 | 0x120 | 2;
+         g->a8_t1_addr = addr;
+         g5p_pbe_a8_reg_words(g->a8_pbe_t1, iview->vk.extent.width, iview->vk.extent.height,
+                              f == VK_FORMAT_B8G8R8A8_UNORM ? G5P_PBE_A8_SWIZZLE_BGRA : G5P_PBE_A8_SWIZZLE_RGBA,
+                              twiddled, level->pitch / 4);
+      }
       if (!t && PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p)) {
          /* The A8's PBE words for target 0 (the kernel's 3D record W+0x118): the formats captured on the A8 */
          /*
@@ -1041,14 +1054,27 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
        * the A8 3D record's +0x118 block carries them (the kernel
        * fills it). Only that pass shape is captured.
        */
-      if (nt != 1 || raw || compact || null_target || g->samples != 1)
-         return G5P_REFUSE(cmd_buffer, "A8 end of tile for %u targets, %u samples%s: only one single-sample "
-                           "colour target is captured", nt, g->samples, raw ? ", integer" : "");
+      if ((nt != 1 && nt != 2) || raw || compact || null_target || g->samples != 1 || (nt == 2 && g->a8_narrow_halves))
+         return G5P_REFUSE(cmd_buffer, "A8 end of tile for %u targets, %u samples%s: one or two single-sample "
+                           "colour targets are captured", nt, g->samples, raw ? ", integer" : "");
       pbe_words[0] = (uint32_t)target0_addr;
       pbe_words[1] = (uint32_t)(target0_addr >> 32);
       pbe_words[2] = g->a8_eot_format; /* packmode << 16 | conversion */
       pbe_words[3] = 0;
       pbe_dwords = 4;
+      if (nt == 2) {
+         /* the second target's block (Apple's mrt2: {t1, 0x122, 0}), one 8-dword DMA */
+         pbe_words[4] = (uint32_t)g->a8_t1_addr;
+         pbe_words[5] = (uint32_t)(g->a8_t1_addr >> 32);
+         pbe_words[6] = g->a8_eot_format_t1;
+         pbe_words[7] = 0;
+         pbe_dwords = 8;
+         /* its clear colours in reverse target order (g5p_mrt_clear_usc()) */
+         float t0[4];
+         memcpy(t0, clear[0], sizeof(t0));
+         memcpy(clear[0], clear[1], sizeof(t0));
+         memcpy(clear[1], t0, sizeof(t0));
+      }
    }
    VkResult result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, clear, 16 * nt, &floats);
    if (result != VK_SUCCESS)
@@ -1253,8 +1279,9 @@ PVR_PER_ARCH(g5p_frag_stream)(const struct pvr_device *device, const struct pvr_
       /* The A8's PBE words, Rogue's pbe_word[8][3]: target 0's REG_WORD0/1, then the empty pair Apple writes for
        * every unused target; word 2 is 0 (the kernel copies words 0-1 to W+0x118 + 16 i) */
       for (unsigned i = 0; i < 8; i++) {
-         g5p_put64(&s, i ? G5P_PBE_A8_EMPTY0 : g->a8_pbe[0]);
-         g5p_put64(&s, i ? G5P_PBE_A8_EMPTY1 : g->a8_pbe[1]);
+         const bool t1 = i == 1 && g->a8_t1_addr;
+         g5p_put64(&s, i ? (t1 ? g->a8_pbe_t1[0] : G5P_PBE_A8_EMPTY0) : g->a8_pbe[0]);
+         g5p_put64(&s, i ? (t1 ? g->a8_pbe_t1[1] : G5P_PBE_A8_EMPTY1) : g->a8_pbe[1]);
          g5p_put64(&s, 0);
       }
    } else {

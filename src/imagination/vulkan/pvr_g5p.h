@@ -202,6 +202,10 @@ struct pvr_g5p_job {
    uint64_t a8_pbe[2];          /* the A8: target 0's PBESTATE_REG_WORD0/1 (g5p_pbe_a8_reg_words()) */
    uint32_t a8_eot_format;      /* the A8: the EOT state's format word, PBE packmode << 16 | conversion */
    uint8_t a8_narrow_halves;    /* the A8: one R8 (1) or RG8 (2) target: one-word output (Apple's 111c) */
+   /* the A8's second colour target (MRT2): its PBE words, address and EOT format word */
+   uint64_t a8_pbe_t1[2];
+   uint64_t a8_t1_addr;
+   uint32_t a8_eot_format_t1;
    uint32_t vdm_bytes;          /* through STREAM_TERMINATE */
    uint32_t width, height;
    unsigned targets;            /* colour targets, 1, 2 or 4 */

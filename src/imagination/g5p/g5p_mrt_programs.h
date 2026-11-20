@@ -166,11 +166,15 @@ static inline unsigned g5p_mrt_clear_usc(uint8_t *out, unsigned n)
    if (n > 4)
       return g5p_mrt_clear_compact(out, n, true);
    unsigned o = 0;
-   for (unsigned t = 0; t < n; t++)
+   /* The A8 (AGXMetalA8, a8-passcap mrt2) converts the last target first and reads target t's clear colour from
+    * slot n - 1 - t of the clear DMA (its colours in reverse target order); the A9 in order */
+   for (unsigned i = 0; i < n; i++)
       for (int c = 3; c >= 0; c--) {
+         const unsigned t = g5p_usc_g4p ? n - 1 - i : i, slot = g5p_usc_g4p ? n - 1 - t : t;
          uint8_t h = 4 * t + c;
+         const uint8_t src = (uint8_t)(4 * slot + c);
          const uint8_t ins[16] = {0x8a, 0x01, h, 0x01, 0x01, 0x01, 0xa0, 0x01,
-                                  (uint8_t)(4 * h + 1), 0x01, 0x40, 0x41, 0x04, 0x01, 0xb0, 0x00};
+                                  (uint8_t)(4 * src + 1), 0x01, 0x40, 0x41, 0x04, 0x01, 0xb0, 0x00};
          memcpy(out + o, ins, sizeof(ins));
          o += sizeof(ins);
       }
@@ -197,13 +201,19 @@ static inline unsigned g5p_mrt_eot_usc_mode(uint8_t *out, unsigned n, bool integ
        * (its address and 2, 0: the EOT DMA), then the A9's branch to an END at the next 64-byte boundary
        * (Apple's program, iOS 12.4, a8-shadercap). Other target counts and the integer form are not
        * captured. */
-      if (n != 1 || integer) {
-         g5p_usc_error = "A8 end of tile captured for one float target only";
+      if ((n != 1 && n != 2) || integer) {
+         g5p_usc_error = "A8 end of tile captured for one or two float targets only";
          return 0;
       }
-      const uint8_t g4[10] = {0x1e, 0x01, 0x00, 0x70, 0x00, 0x01, 0x3c, 0x01, 0x00, 0x00};
-      memcpy(out, g4, sizeof(g4));
-      for (o = sizeof(g4); o < 64; o += 2) {
+      /* two targets (Apple's, a8-passcap mrt2): 1c 01 00 70 (target 0), 4c 04, 1e 01 00 71 08 00 (target 1, its
+       * state from the second EOT DMA block), then the branch to the END at byte 64 */
+      static const uint8_t g4_1[10] = {0x1e, 0x01, 0x00, 0x70, 0x00, 0x01, 0x3c, 0x01, 0x00, 0x00};
+      static const uint8_t g4_2[18] = {0x1c, 0x01, 0x00, 0x70, 0x4c, 0x04, 0x1e, 0x01, 0x00, 0x71,
+                                       0x08, 0x00, 0x00, 0x01, 0x34, 0x01, 0x00, 0x00};
+      const uint8_t *g4 = n == 2 ? g4_2 : g4_1;
+      const unsigned g4_len = n == 2 ? sizeof(g4_2) : sizeof(g4_1);
+      memcpy(out, g4, g4_len);
+      for (o = g4_len; o < 64; o += 2) {
          out[o] = 0x00;
          out[o + 1] = 0xc0;
       }

@@ -5775,7 +5775,10 @@ static void fs_prologue(struct gctx *c)
    uint8_t raw[G5P_USC_MAX];
    if (c->narrow_tex || c->narrow_iter || !any_color(c))
       return;
-   for (unsigned d = 0; d < c->mrt.words; d++) {
+   for (unsigned i = 0; i < c->mrt.words; i++) {
+      /* the A8 writes the last target's output dwords first (AGXMetalA8's two-target f_mrt2: r2, r3, r0, r1) */
+      const unsigned per = c->mrt.targets > 1 ? c->mrt.words / c->mrt.targets : c->mrt.words;
+      const unsigned d = (g5p_usc_g4p && c->mrt.targets > 1) ? (c->mrt.targets - 1 - i / per) * per + i % per : i;
       uint16_t h0 = 0, h1 = 0;
       bool c0 = out_const(c, 2 * d, &h0), c1 = out_const(c, 2 * d + 1, &h1);
       /* the A8's R8 output: half 1 is zero whatever the shader writes (Apple's 7130 literal) */
