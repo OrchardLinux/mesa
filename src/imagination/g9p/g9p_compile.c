@@ -4184,7 +4184,7 @@ generate(struct g9p_ctx *ctx, nir_function_impl *impl, unsigned st)
    memcpy(body, ctx->c->w, body_n * sizeof(uint16_t));
    ctx->c->n = 0;
    if (ctx->stage == MESA_SHADER_COMPUTE)
-      g9p_prologue(ctx->c, 4 * ctx->out->num_buffers);
+      g9p_prologue(ctx->c, 4 * ctx->out->num_buffers, ctx->out->uses_workgroup_id || ctx->out->shared_size);
    if (stack) {
       /*
        * Fragment code: the stack at level 0, all lanes on, as Apple's first level starts

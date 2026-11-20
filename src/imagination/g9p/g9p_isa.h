@@ -140,10 +140,17 @@ g9p_code_word(struct g9p_code *c, unsigned at)
  * half @count_half, i.e. dword @count_half / 2, both halves = threads per
  * group) with r0 and disables the lanes past it.
  */
+extern bool g5p_usc_g4p;
+
+/*
+ * @common: the kernel's record has a common store (threadgroup words: it reads the workgroup ID or threadgroup
+ * memory). The A8 clears bit 15 of the second word then: AGXMetalA8's 25 kernels have 8189 (+8 per buffer)
+ * under common size 0 (k_store_one, k_atomic) and 0189.. under common size 1 or more (the other 23)
+ */
 static inline void
-g9p_prologue(struct g9p_code *c, unsigned count_half)
+g9p_prologue(struct g9p_code *c, unsigned count_half, bool common)
 {
-   G9P_EMIT(c, 0x1181, 0x8181 | 2 * count_half, 0x4100, 0xacb7);
+   G9P_EMIT(c, 0x1181, ((g5p_usc_g4p && common) ? 0x0181 : 0x8181) | 2 * count_half, 0x4100, 0xacb7);
 }
 
 /*
@@ -412,10 +419,25 @@ g9p_addr(struct g9p_code *c, unsigned dst, unsigned base_dword, unsigned idx,
  * bits 8-9 are the load's bank bits: fragment code clears them (Apple's
  * fragment loads are 2012/3812 where compute has 2312, probes/fsload.metal)
  */
+/* the A8 (set by the device for the A8's G5P path, g5p_usc.c) */
+extern bool g5p_usc_g4p;
+
 static inline void
 g9p_mem_at(struct g9p_code *c, bool store, unsigned size, unsigned reg,
            unsigned pair)
 {
+   if (g5p_usc_g4p && !c->fragment) {
+      /*
+       * The A8's compute load/store (AGXMetalA8's output, iPod touch 6 capture, every load and store of the
+       * 25 kernels): W0 size << 11 | 0x0510; W1 0x0500 | data register << 1; W2 the address pair's first
+       * register << 1 | 0x0100, with 0x8000 for a store; W3 0x0020, 0x4000 for a store. k_store_one's store
+       * of r2 to [r0:r1] is 2510 0504 8100 4020. The A9 form (2310, store bit 7 in W1, 8800) stores nothing
+       * on the A8 (Mesa's k_store_lid completes inside Apple's job without a store).
+       */
+      G9P_EMIT(c, size << 11 | 0x0510, 0x0500 | reg << 1, (store ? 0x8100 : 0x0100) | pair << 1,
+               store ? 0x4020 : 0x0020);
+      return;
+   }
    G9P_EMIT(c, size << 11 | (c->fragment ? 0x0010 : 0x0310),
             (1 | pair << 2) << 8 | (store ? 0x80 : 0) | reg << 1, 0x8800);
 }
