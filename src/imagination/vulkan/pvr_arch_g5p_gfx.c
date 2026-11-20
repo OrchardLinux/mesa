@@ -2710,6 +2710,11 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
          c.clip_mode = (enum ROGUE_TA_CLIP_MODE)clip_mode;
          c.flatshade_vtx = ROGUE_TA_FLATSHADE_VTX_VERTEX_0;
          c.wclampen = true;
+         /* The A8 draws clipped edges: AGXMetalA8's render encoder init writes
+          * PPP_CTRL 0x6a0 (0x1a1450cb8) and no setter clears bit 9 (cull
+          * 0x1a1449a90, clip mode 0x1a1449b00, 0x1a144ac2c, 0x1a144ac90). The
+          * A9 captures carry 0x4a0. */
+         c.drawclippededges = PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p);
          if (dyn->rs.cull_mode == VK_CULL_MODE_BACK_BIT || dyn->rs.cull_mode == VK_CULL_MODE_FRONT_BIT) {
             /* Rogue's rule (pvr_setup_ppp_control) */
             const bool ccw = dyn->rs.front_face == VK_FRONT_FACE_COUNTER_CLOCKWISE;
@@ -2740,7 +2745,10 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
       pvr_csb_pack (&w[1], TA_STATE_STREAM_OUT0, s0) {
          s0.stream0_ta_output = true;
       }
-      w[2] = G5P_STREAM_OUT1;
+      /* The A8: PDS data 1, temps 1, no bit 14. AGXMetalA8 0x1a144f654 sets
+       * the low 10 bits to 0x11 over a default of 0 (0x1a1459500), for the
+       * same 16 zero bytes + HALT program (0x1a144f61c). */
+      w[2] = PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p) ? 0x11u : G5P_STREAM_OUT1;
       pvr_csb_pack (&w[3], TA_STATE_STREAM_OUT2, s2) {
          s2.pds_data_addr = PVR_DEV_ADDR(dp->halt.data_offset);
       }
