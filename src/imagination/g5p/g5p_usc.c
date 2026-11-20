@@ -9,6 +9,7 @@
 #include <string.h>
 
 _Thread_local const char *g5p_usc_error;
+bool g5p_usc_g4p;
 
 const char *const g5p_binop_name[G5P_BIN_COUNT] = {"fadd", "fmul", "iadd", "imul", "and", "or", "xor", "ishr",
                                                        "isub"};
@@ -54,6 +55,38 @@ static unsigned finish(uint8_t *out, const uint8_t *raw, unsigned n)
    memcpy(out, raw, n);
    g5p_usc_error = NULL;
    return n;
+}
+
+/* An A8 form: the A9's one-instruction length rule is not established for it */
+static unsigned finish_g4p(uint8_t *out, const uint8_t *raw, unsigned n)
+{
+   memcpy(out, raw, n);
+   g5p_usc_error = NULL;
+   return n;
+}
+
+/*
+ * The A8 varying iterator: 0x18, (count % 4) << 3 | 1, the destination half,
+ * 0x81 (0xa1 for four components), slot << 2, then 0 (32-bit) or, for the
+ * narrow (16-bit) form, 01 04 00. Apple's A8 output (a8-shadercap, iOS 12.4):
+ * 18 09 04 81 10 00 (one f32 component at slot 4 into half 4), 18 11 00 81 04
+ * 00 (two f32), 18 19 00 81 04 01 04 00 (three f16), 18 01 00 a1 04 01 04 00
+ * (four f16), where the A9 writes 08 0b 04 08, 08 13 00 03 00 80, 0a 1b 00 02
+ * and 0a 03 00 02. Only those shapes are accepted; the narrow form only at
+ * slot 1, the one captured (its 0x04 may be the slot or a constant).
+ */
+static unsigned iterator_g4p(uint8_t *out, unsigned dst_half, unsigned slot, unsigned count, bool narrow,
+                             bool saturate, unsigned flags)
+{
+   CHECK(!saturate && !flags, "A8 iterator modes (saturate, linear, centroid, DRC1) not captured");
+   CHECK(narrow ? (count == 3 || count == 4) : (count == 1 || count == 2),
+         "A8 iterator: only 1-2 f32 or 3-4 f16 components are captured");
+   CHECK(!narrow || slot == 1, "A8 narrow iterator captured at slot 1 only");
+   CHECK(dst_half < 256 && slot < 64, "A8 iterator destination/slot range");
+   const uint8_t raw[8] = {0x18, (uint8_t)(((count % 4) << 3) | 1), (uint8_t)dst_half,
+                           (uint8_t)(0x81 | (count == 4 ? 0x20 : 0)), (uint8_t)(slot << 2),
+                           narrow ? 1 : 0, 0x04, 0x00};
+   return finish_g4p(out, raw, narrow ? 8 : 6);
 }
 
 /* _destination / _selector / _header of the reference. */
@@ -567,6 +600,8 @@ unsigned g5p_usc_branch(uint8_t *out, int delta, bool conditional)
 unsigned g5p_usc_iterator(uint8_t *out, unsigned dst_half, unsigned slot, unsigned count,
                           bool narrow, bool saturate)
 {
+   if (g5p_usc_g4p)
+      return iterator_g4p(out, dst_half, slot, count, narrow, saturate, 0);
    CHECK(count >= 1 && count <= 4 && !(dst_half % 2), "iterator count/alignment");
    CHECK(dst_half < 256, "iterator destination must be u8");
    CHECK(slot < 128, "iterator slot must be u7");
@@ -579,6 +614,8 @@ unsigned g5p_usc_iterator_flags(uint8_t *out, unsigned dst_half, unsigned slot, 
 {
    CHECK(!(flags & ~(G5P_ITER_LINEAR | G5P_ITER_CENTROID | G5P_ITER_DRC1)), "unknown iterator flag");
    CHECK(!(narrow && (flags & (G5P_ITER_LINEAR | G5P_ITER_CENTROID))), "narrow iterator modes not witnessed");
+   if (g5p_usc_g4p)
+      return iterator_g4p(out, dst_half, slot, count, narrow, saturate, flags);
    if (!g5p_usc_iterator(out, dst_half, slot, count, narrow, saturate))
       return 0;
    if (flags & G5P_ITER_DRC1)
@@ -600,6 +637,8 @@ unsigned g5p_usc_coeff_load(uint8_t *out, unsigned dst_half, unsigned coeff_dwor
 
 unsigned g5p_usc_coord_iterator(uint8_t *out, unsigned dst_half, unsigned slot, unsigned count)
 {
+   if (g5p_usc_g4p) /* the A8 iterates a texture coordinate with its plain iterator (Apple's f_tex) */
+      return iterator_g4p(out, dst_half, slot, count, false, false, 0);
    CHECK((count == 2 || count == 3) && !(dst_half % 2), "coordinate iterator count/alignment");
    CHECK(dst_half < 64, "coordinate destination half must be u6");
    CHECK(slot < 128, "iterator slot must be u7");
@@ -611,6 +650,13 @@ unsigned g5p_usc_emit(uint8_t *out, unsigned words, unsigned source_half)
 {
    CHECK(words == 2 || words == 4, "only two/four output words characterized");
    CHECK(source_half < 256, "output source half must be u8");
+   if (g5p_usc_g4p) {
+      /* A8: byte 3 bit 0 and the extension halfword 0x8200 (Apple's 1c 21 00 09 00 82 in every captured
+       * fragment program; the A9's 1c 21 00 08) */
+      CHECK(words == 2, "A8 emitpix captured for two words only");
+      const uint8_t g4[6] = {0x1c, (uint8_t)((words << 4) | 1), (uint8_t)source_half, 9, 0x00, 0x82};
+      return finish_g4p(out, g4, 6);
+   }
    uint8_t raw[4] = {0x1c, (words << 4) | 1, source_half, 8};
    return finish(out, raw, 4);
 }
@@ -624,6 +670,8 @@ unsigned g5p_usc_emit_mrt(uint8_t *out, unsigned words, unsigned source_half)
 {
    CHECK(g5p_mrt_emit_words_witnessed(words), "only 1/2/4/8 terminal source words have an Apple witness");
    CHECK(source_half < 256, "output source half must be u8");
+   if (g5p_usc_g4p)
+      return g5p_usc_emit(out, words, source_half);
    uint8_t raw[4] = {0x1c, (g5p_mrt_emit_field(words) << 4) | 1, source_half, 8};
    return finish(out, raw, 4);
 }
@@ -1001,6 +1049,9 @@ static unsigned texture_base(uint8_t *raw, const struct g5p_tex *t)
 
 unsigned g5p_usc_sample(uint8_t *out, const struct g5p_tex *t)
 {
+   /* The A8's sample is another form (Apple's f_tex: 1a 59 00 41 00 01 88 01 00 01 00 80; the A9's
+    * 18 f5 00 01 08 80), not decoded yet */
+   CHECK(!g5p_usc_g4p, "A8 texture sample form not decoded");
    CHECK(!t->read, "mode must be sample");
    uint8_t raw[G5P_USC_MAX];
    if (!texture_base(raw, t))
@@ -1054,6 +1105,9 @@ unsigned g5p_usc_ms_own_sample(uint8_t *out, unsigned dst_half)
 
 unsigned g5p_usc_texture_lod(uint8_t *out, const struct g5p_tex *t)
 {
+   /* The A8's sample is another form (Apple's f_tex: 1a 59 00 41 00 01 88 01 00 01 00 80; the A9's
+    * 18 f5 00 01 08 80), not decoded yet */
+   CHECK(!g5p_usc_g4p, "A8 texture sample form not decoded");
    CHECK(t->lod_bank == 1 || t->lod_bank == 3, "only LOD source banks 1 (shared) and 3 (temp) are measured");
    CHECK(t->lod_dword <= 95, "lod_dword must be an integer in [0,95]");
    CHECK(!t->narrow, "narrow result is not witnessed with explicit LOD");
@@ -1087,6 +1141,9 @@ unsigned g5p_usc_texture_lod(uint8_t *out, const struct g5p_tex *t)
 
 unsigned g5p_usc_gather(uint8_t *out, const struct g5p_tex *t)
 {
+   /* The A8's sample is another form (Apple's f_tex: 1a 59 00 41 00 01 88 01 00 01 00 80; the A9's
+    * 18 f5 00 01 08 80), not decoded yet */
+   CHECK(!g5p_usc_g4p, "A8 texture sample form not decoded");
    CHECK(t->dim == G5P_TEX_2D, "only 2d gather is measured");
    CHECK(!t->read && !t->narrow, "gather is a 2d sample form");
    uint8_t raw[G5P_USC_MAX];
@@ -1100,6 +1157,9 @@ unsigned g5p_usc_gather(uint8_t *out, const struct g5p_tex *t)
 
 unsigned g5p_usc_sample_ext(uint8_t *out, const struct g5p_tex_ext *t)
 {
+   /* The A8's sample is another form (Apple's f_tex: 1a 59 00 41 00 01 88 01 00 01 00 80; the A9's
+    * 18 f5 00 01 08 80), not decoded yet */
+   CHECK(!g5p_usc_g4p, "A8 texture sample form not decoded");
    const bool coupled = t->tuple != G5P_TEX_TUPLE_ORDINARY;
    CHECK((unsigned)t->tuple <= G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL_COMPARE_OFFSET, "unqualified texture recipe");
    CHECK(!coupled || t->lod_shared == (t->tuple == G5P_TEX_TUPLE_COUPLED_SHARED_LEVEL),
@@ -1187,6 +1247,9 @@ unsigned g5p_usc_sample_ext(uint8_t *out, const struct g5p_tex_ext *t)
 #define G5P_TEX_COORD_LAST_READ 0x80
 unsigned g5p_usc_sample_register_lod(uint8_t *out, const struct g5p_tex_ext *t)
 {
+   /* The A8's sample is another form (Apple's f_tex: 1a 59 00 41 00 01 88 01 00 01 00 80; the A9's
+    * 18 f5 00 01 08 80), not decoded yet */
+   CHECK(!g5p_usc_g4p, "A8 texture sample form not decoded");
    CHECK(t->tuple == G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL && t->lod == G5P_TEX_LOD_LEVEL && !t->lod_shared &&
          (t->dim == G5P_TEX_2D_ARRAY || t->dim == G5P_TEX_CUBE),
          "the register-LOD form is an array or cube sample at a level");

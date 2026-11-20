@@ -10,6 +10,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "g5p_usc.h"
 #include "pvr_physical_device.h"
 
 #include <sys/sysmacros.h>
@@ -1388,6 +1389,10 @@ VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
                          "Failed to get driver build sha.");
       goto err_vk_physical_device_finish;
    }
+
+   /* The A8's USC forms (g5p_usc.h); one process drives one Apple GPU */
+   if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g4p))
+      g5p_usc_g4p = true;
 
    pdevice->skip_refused_work = PVR_HAS_FEATURE(&pdevice->dev_info, apple_g5p) &&
                                  instance->drirc.misc.pvr_skip_refused_work;

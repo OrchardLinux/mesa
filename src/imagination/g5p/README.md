@@ -47,10 +47,15 @@ Where the A8 is known to differ, `apple_g4p` selects its form:
   Rogue's unit: 0x202 for one target on the A8, 0x402 on the A9
   (`g5p_mrt_eot_info_g4p()`).
 
-Where the A8 is known to differ and this driver has no A8 form yet, it
-refuses by name: compute pipelines, until Apple's residency limits for the
-A8 are known (`pvr_arch_g5p_compute.c`). Which A9 instructions are G5-only
-is not known yet; the A8 notes list the captures that settle it.
+- Compute: Apple's A8 residency limits (`apple-a8.h`), the PDS in Rogue's
+  layout (`G5P_PDS_DOUT()`), the kernel launch and KERNEL8 max_instances
+  as AGXMetalA8 builds them (`pvr_arch_g5p_compute.c`, `g5p_cdm.h`).
+- USC (`g5p_usc_g4p`, from Apple's A8 compiler output): the long emitpix,
+  the A8 varying iterator, the A8 end of tile (`1e010070`, fed the target's
+  address); the background program is the A9's.
+
+Where the A8 differs and this driver has no A8 form yet, it refuses by
+name: texture samples, several colour targets, integer targets, 4x, LOAD.
 
 ## Origin
 

@@ -37,10 +37,29 @@
 static const struct pvr_device_features pvr_device_features_3_V_4_5 = {
    .has_apple_g5p = true,
    .has_apple_g4p = true,
-   /* No has_apple_compute_dispatch: the residency parameters come from
-    * AGXMetalA8 and are not established yet, so compute pipelines are
-    * refused by name (pvr_arch_g5p_compute.c).
+   .has_apple_compute_dispatch = true,
+   /* A8: AGXMetalA8 (iOS 12.4) ComputeProgramVariant constructor
+    * (0x1a13eb034) -> +0x790, what -[AGXA8ComputePipeline
+    * maxTotalThreadsPerThreadgroup] (0x1a13c5028) returns:
+    * min(32 * floor((3585 - a) / a), 262144 / b), a = (4t + 28) & ~31,
+    * b = (64f + 448) & ~511, at most 512 and a multiple of 32; the A9's
+    * routine is the same with 3329 and 393216. threadExecutionWidth is 32
+    * (0x1a13c5020). The shared formula's bank-1 term keeps one task in
+    * reserve (pvr_compute_limits.h), below Apple's for both chips.
     */
+   .apple_compute_dispatch = {
+      .bank0_budget = 3585U,
+      .bank1_budget = 262144U,
+      .register_granularity = 8U,
+      .bank0_scale = 4U,
+      .bank0_rounding_bias = 28U,
+      .bank0_granularity = 32U,
+      .bank1_scale = 64U,
+      .bank1_rounding_bias = 448U,
+      .bank1_granularity = 512U,
+      .task_size = 32U,
+      .max_workgroup_size = 512U,
+   },
    .has_num_clusters = true,            /* A8 */
 
    /* A9 placeholders (apple-a9.h) */

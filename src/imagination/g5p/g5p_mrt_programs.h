@@ -148,7 +148,14 @@ static inline unsigned g5p_mrt_clear_usc(uint8_t *out, unsigned n)
          memcpy(out + o, ins, sizeof(ins));
          o += sizeof(ins);
       }
-   /* emitpix of 2N words (the 3-bit field wraps: 8 is 0), then END */
+   /* emitpix of 2N words (the 3-bit field wraps: 8 is 0), then END. The A8 takes the long emitpix
+    * (g5p_usc_emit()); its background program for one target is otherwise these bytes (Apple's, iOS 12.4) */
+   if (g5p_usc_g4p) {
+      const unsigned len = g5p_usc_emit(out + o, 2 * n, 0);
+      if (!len)
+         return 0;
+      return o + len + g5p_usc_special(out + o + len, true);
+   }
    const uint8_t tail[6] = {0x1c, (uint8_t)(((2 * n) & 7) << 4 | 1), 0x00, 0x08, 0x00, 0x80};
    memcpy(out + o, tail, sizeof(tail));
    return o + sizeof(tail);
@@ -159,6 +166,25 @@ static inline unsigned g5p_mrt_clear_usc(uint8_t *out, unsigned n)
 static inline unsigned g5p_mrt_eot_usc_mode(uint8_t *out, unsigned n, bool integer)
 {
    unsigned o = 0;
+   if (g5p_usc_g4p) {
+      /* The A8's end of tile for one target: 1e 01 00 70, which takes the target from the common store
+       * (its address and 2, 0: the EOT DMA), then the A9's branch to an END at the next 64-byte boundary
+       * (Apple's program, iOS 12.4, a8-shadercap). Other target counts and the integer form are not
+       * captured. */
+      if (n != 1 || integer) {
+         g5p_usc_error = "A8 end of tile captured for one float target only";
+         return 0;
+      }
+      const uint8_t g4[10] = {0x1e, 0x01, 0x00, 0x70, 0x00, 0x01, 0x3c, 0x01, 0x00, 0x00};
+      memcpy(out, g4, sizeof(g4));
+      for (o = sizeof(g4); o < 64; o += 2) {
+         out[o] = 0x00;
+         out[o + 1] = 0xc0;
+      }
+      out[o] = 0x00;
+      out[o + 1] = 0x80;
+      return o + 2;
+   }
    for (unsigned k = 0; k < n; k++) {
       /* output half 2 * (n - 1 - k) = target k's output-half offset (in its PBE block) */
       const unsigned len = g5p_usc_mov_shared_half(out + o, 2 * (n - 1 - k),

@@ -98,9 +98,7 @@ PVR_PER_ARCH(g5p_compute_pipeline_compile)(
       pvr_g5p_shader_dump(&create_info->stage, create_info->layout, "comp", NULL, 0, "ADMIT", NULL);
    }
    if (!PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_compute_dispatch)) {
-      /* The A8: its residency parameters (AGXMetalA8) are not established,
-       * and a workgroup above them does not run.
-       */
+      /* A device entry without Apple's residency parameters */
       mesa_logw("G5P refuses: compute on %s, whose workgroup residency limits are not established",
                 device->pdevice->dev_info.ident.public_name);
       result = vk_errorf(device, VK_ERROR_FEATURE_NOT_PRESENT,
@@ -293,6 +291,7 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
                                const uint32_t group_count[static 3])
 {
    struct pvr_device *device = cmd_buffer->device;
+   const bool g4p = PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p);
    const struct pvr_compute_pipeline *pipeline = cmd_buffer->state.compute_pipeline;
    const struct pvr_g9p_compute_state *state = &pipeline->g9p;
    const struct pvr_descriptor_state *desc = &cmd_buffer->state.compute_desc_state;
@@ -557,7 +556,7 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
       bind_data[2 * k + 1] = src >> 32;
       bind_data[ctrl0 + k] =
          (k+1 == transfers ? BITFIELD_BIT(31) : 0) | BITFIELD_BIT(28) | dest << 13 | dwords;
-      bind_code[nc++] = g9p_pds_dout(G9P_DOUTD, k, G9P_PDS_DATA, ctrl0 + k,
+      bind_code[nc++] = G5P_PDS_DOUT(g4p, G9P_DOUTD, k, G9P_PDS_DATA, ctrl0 + k,
                                      k+1 == transfers ? G9P_PDS_END : 0);
    }
    bind_code[nc++] = g9p_pds_halt();
@@ -586,11 +585,11 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
    kernel_data[2] = 0x80000000;
    kernel_data[4] = 0x90000002;
    kernel_code[0] = g9p_pds_bra_not_if1(4);
-   kernel_code[1] = g9p_pds_dout(G9P_DOUTW, 0, G9P_PDS_TEMPS, 4, G9P_PDS_END);
+   kernel_code[1] = G5P_PDS_DOUT(g4p, G9P_DOUTW, 0, G9P_PDS_TEMPS, 4, G9P_PDS_END);
    kernel_code[2] = g9p_pds_halt();
    kernel_code[3] = g9p_pds_halt();
-   kernel_code[4] = g9p_pds_dout(G9P_DOUTW, 0, G9P_PDS_TEMPS, 2, 0);
-   kernel_code[5] = g9p_pds_dout(G9P_DOUTU, 0, G9P_PDS_DATA, 0,
+   kernel_code[4] = G5P_PDS_DOUT(g4p, G9P_DOUTW, 0, G9P_PDS_TEMPS, 2, 0);
+   kernel_code[5] = G5P_PDS_DOUT(g4p, G9P_DOUTU, 0, G9P_PDS_DATA, 0,
                                  G9P_PDS_END | G9P_PDS_CC);
    kernel_code[6] = g9p_pds_halt();
    kernel_code[7] = g9p_pds_halt();
@@ -601,11 +600,11 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
       kernel_dwords = 12;
       kernel_data[6] = BITFIELD_BIT(28) | 2u << 13 | 2;
       kernel_code[0] = g9p_pds_bra_not_if1(5);
-      kernel_code[1] = g9p_pds_dout(G9P_DOUTW, 4, G9P_PDS_DATA, 6, 0);
-      kernel_code[2] = g9p_pds_dout(G9P_DOUTW, 0, G9P_PDS_TEMPS, 4, G9P_PDS_END);
+      kernel_code[1] = G5P_PDS_DOUT(g4p, G9P_DOUTW, 4, G9P_PDS_DATA, 6, 0);
+      kernel_code[2] = G5P_PDS_DOUT(g4p, G9P_DOUTW, 0, G9P_PDS_TEMPS, 4, G9P_PDS_END);
       kernel_code[3] = kernel_code[4] = g9p_pds_halt();
-      kernel_code[5] = g9p_pds_dout(G9P_DOUTW, 0, G9P_PDS_TEMPS, 2, 0);
-      kernel_code[6] = g9p_pds_dout(G9P_DOUTU, 0, G9P_PDS_DATA, 0, G9P_PDS_END | G9P_PDS_CC);
+      kernel_code[5] = G5P_PDS_DOUT(g4p, G9P_DOUTW, 0, G9P_PDS_TEMPS, 2, 0);
+      kernel_code[6] = G5P_PDS_DOUT(g4p, G9P_DOUTU, 0, G9P_PDS_DATA, 0, G9P_PDS_END | G9P_PDS_CC);
    }
    if (state->a9_wgid_z) {
       /* Workgroup ID z, only for a kernel that reads it: AGXMetalA9's EncodeComputePDSProgram (0x207d1ea4c, flags
@@ -620,13 +619,38 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
                        PVR_ROGUE_PDSINST_DOUT_FIELDS_DOUTW_SRC1_DEST_COMMON_STORE |
                        G9P_A9_TG_WGID_Z << PVR_ROGUE_PDSINST_DOUT_FIELDS_DOUTW_SRC1_AO_SHIFT |
                        PVR_ROGUE_PDSINST_DOUT_FIELDS_DOUTW_SRC1_BSIZE_UPPER;
-      kernel_code[at] = g9p_pds_dout(G9P_DOUTW, 0, G9P_PDS_TEMPS, 4, 0);
-      kernel_code[at + 1] = g9p_pds_dout(G9P_DOUTW, 1, G9P_PDS_TEMPS, 5, G9P_PDS_END);
+      kernel_code[at] = G5P_PDS_DOUT(g4p, G9P_DOUTW, 0, G9P_PDS_TEMPS, 4, 0);
+      kernel_code[at + 1] = G5P_PDS_DOUT(g4p, G9P_DOUTW, 1, G9P_PDS_TEMPS, 5, G9P_PDS_END);
+   }
+   unsigned kernel_code_dwords = ARRAY_SIZE(kernel_code);
+   if (g4p) {
+      /*
+       * The A8 kernel launch in AGXMetalA8's order (its compute PDS encoder,
+       * iOS 12.4, 0x1a1453d44): the branch past the coefficient (IF1) task's
+       * part, that part (the barrier counter's zero pair, the workgroup ID
+       * x/y and then z into the threadgroup words) with no END bit, its HALT;
+       * then the local ID into r0, DOUTU.END.CC and HALT. No padding HALTs.
+       * Without the IF1 writes this is Metal's A8 store kernel, c2c00002
+       * d3000000 f0024001 fc000002 d3000000. The data words are the A9's.
+       */
+      unsigned k = 1;
+      if (state->a9_has_barriers)
+         kernel_code[k++] = G5P_PDS_DOUT(g4p, G9P_DOUTW, 4, G9P_PDS_DATA, 6, 0);
+      kernel_code[k++] = G5P_PDS_DOUT(g4p, G9P_DOUTW, 0, G9P_PDS_TEMPS, 4, 0);
+      if (state->a9_wgid_z)
+         kernel_code[k++] = G5P_PDS_DOUT(g4p, G9P_DOUTW, 1, G9P_PDS_TEMPS, 5, 0);
+      kernel_code[k++] = g9p_pds_halt();
+      kernel_code[0] = g9p_pds_bra_not_if1(k);
+      kernel_code[k++] = G5P_PDS_DOUT(g4p, G9P_DOUTW, 0, G9P_PDS_TEMPS, 2, 0);
+      kernel_code[k++] = G5P_PDS_DOUT(g4p, G9P_DOUTU, 0, G9P_PDS_DATA, 0, G9P_PDS_END | G9P_PDS_CC);
+      kernel_code[k++] = g9p_pds_halt();
+      assert(k <= ARRAY_SIZE(kernel_code));
+      kernel_code_dwords = k;
    }
    result = pvr_arch_cmd_buffer_upload_pds(cmd_buffer, kernel_data,
                                            kernel_dwords,
                                            ROGUE_CDMCTRL_KERNEL1_DATA_ADDR_ALIGNMENT,
-                                           kernel_code, ARRAY_SIZE(kernel_code),
+                                           kernel_code, kernel_code_dwords,
                                            ROGUE_CDMCTRL_KERNEL2_CODE_ADDR_ALIGNMENT,
                                            ROGUE_CDMCTRL_KERNEL1_DATA_ADDR_ALIGNMENT,
                                            &kernel);
@@ -638,12 +662,17 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
       const struct g5p_cdm_record bind_rec =
          g5p_cdm_dma_task(G9P_CDM_DATA_BLOCKS(bind_dwords / 4), bind.data_offset,
                           bind.code_offset, (state->a9_device_fence || images || nup) ? 4 : DIV_ROUND_UP(2 * n + 1, 16));
-      const struct g5p_cdm_record kernel_rec = g5p_cdm_kernel(
+      struct g5p_cdm_record kernel_rec = g5p_cdm_kernel(
          G9P_CDM_KERNEL_REGS(bank1) | G9P_CDM_ANY_CLUSTER |
             G9P_CDM_FENCE |
             G9P_CDM_DATA_BLOCKS(kernel_dwords / 4),
          kernel.data_offset, kernel.code_offset, group_count[0], group_count[1],
          group_count[2], hw_threads, DIV_ROUND_UP(state->a9_local_dwords, 16));
+      /* KERNEL8 max_instances: the A8 sets it the way AGXMetalA8 does (g5p_cdm_max_instances_g4p());
+       * the A9 leaves it 0 (32 instances per task) */
+      const uint32_t max_instances =
+         g4p ? g5p_cdm_max_instances_g4p(threads, state->a9_has_barriers, 4 * state->a9_local_dwords) << 27 : 0;
+      kernel_rec.w[6] |= max_instances;
 
       pvr_csb_set_relocation_mark(csb);
       emit_record(csb, &bind_rec);
@@ -653,7 +682,11 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
             kernel_rec.w[0], kernel.data_offset, kernel.code_offset,
             indirect_va, hw_threads, 0);
          uint32_t *w = pvr_arch_csb_alloc_dwords(csb, 6);
-         if (w) memcpy(w, rec.w, sizeof(rec.w));
+         /* rec is const: KERNEL8 is its word 5 */
+         if (w) {
+            memcpy(w, rec.w, sizeof(rec.w));
+            w[5] |= max_instances;
+         }
       } else {
          emit_record(csb, &kernel_rec);
       }
@@ -673,6 +706,7 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
 static VkResult
 upload_cdm_task(struct pvr_cmd_buffer *cmd, bool fenced, struct pvr_pds_upload *out)
 {
+   const bool g4p = PVR_HAS_FEATURE(&cmd->device->pdevice->dev_info, apple_g4p);
    uint8_t usc[128] = {0};
    const uint16_t control = (0xc4u << 8) | 1u;
    unsigned at = 0;
@@ -692,7 +726,7 @@ upload_cdm_task(struct pvr_cmd_buffer *cmd, bool fenced, struct pvr_pds_upload *
    /* Same unconditional DOUTU.END/HALT as the original ta_kick; only the
     * USC target changes, so probe2 does not also vary the IF1 launch. */
    uint32_t code[2] = {
-      g9p_pds_dout(G9P_DOUTU, 0, G9P_PDS_DATA, 0, G9P_PDS_END),
+      G5P_PDS_DOUT(g4p, G9P_DOUTU, 0, G9P_PDS_DATA, 0, G9P_PDS_END),
       g9p_pds_halt(),
    };
    return pvr_arch_cmd_buffer_upload_pds(cmd, data, 4, 16, code, 2, 32, 64, out);
@@ -729,6 +763,7 @@ upload_cdm_task(struct pvr_cmd_buffer *cmd, bool fenced, struct pvr_pds_upload *
 static VkResult
 upload_end_barrier(struct pvr_cmd_buffer *cmd, struct pvr_pds_upload *out)
 {
+   const bool g4p = PVR_HAS_FEATURE(&cmd->device->pdevice->dev_info, apple_g4p);
    uint8_t usc[128] = {0};
    const unsigned at = g5p_end_barrier_helper(usc);
    if (!at)
@@ -757,8 +792,8 @@ upload_end_barrier(struct pvr_cmd_buffer *cmd, struct pvr_pds_upload *out)
    uint32_t data[8] = {(uint32_t)doutd_src0, (uint32_t)(doutd_src0 >> 32), doutd_src1, 0};
    g9p_pds_kick_data(&data[4], usc_offset(cmd->device, bo)); /* q2: DOUTU source */
    uint32_t code[3] = {
-      g9p_pds_dout(G9P_DOUTD, 0, G9P_PDS_DATA, 2, 0),
-      g9p_pds_dout(G9P_DOUTU, 2, G9P_PDS_DATA, 0, G9P_PDS_END),
+      G5P_PDS_DOUT(g4p, G9P_DOUTD, 0, G9P_PDS_DATA, 2, 0),
+      G5P_PDS_DOUT(g4p, G9P_DOUTU, 2, G9P_PDS_DATA, 0, G9P_PDS_END),
       g9p_pds_halt(),
    };
    return pvr_arch_cmd_buffer_upload_pds(cmd, data, 8, 16, code, 3, 32, 64, out);

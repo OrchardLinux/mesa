@@ -350,6 +350,9 @@ g5p_raw_programs_unlocked(struct pvr_device *device, unsigned raw, unsigned word
 {
    struct pvr_g5p_programs *p = &device->g5p->programs;
    VkResult result;
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p))
+      return vk_errorf(device, VK_ERROR_FEATURE_NOT_PRESENT,
+                       "G5P: an integer colour pass on the A8 (its end of tile is captured for float targets only)");
    const unsigned variant = g5p_raw_variant(words);
    if (!p->raw_clear_usc[variant]) {
       uint8_t code[6 * G5P_USC_MAX];
@@ -414,8 +417,13 @@ g5p_upload_programs(struct pvr_device *device, struct pvr_g5p_programs *p)
       return vk_errorf(device, VK_ERROR_INITIALIZATION_FAILED, "G5P: the HALT's code is at data + %#x, not + 0x10",
                        p->halt.code_offset - p->halt.data_offset);
 
+   /* The A8 builds the forms captured on it: one colour target, one sample, no LOAD (its texture sample
+    * is not decoded); the others stay unbuilt and their passes are refused by name */
+   const bool g4p = PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p);
    for (unsigned i = 0; i < PVR_G5P_MRT_VARIANTS; i++) {
       const unsigned n = g5p_mrt_variant_targets[i];
+      if (g4p && (n != 1 || i >= 7))
+         continue;
       uint8_t code[MAX2(G5P_MRT_CLEAR_USC_MAX, G5P_MRT_EOT_USC_MAX)];
       /* variants 7..10: the RGBA8 byte order of the compact clear */
       unsigned size = i >= 7 ? g5p_mrt_clear_compact(code, n, false) : g5p_mrt_clear_usc(code, n);
@@ -433,7 +441,7 @@ g5p_upload_programs(struct pvr_device *device, struct pvr_g5p_programs *p)
    }
    /* 4x (one target): the multisample store's end of tile, and the clear's
     * kick at sample rate */
-   {
+   if (!g4p) {
       uint8_t code[G5P_MRT_EOT_USC_MAX];
       const unsigned size = pvr_g5p_msaa_eot_usc(code);
       result = pvr_gpu_upload_usc(device, code, size, 64, &p->eot_usc_ms);
@@ -477,7 +485,7 @@ g5p_upload_programs(struct pvr_device *device, struct pvr_g5p_programs *p)
       result = g5p_upload_zeroed(device, G5P_SCISSOR_POOL_BYTES, &p->scissor_pool);
    if (result == VK_SUCCESS)
       result = g5p_upload_zeroed(device, G5P_DBIAS_POOL_BYTES, &p->dbias_pool);
-   if (result == VK_SUCCESS)
+   if (result == VK_SUCCESS && !g4p)
       result = g5p_upload_load(device, p, 0);
    return result;
 }
@@ -747,6 +755,7 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
       g->width = info->rstate->width;
       g->height = info->rstate->height;
    }
+   uint64_t target0_addr = 0; /* the A8's end of tile takes the target's address (below) */
    for (unsigned t = 0; t < n && !null_target; t++) {
       const struct pvr_image_view *iview = info->attachments[hw_render->eot_surfaces[t].attachment_idx];
       const struct pvr_image *image = pvr_image_view_get_image(iview);
@@ -754,6 +763,8 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
       const struct pvr_mip_level *level = &plane->mip_levels[iview->vk.base_mip_level];
       const uint64_t addr = image->dev_addr.addr + plane->offset + level->offset +
                             iview->vk.base_array_layer * plane->layer_size;
+      if (!t)
+         target0_addr = addr;
       uint32_t key;
       bool srgb;
       /* 4x (admitted above: one target): the samples stored as they are, or the PBE resolve into the
@@ -962,8 +973,26 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
    struct pvr_suballoc_bo *floats, *block;
    uint32_t pbe_words[G5P_MRT_PBE_STRIDE * G5P_MRT_MAX];
    /* each target's source: output half 4t (8-bit RGBA, two dwords), 8t (raw32, four words) */
-   const unsigned pbe_dwords = g5p_mrt_pbe_block_halves(pbe_words, nt, (const uint64_t(*)[3])pbe,
-                                                        raw ? 2 * raw_words : compact ? 2 : 4);
+   unsigned pbe_dwords = g5p_mrt_pbe_block_halves(pbe_words, nt, (const uint64_t(*)[3])pbe,
+                                                  raw ? 2 * raw_words : compact ? 2 : 4);
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p)) {
+      /*
+       * The A8's end of tile DMAs four dwords: the target's address and 2, 0
+       * (iPod touch 6, iOS 12.4, a8-shadercap: the EOT PDS data's DOUTD source
+       * for a one-target 64x64 BGRA8 pass; the program is g5p_mrt_eot_usc(),
+       * Apple's 1e010070). Its format, size and stride are not in these words:
+       * the A8 3D record's +0x118 block carries them (the kernel
+       * fills it). Only that pass shape is captured.
+       */
+      if (nt != 1 || raw || compact || null_target || g->samples != 1)
+         return G5P_REFUSE(cmd_buffer, "A8 end of tile for %u targets, %u samples%s: only one single-sample "
+                           "colour target is captured", nt, g->samples, raw ? ", integer" : "");
+      pbe_words[0] = (uint32_t)target0_addr;
+      pbe_words[1] = (uint32_t)(target0_addr >> 32);
+      pbe_words[2] = 2;
+      pbe_words[3] = 0;
+      pbe_dwords = 4;
+   }
    VkResult result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, clear, 16 * nt, &floats);
    if (result != VK_SUCCESS)
       return result;
@@ -995,6 +1024,8 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
 
    /* PDS_BGRND0..3: the clear kick, the clear DMA, its data; sizes */
    uint64_t bgnd[4] = { 0 };
+   if (load && PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p))
+      return G5P_REFUSE(cmd_buffer, "A8 LOAD of a colour target: the A8 texture sample form is not decoded");
    if (load) {
       result = g5p_load_background(cmd_buffer, (const uint64_t(*)[4])load_state, g->width, g->height, bgnd,
                                    load_program);

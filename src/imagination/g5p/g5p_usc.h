@@ -22,6 +22,16 @@
 
 extern _Thread_local const char *g5p_usc_error;
 
+/*
+ * Encode for the A8 (G4P) instead of the A9: set once by the driver for an A8
+ * device (one process drives one Apple GPU). The forms that differ, from
+ * Apple's A8 compiler output (iPod touch 6, iOS 12.4, a8-shadercap): emitpix
+ * takes an extension halfword, varyings iterate with opcode 0x18, and texture
+ * samples have another form (refused until decoded). Everything else Apple's
+ * A8 compiler emits the A9's way (the vertex programs byte for byte).
+ */
+extern bool g5p_usc_g4p;
+
 enum g5p_binop {
    G5P_BIN_FADD, G5P_BIN_FMUL, G5P_BIN_IADD, G5P_BIN_IMUL,
    G5P_BIN_AND, G5P_BIN_OR, G5P_BIN_XOR, G5P_BIN_ISHR,
