@@ -233,6 +233,9 @@ g5p_free_programs(struct pvr_device *device, struct pvr_g5p_programs *p)
    pvr_bo_suballoc_free(p->clear_kick_rgba8ui.pvr_bo);
    pvr_bo_suballoc_free(p->clear_usc_r32f);
    pvr_bo_suballoc_free(p->clear_kick_r32f.pvr_bo);
+   pvr_bo_suballoc_free(p->a8_load_usc);
+   pvr_bo_suballoc_free(p->a8_load_kick.pvr_bo);
+   pvr_bo_suballoc_free(p->a8_load_dma.pvr_bo);
    for (unsigned i = 0; i < ARRAY_SIZE(p->raw_load); i++) {
       if (p->raw_load[i]) {
          g5p_free_programs(device, p->raw_load[i]);
@@ -473,6 +476,22 @@ g5p_upload_programs(struct pvr_device *device, struct pvr_g5p_programs *p)
       if (result != VK_SUCCESS)
          return result;
    }
+   /* the A8's colour LOAD background: Apple's program, its kick, and the loader of its three uploads */
+   if (g4p) {
+      uint8_t code[G5P_A8_LOAD_USC_BYTES];
+      const unsigned size = g5p_mrt_load_usc_g4p(code);
+      result = pvr_gpu_upload_usc(device, code, size, 64, &p->a8_load_usc);
+      if (result != VK_SUCCESS)
+         return result;
+      result = g5p_upload_kick(device, p->a8_load_usc, 1, &p->a8_load_kick);
+      if (result != VK_SUCCESS)
+         return result;
+      uint32_t pds[8];
+      const unsigned n = g5p_pds_loader_code(pds, 3, PVR_G5P_PDS_FEATURES(&device->pdevice->dev_info));
+      result = pvr_gpu_upload_pds(device, NULL, 0, 0, pds, n, 16, 64, &p->a8_load_dma);
+      if (result != VK_SUCCESS)
+         return result;
+   }
    /* the A8's R32F background program */
    if (g4p) {
       uint8_t code[G5P_MRT_CLEAR_USC_MAX];
@@ -688,6 +707,51 @@ g5p_load_background(struct pvr_cmd_buffer *cmd_buffer, const uint64_t state[][4]
    return VK_SUCCESS;
 }
 
+/*
+ * The A8's colour LOAD background (AGXMetalA8, a8-passcap load): Apple's program (g5p_mrt_load_usc_g4p()) reads, by
+ * three DOUTDs of 4 + 4 + 6 dwords into common dwords 0, 4 and 8, the target's texture state (its first two qwords),
+ * Apple's load sampler (00000fff 02022400 0 0: the passcap's words) and the 2x3 matrix from the fragment position to the
+ * sample coordinate (identity: 1, 0, 0, 1, 0, 0). Data controls 10000004, 10008004, 90010006; uniform size 3 units,
+ * common-store size 14 dwords, as Apple's record has them.
+ */
+static VkResult
+g5p_load_background_g4p(struct pvr_cmd_buffer *cmd_buffer, const uint64_t state[4], uint64_t bgnd[4],
+                        const struct pvr_g5p_programs *p)
+{
+   static const uint32_t sampler[4] = { 0x00000fff, 0x02022400, 0, 0 };
+   static const float matrix[6] = { 1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f };
+   static const struct { unsigned common, dwords; } up[3] = { { 0, 4 }, { 4, 4 }, { 8, 6 } };
+   struct pvr_suballoc_bo *bo[3];
+   const void *src[3] = { state, sampler, matrix };
+   const size_t bytes[3] = { 16, sizeof(sampler), sizeof(matrix) };
+   uint32_t data[12] = { 0 };
+   for (unsigned i = 0; i < 3; i++) {
+      VkResult result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, src[i], bytes[i], &bo[i]);
+      if (result != VK_SUCCESS)
+         return result;
+      data[2 * i] = (uint32_t)bo[i]->dev_addr.addr;
+      data[2 * i + 1] = (uint32_t)(bo[i]->dev_addr.addr >> 32);
+      data[6 + 2 * i] = g5p_doutd_control_at(up[i].common, up[i].dwords, i == 2);
+   }
+   struct pvr_pds_upload load_data;
+   VkResult result = pvr_arch_cmd_buffer_upload_pds(cmd_buffer, data, ARRAY_SIZE(data), 16, NULL, 0, 0, 16,
+                                                    &load_data);
+   if (result != VK_SUCCESS)
+      return result;
+   pvr_csb_pack (&bgnd[0], CR_PDS_BGRND0_BASE, b0) {
+      b0.shader_addr = PVR_DEV_ADDR(p->a8_load_kick.data_offset);
+      b0.texunicode_addr = PVR_DEV_ADDR(p->a8_load_dma.code_offset);
+   }
+   pvr_csb_pack (&bgnd[2], CR_PDS_BGRND2_BASE, b2) {
+      b2.uniformdata_addr = PVR_DEV_ADDR(load_data.data_offset);
+   }
+   pvr_csb_pack (&bgnd[3], CR_PDS_BGRND3_SIZEINFO, b3) {
+      b3.pds_uniformsize = DIV_ROUND_UP(ARRAY_SIZE(data), ROGUE_CR_PDS_BGRND3_SIZEINFO_PDS_UNIFORMSIZE_UNIT_SIZE);
+      b3.usc_sharedsize = DIV_ROUND_UP(14, ROGUE_CR_PDS_BGRND3_SIZEINFO_USC_SHAREDSIZE_UNIT_SIZE);
+   }
+   return VK_SUCCESS;
+}
+
 VkResult
 PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd_gfx *sub_cmd,
                            const struct pvr_renderpass_hwsetup_render *hw_render,
@@ -814,6 +878,7 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
       g->height = info->rstate->height;
    }
    uint64_t target0_addr = 0; /* the A8's end of tile takes the target's address (below) */
+   bool a8_load_twiddled = false; /* the A8's LOAD samples a twiddled target only (Apple's capture) */
    for (unsigned t = 0; t < n && !null_target; t++) {
       const struct pvr_image_view *iview = info->attachments[hw_render->eot_surfaces[t].attachment_idx];
       const struct pvr_image *image = pvr_image_view_get_image(iview);
@@ -830,6 +895,8 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
       const bool ms_store = g->samples == 4 && !hw_render->eot_surfaces[t].need_resolve;
 
       const bool twiddled=image->memlayout!=PVR_MEMLAYOUT_LINEAR && !ms_store;
+      if (!t)
+         a8_load_twiddled = twiddled;
       /* A twiddled 2D target (a mip level, an array layer or a cube face, one
        * layer per render): q0 bit 3 and no row pitch, as the native A9
        * captures store (g5p_pbe.h). Device-proven as the L11 probe (36 CTS
@@ -945,7 +1012,12 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
          }
       }
       if (!t || compact) {
-         if(twiddled) {
+         if (twiddled && PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p)) {
+            /* the A8 loads through Rogue's texture state: the view's own (pvr_arch_image.c keeps the Rogue words on
+             * the A8; Apple's load pass DMAs TEXSTATE_IMAGE_WORD0/1) */
+            load_state[t][0] = iview->image_state[PVR_TEXTURE_STATE_SAMPLE].words[0];
+            load_state[t][1] = iview->image_state[PVR_TEXTURE_STATE_SAMPLE].words[1];
+         } else if(twiddled) {
             struct pvr_image_descriptor desc;
             /* A one-layer array attachment is still a 2D store/restore
              * surface. Bake its base-layer offset into a 2D LOAD view;
@@ -1057,7 +1129,7 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
       if (lr != VK_SUCCESS)
          return lr;
    }
-   if (load && !load_program->load_usc)
+   if (load && !load_program->load_usc && !PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p))
       return G5P_REFUSE(cmd_buffer, "LOAD of a %scolour attachment%s: the load program: %s",
                         g->samples == 4 ? "4x " : "", partial ? " (a partial render area)" : "",
                         load_program->load_refusal);
@@ -1155,9 +1227,19 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
 
    /* PDS_BGRND0..3: the clear kick, the clear DMA, its data; sizes */
    uint64_t bgnd[4] = { 0 };
-   if (load && PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p))
-      return G5P_REFUSE(cmd_buffer, "A8 LOAD of a colour target: the A8 texture sample form is not decoded");
-   if (load) {
+   if (load && PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p)) {
+      /* Apple's capture: one single-sample twiddled BGRA8 target (8-bit UNORM targets share the program; the
+       * texture state carries the format) */
+      const VkFormat f = first_format;
+      if (nt != 1 || raw || compact || g->samples != 1 || !a8_load_twiddled || g->a8_narrow_halves ||
+          (f != VK_FORMAT_B8G8R8A8_UNORM && f != VK_FORMAT_R8G8B8A8_UNORM))
+         return G5P_REFUSE(cmd_buffer, "A8 LOAD of %s (%u targets, %u samples%s): one single-sample twiddled "
+                           "BGRA8/RGBA8 target is captured", vk_Format_to_str(f), nt, g->samples,
+                           a8_load_twiddled ? "" : ", linear");
+      result = g5p_load_background_g4p(cmd_buffer, load_state[0], bgnd, p);
+      if (result != VK_SUCCESS)
+         return result;
+   } else if (load) {
       result = g5p_load_background(cmd_buffer, (const uint64_t(*)[4])load_state, g->width, g->height, bgnd,
                                    load_program);
       if (result != VK_SUCCESS)

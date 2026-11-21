@@ -161,6 +161,9 @@ struct pvr_g5p_programs {
    struct pvr_g5p_programs *mrt_load[8];
    /* Lazy 4x LOAD (one UNORM/float target, pvr_g5p_compile_load_ms()), kicked at sample rate */
    struct pvr_g5p_programs *ms_load;
+   /* the A8's colour LOAD background (g5p_mrt_load_usc_g4p()): its USC, kick and the three-DOUTD loader */
+   struct pvr_suballoc_bo *a8_load_usc;
+   struct pvr_pds_upload a8_load_kick, a8_load_dma;
    /* raw clear programs by total output words: 2, 4, 8 (two 32-bit integer targets) */
    struct pvr_suballoc_bo *raw_clear_usc[4]; /*2/4/8 words, then scalar1 */
    /* raw end-of-tile programs by target count: 1, 2 */
