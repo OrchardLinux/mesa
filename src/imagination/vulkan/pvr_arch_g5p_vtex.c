@@ -41,12 +41,13 @@ static_assert(VTEX_COMMON >= PCO_G5P_COMMON_DWORDS, "vertex common-store plan bo
 
 static uint32_t vtex_control(unsigned common, unsigned dwords, bool last)
 {
-   pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-vtex-control");
+   /* packing a field reads only the feature set: no program allocation per draw */
+   static const pdsc_program pack = { .name = "g5p-vtex-control", .features = PDSC_FEATURE_DOUT_EXT };
+   const pdsc_program *p = &pack;
    struct pdsc_doutd_src1 s = {
       .last_issue = last, .store_dest = PDSC_STORE_DEST_COMMON, .ao = common, .bsize = dwords,
    };
    uint32_t word = pdsc_doutd_src1_pack(p, &s);
-   ralloc_free(p);
    return word;
 }
 

@@ -96,11 +96,11 @@ pds_pack(pdsc_program *p, uint32_t *dest)
 static uint64_t
 doutu_src0(uint32_t exe_off, unsigned temps)
 {
-   pdsc_init();
-   pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-doutu");
+   /* packing a field reads only the feature set: no program allocation per draw */
+   static const pdsc_program pack = { .name = "g5p-doutu", .features = PDSC_FEATURE_DOUT_EXT };
+   const pdsc_program *p = &pack;
    struct pdsc_doutu_src0 s = { .exe_off = exe_off, .temps = temps };
    const uint64_t v = pdsc_doutu_src0_pack(p, &s);
-   ralloc_free(p);
    return v;
 }
 
@@ -108,23 +108,23 @@ doutu_src0(uint32_t exe_off, unsigned temps)
 static uint32_t
 doutw_control(unsigned reg, bool upper, bool last)
 {
-   pdsc_init();
-   pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-doutw");
+   /* packing a field reads only the feature set: no program allocation per draw */
+   static const pdsc_program pack = { .name = "g5p-doutw", .features = PDSC_FEATURE_DOUT_EXT };
+   const pdsc_program *p = &pack;
    struct pdsc_doutw_src1 s = { .last_issue = last, .store_dest = PDSC_STORE_DEST_UNIFIED, .ao = reg,
                                 .bsize = upper ? PDSC_DOUTW_BSIZE_UPPER : PDSC_DOUTW_BSIZE_LOWER };
    const uint32_t v = pdsc_doutw_src1_pack(p, &s);
-   ralloc_free(p);
    return v;
 }
 
 static uint64_t
 ddmad_src3(unsigned dwords, unsigned ao, bool last)
 {
-   pdsc_init();
-   pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-ddmad");
+   /* packing a field reads only the feature set: no program allocation per draw */
+   static const pdsc_program pack = { .name = "g5p-ddmad", .features = PDSC_FEATURE_DOUT_EXT };
+   const pdsc_program *p = &pack;
    struct pdsc_ddmad_src3 s = { .last_issue = last, .bsize = dwords, .ao = ao };
    const uint64_t v = pdsc_ddmad_src3_pack(p, &s);
-   ralloc_free(p);
    return v;
 }
 
@@ -133,12 +133,12 @@ ddmad_src3(unsigned dwords, unsigned ao, bool last)
 static uint32_t
 doutd_control(unsigned common, unsigned dwords, bool last)
 {
-   pdsc_init();
-   pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-doutd");
+   /* packing a field reads only the feature set: no program allocation per draw */
+   static const pdsc_program pack = { .name = "g5p-doutd", .features = PDSC_FEATURE_DOUT_EXT };
+   const pdsc_program *p = &pack;
    struct pdsc_doutd_src1 s = { .last_issue = last, .store_dest = PDSC_STORE_DEST_COMMON, .ao = common,
                                 .bsize = dwords };
    const uint32_t v = pdsc_doutd_src1_pack(p, &s);
-   ralloc_free(p);
    return v;
 }
 
