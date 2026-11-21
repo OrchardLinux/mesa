@@ -284,7 +284,10 @@ VkResult pvr_arch_pack_tex_state(struct pvr_device *device,
    } else {
       pvr_csb_pack (&state->words[1], TEXSTATE_IMAGE_WORD1, word1) {
          word1.num_mip_levels = info->mip_levels;
-         word1.mipmaps_present = info->mipmaps_present;
+         /* the A8 sets mipmaps_present only for a state of several levels (AGXMetalA8: 0 for the one-level load
+          * target, 1 with seven levels in tex_plain); a one-level view of a mipmapped image is one level to it */
+         word1.mipmaps_present = info->mipmaps_present &&
+                                 (!PVR_HAS_FEATURE(dev_info, apple_g4p) || info->mip_levels > 1);
          word1.baselevel = info->base_level;
 
          if (iview_type == VK_IMAGE_VIEW_TYPE_3D ||
