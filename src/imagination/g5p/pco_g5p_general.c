@@ -836,6 +836,19 @@ static bool plain_tex(const nir_tex_instr *t)
    return true;
 }
 
+/* The A8's cube sample (sample_g4p()): an implicit-LOD float sample of a cube, not an array, no compare */
+static bool a8_cube_tex(const nir_tex_instr *t)
+{
+   if (!g5p_usc_g4p || t->op != nir_texop_tex || t->sampler_dim != GLSL_SAMPLER_DIM_CUBE || t->is_array ||
+       t->is_shadow || t->def.num_components != 4 || nir_alu_type_get_base_type(t->dest_type) != nir_type_float)
+      return false;
+   for (unsigned i = 0; i < t->num_srcs; i++)
+      if (t->src[i].src_type != nir_tex_src_coord && t->src[i].src_type != nir_tex_src_texture_deref &&
+          t->src[i].src_type != nir_tex_src_sampler_deref)
+         return false;
+   return true;
+}
+
 static bool size_query(const nir_tex_instr *t)
 {
    return t->op == nir_texop_txs || t->op == nir_texop_query_levels;
@@ -5302,6 +5315,43 @@ static void emit_tex_ms_own_sample(struct gctx *c, nir_tex_instr *t, struct tex_
    c->p->evidence |= PCO_G5P_EV_TEX_CAPTURE;
 }
 
+/* The A8's cube sample, as AGXMetalA8's f_tex_cube: the direction in three consecutive temps (computed: FMAs and a
+ * move, no cube-coordinate instruction; the hardware selects the face), then the narrow sample in mode 4 */
+static void emit_tex_cube_g4p(struct gctx *c, nir_tex_instr *t)
+{
+   uint8_t raw[G5P_USC_MAX];
+   struct tex_bind *b = tex_for(c, t);
+   const bool narrow = c->narrow_tex == t;
+   if (!narrow)
+      refuse(c, "A8 cube sample whose result feeds arithmetic (only the narrow form, straight to the output, is "
+                "captured)");
+   nir_def *cd = nir_get_tex_src(t, nir_tex_src_coord);
+   struct ref r[3];
+   unsigned reg[3];
+   for (unsigned k = 0; k < 3; k++) {
+      r[k] = resolve_value(c, cd, k);
+      reg[k] = reg_of(c, r[k], "cube direction");
+   }
+   unsigned coord;
+   if (reg[1] == reg[0] + 1 && reg[2] == reg[0] + 2) {
+      coord = reg[0];
+      for (unsigned k = 0; k < 3; k++)
+         vgrp(c, r[k]); /* read by the sample instruction, the next one put */
+   } else {
+      coord = alloc_run(c, 3, "cube direction");
+      for (unsigned k = 0; k < 3; k++)
+         put(c, raw, g5p_usc_move(raw, 2 * (coord + k), 2 * reg[k], 0, vgrp(c, r[k]), 1), "cube direction");
+      c->scratch |= BITFIELD64_RANGE(coord, 3);
+   }
+   struct g5p_tex s = {.image_qword = b->image / 2, .sampler_qword = b->sampler, .coord_dword = coord,
+                       .coord_control = true, .dim = G5P_TEX_CUBE, .narrow = true};
+   put(c, raw, g5p_usc_sample(raw, &s), "cube sample");
+   c->tex_coord_pending |= BITFIELD64_RANGE(coord, 3);
+   c->tex_batch++;
+   tex_flush(c);
+   c->p->evidence |= PCO_G5P_EV_TEX_CAPTURE;
+}
+
 static void emit_tex(struct gctx *c, nir_tex_instr *t)
 {
    if (c->tex_batch == 4 || c->vs || !plain_tex(t) || size_query(t) || c->narrow_tex == t)
@@ -5312,6 +5362,10 @@ static void emit_tex(struct gctx *c, nir_tex_instr *t)
    }
    if (c->vs && g5p_vtex_qualified()) {
       emit_vertex_qualified_texture(c, t);
+      return;
+   }
+   if (!c->vs && a8_cube_tex(t)) {
+      emit_tex_cube_g4p(c, t);
       return;
    }
    if (c->vs || !plain_tex(t)) {
@@ -5743,7 +5797,7 @@ static void plan_fs_output(struct gctx *c)
               V(c, c->out[k].def, k)->uses == 1;
    if (plain) {
       nir_instr *p = nir_def_instr(c->out[0].def);
-      if (p->type == nir_instr_type_tex && plain_tex(nir_instr_as_tex(p))) {
+      if (p->type == nir_instr_type_tex && (plain_tex(nir_instr_as_tex(p)) || a8_cube_tex(nir_instr_as_tex(p)))) {
          c->narrow_tex = nir_instr_as_tex(p);
          return;
       }

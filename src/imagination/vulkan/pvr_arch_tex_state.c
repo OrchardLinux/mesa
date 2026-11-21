@@ -299,7 +299,10 @@ VkResult pvr_arch_pack_tex_state(struct pvr_device *device,
          } else {
             uint32_t array_layers = info->array_size;
 
-            if (iview_type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY)
+            /* the A8 counts cubes, not faces, for a cube view as well (AGXMetalA8's tex_cube state: word1 depth 0
+             * for one 6-face cube, passcap round 1: 60008863 003f00fc 30008007 000040b0) */
+            if (iview_type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY ||
+                (iview_type == VK_IMAGE_VIEW_TYPE_CUBE && PVR_HAS_FEATURE(dev_info, apple_g4p)))
                array_layers /= 6;
 
             if (array_layers > 0)

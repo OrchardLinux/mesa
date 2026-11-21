@@ -139,6 +139,11 @@ pvr_g5p_image_layout(struct pvr_image *image, unsigned stride_align)
       plane->layer_size = image->vk.array_layers > 1 || is3d
                              ? align64(size, size >= PVR_G5P_IMAGE_BIG_LAYER ? PVR_G5P_IMAGE_BIG_LAYER : 64)
                              : own;
+      /* The A8 (a Rogue TPU) steps a 2D array's layers and a cube's faces by the chain's size rounded up to 4 KiB:
+       * AGXMetalA8's texture size (iOS 12.4, sub_1a13cfb68) rounds one face's or layer's chain to 0x1000 and
+       * multiplies by 6 for a cube (by the layer count for an array of two or more), Rogue's CEM 4K face packing */
+      if (g5p_usc_g4p && image->vk.array_layers > 1 && !is3d)
+         plane->layer_size = align64(size, 4096);
    }
    plane->size = plane->layer_size * (is3d ? image->vk.extent.depth : image->vk.array_layers);
    plane->offset = 0;

@@ -1124,9 +1124,13 @@ static unsigned sample_g4p(uint8_t *out, const struct g5p_tex *t)
     * 32-bit (byte 1 0x79: one 32-bit register per channel, read by ALU after the wait; AGXMetalA8's R32F and RGBA8UI
     * load backgrounds, passcap USC 0x4826 and 0x4da6, the latter feeding umin and byte packs). Metal's blit program
     * has the 32-bit form with byte 10 = 0x14, an operand not decoded and not used here. */
-   CHECK(t->dim == G5P_TEX_2D && !t->read && !t->class_variant && t->coord_control &&
+   CHECK((t->dim == G5P_TEX_2D || t->dim == G5P_TEX_CUBE) && !t->read && !t->class_variant && t->coord_control &&
             !t->gradient && !t->lod_control && !t->length,
-         "A8 sample captured only as a 2D sample with an implicit LOD");
+         "A8 sample captured only as a 2D or cube sample with an implicit LOD");
+   /* the cube sample: mode 4 (byte 6 0xc8 with the sampler at dword 4), the direction in three temps from the
+    * coordinate dword, no cube-coordinate instruction (AGXMetalA8's f_tex_cube, passcap USC 0x6076: two FMAs and a
+    * move build r0..r2, then 1a 59 00 41 00 01 c8 01 00 01 00 80). Only the narrow form is captured. */
+   CHECK(t->dim != G5P_TEX_CUBE || t->narrow, "A8 cube sample captured only in the narrow form (result straight to the output)");
    CHECK(t->image_qword == 0, "A8 sample captured only with the image descriptor at common qword 0");
    /* the A8 names the sampler by its common DWORD (Apple's 0x88 reads the sampler at dword 4 in tex_plain and in
     * the load background): the caller passes the dword in sampler_qword */
@@ -1139,7 +1143,9 @@ static unsigned sample_g4p(uint8_t *out, const struct g5p_tex *t)
     * and bit 0 by its 0x3000 sample (89), neither decoded, so an odd dword could alias a flag */
    CHECK(!(t->sampler_qword & 1), "A8 sample: odd sampler dword (byte 6 bit 1 is set by Apple's undecoded array sample)");
    CHECK(t->coord_dword <= 31 && !(t->dst_half & 1) && t->dst_half < 64, "A8 sample: coordinate/destination range");
-   const uint8_t raw[12] = {0x1a, t->narrow ? 0x59 : 0x79, (uint8_t)t->dst_half, 0x41, 0x00, 0x01, (uint8_t)(0x80 | t->sampler_qword << 1),
+   const uint8_t mode = t->dim == G5P_TEX_CUBE ? 4 : 0;
+   const uint8_t raw[12] = {0x1a, t->narrow ? 0x59 : 0x79, (uint8_t)t->dst_half, 0x41, 0x00, 0x01,
+                            (uint8_t)(0x80 | mode << 4 | t->sampler_qword << 1),
                             0x01, (uint8_t)(t->coord_dword << 1), 0x01, 0x00, 0x80};
    return finish_g4p(out, raw, sizeof(raw));
 }
