@@ -6361,6 +6361,10 @@ zink_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags)
       if (!ctx->blitter)
          goto fail;
       ctx->blitter->use_single_triangle = screen->driver_workarounds.inconsistent_interpolation;
+      /* the A8 (G5P): a 1:1 blit samples NEAREST at texel centres, the same texels a fetch reads; the A8's
+       * texel fetch is not captured, so a fetching blit shader is refused (glReadPixels of an XRGB8888 buffer) */
+      if (screen->is_g5p_a8)
+         util_blitter_set_txf(ctx->blitter, false);
    }
 
    zink_set_last_vertex_key(ctx)->last_vertex_stage = true;

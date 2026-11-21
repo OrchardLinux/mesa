@@ -78,7 +78,11 @@ static unsigned finish_g4p(uint8_t *out, const uint8_t *raw, unsigned n)
 static unsigned iterator_g4p(uint8_t *out, unsigned dst_half, unsigned slot, unsigned count, bool narrow,
                              bool saturate, unsigned flags)
 {
-   CHECK(!saturate && !flags, "A8 iterator modes (saturate, linear, centroid, DRC1) not captured");
+   /* by name: the mode a refused shader needs */
+   CHECK(!saturate, "A8 saturating iterator not captured");
+   CHECK(!(flags & G5P_ITER_LINEAR), "A8 no-perspective iterator not captured");
+   CHECK(!(flags & G5P_ITER_CENTROID), "A8 centroid iterator not captured");
+   CHECK(!(flags & G5P_ITER_DRC1), "A8 iterator on the second dependent-read counter not captured");
    CHECK(narrow ? (count == 3 || count == 4) : (count == 1 || count == 2),
          "A8 iterator: only 1-2 f32 or 3-4 f16 components are captured");
    CHECK(!narrow || slot == 1, "A8 narrow iterator captured at slot 1 only");

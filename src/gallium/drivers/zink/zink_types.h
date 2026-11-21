@@ -1506,6 +1506,7 @@ struct zink_screen {
    unsigned frames_in_flight; /* pipe_caps.throttle_frames */
    bool precise_sync;
    bool is_g5p;
+   bool is_g5p_a8; /* the A8 on the G5P driver: no texel fetch (its form is not captured) */
 
    const char *vendor_name;
    const char *device_name;
