@@ -1135,6 +1135,9 @@ static unsigned sample_g4p(uint8_t *out, const struct g5p_tex *t)
     * and the blit's explicit-LOD samples are ac (sampler dword 6). Bits 4-6 are the sample mode, so a sampler at
     * dword 8 or above would encode another mode: the field is three bits. */
    CHECK(t->sampler_qword <= 7, "A8 sample: sampler dword above 7 (byte 6 bits 4-6 are the sample mode)");
+   /* witnessed sampler dwords are 0, 4 and 6; byte 6 bit 1 (an odd dword) is also set by Apple's array sample (8a)
+    * and bit 0 by its 0x3000 sample (89), neither decoded, so an odd dword could alias a flag */
+   CHECK(!(t->sampler_qword & 1), "A8 sample: odd sampler dword (byte 6 bit 1 is set by Apple's undecoded array sample)");
    CHECK(t->coord_dword <= 31 && !(t->dst_half & 1) && t->dst_half < 64, "A8 sample: coordinate/destination range");
    const uint8_t raw[12] = {0x1a, t->narrow ? 0x59 : 0x79, (uint8_t)t->dst_half, 0x41, 0x00, 0x01, (uint8_t)(0x80 | t->sampler_qword << 1),
                             0x01, (uint8_t)(t->coord_dword << 1), 0x01, 0x00, 0x80};
