@@ -273,6 +273,21 @@ static void pvr_image_plane_setup_mip_levels(struct pvr_image *image, uint8_t i)
          return;
       }
    }
+   /*
+    * G9P: the ZLS loads and stores whole 32x32 tiles, ISP_ZLS_PIXELS aligned to
+    * 32 (g9p_zls_pixels()). A depth/stencil image with a side under 32 pixels
+    * holds those whole tiles, or the store writes past it.
+    */
+   if (PVR_HAS_FEATURE(&cpp_device->pdevice->dev_info, apple_g9p) &&
+       vk_format_is_depth_or_stencil(image->vk.format) && image->vk.mip_levels == 1) {
+      const VkDeviceSize tiles = (VkDeviceSize)image->vk.samples * cpp *
+                                 align(plane->physical_extent.width, 32) *
+                                 align(plane->physical_extent.height, 32);
+
+      plane->mip_levels[0].size = MAX2(plane->mip_levels[0].size, tiles);
+      plane->layer_size = MAX2(plane->layer_size, tiles);
+   }
+
    if (image->vk.array_layers > 1)
       plane->layer_size = align64(plane->layer_size, image->alignment);
 

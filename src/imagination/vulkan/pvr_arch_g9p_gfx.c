@@ -3455,11 +3455,11 @@ g9p_ds_check(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_renderpass_hwse
    if (!g9p_ds_format(iview->vk.format))
       return g9p_feature_error(cmd_buffer,
                        "G9P: depth/stencil format %s", vk_Format_to_str(iview->vk.format));
-   if (plane->physical_extent.width < 32 || plane->physical_extent.height < 32 ||
-       iview->vk.base_mip_level || iview->vk.base_array_layer)
+   /* Sides under 32 pixels: the image holds the ZLS's whole tiles (pvr_image.c) */
+   if (iview->vk.base_mip_level || iview->vk.base_array_layer)
       return g9p_feature_error(cmd_buffer,
                        "G9P: a depth/stencil attachment of %ux%u (level %u, layer %u): "
-                       "32x32 or larger, level 0, layer 0 only",
+                       "level 0, layer 0 only",
                        plane->physical_extent.width, plane->physical_extent.height,
                        iview->vk.base_mip_level, iview->vk.base_array_layer);
    return VK_SUCCESS;
@@ -4009,8 +4009,9 @@ PVR_PER_ARCH(g9p_geom_stream)(const struct pvr_device *device,
  * Never 24-bit depth: X8_D24 crashed the A10's GFX firmware (glmark2), and
  * Zink renders GL's DEPTH24_STENCIL8 with D32F_S8.
  * Sampled as the matching colour format.
- * Refused by name: sides under 32 pixels (the ZLS writes whole 32-pixel
- * tiles past such an image), mip levels and layers other than the first.
+ * Sides under 32 pixels: the ZLS writes whole 32-pixel tiles, so such an
+ * image is allocated with them (pvr_image.c). Refused by name: mip levels
+ * and layers other than the first.
  */
 
 /* The stencil plane's offset in a D32F_S8 image: the second half, after the depth's whole chain */
