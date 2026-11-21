@@ -5324,6 +5324,13 @@ static void emit_tex(struct gctx *c, nir_tex_instr *t)
       tex_flush(c);
       coord = narrow ? 0 : alloc_run(c, 2, "texture coordinate");
       put(c, raw, g5p_usc_coord_iterator(raw, 2 * coord, slot, 2), "coordinate iterator");
+      /* The A8's coordinate is the plain iterator's result, a dependent read on counter 0 that the sample must
+       * wait for: AGXMetalA8's f_tex and every tex_* fragment program are `18 11 00 81 04 00`, `4d 00`, then the
+       * sample (the A9's coordinate iterator feeds its sample directly). Without the wait the sample read the
+       * coordinate register before the iteration landed (the live ladder's texture rungs: clamped, run-dependent
+       * texels). */
+      if (g5p_usc_g4p)
+         put(c, raw, g5p_usc_wait(raw, 0), "wait (coordinate)");
    } else {
       /* ISA round 2 §4: an ALU-produced coordinate uses the same sample
        * encoding with the temp base (21 Apple computed-coordinate probes). */
