@@ -1120,15 +1120,19 @@ static unsigned texture_base(uint8_t *raw, const struct g5p_tex *t)
  */
 static unsigned sample_g4p(uint8_t *out, const struct g5p_tex *t)
 {
-   CHECK(t->dim == G5P_TEX_2D && !t->read && !t->class_variant && t->narrow && t->coord_control &&
+   /* Two result forms, both Apple's: narrow (byte 1 0x59: the f16 results f_tex writes straight to the output) and
+    * 32-bit (byte 1 0x79: one 32-bit register per channel, read by ALU after the wait; AGXMetalA8's R32F and RGBA8UI
+    * load backgrounds, passcap USC 0x4826 and 0x4da6, the latter feeding umin and byte packs). Metal's blit program
+    * has the 32-bit form with byte 10 = 0x14, an operand not decoded and not used here. */
+   CHECK(t->dim == G5P_TEX_2D && !t->read && !t->class_variant && t->coord_control &&
             !t->gradient && !t->lod_control && !t->length,
-         "A8 sample captured only as a narrow 2D sample with an implicit LOD");
+         "A8 sample captured only as a 2D sample with an implicit LOD");
    CHECK(t->image_qword == 0, "A8 sample captured only with the image descriptor at common qword 0");
    /* the A8 names the sampler by its common DWORD (Apple's 0x88 reads the sampler at dword 4 in tex_plain and in
     * the load background): the caller passes the dword in sampler_qword */
    CHECK(t->sampler_qword <= 63, "A8 sample: sampler dword range");
    CHECK(t->coord_dword <= 31 && !(t->dst_half & 1) && t->dst_half < 64, "A8 sample: coordinate/destination range");
-   const uint8_t raw[12] = {0x1a, 0x59, (uint8_t)t->dst_half, 0x41, 0x00, 0x01, (uint8_t)(0x80 | t->sampler_qword << 1),
+   const uint8_t raw[12] = {0x1a, t->narrow ? 0x59 : 0x79, (uint8_t)t->dst_half, 0x41, 0x00, 0x01, (uint8_t)(0x80 | t->sampler_qword << 1),
                             0x01, (uint8_t)(t->coord_dword << 1), 0x01, 0x00, 0x80};
    return finish_g4p(out, raw, sizeof(raw));
 }
