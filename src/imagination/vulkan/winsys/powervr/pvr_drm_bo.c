@@ -559,8 +559,60 @@ VkResult pvr_drm_winsys_vma_map(struct pvr_winsys_vma *vma,
    return VK_SUCCESS;
 }
 
+VkResult pvr_drm_winsys_vma_map_mirror(struct pvr_winsys_vma *vma, struct pvr_winsys_bo *bo)
+{
+   struct pvr_drm_winsys_bo *const drm_bo = to_pvr_drm_winsys_bo(bo);
+   struct pvr_drm_winsys *const drm_ws = to_pvr_drm_winsys(bo->ws);
+   const uint64_t size = bo->size;
+
+   assert(!vma->bo);
+   if (size % vma->heap->page_size || 2 * size > vma->size)
+      return vk_error(NULL, VK_ERROR_MEMORY_MAP_FAILED);
+
+   for (unsigned i = 0; i < 2; i++) {
+      struct drm_pvr_ioctl_vm_map_args args = { .device_addr = vma->dev_addr.addr + i * size,
+                                                .flags = 0U,
+                                                .handle = drm_bo->handle,
+                                                .offset = 0,
+                                                .size = size,
+                                                .vm_context_handle = drm_ws->vm_context };
+      if (drmIoctl(drm_ws->base.render_fd, DRM_IOCTL_PVR_VM_MAP, &args)) {
+         const int err = errno;
+         if (i) {
+            struct drm_pvr_ioctl_vm_unmap_args un = { .vm_context_handle = drm_ws->vm_context,
+                                                      .device_addr = vma->dev_addr.addr,
+                                                      .size = size };
+            drmIoctl(drm_ws->base.render_fd, DRM_IOCTL_PVR_VM_UNMAP, &un);
+         }
+         return vk_errorf(NULL, err == EIO ? VK_ERROR_OUT_OF_HOST_MEMORY : VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                          "DRM_IOCTL_PVR_VM_MAP (mirror %u) failed (errno %d: %s)", i, err, strerror(err));
+      }
+   }
+
+   pvr_drm_buffer_acquire(drm_bo);
+   vma->bo = &drm_bo->base;
+   vma->bo_offset = 0;
+   vma->mapped_size = 2 * size;
+   vma->mirrored = true;
+   return VK_SUCCESS;
+}
+
 void pvr_drm_winsys_vma_unmap(struct pvr_winsys_vma *vma)
 {
+   if (vma->mirrored) {
+      /* two mappings of the buffer (pvr_drm_winsys_vma_map_mirror()): the second one first, then the first
+       * through the ordinary path */
+      struct pvr_drm_winsys *const ws = to_pvr_drm_winsys(vma->bo->ws);
+      const uint64_t half = vma->mapped_size / 2;
+      struct drm_pvr_ioctl_vm_unmap_args un = { .vm_context_handle = ws->vm_context,
+                                                .device_addr = vma->dev_addr.addr + half,
+                                                .size = half };
+      if (drmIoctl(ws->base.render_fd, DRM_IOCTL_PVR_VM_UNMAP, &un) && !p_atomic_read(&ws->lost))
+         mesa_logw("G5P: VM_UNMAP of the mirror half failed (errno %d)", errno);
+      vma->mapped_size = half;
+      vma->mirrored = false;
+   }
+
    struct pvr_drm_winsys_bo *const drm_bo = to_pvr_drm_winsys_bo(vma->bo);
    struct pvr_drm_winsys *const drm_ws = to_pvr_drm_winsys(vma->bo->ws);
 

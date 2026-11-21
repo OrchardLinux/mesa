@@ -51,6 +51,8 @@ struct pvr_drm_winsys {
    uint64_t bvnc;
 
    bool is_g5p;
+   /* pvr_drm_winsys_create(query_only) on the A8: device queries only, no VM context */
+   bool query_only;
    /* The kernel sets a job fence's error when it resets (pvr_apple.c);
     * upstream pvr_queue.c does not.
     */

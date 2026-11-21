@@ -317,7 +317,7 @@ void PVR_PER_ARCH(g5p_query_programs_destroy)(struct pvr_device *device)
 static uint32_t usc_offset(const struct pvr_device *device,
                            const struct pvr_suballoc_bo *bo)
 {
-   return bo->dev_addr.addr - device->heaps.usc_heap->base_addr.addr;
+   return bo->dev_addr.addr - PVR_G5P_USC_EXEC_BASE(device);
 }
 
 static void emit_record(struct pvr_csb *csb,
@@ -338,6 +338,7 @@ emit_query_dispatch(struct pvr_cmd_buffer *cmd_buffer,
                     const struct g5p_query_params *params)
 {
    struct pvr_device *device = cmd_buffer->device;
+   const bool g4p = PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p);
    const unsigned num_buffers = program->g5p_num_buffers;
    const unsigned transfers = num_buffers + 1;
    uint32_t uniforms[2 * 4 + 1] = { 0 };
@@ -401,7 +402,7 @@ emit_query_dispatch(struct pvr_cmd_buffer *cmd_buffer,
          (i + 1 == transfers ? BITFIELD_BIT(31) : 0) | BITFIELD_BIT(28) |
          (2 * i) << 13 | dwords;
       bind_code[code_count++] =
-         g9p_pds_dout(G9P_DOUTD,
+         G5P_PDS_DOUT(g4p, G9P_DOUTD,
                       i,
                       G9P_PDS_DATA,
                       control_base + i,
@@ -428,14 +429,25 @@ emit_query_dispatch(struct pvr_cmd_buffer *cmd_buffer,
    kernel_data[2] = 0x80000000;
    kernel_data[4] = 0x90000002;
    kernel_code[0] = g9p_pds_bra_not_if1(4);
-   kernel_code[1] = g9p_pds_dout(G9P_DOUTW, 0, G9P_PDS_TEMPS, 4, G9P_PDS_END);
+   kernel_code[1] = G5P_PDS_DOUT(g4p, G9P_DOUTW, 0, G9P_PDS_TEMPS, 4, G9P_PDS_END);
    kernel_code[2] = g9p_pds_halt();
    kernel_code[3] = g9p_pds_halt();
-   kernel_code[4] = g9p_pds_dout(G9P_DOUTW, 0, G9P_PDS_TEMPS, 2, 0);
+   kernel_code[4] = G5P_PDS_DOUT(g4p, G9P_DOUTW, 0, G9P_PDS_TEMPS, 2, 0);
    kernel_code[5] =
-      g9p_pds_dout(G9P_DOUTU, 0, G9P_PDS_DATA, 0, G9P_PDS_END | G9P_PDS_CC);
+      G5P_PDS_DOUT(g4p, G9P_DOUTU, 0, G9P_PDS_DATA, 0, G9P_PDS_END | G9P_PDS_CC);
    kernel_code[6] = g9p_pds_halt();
    kernel_code[7] = g9p_pds_halt();
+   unsigned kernel_code_dwords = ARRAY_SIZE(kernel_code);
+   if (g4p) {
+      /* The A8 launch, as g5p_cmd_dispatch() builds it (AGXMetalA8's order, no END in the IF1 part, no padding) */
+      kernel_code[0] = g9p_pds_bra_not_if1(3);
+      kernel_code[1] = G5P_PDS_DOUT(g4p, G9P_DOUTW, 0, G9P_PDS_TEMPS, 4, 0);
+      kernel_code[2] = g9p_pds_halt();
+      kernel_code[3] = G5P_PDS_DOUT(g4p, G9P_DOUTW, 0, G9P_PDS_TEMPS, 2, 0);
+      kernel_code[4] = G5P_PDS_DOUT(g4p, G9P_DOUTU, 0, G9P_PDS_DATA, 0, G9P_PDS_END | G9P_PDS_CC);
+      kernel_code[5] = g9p_pds_halt();
+      kernel_code_dwords = 6;
+   }
 
    result =
       pvr_arch_cmd_buffer_upload_pds(cmd_buffer,
@@ -443,7 +455,7 @@ emit_query_dispatch(struct pvr_cmd_buffer *cmd_buffer,
                                      ARRAY_SIZE(kernel_data),
                                      ROGUE_CDMCTRL_KERNEL1_DATA_ADDR_ALIGNMENT,
                                      kernel_code,
-                                     ARRAY_SIZE(kernel_code),
+                                     kernel_code_dwords,
                                      ROGUE_CDMCTRL_KERNEL2_CODE_ADDR_ALIGNMENT,
                                      ROGUE_CDMCTRL_KERNEL1_DATA_ADDR_ALIGNMENT,
                                      &kernel);
@@ -451,14 +463,15 @@ emit_query_dispatch(struct pvr_cmd_buffer *cmd_buffer,
       return result;
 
    const struct g5p_cdm_record bind_record =
-      g5p_cdm_dma_task(G9P_CDM_DATA_BLOCKS(bind_dwords / 4),
+      g5p_cdm_dma_task(G5P_CDM_DATA_UNITS(g4p, bind_dwords / 4),
                        bind.data_offset,
                        bind.code_offset,
                        DIV_ROUND_UP(2 * num_buffers + 1, 16));
    const uint32_t groups = DIV_ROUND_UP(params->count, G5P_QUERY_LOCAL_SIZE);
-   const struct g5p_cdm_record kernel_record = g5p_cdm_kernel(
+   struct g5p_cdm_record kernel_record = g5p_cdm_kernel(
       G9P_CDM_KERNEL_REGS(program->g5p_num_regs) | G9P_CDM_ANY_CLUSTER |
-         G9P_CDM_FENCE | G9P_CDM_DATA_BLOCKS(G5P_QUERY_KERNEL_DATA_DWORDS / 4),
+         /* the A8: no fence on a kernel, data units counted directly (pvr_arch_g5p_compute.c) */
+         (g4p ? 0 : G9P_CDM_FENCE) | G5P_CDM_DATA_UNITS(g4p, G5P_QUERY_KERNEL_DATA_DWORDS / 4),
       kernel.data_offset,
       kernel.code_offset,
       groups,
@@ -466,6 +479,8 @@ emit_query_dispatch(struct pvr_cmd_buffer *cmd_buffer,
       1,
       g5p_cdm_workgroup_threads(G5P_QUERY_LOCAL_SIZE),
       DIV_ROUND_UP(program->g5p_local_dwords, 16));
+   if (g4p)
+      kernel_record.w[6] |= g5p_cdm_max_instances_g4p(G5P_QUERY_LOCAL_SIZE, false, 4 * program->g5p_local_dwords) << 27;
 
    pvr_csb_set_relocation_mark(&sub_cmd->control_stream);
    emit_record(&sub_cmd->control_stream, &bind_record);

@@ -203,7 +203,10 @@ VkResult PVR_PER_ARCH(CreateImageView)(VkDevice _device,
 
    util_format_compose_swizzles(format_swizzle, input_swizzle, info.swizzle);
 
-   info.skip_rogue_words = PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p) ||
+   /* The A8's TPU takes Rogue's texture state (AGXMetalA8's TEXSTATE_IMAGE_WORD0/1 in the a8-passcap load pass:
+    * 60008861 003f00fc 40000001 0000403d), so its views keep the Rogue words; the A9 and A10 have their own */
+   info.skip_rogue_words = (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p) &&
+                            !PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p)) ||
                            PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p);
    result = pvr_arch_pack_tex_state(device,
                                     &info,
@@ -222,7 +225,8 @@ VkResult PVR_PER_ARCH(CreateImageView)(VkDevice _device,
     */
    if (info.is_cube && image->vk.usage & VK_IMAGE_USAGE_STORAGE_BIT) {
       info.tex_state_type = PVR_TEXTURE_STATE_STORAGE;
-      info.skip_rogue_words = PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p);
+      info.skip_rogue_words = PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p) &&
+                              !PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p);
 
       result =
          pvr_arch_pack_tex_state(device,

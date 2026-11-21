@@ -9,6 +9,7 @@
 #include <string.h>
 
 _Thread_local const char *g5p_usc_error;
+bool g5p_usc_g4p;
 
 const char *const g5p_binop_name[G5P_BIN_COUNT] = {"fadd", "fmul", "iadd", "imul", "and", "or", "xor", "ishr",
                                                        "isub"};
@@ -54,6 +55,38 @@ static unsigned finish(uint8_t *out, const uint8_t *raw, unsigned n)
    memcpy(out, raw, n);
    g5p_usc_error = NULL;
    return n;
+}
+
+/* An A8 form: the A9's one-instruction length rule is not established for it */
+static unsigned finish_g4p(uint8_t *out, const uint8_t *raw, unsigned n)
+{
+   memcpy(out, raw, n);
+   g5p_usc_error = NULL;
+   return n;
+}
+
+/*
+ * The A8 varying iterator: 0x18, (count % 4) << 3 | 1, the destination half,
+ * 0x81 (0xa1 for four components), slot << 2, then 0 (32-bit) or, for the
+ * narrow (16-bit) form, 01 04 00. Apple's A8 output (a8-shadercap, iOS 12.4):
+ * 18 09 04 81 10 00 (one f32 component at slot 4 into half 4), 18 11 00 81 04
+ * 00 (two f32), 18 19 00 81 04 01 04 00 (three f16), 18 01 00 a1 04 01 04 00
+ * (four f16), where the A9 writes 08 0b 04 08, 08 13 00 03 00 80, 0a 1b 00 02
+ * and 0a 03 00 02. Only those shapes are accepted; the narrow form only at
+ * slot 1, the one captured (its 0x04 may be the slot or a constant).
+ */
+static unsigned iterator_g4p(uint8_t *out, unsigned dst_half, unsigned slot, unsigned count, bool narrow,
+                             bool saturate, unsigned flags)
+{
+   CHECK(!saturate && !flags, "A8 iterator modes (saturate, linear, centroid, DRC1) not captured");
+   CHECK(narrow ? (count == 3 || count == 4) : (count == 1 || count == 2),
+         "A8 iterator: only 1-2 f32 or 3-4 f16 components are captured");
+   CHECK(!narrow || slot == 1, "A8 narrow iterator captured at slot 1 only");
+   CHECK(dst_half < 256 && slot < 64, "A8 iterator destination/slot range");
+   const uint8_t raw[8] = {0x18, (uint8_t)(((count % 4) << 3) | 1), (uint8_t)dst_half,
+                           (uint8_t)(0x81 | (count == 4 ? 0x20 : 0)), (uint8_t)(slot << 2),
+                           narrow ? 1 : 0, 0x04, 0x00};
+   return finish_g4p(out, raw, narrow ? 8 : 6);
 }
 
 /* _destination / _selector / _header of the reference. */
@@ -567,6 +600,8 @@ unsigned g5p_usc_branch(uint8_t *out, int delta, bool conditional)
 unsigned g5p_usc_iterator(uint8_t *out, unsigned dst_half, unsigned slot, unsigned count,
                           bool narrow, bool saturate)
 {
+   if (g5p_usc_g4p)
+      return iterator_g4p(out, dst_half, slot, count, narrow, saturate, 0);
    CHECK(count >= 1 && count <= 4 && !(dst_half % 2), "iterator count/alignment");
    CHECK(dst_half < 256, "iterator destination must be u8");
    CHECK(slot < 128, "iterator slot must be u7");
@@ -579,6 +614,8 @@ unsigned g5p_usc_iterator_flags(uint8_t *out, unsigned dst_half, unsigned slot, 
 {
    CHECK(!(flags & ~(G5P_ITER_LINEAR | G5P_ITER_CENTROID | G5P_ITER_DRC1)), "unknown iterator flag");
    CHECK(!(narrow && (flags & (G5P_ITER_LINEAR | G5P_ITER_CENTROID))), "narrow iterator modes not witnessed");
+   if (g5p_usc_g4p)
+      return iterator_g4p(out, dst_half, slot, count, narrow, saturate, flags);
    if (!g5p_usc_iterator(out, dst_half, slot, count, narrow, saturate))
       return 0;
    if (flags & G5P_ITER_DRC1)
@@ -600,6 +637,8 @@ unsigned g5p_usc_coeff_load(uint8_t *out, unsigned dst_half, unsigned coeff_dwor
 
 unsigned g5p_usc_coord_iterator(uint8_t *out, unsigned dst_half, unsigned slot, unsigned count)
 {
+   if (g5p_usc_g4p) /* the A8 iterates a texture coordinate with its plain iterator (Apple's f_tex) */
+      return iterator_g4p(out, dst_half, slot, count, false, false, 0);
    CHECK((count == 2 || count == 3) && !(dst_half % 2), "coordinate iterator count/alignment");
    CHECK(dst_half < 64, "coordinate destination half must be u6");
    CHECK(slot < 128, "iterator slot must be u7");
@@ -609,8 +648,15 @@ unsigned g5p_usc_coord_iterator(uint8_t *out, unsigned dst_half, unsigned slot, 
 
 unsigned g5p_usc_emit(uint8_t *out, unsigned words, unsigned source_half)
 {
-   CHECK(words == 2 || words == 4, "only two/four output words characterized");
    CHECK(source_half < 256, "output source half must be u8");
+   if (g5p_usc_g4p) {
+      /* A8: byte 3 bit 0 and the extension halfword 0x8200 (Apple's 1c 21 00 09 00 82 in every captured
+       * fragment program; the A9's 1c 21 00 08) */
+      CHECK(words == 1 || words == 2 || words == 4, "A8 emitpix captured for 1, 2 and 4 words (111c, 211c, 411c)");
+      const uint8_t g4[6] = {0x1c, (uint8_t)((words << 4) | 1), (uint8_t)source_half, 9, 0x00, 0x82};
+      return finish_g4p(out, g4, 6);
+   }
+   CHECK(words == 2 || words == 4, "only two/four output words characterized");
    uint8_t raw[4] = {0x1c, (words << 4) | 1, source_half, 8};
    return finish(out, raw, 4);
 }
@@ -624,6 +670,8 @@ unsigned g5p_usc_emit_mrt(uint8_t *out, unsigned words, unsigned source_half)
 {
    CHECK(g5p_mrt_emit_words_witnessed(words), "only 1/2/4/8 terminal source words have an Apple witness");
    CHECK(source_half < 256, "output source half must be u8");
+   if (g5p_usc_g4p)
+      return g5p_usc_emit(out, words, source_half);
    uint8_t raw[4] = {0x1c, (g5p_mrt_emit_field(words) << 4) | 1, source_half, 8};
    return finish(out, raw, 4);
 }
@@ -840,6 +888,67 @@ unsigned g5p_usc_unorm8_byte(uint8_t *out, unsigned dst_half, unsigned byte, uns
    return finish(out, raw, n);
 }
 
+/* Integer min/max of a short literal A and a common-store dword C, the 32-bit result in bank 0: AGXMetalA8's
+ * RGBA8UI clear (iPod touch 6, iOS 12.4, a8-passcap rgba8u) clamps each clear channel with
+ *   9a 01 DD CC 7f 01 26 01 SS 01 00 41 b2 21 b0 00      (umin(255, common dword SS))
+ * laid out as g5p_usc_fma_literal(): literal_prefix() in the three-source class 0x9a, B unused (selector 0),
+ * then C = the common-store dword (shared_src(), group 1), the min/max code (minmax_code[], as
+ * g5p_usc_minmax_literal()), control 0x21 and the routing byte 0xb0 (literal A, common-store C; the register
+ * forms route 0x08 and 0x7c), no source control. CC carries the destination control: Apple sets 0x80 on one of
+ * its four clamps (the second), on a register its next clamp writes again. Only the short literal is witnessed. */
+#define G5P_MINMAX_CTL 0x21
+#define G5P_ROUTING_LITERAL_A_SHARED_C 0xb0
+unsigned g5p_usc_minmax_literal_shared(uint8_t *out, enum g5p_minmax op, unsigned dst_half, unsigned dst_control,
+                                       uint32_t value, unsigned c_dword)
+{
+   CHECK(op < G5P_MINMAX_COUNT, "unsupported integer min/max");
+   CHECK(value <= 0xffff, "only the short literal is witnessed");
+   CHECK(half_register(dst_half, "dst_half requires a measured 32-bit aligned half index"), g5p_usc_error);
+   uint8_t raw[G5P_USC_MAX];
+   unsigned n = literal_prefix(raw, 0x9a, dst_half, 0, value, 0, 0, G5P_HEADER_FRAGMENT, 0);
+   if (!n)
+      return 0;
+   if (!cdestination(raw + 2, dst_half, 0, dst_control))
+      return 0;
+   if (!shared_src(raw + n, c_dword, 1))
+      return 0;
+   n += 4;
+   raw[n++] = minmax_code[op];
+   raw[n++] = G5P_MINMAX_CTL;
+   raw[n++] = G5P_ROUTING_LITERAL_A_SHARED_C;
+   raw[n++] = G5P_SOURCE_CONTROL_NONE;
+   return finish(out, raw, n);
+}
+
+/* Two bytes into one 16-bit half of bank 0, dst = B | C << shift: AGXMetalA8's RGBA8UI clear (a8-passcap rgba8u)
+ * packs its clamped channels (each 0..255) pairwise with
+ *   8a 01 DH 01 11 BB 20 01 CC 01 f1 1f 58 00            (dst half DH = half BB | half CC << 8)
+ * literal_prefix() in the three-source class with the 16-bit result (0x8a) and the shift as A's short literal,
+ * B and C register halves of group 1 (C's selector without the continuation, then the 0x01 parcel byte, as
+ * g5p_usc_fma_literal()), opcode 0xf1, control 0x1f, routing 0x58, no source control. The captured operands are
+ * 0..255, so whether the opcode ors, adds or inserts the shifted C is not distinguished; only shift 8 is witnessed. */
+#define G5P_PACK_BYTE_OP 0xf1
+#define G5P_PACK_BYTE_CTL 0x1f
+#define G5P_PACK_BYTE_ROUTING 0x58
+unsigned g5p_usc_pack_byte_half(uint8_t *out, unsigned dst_half, unsigned b_half, unsigned c_half,
+                                unsigned shift)
+{
+   CHECK(shift == 8, "only the byte pack (shift 8) is witnessed");
+   uint8_t raw[G5P_USC_MAX];
+   unsigned n = literal_prefix(raw, G5P_CLASS_TERNARY_RESULT_HALF, dst_half, 0, shift, b_half, 1,
+                               G5P_HEADER_FRAGMENT, 0);
+   if (!n)
+      return 0;
+   SEL(c, c_half, 1, 0);
+   raw[n++] = c;
+   raw[n++] = G5P_PARCEL_CONTINUES;
+   raw[n++] = G5P_PACK_BYTE_OP;
+   raw[n++] = G5P_PACK_BYTE_CTL;
+   raw[n++] = G5P_PACK_BYTE_ROUTING;
+   raw[n++] = G5P_SOURCE_CONTROL_NONE;
+   return finish(out, raw, n);
+}
+
 /* A move of a common-store dword into a 16-bit half of bank 0 (the end-of-tile program's state moves,
  * g5p_mrt_programs.h): alu_header() with the 16-bit move class (G5P_CLASS_MOVE_HALF, as g5p_usc_half_immediate())
  * and the fragment header, A = the common-store dword (shared_src(), group 1), then the half move's opcode and
@@ -999,8 +1108,52 @@ static unsigned texture_base(uint8_t *raw, const struct g5p_tex *t)
    return 6;
 }
 
+/*
+ * The A8's 2D sample with an implicit LOD and a packed-f16 (narrow) result, as Apple's A8 compiler writes
+ * f_tex's (iPod touch 6, iOS 12.4, a8-shadercap): 1a 59 00 41 00 01 88 01 00 01 00 80, where the A9 writes
+ * 18 f5 00 01 08 80 for the same source (image qword 0, sampler qword 4, coordinate dword 0 under coordinate
+ * control). Byte 2 is the destination half and byte 8 the coordinate dword << 1 (Metal's blit program has
+ * eight samples, 1a 79 DD 41 00 01 ac 01 CC 01 14 80, with eight destinations and coordinates); byte 6 is
+ * 0x80 | mode << 4 | sampler dword << 1 (sampler 4 here, 6 in the blit, whose mode 2 is an explicit LOD). Byte 1 bit 5 is a 32-bit result there, which
+ * also carries an operand byte 10 not decoded, so only the narrow form is taken; the image qword is 0 in
+ * every witness (bytes 3-4 41 00), so only image qword 0.
+ */
+static unsigned sample_g4p(uint8_t *out, const struct g5p_tex *t)
+{
+   /* Two result forms, both Apple's: narrow (byte 1 0x59: the f16 results f_tex writes straight to the output) and
+    * 32-bit (byte 1 0x79: one 32-bit register per channel, read by ALU after the wait; AGXMetalA8's R32F and RGBA8UI
+    * load backgrounds, passcap USC 0x4826 and 0x4da6, the latter feeding umin and byte packs). Metal's blit program
+    * has the 32-bit form with byte 10 = 0x14, an operand not decoded and not used here. */
+   CHECK((t->dim == G5P_TEX_2D || t->dim == G5P_TEX_CUBE) && !t->read && !t->class_variant && t->coord_control &&
+            !t->gradient && !t->lod_control && !t->length,
+         "A8 sample captured only as a 2D or cube sample with an implicit LOD");
+   /* the cube sample: mode 4 (byte 6 0xc8 with the sampler at dword 4), the direction in three temps from the
+    * coordinate dword, no cube-coordinate instruction (AGXMetalA8's f_tex_cube, passcap USC 0x6076: two FMAs and a
+    * move build r0..r2, then 1a 59 00 41 00 01 c8 01 00 01 00 80). Only the narrow form is captured. */
+   CHECK(t->dim != G5P_TEX_CUBE || t->narrow, "A8 cube sample captured only in the narrow form (result straight to the output)");
+   CHECK(t->image_qword == 0, "A8 sample captured only with the image descriptor at common qword 0");
+   /* the A8 names the sampler by its common DWORD (Apple's 0x88 reads the sampler at dword 4 in tex_plain and in
+    * the load background): the caller passes the dword in sampler_qword */
+   /* byte 6 is 0x80 | mode << 4 | sampler dword << 1: Apple's tex_lod, tex_bias, tex_grad and tex_cube samples
+    * (passcap USC 0x5388, 0x5588, 0x57bc, 0x6076) read the same sampler (dword 4) with bytes a8, 98, b8 and c8,
+    * and the blit's explicit-LOD samples are ac (sampler dword 6). Bits 4-6 are the sample mode, so a sampler at
+    * dword 8 or above would encode another mode: the field is three bits. */
+   CHECK(t->sampler_qword <= 7, "A8 sample: sampler dword above 7 (byte 6 bits 4-6 are the sample mode)");
+   /* witnessed sampler dwords are 0, 4 and 6; byte 6 bit 1 (an odd dword) is also set by Apple's array sample (8a)
+    * and bit 0 by its 0x3000 sample (89), neither decoded, so an odd dword could alias a flag */
+   CHECK(!(t->sampler_qword & 1), "A8 sample: odd sampler dword (byte 6 bit 1 is set by Apple's undecoded array sample)");
+   CHECK(t->coord_dword <= 31 && !(t->dst_half & 1) && t->dst_half < 64, "A8 sample: coordinate/destination range");
+   const uint8_t mode = t->dim == G5P_TEX_CUBE ? 4 : 0;
+   const uint8_t raw[12] = {0x1a, t->narrow ? 0x59 : 0x79, (uint8_t)t->dst_half, 0x41, 0x00, 0x01,
+                            (uint8_t)(0x80 | mode << 4 | t->sampler_qword << 1),
+                            0x01, (uint8_t)(t->coord_dword << 1), 0x01, 0x00, 0x80};
+   return finish_g4p(out, raw, sizeof(raw));
+}
+
 unsigned g5p_usc_sample(uint8_t *out, const struct g5p_tex *t)
 {
+   if (g5p_usc_g4p)
+      return sample_g4p(out, t);
    CHECK(!t->read, "mode must be sample");
    uint8_t raw[G5P_USC_MAX];
    if (!texture_base(raw, t))
@@ -1054,6 +1207,8 @@ unsigned g5p_usc_ms_own_sample(uint8_t *out, unsigned dst_half)
 
 unsigned g5p_usc_texture_lod(uint8_t *out, const struct g5p_tex *t)
 {
+   /* The A8 takes only the narrow implicit-LOD 2D sample (sample_g4p()) */
+   CHECK(!g5p_usc_g4p, "A8 texture sample form not captured");
    CHECK(t->lod_bank == 1 || t->lod_bank == 3, "only LOD source banks 1 (shared) and 3 (temp) are measured");
    CHECK(t->lod_dword <= 95, "lod_dword must be an integer in [0,95]");
    CHECK(!t->narrow, "narrow result is not witnessed with explicit LOD");
@@ -1087,6 +1242,8 @@ unsigned g5p_usc_texture_lod(uint8_t *out, const struct g5p_tex *t)
 
 unsigned g5p_usc_gather(uint8_t *out, const struct g5p_tex *t)
 {
+   /* The A8 takes only the narrow implicit-LOD 2D sample (sample_g4p()) */
+   CHECK(!g5p_usc_g4p, "A8 texture sample form not captured");
    CHECK(t->dim == G5P_TEX_2D, "only 2d gather is measured");
    CHECK(!t->read && !t->narrow, "gather is a 2d sample form");
    uint8_t raw[G5P_USC_MAX];
@@ -1100,6 +1257,8 @@ unsigned g5p_usc_gather(uint8_t *out, const struct g5p_tex *t)
 
 unsigned g5p_usc_sample_ext(uint8_t *out, const struct g5p_tex_ext *t)
 {
+   /* The A8 takes only the narrow implicit-LOD 2D sample (sample_g4p()) */
+   CHECK(!g5p_usc_g4p, "A8 texture sample form not captured");
    const bool coupled = t->tuple != G5P_TEX_TUPLE_ORDINARY;
    CHECK((unsigned)t->tuple <= G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL_COMPARE_OFFSET, "unqualified texture recipe");
    CHECK(!coupled || t->lod_shared == (t->tuple == G5P_TEX_TUPLE_COUPLED_SHARED_LEVEL),
@@ -1187,6 +1346,8 @@ unsigned g5p_usc_sample_ext(uint8_t *out, const struct g5p_tex_ext *t)
 #define G5P_TEX_COORD_LAST_READ 0x80
 unsigned g5p_usc_sample_register_lod(uint8_t *out, const struct g5p_tex_ext *t)
 {
+   /* The A8 takes only the narrow implicit-LOD 2D sample (sample_g4p()) */
+   CHECK(!g5p_usc_g4p, "A8 texture sample form not captured");
    CHECK(t->tuple == G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL && t->lod == G5P_TEX_LOD_LEVEL && !t->lod_shared &&
          (t->dim == G5P_TEX_2D_ARRAY || t->dim == G5P_TEX_CUBE),
          "the register-LOD form is an array or cube sample at a level");
@@ -1314,6 +1475,13 @@ unsigned g5p_usc_address_load(uint8_t *out, unsigned dst_half, unsigned byte_cou
    return finish(out, raw, length);
 }
 
+/* The A8 has no 64-bit address add: AGXMetalA8 never emits class 0x89 (none in the iPod touch 6 shader and pass
+ * captures), the A10/A9 form faults in A8 compute, and Apple's A8 builds base + offset from 32-bit adds
+ * with the carry's high half (g9p_addr()). That build needs a scratch register the fragment/vertex allocator does
+ * not provide here yet, so graphics programs that index a buffer are refused on the A8. */
+#define G5P_A8_NO_ADDR_ADD "the A8 has no 64-bit address add (Apple's 32-bit carry build is not ported to " \
+                           "graphics programs)"
+
 /* `89 11` (vertex) / `89 01` (fragment): pair = pointer pair at common dword
  * `base` + (index << shift). Bytes from Apple's own compiles of a constant
  * buffer indexed by a register (tools/mesa-a9-gles3tex/dynubo.metal: v_cexpr,
@@ -1329,6 +1497,7 @@ unsigned g5p_usc_address_add_shift(uint8_t *out, unsigned pair_half, unsigned ba
    CHECK(half_register(index_half, "index_half requires a measured 32-bit register"), g5p_usc_error);
    CHECK(base_common_dword < 256 && !(base_common_dword & 1), "pointer base must be an even common dword below 256");
    CHECK(shift <= 4, "only shifts 0-4 are corpus-verified");
+   CHECK(!g5p_usc_g4p, G5P_A8_NO_ADDR_ADD);
    /* The layout of g5p_usc_alu_shared(): alu_header() (vertex code: destination bank 1, and B's bank bit in
     * the header), A = the pointer base (shared_src(), group 1; above dword 31 its high bits are the field that
     * the vertex XFB record's address add and every shared ALU operand use), B = the index with its last read,
@@ -2086,6 +2255,7 @@ unsigned g5p_usc_address_add(uint8_t *out, unsigned dst_half, unsigned ptr_dword
    CHECK(!(ptr_dword & 1), "64-bit pointer base must be pair aligned");
    CHECK(off_group <= 1, "off_group must be an integer in [0,1]");
    CHECK(shift <= 4, "address shifts 0..4 (uchar..uint4) are witnessed");
+   CHECK(!g5p_usc_g4p, G5P_A8_NO_ADDR_ADD);
    uint8_t raw[G5P_USC_MAX], a[4];
    if (!alu_header(raw, 0x89, dst_half, 1, 0x11, 0, 0) || !shared_src(a, ptr_dword, ptr_group))
       return 0;

@@ -10,6 +10,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "g5p_usc.h"
 #include "pvr_physical_device.h"
 
 #include <sys/sysmacros.h>
@@ -256,8 +257,9 @@ static void pvr_physical_device_get_supported_features(
       .sampleRateShading = true,
       .dualSrcBlend = false,
       .logicOp = true,
-      .multiDrawIndirect = true,
-      .drawIndirectFirstInstance = true,
+      /* the A8: no indirect draw in Apple's driver; vkCmdDraw*Indirect is refused by name (pvr_arch_g5p_gfx.c) */
+      .multiDrawIndirect = !PVR_HAS_FEATURE(dev_info, apple_g4p),
+      .drawIndirectFirstInstance = !PVR_HAS_FEATURE(dev_info, apple_g4p),
       .depthClamp = false,
       .depthBiasClamp = true,
       .fillModeNonSolid = false,
@@ -1252,7 +1254,7 @@ VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
    pdevice->render_devid = render_stat.st_rdev;
 
    result =
-      pvr_winsys_create(render_path, display_path, true,
+      pvr_winsys_create(render_path, display_path, true, true,
                         &instance->vk.alloc, &ws);
    if (result != VK_SUCCESS)
       goto err_vk_free_display_path;
@@ -1388,6 +1390,10 @@ VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
                          "Failed to get driver build sha.");
       goto err_vk_physical_device_finish;
    }
+
+   /* The A8's USC forms (g5p_usc.h); one process drives one Apple GPU */
+   if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g4p))
+      g5p_usc_g4p = true;
 
    pdevice->skip_refused_work = PVR_HAS_FEATURE(&pdevice->dev_info, apple_g5p) &&
                                  instance->drirc.misc.pvr_skip_refused_work;

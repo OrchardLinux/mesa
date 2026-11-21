@@ -22,6 +22,16 @@
 
 extern _Thread_local const char *g5p_usc_error;
 
+/*
+ * Encode for the A8 (G4P) instead of the A9: set once by the driver for an A8
+ * device (one process drives one Apple GPU). The forms that differ, from
+ * Apple's A8 compiler output (iPod touch 6, iOS 12.4, a8-shadercap): emitpix
+ * takes an extension halfword, varyings iterate with opcode 0x18, and texture
+ * samples have another form (refused until decoded). Everything else Apple's
+ * A8 compiler emits the A9's way (the vertex programs byte for byte).
+ */
+extern bool g5p_usc_g4p;
+
 enum g5p_binop {
    G5P_BIN_FADD, G5P_BIN_FMUL, G5P_BIN_IADD, G5P_BIN_IMUL,
    G5P_BIN_AND, G5P_BIN_OR, G5P_BIN_XOR, G5P_BIN_ISHR,
@@ -236,6 +246,14 @@ unsigned g5p_usc_f2u16_half(uint8_t *out, unsigned dst_half, unsigned src_half, 
  * end-of-tile program's state moves (g5p_mrt_programs.h). */
 unsigned g5p_usc_mov_shared_half(uint8_t *out, unsigned dst_half, unsigned src_dword);
 unsigned g5p_usc_unorm8_byte(uint8_t *out, unsigned dst_half, unsigned byte, unsigned src_dword);
+/* Integer min/max of a short literal and common-store dword c_dword (group 1) into the 32-bit register at
+ * dst_half, bank 0 (fields at the encoder): the A8's RGBA8UI clear clamps each channel with umin(255, c). */
+unsigned g5p_usc_minmax_literal_shared(uint8_t *out, enum g5p_minmax op, unsigned dst_half, unsigned dst_control,
+                                       uint32_t value, unsigned c_dword);
+/* The 16-bit dst_half of bank 0 = half b_half | half c_half << 8 (fields at the encoder): the A8's RGBA8UI clear
+ * packs two clamped channels into one half with it. */
+unsigned g5p_usc_pack_byte_half(uint8_t *out, unsigned dst_half, unsigned b_half, unsigned c_half,
+                                unsigned shift);
 /* length 0 = minimum */
 unsigned g5p_usc_buffer_load(uint8_t *out, unsigned dst_half, unsigned byte_count,
                              unsigned base_common_dword, unsigned index, unsigned length);

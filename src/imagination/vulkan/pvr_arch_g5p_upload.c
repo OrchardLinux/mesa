@@ -32,6 +32,7 @@
 #include "pvr_csb.h"
 #include "pvr_descriptor_set.h"
 #include "pvr_device.h"
+#include "pvr_physical_device.h"
 #include "pvr_g5p_upload.h"
 #include "pvr_g5p_vtex.h"
 
@@ -39,10 +40,10 @@
 /* The loader: DOUTD c(2i):c(2i+1) -> common store with the control word in
  * c(2n+2i), the last one ends, then HALT (the fragment loader's shape) */
 static unsigned
-g5p_up_loader_program(uint32_t *dest, unsigned n)
+g5p_up_loader_program(uint32_t *dest, unsigned n, enum pdsc_feature features)
 {
    pdsc_init();
-   pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-vs-loader");
+   pdsc_program *p = pdsc_program_create(NULL, features, "g5p-vs-loader");
    for (unsigned i = 0; i < n; i++)
       pdsc_dout(p, pdsc_ref_const64(2 * i), pdsc_ref_const32(2 * n + 2 * i), pdsc_ref_null(),
                 .dstdout = PDSC_DSTDOUT_D, .end = i == n - 1);
@@ -58,12 +59,12 @@ g5p_up_loader_program(uint32_t *dest, unsigned n)
 static uint32_t
 g5p_up_doutd_control(unsigned common, unsigned dwords, bool last)
 {
-   pdsc_init();
-   pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-doutd");
+   /* packing a field reads only the feature set: no program allocation per draw */
+   static const pdsc_program pack = { .name = "g5p-doutd", .features = PDSC_FEATURE_DOUT_EXT };
+   const pdsc_program *p = &pack;
    struct pdsc_doutd_src1 s = { .last_issue = last, .store_dest = PDSC_STORE_DEST_COMMON, .ao = common,
                                 .bsize = dwords };
    const uint32_t v = pdsc_doutd_src1_pack(p, &s);
-   ralloc_free(p);
    return v;
 }
 
@@ -134,7 +135,7 @@ PVR_PER_ARCH(g5p_vs_uploads_create)(struct pvr_device *device, const struct pco_
    }
 
    uint32_t code[4 * PVR_G5P_MAX_STAGE_UPLOADS + 4];
-   const unsigned n = g5p_up_loader_program(code, up->count);
+   const unsigned n = g5p_up_loader_program(code, up->count, PVR_G5P_PDS_FEATURES(&device->pdevice->dev_info));
    VkResult result = pvr_gpu_upload_pds(device, NULL, 0, 0, code, n, 16, 64, &up->loader);
    if (result != VK_SUCCESS) {
       vk_free(&device->vk.alloc, up);

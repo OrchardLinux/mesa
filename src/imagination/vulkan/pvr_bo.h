@@ -125,6 +125,14 @@ VkResult pvr_bo_alloc_tagged(const char *tag,
                              uint64_t flags,
                              struct pvr_bo **const bo_out);
 #define pvr_bo_alloc(...) pvr_bo_alloc_tagged(__func__, __VA_ARGS__)
+/* A GPU-only buffer of size bytes mapped twice back to back (at vma->dev_addr and vma->dev_addr + size, the vma
+ * 2 * size long): winsys vma_map_mirror(). pvr_bo_free() releases it. */
+VkResult pvr_bo_alloc_mirrored(struct pvr_device *device,
+                               struct pvr_winsys_heap *heap,
+                               uint64_t size,
+                               uint64_t alignment,
+                               uint64_t flags,
+                               struct pvr_bo **const pvr_bo_out);
 
 VkResult pvr_bo_cpu_map(struct pvr_device *device, struct pvr_bo *bo);
 void pvr_bo_cpu_unmap(struct pvr_device *device, struct pvr_bo *bo);

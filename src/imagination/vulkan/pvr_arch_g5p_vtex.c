@@ -27,6 +27,7 @@
 #include "pvr_csb.h"
 #include "pvr_descriptor_set.h"
 #include "pvr_device.h"
+#include "pvr_physical_device.h"
 #include "pvr_g5p_tex.h"
 #include "pvr_g5p_tex_encode.h"
 #include "pvr_g5p_vtex.h"
@@ -40,12 +41,13 @@ static_assert(VTEX_COMMON >= PCO_G5P_COMMON_DWORDS, "vertex common-store plan bo
 
 static uint32_t vtex_control(unsigned common, unsigned dwords, bool last)
 {
-   pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-vtex-control");
+   /* packing a field reads only the feature set: no program allocation per draw */
+   static const pdsc_program pack = { .name = "g5p-vtex-control", .features = PDSC_FEATURE_DOUT_EXT };
+   const pdsc_program *p = &pack;
    struct pdsc_doutd_src1 s = {
       .last_issue = last, .store_dest = PDSC_STORE_DEST_COMMON, .ao = common, .bsize = dwords,
    };
    uint32_t word = pdsc_doutd_src1_pack(p, &s);
-   ralloc_free(p);
    return word;
 }
 
@@ -69,7 +71,7 @@ PVR_PER_ARCH(g5p_vtex_create)(struct pvr_device *device, const struct pco_g5p_pr
    up->count = plan.dmas;
    up->common_dwords = vs->common_dwords;
    pdsc_init();
-   pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-vtex-loader");
+   pdsc_program *p = pdsc_program_create(NULL, PVR_G5P_PDS_FEATURES(&device->pdevice->dev_info), "g5p-vtex-loader");
    for (unsigned i = 0; i < plan.dmas; i++)
       pdsc_dout(p, pdsc_ref_const64(2*i), pdsc_ref_const32(2*plan.dmas + 2*i), pdsc_ref_null(),
                 .dstdout = PDSC_DSTDOUT_D, .end = i == plan.dmas - 1);

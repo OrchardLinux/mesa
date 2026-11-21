@@ -18,7 +18,8 @@ static inline unsigned g5p_common_align(unsigned n, unsigned a)
 }
 
 static inline bool
-g5p_stage_common_plan(unsigned start, unsigned textures, unsigned samplers,
+g5p_stage_common_plan(unsigned start, unsigned textures, unsigned samplers, unsigned image_dwords,
+                   unsigned sampler_dwords,
                    bool compact, unsigned dynamic_ptrs,
                    unsigned size_queries, unsigned ubos, uint64_t ubo_dwords,
                    uint64_t push_dwords, struct g5p_fs_common_plan *p)
@@ -39,10 +40,10 @@ g5p_stage_common_plan(unsigned start, unsigned textures, unsigned samplers,
          p->pointer_end = next;
       }
       if (textures && p->compact) {
-         next = g5p_common_align(next, 8) + 8 * textures + 2 * samplers;
+         next = g5p_common_align(next, 8) + image_dwords * textures + sampler_dwords * samplers;
       } else {
          for (unsigned i = 0; i < textures; i++)
-            next = g5p_common_align(next, 8) + 10;
+            next = g5p_common_align(next, 8) + image_dwords + sampler_dwords;
       }
       unsigned dynamic_end = next;
       if (!p->low_pointers)
@@ -75,7 +76,7 @@ g5p_fs_common_plan(unsigned start, unsigned textures, unsigned dynamic_ptrs,
                    unsigned size_queries, unsigned ubos, uint64_t ubo_dwords,
                    uint64_t push_dwords, struct g5p_fs_common_plan *p)
 {
-   return g5p_stage_common_plan(start, textures, textures, textures > 4,
+   return g5p_stage_common_plan(start, textures, textures, 8, 2, textures > 4,
                                 dynamic_ptrs, size_queries, ubos, ubo_dwords,
                                 push_dwords, p);
 }

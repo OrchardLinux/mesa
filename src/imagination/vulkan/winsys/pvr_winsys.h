@@ -137,6 +137,8 @@ struct pvr_winsys_vma {
    pvr_dev_addr_t dev_addr;
    uint64_t size;
    uint64_t mapped_size;
+   /* vma_map_mirror(): the whole buffer is mapped twice, at dev_addr and at dev_addr + bo->size */
+   bool mirrored;
 };
 
 struct pvr_winsys_free_list {
@@ -405,6 +407,11 @@ struct pvr_winsys_ops {
                        uint64_t size,
                        pvr_dev_addr_t *dev_addr_out);
    void (*vma_unmap)(struct pvr_winsys_vma *vma);
+   /* The whole of bo mapped twice back to back, at vma->dev_addr and vma->dev_addr + bo->size (the vma holds
+    * at least 2 * bo->size): the A8's region-header ring, which AGXG4P maps that way (kext 0x847d738, resources
+    * created with flag 0x200000) so a frame's slice can run past the ring's end. Two VM_MAPs of one buffer;
+    * vma_unmap() removes both. NULL where the winsys has no such mapping. */
+   VkResult (*vma_map_mirror)(struct pvr_winsys_vma *vma, struct pvr_winsys_bo *bo);
 
    VkResult (*free_list_create)(
       struct pvr_winsys *ws,
@@ -493,9 +500,12 @@ void pvr_winsys_count_bo(int kind, int64_t delta);
 uint64_t pvr_winsys_counted_bytes(int kind);
 
 void pvr_winsys_destroy(struct pvr_winsys *ws);
+/* query_only: the physical device's winsys, used for device queries; where the winsys supports it (the A8's powervr
+ * winsys), it then creates no VM context */
 VkResult pvr_winsys_create(const char *render_path,
                            const char *display_path,
                            bool keep_display_master,
+                           bool query_only,
                            const VkAllocationCallbacks *alloc,
                            struct pvr_winsys **ws_out);
 

@@ -21,6 +21,43 @@ its A9 mode (`g9p/g9p_a9*.h`).
 None of this is proposed upstream. It was written by AI agents (every commit
 carries `Generated-by: LLM`).
 
+## The A8
+
+The Apple A8's GPU (T7000, BVNC 3.10.4.5, `common/device_info/apple-a8.h`)
+takes these paths too: its entry sets `apple_g5p` and `apple_g4p`. The
+evidence for sharing them:
+
+- Apple's LLVM backend for these GPUs (`libLLVM.dylib`, iOS 16) has one
+  processor table with `g4p-b1` (A8), `g5p-b0` (A9) and `g9p-a0`/`g9p-b0`
+  (A10), and the features "Enable G4 instructions", "Enable G5
+  instructions" and "Enable G9 instructions". The A8 is the base set; the
+  A9 adds to it. The A8 has its own scheduling model, the A9 and A10 share
+  one.
+- On an A8 (iPadOS 15) Metal's compute kernels end the A10 way (`0x8000` at
+  a 64-byte boundary after `0xc000` padding), its empty kernel is the A10's,
+  and its CDM control stream has the seven-word records this driver writes
+  for the A9 (`g5p_cdm.h`).
+
+Where the A8 is known to differ, `apple_g4p` selects its form:
+
+- PDS programs encode DOUT the Rogue way, not in Apple's extended form
+  (`PVR_G5P_PDS_FEATURES()`, `vulkan/pvr_g5p.h`): Metal's compute PDS
+  programs on an A8 decode to the A10's operands in Rogue's field layout.
+- The end of tile's EVENT_PIXEL_PDS_INFO counts the USC shared size in
+  Rogue's unit: 0x202 for one target on the A8, 0x402 on the A9
+  (`g5p_mrt_eot_info_g4p()`).
+
+- Compute: Apple's A8 residency limits (`apple-a8.h`), the PDS in Rogue's
+  layout (`G5P_PDS_DOUT()`), the kernel launch and KERNEL8 max_instances
+  as AGXMetalA8 builds them (`pvr_arch_g5p_compute.c`, `g5p_cdm.h`).
+- USC (`g5p_usc_g4p`, from Apple's A8 compiler output): the long emitpix,
+  the A8 varying iterator, the A8 end of tile (`1e010070`, fed the target's
+  address); the background program is the A9's.
+
+Where the A8 differs and this driver has no A8 form yet, it refuses by
+name: texture samples other than the narrow implicit-LOD 2D one (`sample_g4p()`),
+several colour targets, integer targets, 4x, LOAD.
+
 ## Origin
 
 The A9 driver is Berkay Kösebay's: the shader backend, the state packing, the
