@@ -4333,10 +4333,17 @@ static void read_varying(struct gctx *c, nir_intrinsic_instr *in, struct drc *d)
    }
    unsigned flags = (v->interp == PCO_G5P_INTERP_NOPERSPECTIVE || flat_iterated ? G5P_ITER_LINEAR : 0) |
                     (v->centroid && !flat_iterated ? G5P_ITER_CENTROID : 0);
-   if (drc_take(c, d))
-      flags |= G5P_ITER_DRC1;
    unsigned dst = alloc_run(c, n, "varying");
-   put(c, raw, g5p_usc_iterator_flags(raw, 2 * dst, slot, n, false, false, flags), "iterator");
+   /* The A8's f32 iterator is captured for one and two components (AGXMetalA8's f_discard and f_tex: `18 09 ..`,
+    * `18 11 ..`), whose slot counts components (f_discard's color.a is slot 4). A three- or four-component f32
+    * varying is iterated as those pieces: components 0-1, then 2(-3), each its own dependent read. */
+   for (unsigned j0 = 0; j0 < n; j0 += g5p_usc_g4p ? 2 : n) {
+      const unsigned cnt = g5p_usc_g4p ? MIN2(2, n - j0) : n;
+      unsigned f = flags;
+      if (drc_take(c, d))
+         f |= G5P_ITER_DRC1;
+      put(c, raw, g5p_usc_iterator_flags(raw, 2 * (dst + j0), slot + j0, cnt, false, false, f), "iterator");
+   }
    for (unsigned j = 0; j < n; j++) {
       struct val *val = V(c, &in->def, j);
       val->state = VAL_REG;
