@@ -1012,9 +1012,11 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
          }
       }
       if (!t || compact) {
-         if (twiddled && PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p)) {
+         if (!ms_store && PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p)) {
             /* the A8 loads through Rogue's texture state: the view's own (pvr_arch_image.c keeps the Rogue words on
-             * the A8; Apple's load pass DMAs TEXSTATE_IMAGE_WORD0/1) */
+             * the A8; Apple's load pass DMAs TEXSTATE_IMAGE_WORD0/1). A linear target (every image shared outside
+             * the driver: GBM/dmabuf, so the compositor's output buffers) has the stride form of the same two
+             * words, the ones the A8 already samples linear textures with. */
             load_state[t][0] = iview->image_state[PVR_TEXTURE_STATE_SAMPLE].words[0];
             load_state[t][1] = iview->image_state[PVR_TEXTURE_STATE_SAMPLE].words[1];
          } else if(twiddled) {
@@ -1231,9 +1233,12 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
       /* Apple's capture: one single-sample twiddled BGRA8 target (8-bit UNORM targets share the program; the
        * texture state carries the format) */
       const VkFormat f = first_format;
-      if (nt != 1 || raw || compact || g->samples != 1 || !a8_load_twiddled || g->a8_narrow_halves ||
+      /* a linear target loads through its stride texture state (above): Apple's load program samples whatever the
+       * state describes. Without it, a compositor's damage-only redraw into its (linear, shared) output buffer was
+       * refused and the frame never drawn. */
+      if (nt != 1 || raw || compact || g->samples != 1 || g->a8_narrow_halves ||
           (f != VK_FORMAT_B8G8R8A8_UNORM && f != VK_FORMAT_R8G8B8A8_UNORM))
-         return G5P_REFUSE(cmd_buffer, "A8 LOAD of %s (%u targets, %u samples%s): one single-sample twiddled "
+         return G5P_REFUSE(cmd_buffer, "A8 LOAD of %s (%u targets, %u samples%s): one single-sample "
                            "BGRA8/RGBA8 target is captured", vk_Format_to_str(f), nt, g->samples,
                            a8_load_twiddled ? "" : ", linear");
       result = g5p_load_background_g4p(cmd_buffer, load_state[0], bgnd, p);
