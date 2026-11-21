@@ -500,9 +500,12 @@ void pvr_winsys_count_bo(int kind, int64_t delta);
 uint64_t pvr_winsys_counted_bytes(int kind);
 
 void pvr_winsys_destroy(struct pvr_winsys *ws);
+/* query_only: the physical device's winsys, used for device queries; where the winsys supports it (the A8's powervr
+ * winsys), it then creates no VM context */
 VkResult pvr_winsys_create(const char *render_path,
                            const char *display_path,
                            bool keep_display_master,
+                           bool query_only,
                            const VkAllocationCallbacks *alloc,
                            struct pvr_winsys **ws_out);
 

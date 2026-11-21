@@ -1254,7 +1254,7 @@ VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
    pdevice->render_devid = render_stat.st_rdev;
 
    result =
-      pvr_winsys_create(render_path, display_path, true,
+      pvr_winsys_create(render_path, display_path, true, true,
                         &instance->vk.alloc, &ws);
    if (result != VK_SUCCESS)
       goto err_vk_free_display_path;

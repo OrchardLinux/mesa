@@ -154,6 +154,9 @@ static void pvr_drm_winsys_destroy(struct pvr_winsys *ws)
       .handle = drm_ws->vm_context,
    };
 
+   if (drm_ws->query_only)
+      goto out;
+
    pvr_winsys_helper_free_static_memory(drm_ws->general_vma,
                                         drm_ws->pds_vma,
                                         drm_ws->usc_vma);
@@ -165,6 +168,7 @@ static void pvr_drm_winsys_destroy(struct pvr_winsys *ws)
              &destroy_vm_context_args,
              VK_ERROR_UNKNOWN);
 
+out:
    util_sparse_array_finish(&drm_ws->bo_map);
    u_rwlock_destroy(&drm_ws->dmabuf_bo_lock);
 
@@ -751,6 +755,7 @@ err_pvr_drm_heap_finish_all_heaps:
 
 VkResult pvr_drm_winsys_create(const int render_fd,
                                const int display_fd,
+                               const bool query_only,
                                const VkAllocationCallbacks *alloc,
                                struct pvr_winsys **const ws_out)
 {
@@ -804,6 +809,14 @@ VkResult pvr_drm_winsys_create(const int render_fd,
                                  PVR_HAS_FEATURE(&info, apple_g9p);
       drm_ws->base.job_sync_size = drm_ws->job_fence_errors
                                     ? sizeof(struct pvr_drm_job_sync) : 0;
+      /* The A8's physical-device winsys answers device queries only: no VM context, heaps or static memory, so
+       * a process holds one VM (its VkDevice's) instead of two. powervr's A8 variant gives every VM the hardware
+       * object window, the zero and data pages and a user slot, and a client that never submits needs none. */
+      drm_ws->query_only = query_only && PVR_HAS_FEATURE(&info, apple_g4p);
+   }
+   if (drm_ws->query_only) {
+      *ws_out = &drm_ws->base;
+      return VK_SUCCESS;
    }
 
    result = pvr_ioctl(render_fd,
