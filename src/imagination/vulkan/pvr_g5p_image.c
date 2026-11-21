@@ -47,6 +47,7 @@
 #include "pvr_g5p_tex.h"
 #include "pvr_image.h"
 #include "pvr_physical_device.h"
+#include "g5p/g5p_usc.h"
 
 void
 pvr_g5p_image_layout(struct pvr_image *image, unsigned stride_align)
@@ -65,7 +66,13 @@ pvr_g5p_image_layout(struct pvr_image *image, unsigned stride_align)
                          (image->vk.usage & VK_IMAGE_USAGE_STORAGE_BIT) ||
                          (image->vk.create_flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) ||
                          (image->vk.array_layers > 1 && (image->vk.usage & VK_IMAGE_USAGE_SAMPLED_BIT)) ||
-                         vk_format_is_compressed(image->vk.format);
+                         vk_format_is_compressed(image->vk.format) ||
+                         /* The A8 twiddles single-level colour images as Metal does: every A8 colour target
+                          * Apple's captures show is twiddled (a8-passcap base, load, mrt2: PBE memlayout 1), and
+                          * the A8's LOAD background is captured for a twiddled target only, so a linear one-level
+                          * target (Zink's GL textures and renderbuffers) could not be drawn twice. Images shared
+                          * outside the driver stay linear. */
+                         (g5p_usc_g4p && !image->vk.external_handle_types);
 
    if (!twiddled) {
       const unsigned cpp = vk_format_get_blocksize(image->vk.format);
