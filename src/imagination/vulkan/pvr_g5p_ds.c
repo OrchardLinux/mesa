@@ -23,6 +23,7 @@
 #include "csbgen/rogue/ppp.h"
 
 #include "pvr_g5p_ds.h"
+#include "g5p/g5p_usc.h"
 #include "pvr_g5p_shader_dump.h"
 
 static uint32_t
@@ -340,6 +341,16 @@ pvr_g5p_ds_texture_plane(VkFormat format, VkImageAspectFlags aspect, uint32_t wi
    }
 }
 
+/* The depth/stencil attachments the A8 renders: what a8-passcap captured (iPod touch 6, iOS 12.4),
+ * D32F and D32F_S8. The render path refuses any other by name
+ * (pvr_arch_g5p_ds.c), and the format features offer no other, so Zink renders GL's DEPTH_COMPONENT16 with
+ * one of these instead of being refused at the draw. */
+bool
+pvr_g5p_ds_a8_attachment(VkFormat format)
+{
+   return format == VK_FORMAT_D32_SFLOAT || format == VK_FORMAT_D32_SFLOAT_S8_UINT;
+}
+
 VkFormatFeatureFlags2
 pvr_g5p_ds_format_features(VkFormat format)
 {
@@ -347,7 +358,7 @@ pvr_g5p_ds_format_features(VkFormat format)
 
    if (!f)
       return 0;
-   return VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT |
+   return (g5p_usc_g4p && !pvr_g5p_ds_a8_attachment(format) ? 0 : VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT) |
           VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT |
           (f->sampled ? VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT : 0) |
           (f->sampled && f->depth ? VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT : 0);

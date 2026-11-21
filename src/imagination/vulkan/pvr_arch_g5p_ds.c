@@ -47,8 +47,7 @@ PVR_PER_ARCH(g5p_ds_admit)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_r
    /* The A8: what a8-passcap captured (iPod touch 6, iOS 12.4): D32F
     * and D32F_S8 at one sample, clear/load and store */
    if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g4p) &&
-       ((iview->vk.format != VK_FORMAT_D32_SFLOAT && iview->vk.format != VK_FORMAT_D32_SFLOAT_S8_UINT) ||
-        image->vk.samples != 1))
+       (!pvr_g5p_ds_a8_attachment(iview->vk.format) || image->vk.samples != 1))
       return G5P_REFUSE(cmd_buffer, "A8 depth/stencil %s at %u samples (D32F and D32F_S8 at one sample are captured)",
                         vk_Format_to_str(iview->vk.format), image->vk.samples);
 

@@ -131,6 +131,7 @@ const char *pvr_g5p_ds_texture_plane(VkFormat format, VkImageAspectFlags aspect,
  * 32-bit float texture, and ES 3.0 asks none of DEPTH_COMPONENT32F), and no
  * transfers (the planes are in the ZLS's Morton order). */
 VkFormatFeatureFlags2 pvr_g5p_ds_format_features(VkFormat format);
+bool pvr_g5p_ds_a8_attachment(VkFormat format);
 
 /* pvr_image_init(): a depth/stencil image of a ZLS format takes exactly the
  * ZLS planes' size (pvr_g5p_ds_layout()), not upstream's larger D32F_S8
