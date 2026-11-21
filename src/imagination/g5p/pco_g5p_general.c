@@ -5825,7 +5825,9 @@ static void plan_fs_output(struct gctx *c)
       src = in;
       c->narrow_sat[k] = a;
    }
-   if (sat4) {
+   /* The A8 has no captured saturating narrow iterator: there the A9's general path iterates the varying and
+    * saturates it in the ALU (the shader's own fsat), as the A9 does whenever the narrow form does not apply. */
+   if (sat4 && !g5p_usc_g4p) {
       c->narrow_iter = src;
       return;
    }
