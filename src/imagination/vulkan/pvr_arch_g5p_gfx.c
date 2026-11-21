@@ -2095,6 +2095,18 @@ fs_uploads(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_pipeline *g, 
       default:
          return G5P_REFUSE(cmd_buffer, "fragment upload kind %u", u->kind);
       }
+      if (getenv("PVR_G5P_TEXDIAG") && (u->kind == PCO_G5P_UPLOAD_IMAGE || u->kind == PCO_G5P_UPLOAD_SAMPLER)) {
+         /* the texture and sampler words a fragment program's DOUTDs take into the common store */
+         fprintf(stderr, "G5P texdiag: %s set %u binding %u -> common %u, %u dwords:", u->kind == PCO_G5P_UPLOAD_IMAGE ?
+                 "image" : "sampler", u->set, u->binding, u->common, u->dwords);
+         for (unsigned k = 0; k < u->dwords; k++)
+            fprintf(stderr, " %08x", out[k]);
+         if (u->kind == PCO_G5P_UPLOAD_IMAGE && u->dwords >= 4) {
+            const uint64_t w1 = out[2] | (uint64_t)out[3] << 32;
+            fprintf(stderr, " (Rogue texaddr %#" PRIx64 ")", (uint64_t)(((w1 >> 16) & ((UINT64_C(1) << 38) - 1)) << 2));
+         }
+         fprintf(stderr, "\n");
+      }
       copied[i] = true;
    }
    bool any_copied = false;

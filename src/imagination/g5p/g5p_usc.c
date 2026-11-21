@@ -1124,7 +1124,9 @@ static unsigned sample_g4p(uint8_t *out, const struct g5p_tex *t)
             !t->gradient && !t->lod_control && !t->length,
          "A8 sample captured only as a narrow 2D sample with an implicit LOD");
    CHECK(t->image_qword == 0, "A8 sample captured only with the image descriptor at common qword 0");
-   CHECK(t->sampler_qword <= 63, "A8 sample: sampler qword range");
+   /* the A8 names the sampler by its common DWORD (Apple's 0x88 reads the sampler at dword 4 in tex_plain and in
+    * the load background): the caller passes the dword in sampler_qword */
+   CHECK(t->sampler_qword <= 63, "A8 sample: sampler dword range");
    CHECK(t->coord_dword <= 31 && !(t->dst_half & 1) && t->dst_half < 64, "A8 sample: coordinate/destination range");
    const uint8_t raw[12] = {0x1a, 0x59, (uint8_t)t->dst_half, 0x41, 0x00, 0x01, (uint8_t)(0x80 | t->sampler_qword << 1),
                             0x01, (uint8_t)(t->coord_dword << 1), 0x01, 0x00, 0x80};

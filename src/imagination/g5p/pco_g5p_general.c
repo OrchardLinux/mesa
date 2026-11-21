@@ -2290,12 +2290,23 @@ static void plan_common(struct gctx *c)
     * Apple's f16 capacity layout: all eight-dword images, then samplers.
     * Interleaving wastes six dwords per binding and exceeds the selectors. */
    bool compact = qualified || (!c->vs && c->ntex > 4);
+   /* The texture and sampler state each texture takes in the common store: the A9's three-qword image state
+    * (eight dwords with its metadata) and one-qword sampler; the A8's Rogue TEXSTATE_IMAGE_WORD0/1 and
+    * TEXSTATE_SAMPLER_WORD0/1, four dwords each, the sampler right after the image (AGXMetalA8's tex_plain and load:
+    * texture state then sampler in one 8-dword block, the sample's sampler field naming dword 4) */
+   const unsigned sdw = g5p_usc_g4p ? 4 : 2, idw = g5p_usc_g4p ? 4 : 8;
+   if (g5p_usc_g4p && compact && c->ntex)
+      refuse(c, "the A8 samples one image slot (common dword 0); more than four textures or vertex textures are "
+                "not captured");
    unsigned sampler_count = 0;
    bool fetch_sampler = false;
    for (unsigned i = 0; i < c->ntex; i++) {
       sampler_count += !qualified || c->tex[i].needs_sampler;
       fetch_sampler |= qualified && c->tex[i].needs_fetch_sampler;
    }
+   /* the samplerless read's sampler policy is the A9's one-qword word (pvr_g5p_fetch_sampler_word()) */
+   if (g5p_usc_g4p && fetch_sampler)
+      refuse(c, "a samplerless texture read on the A8 (its fetch sampler is the A9's word, not Rogue's)");
    struct g5p_fs_common_plan common_plan = {0};
    bool planned = !c->vs || qualified;
    if (planned) {
@@ -2310,7 +2321,7 @@ static void plan_common(struct gctx *c)
             push_dwords += (r->hi - r->lo) / 4;
          }
       }
-      if (!g5p_stage_common_plan(next, c->ntex, sampler_count + fetch_sampler,
+      if (!g5p_stage_common_plan(next, c->ntex, sampler_count + fetch_sampler, idw, sdw,
                                  compact, c->nuptr, c->nsize, ubos,
                                  ubo_dwords, push_dwords + ssbo_reserve, &common_plan))
          refuse(c, "common layout cannot fit pointers below 32 and data below 256 dwords");
@@ -2338,18 +2349,18 @@ static void plan_common(struct gctx *c)
    }
    unsigned image_base = align(next, 8), sampler_base = image_base + 8 * c->ntex;
    unsigned sampler_cursor = sampler_base;
-   c->fetch_sampler_common = sampler_base + 2 * sampler_count;
+   c->fetch_sampler_common = sampler_base + sdw * sampler_count;
    for (unsigned i = 0; i < c->ntex; i++) {
       struct tex_bind *t = &c->tex[i];
       t->image = compact ? image_base + 8 * i : align(next, 8);
-      t->sampler = compact ? ((!qualified || t->needs_sampler) ? sampler_cursor : c->fetch_sampler_common) : t->image + 8;
-      sampler_cursor += compact && (!qualified || t->needs_sampler) ? 2 : 0;
-      next = compact ? c->fetch_sampler_common + 2 * (qualified && fetch_sampler) : t->image + 10;
+      t->sampler = compact ? ((!qualified || t->needs_sampler) ? sampler_cursor : c->fetch_sampler_common) : t->image + idw;
+      sampler_cursor += compact && (!qualified || t->needs_sampler) ? sdw : 0;
+      next = compact ? c->fetch_sampler_common + 2 * (qualified && fetch_sampler) : t->image + idw + sdw;
       if (t->image / 2 > (compact ? 120 : 28) || t->sampler / 2 > (compact ? 124 : 32))
          refuse(c, "texture descriptors beyond the bounded qualified selectors");
-      add_upload(c, PCO_G5P_UPLOAD_IMAGE, t->set, t->binding, t->element, t->image_flags, 8, t->image);
+      add_upload(c, PCO_G5P_UPLOAD_IMAGE, t->set, t->binding, t->element, t->image_flags, idw, t->image);
       if (!qualified || t->needs_sampler)
-         add_upload(c, PCO_G5P_UPLOAD_SAMPLER, t->sset, t->sbinding, t->selement, 32, 2, t->sampler);
+         add_upload(c, PCO_G5P_UPLOAD_SAMPLER, t->sset, t->sbinding, t->selement, 32, sdw, t->sampler);
    }
    if (qualified && fetch_sampler)
       add_upload(c, PCO_G5P_UPLOAD_FETCH_SAMPLER, 0, 0, 0, 0, 2, c->fetch_sampler_common);
@@ -4929,7 +4940,7 @@ static void emit_fragment_cube_gradient(struct gctx *c, nir_tex_instr *t)
    unsigned dst = alloc_run(c, 4, "cube gradient result");
    struct g5p_tex_ext x = {
       .dst_half = 2 * dst, .image_qword = b->image / 2,
-      .sampler_qword = b->sampler / 2, .coord_dword = 0,
+      .sampler_qword = g5p_usc_g4p ? b->sampler : b->sampler / 2, .coord_dword = 0,
       .dim = G5P_TEX_CUBE, .mask = 15, .lod = G5P_TEX_LOD_GRAD,
       .lod_dword = 3,
    };
@@ -4957,7 +4968,7 @@ static void emit_tex_ext(struct gctx *c, nir_tex_instr *t)
    bool third = array || sd == GLSL_SAMPLER_DIM_3D || sd == GLSL_SAMPLER_DIM_CUBE;
    int packed = packed_offset_components(t, sd == GLSL_SAMPLER_DIM_3D ? 3 : 2);
    struct g5p_tex_ext x = {
-      .image_qword = b->image / 2, .sampler_qword = b->sampler / 2, .read = read,
+      .image_qword = b->image / 2, .sampler_qword = g5p_usc_g4p ? b->sampler : b->sampler / 2, .read = read,
       .dim = sd == GLSL_SAMPLER_DIM_CUBE ? G5P_TEX_CUBE : sd == GLSL_SAMPLER_DIM_3D ? G5P_TEX_3D :
              array ? G5P_TEX_2D_ARRAY : G5P_TEX_2D,
       .mask = t->is_shadow ? 1 : 0xf, .compare = t->is_shadow, .offset = packed >= 0,
@@ -5275,7 +5286,7 @@ static void emit_tex_ms_own_sample(struct gctx *c, nir_tex_instr *t, struct tex_
    put(c, raw, g5p_usc_move(raw, 2 * coord + 2, 2 * yr, 0, vgrp(c, y), 1), "coordinate y");
    put(c, raw, g5p_usc_ms_own_sample(raw, 2 * coord + 4), "the task's own sample");
    c->scratch |= BITFIELD64_RANGE(coord, 3);
-   struct g5p_tex s = {.image_qword = b->image / 2, .sampler_qword = b->sampler / 2, .coord_dword = coord,
+   struct g5p_tex s = {.image_qword = b->image / 2, .sampler_qword = g5p_usc_g4p ? b->sampler : b->sampler / 2, .coord_dword = coord,
                        .coord_control = true, .dim = G5P_TEX_2D_MS, .narrow = true, .dst_half = 0};
    put(c, raw, g5p_usc_sample(raw, &s), "texture sample (2D multisample)");
    c->tex_coord_pending |= BITFIELD64_RANGE(coord, 3);
@@ -5332,7 +5343,7 @@ static void emit_tex(struct gctx *c, nir_tex_instr *t)
       }
       c->p->evidence |= PCO_G5P_EV_TEX_COMPUTED;
    }
-   struct g5p_tex s = {.image_qword = b->image / 2, .sampler_qword = b->sampler / 2, .coord_dword = coord,
+   struct g5p_tex s = {.image_qword = b->image / 2, .sampler_qword = g5p_usc_g4p ? b->sampler : b->sampler / 2, .coord_dword = coord,
                        .coord_control = true, .dim = G5P_TEX_2D, .narrow = narrow};
    unsigned dst = 0;
    if (!narrow) {

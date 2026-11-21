@@ -111,6 +111,15 @@ static uint32_t setup_pck_info(VkFormat vk_format)
    return pck_info;
 }
 
+/* The A8 (AGXMetalA8, every texture state of the a8-passcap tex_* and load passes: BGRA8 and RGBA8, one level and
+ * mipmapped) leaves alpha_msb clear for 8-bit-per-channel formats, where upstream sets it for any alpha-in-W format */
+static bool pvr_tex_state_a8_no_alpha_msb(const struct pvr_device_info *dev_info, VkFormat format)
+{
+   const struct util_format_description *desc = vk_format_description(format);
+   return PVR_HAS_FEATURE(dev_info, apple_g4p) && desc->nr_channels == 4 && desc->block.bits == 32 &&
+          desc->channel[0].size == 8 && desc->channel[3].size == 8;
+}
+
 VkResult pvr_arch_pack_tex_state(struct pvr_device *device,
                                  const struct pvr_texture_state_info *info,
                                  struct pvr_image_descriptor *state)
@@ -254,7 +263,7 @@ VkResult pvr_arch_pack_tex_state(struct pvr_device *device,
 
          word1.texaddr = PVR_DEV_ADDR_OFFSET(info->addr, info->offset);
 
-         if (vk_format_is_alpha_on_msb(info->format))
+         if (vk_format_is_alpha_on_msb(info->format) && !pvr_tex_state_a8_no_alpha_msb(dev_info, info->format))
             word1.alpha_msb = true;
 
          if (!PVR_HAS_FEATURE(dev_info, tpu_extended_integer_lookup) &&
@@ -309,7 +318,7 @@ VkResult pvr_arch_pack_tex_state(struct pvr_device *device,
          if (info->flags & PVR_TEXFLAGS_BORDER)
             word1.border = true;
 
-         if (vk_format_is_alpha_on_msb(info->format))
+         if (vk_format_is_alpha_on_msb(info->format) && !pvr_tex_state_a8_no_alpha_msb(dev_info, info->format))
             word1.alpha_msb = true;
 
          if (PVR_HAS_FEATURE(dev_info, tpu_image_state_v2) &&
