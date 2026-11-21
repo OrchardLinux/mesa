@@ -29,6 +29,7 @@
 #include "pvr_device.h"
 #include "pvr_g5p.h"
 #include "pvr_image.h"
+#include "pvr_physical_device.h"
 #include "pvr_g5p_meta.h"
 
 
@@ -147,6 +148,9 @@ g5p_meta_blit_eligible(const struct pvr_cmd_buffer *cmd_buffer, const VkBlitImag
       return false;
    if (!g5p_meta_image(src, VK_IMAGE_USAGE_SAMPLED_BIT) || !g5p_meta_image(dst, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))
       return false;
+   /* the A8 renders no sRGB target yet (pvr_arch_g5p.c refuses it by name): keep such a blit a CPU transfer */
+   if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g4p) && vk_format_is_srgb(dst->vk.format))
+      return false;
    for (uint32_t i = 0; i < info->regionCount; i++) {
       const VkImageBlit2 *r = &info->pRegions[i];
 
@@ -157,6 +161,77 @@ g5p_meta_blit_eligible(const struct pvr_cmd_buffer *cmd_buffer, const VkBlitImag
           r->srcOffsets[0].z != 0 || r->srcOffsets[1].z != 1 || r->dstOffsets[0].z != 0 ||
           r->dstOffsets[1].z != 1 || !g5p_meta_dst_level(dst, &r->dstSubresource))
          return false;
+   }
+   return true;
+}
+
+/*
+ * vkCmdClearColorImage on the GPU, or false to keep it a CPU transfer: a render pass per level and range whose
+ * colour attachment is cleared by its background object and stored (vk_meta_clear_color_image(); Metal clears the
+ * same way, with a load action). The CPU path writes every texel through the GPU's mapping after the GPU drains:
+ * vkmark's clear scene at 750x1334 took 12.8 ms a frame on the A8. A8 only for now (the A9 keeps the CPU path it
+ * was qualified with); the image must be one the meta blits render (g5p_meta_image(), g5p_meta_dst_level()).
+ */
+bool
+PVR_PER_ARCH(g5p_meta_clear_color)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_image *image,
+                                   VkImageLayout layout, const VkClearColorValue *color, uint32_t range_count,
+                                   const VkImageSubresourceRange *ranges)
+{
+   struct pvr_device *device = cmd_buffer->device;
+
+   if (!PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p) || !device->g5p || !device->g5p->meta_ready ||
+       cmd_buffer->state.vis_test_enabled || cmd_buffer->vk.level != VK_COMMAND_BUFFER_LEVEL_PRIMARY ||
+       !g5p_meta_image(image, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) || getenv("PVR_G5P_CPU_CLEAR"))
+      return false;
+   /* the A8 renders no sRGB target yet (pvr_arch_g5p.c refuses it by name): an sRGB image keeps the CPU clear */
+   if (vk_format_is_srgb(image->vk.format))
+      return false;
+   for (uint32_t i = 0; i < range_count; i++) {
+      if (ranges[i].aspectMask != VK_IMAGE_ASPECT_COLOR_BIT ||
+          vk_image_subresource_layer_count(&image->vk, &ranges[i]) != 1)
+         return false;
+      const uint32_t levels = vk_image_subresource_level_count(&image->vk, &ranges[i]);
+      for (uint32_t l = 0; l < levels; l++) {
+         const VkImageSubresourceLayers sub = { VK_IMAGE_ASPECT_COLOR_BIT, ranges[i].baseMipLevel + l,
+                                                ranges[i].baseArrayLayer, 1 };
+         if (!g5p_meta_dst_level(image, &sub))
+            return false;
+      }
+   }
+
+   struct g5p_meta_save *save = malloc(sizeof(*save));
+   if (!save) {
+      vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return true;
+   }
+   VkResult result = pvr_arch_cmd_buffer_end_sub_cmd(cmd_buffer);
+   if (result != VK_SUCCESS) {
+      free(save);
+      return true;
+   }
+   struct list_head *mark = cmd_buffer->sub_cmds.prev;
+
+   g5p_meta_begin(cmd_buffer, save);
+   pvr_g5p_internal_pipeline++;
+   vk_meta_clear_color_image(&cmd_buffer->vk, &device->g5p->meta, &image->vk, layout, image->vk.format, color,
+                             range_count, ranges);
+   pvr_g5p_internal_pipeline--;
+   g5p_meta_end(cmd_buffer, save);
+   free(save);
+
+   bool rendered = false;
+   for (struct list_head *l = mark->next; l != &cmd_buffer->sub_cmds; l = l->next) {
+      struct pvr_sub_cmd *sub_cmd = list_entry(l, struct pvr_sub_cmd, link);
+
+      if (sub_cmd->type == PVR_SUB_CMD_TYPE_GRAPHICS) {
+         sub_cmd->gfx.g5p_transfer = true;
+         rendered = true;
+      }
+   }
+   /* later transfer-stage barriers wait for these renders as well */
+   if (rendered) {
+      for (uint32_t i = 0; i < ARRAY_SIZE(cmd_buffer->state.barriers_needed); i++)
+         cmd_buffer->state.barriers_needed[i] |= PVR_PIPELINE_STAGE_TRANSFER_BIT;
    }
    return true;
 }

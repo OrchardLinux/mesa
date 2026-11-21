@@ -1437,6 +1437,10 @@ void pvr_rogue_CmdClearColorImage(VkCommandBuffer commandBuffer,
    if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g9p) &&
        pvr_arch_g9p_meta_clear_color(cmd_buffer, image, imageLayout, pColor, rangeCount, pRanges))
       return;
+   /* G5P (the A8 for now): a render pass whose background object clears (pvr_arch_g5p_meta.c) */
+   if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g5p) &&
+       pvr_arch_g5p_meta_clear_color(cmd_buffer, image, imageLayout, pColor, rangeCount, pRanges))
+      return;
 
    for (uint32_t i = 0; i < rangeCount; i++) {
       const VkResult result =

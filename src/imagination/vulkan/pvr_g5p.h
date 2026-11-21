@@ -524,6 +524,9 @@ VkResult PVR_PER_ARCH(g5p_device_init)(struct pvr_device *device);
 VkResult PVR_PER_ARCH(g5p_meta_init)(struct pvr_device *device);
 void PVR_PER_ARCH(g5p_meta_finish)(struct pvr_device *device);
 bool PVR_PER_ARCH(g5p_meta_blit)(struct pvr_cmd_buffer *cmd_buffer, const VkBlitImageInfo2 *info);
+bool PVR_PER_ARCH(g5p_meta_clear_color)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_image *image,
+                                        VkImageLayout layout, const VkClearColorValue *color, uint32_t range_count,
+                                        const VkImageSubresourceRange *ranges);
 void PVR_PER_ARCH(g5p_device_finish)(struct pvr_device *device);
 VkResult PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer,
                                     struct pvr_sub_cmd_gfx *sub_cmd,
@@ -541,6 +544,7 @@ uint32_t PVR_PER_ARCH(g5p_compute_stream)(const struct pvr_device *device, uint6
 
 #   define pvr_arch_g5p_device_init PVR_PER_ARCH(g5p_device_init)
 #   define pvr_arch_g5p_meta_blit PVR_PER_ARCH(g5p_meta_blit)
+#   define pvr_arch_g5p_meta_clear_color PVR_PER_ARCH(g5p_meta_clear_color)
 #   define pvr_arch_g5p_device_finish PVR_PER_ARCH(g5p_device_finish)
 #   define pvr_arch_g5p_job_init PVR_PER_ARCH(g5p_job_init)
 #   define pvr_arch_g5p_geom_stream PVR_PER_ARCH(g5p_geom_stream)
