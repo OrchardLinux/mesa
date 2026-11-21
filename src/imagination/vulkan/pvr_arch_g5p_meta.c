@@ -148,8 +148,10 @@ g5p_meta_blit_eligible(const struct pvr_cmd_buffer *cmd_buffer, const VkBlitImag
       return false;
    if (!g5p_meta_image(src, VK_IMAGE_USAGE_SAMPLED_BIT) || !g5p_meta_image(dst, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))
       return false;
-   /* the A8 renders no sRGB target yet (pvr_arch_g5p.c refuses it by name): keep such a blit a CPU transfer */
-   if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g4p) && vk_format_is_srgb(dst->vk.format))
+   /* The A8 keeps every blit a CPU transfer: vk_meta's blit shader samples with an explicit LOD, a form the A8
+    * compiler refuses (the LOD operand is not decoded), so the
+    * command buffer failed (Zink's glGenerateMipmap lost the GL context). The A8 renders no sRGB target either. */
+   if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g4p))
       return false;
    for (uint32_t i = 0; i < info->regionCount; i++) {
       const VkImageBlit2 *r = &info->pRegions[i];
