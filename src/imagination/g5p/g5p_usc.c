@@ -1114,7 +1114,7 @@ static unsigned texture_base(uint8_t *raw, const struct g5p_tex *t)
  * 18 f5 00 01 08 80 for the same source (image qword 0, sampler qword 4, coordinate dword 0 under coordinate
  * control). Byte 2 is the destination half and byte 8 the coordinate dword << 1 (Metal's blit program has
  * eight samples, 1a 79 DD 41 00 01 ac 01 CC 01 14 80, with eight destinations and coordinates); byte 6 is
- * 0x80 | sampler qword << 1 (sampler 4 here, 22 in the blit). Byte 1 bit 5 is a 32-bit result there, which
+ * 0x80 | mode << 4 | sampler dword << 1 (sampler 4 here, 6 in the blit, whose mode 2 is an explicit LOD). Byte 1 bit 5 is a 32-bit result there, which
  * also carries an operand byte 10 not decoded, so only the narrow form is taken; the image qword is 0 in
  * every witness (bytes 3-4 41 00), so only image qword 0.
  */
@@ -1130,7 +1130,11 @@ static unsigned sample_g4p(uint8_t *out, const struct g5p_tex *t)
    CHECK(t->image_qword == 0, "A8 sample captured only with the image descriptor at common qword 0");
    /* the A8 names the sampler by its common DWORD (Apple's 0x88 reads the sampler at dword 4 in tex_plain and in
     * the load background): the caller passes the dword in sampler_qword */
-   CHECK(t->sampler_qword <= 63, "A8 sample: sampler dword range");
+   /* byte 6 is 0x80 | mode << 4 | sampler dword << 1: Apple's tex_lod, tex_bias, tex_grad and tex_cube samples
+    * (passcap USC 0x5388, 0x5588, 0x57bc, 0x6076) read the same sampler (dword 4) with bytes a8, 98, b8 and c8,
+    * and the blit's explicit-LOD samples are ac (sampler dword 6). Bits 4-6 are the sample mode, so a sampler at
+    * dword 8 or above would encode another mode: the field is three bits. */
+   CHECK(t->sampler_qword <= 7, "A8 sample: sampler dword above 7 (byte 6 bits 4-6 are the sample mode)");
    CHECK(t->coord_dword <= 31 && !(t->dst_half & 1) && t->dst_half < 64, "A8 sample: coordinate/destination range");
    const uint8_t raw[12] = {0x1a, t->narrow ? 0x59 : 0x79, (uint8_t)t->dst_half, 0x41, 0x00, 0x01, (uint8_t)(0x80 | t->sampler_qword << 1),
                             0x01, (uint8_t)(t->coord_dword << 1), 0x01, 0x00, 0x80};
