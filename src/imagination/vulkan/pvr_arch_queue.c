@@ -30,6 +30,7 @@
  */
 
 #include "util/os_time.h"
+#include "pvr_bo_log.h"
 #include "pvr_g9p.h"
 #include "pvr_queue.h"
 #include "pvr_rt_dataset.h"
@@ -1723,6 +1724,9 @@ static VkResult pvr_driver_queue_submit(struct vk_queue *queue,
    struct pvr_queue *driver_queue = container_of(queue, struct pvr_queue, vk);
    const bool is_g5p =
       PVR_HAS_FEATURE(&driver_queue->device->pdevice->dev_info, apple_g5p);
+   /* bo_log's periodic summary also for a client whose BO set is steady (a desktop shell) */
+   if (unlikely(driver_queue->device->bo_log))
+      pvr_bo_log_tick(driver_queue->device);
 
    if (is_g5p && vk_queue_is_lost(queue)) {
       for (uint32_t i = 0; i < submit->signal_count; i++)

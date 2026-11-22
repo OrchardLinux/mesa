@@ -309,6 +309,14 @@ static void summary_period_locked(struct pvr_bo_log *log)
    }
 }
 
+void pvr_bo_log_tick(struct pvr_device *device)
+{
+   struct pvr_bo_log *log = device->bo_log;
+   simple_mtx_lock(&log->mutex);
+   summary_period_locked(log);
+   simple_mtx_unlock(&log->mutex);
+}
+
 void pvr_bo_log_summary(struct pvr_device *device, const char *why)
 {
    struct pvr_bo_log *log = device->bo_log;

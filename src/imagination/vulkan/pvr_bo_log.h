@@ -15,6 +15,8 @@ struct pvr_winsys_heap;
 void pvr_bo_log_device_init(struct pvr_device *device);
 void pvr_bo_log_device_finish(struct pvr_device *device);
 void pvr_bo_log_summary(struct pvr_device *device, const char *why);
+/* PVR_BO_LOG_PERIOD_S's summary when the period has passed (called per queue submission) */
+void pvr_bo_log_tick(struct pvr_device *device);
 void pvr_bo_log_driver_alloc(struct pvr_device *device,
                              const char *tag,
                              struct pvr_winsys_heap *heap,
