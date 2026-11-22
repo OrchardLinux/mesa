@@ -168,6 +168,17 @@ struct pvr_device {
    struct pvr_suballocator suballoc_usc;
    struct pvr_suballocator suballoc_vis_test;
 
+   /* Command buffer uploads (general, PDS and USC heaps). They live until
+    * their command buffer is reset, so they are kept apart from pipelines,
+    * descriptor pools and queries, which live much longer: mixing the two
+    * lets one long-lived allocation keep a whole buffer of freed uploads.
+    * PVR_CMD_SUBALLOC=0 shares the allocators above instead.
+    */
+   bool cmd_suballoc;
+   struct pvr_suballocator suballoc_cmd_general;
+   struct pvr_suballocator suballoc_cmd_pds;
+   struct pvr_suballocator suballoc_cmd_usc;
+
    struct {
       struct pvr_pds_upload pds;
       struct pvr_suballoc_bo *usc;
@@ -291,6 +302,25 @@ VkResult pvr_sync_wait_many(struct vk_device *vk, uint32_t count,
 
 VkResult pvr_device_tile_buffer_ensure_cap(struct pvr_device *device,
                                            uint32_t capacity);
+
+/* The allocator a command buffer upload takes in place of a device-lifetime
+ * one: general, PDS and USC uploads go to the command buffer allocators while
+ * they are enabled; every other heap keeps its allocator.
+ */
+static inline struct pvr_suballocator *
+pvr_cmd_suballocator(struct pvr_device *device,
+                     struct pvr_suballocator *shared)
+{
+   if (!device->cmd_suballoc)
+      return shared;
+   if (shared == &device->suballoc_general)
+      return &device->suballoc_cmd_general;
+   if (shared == &device->suballoc_pds)
+      return &device->suballoc_cmd_pds;
+   if (shared == &device->suballoc_usc)
+      return &device->suballoc_cmd_usc;
+   return shared;
+}
 
 static inline void pvr_device_free_tile_buffer_state(struct pvr_device *device)
 {

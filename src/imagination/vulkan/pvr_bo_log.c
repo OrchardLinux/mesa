@@ -178,6 +178,9 @@ static void summary_locked(struct pvr_bo_log *log, const char *why, bool tables)
       { "transfer", &log->device->suballoc_transfer },
       { "usc", &log->device->suballoc_usc },
       { "vis_test", &log->device->suballoc_vis_test },
+      { "cmd_general", &log->device->suballoc_cmd_general },
+      { "cmd_pds", &log->device->suballoc_cmd_pds },
+      { "cmd_usc", &log->device->suballoc_cmd_usc },
    };
    for (unsigned i = 0; i < ARRAY_SIZE(suballocators); i++) {
       const struct pvr_suballocator *a = suballocators[i].allocator;

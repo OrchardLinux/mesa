@@ -394,8 +394,9 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
       }
       /* bo_list is freed as pvr_suballoc_bo, despite its pvr_bo comment.
        * Give the dedicated generic BO a normal ownership wrapper. Reset
-       * may cache it in suballoc_general, so use that allocator's mapping
-       * flags too; a later ordinary upload must find a mapped BO. */
+       * may cache it in the general command-buffer allocator, so use that
+       * allocator's mapping flags too; a later ordinary upload must find a
+       * mapped BO. */
       struct pvr_suballoc_bo *owner = vk_zalloc(&device->vk.alloc, sizeof(*owner), 8,
                                                 VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
       if (!owner) {
@@ -410,7 +411,7 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
          vk_command_buffer_set_error(&cmd_buffer->vk, result);
          return result;
       }
-      owner->allocator = &device->suballoc_general;
+      owner->allocator = pvr_cmd_suballocator(device, &device->suballoc_general);
       owner->bo = shared_spill;
       owner->dev_addr = shared_spill->vma->dev_addr;
       owner->size = groups * state->shared_spill_stride;
