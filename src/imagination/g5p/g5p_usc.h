@@ -53,6 +53,9 @@ extern int g5p_usc_g4p_texfetch_level;
  * otherwise the A9's.
  */
 extern bool g5p_usc_g4p_vtex;
+/* A fragment texel-buffer read on the A8 (st/mesa's pixel-buffer uploads) as a 2D texelFetch of the buffer's linear
+ * state (PVR_A8_TBO, on by default; 0 refuses it) */
+extern bool g5p_usc_g4p_tbo;
 
 enum g5p_binop {
    G5P_BIN_FADD, G5P_BIN_FMUL, G5P_BIN_IADD, G5P_BIN_IMUL,

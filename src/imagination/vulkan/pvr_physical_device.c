@@ -1414,6 +1414,8 @@ VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
       /* vertex textures: refused by default; PVR_A8_VTEX=1 takes the A9's recipe on the A8's words, which does not
        * work yet (g5p_usc.h) */
       g5p_usc_g4p_vtex = debug_get_bool_option("PVR_A8_VTEX", false);
+      /* fragment texel-buffer reads (g5p_usc.h) */
+      g5p_usc_g4p_tbo = debug_get_bool_option("PVR_A8_TBO", true);
    }
 
    /* The A8 skips refused work by default: a refused program or pass loses its draws (named on stderr) instead of

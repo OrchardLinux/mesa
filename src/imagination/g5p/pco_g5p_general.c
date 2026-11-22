@@ -6718,12 +6718,19 @@ static bool layer0_as_2d(nir_builder *b, nir_tex_instr *t, void *data)
  * non-normalized, clamped, level 0: PCO_G5P_UPLOAD_SAMPLER_FETCH), marked G5P_TEX_FETCH. */
 static bool a8_fetch_as_sample(nir_builder *b, nir_tex_instr *t, void *data)
 {
-   if (t->op != nir_texop_txf || t->sampler_dim != GLSL_SAMPLER_DIM_2D || t->is_array || t->is_shadow ||
+   /* a uniform texel buffer's fetch, folded to 2D (g5p_texel_nir.h: the 4096-wide linear state over the buffer, the
+    * folded coordinate in backend1): the same 2D fetch of that state (st/mesa's PBO upload reads one) */
+   const bool buf = t->sampler_dim == GLSL_SAMPLER_DIM_BUF && (t->backend_flags & PVR_G5P_TBO_NIR_FOLDED) &&
+                    g5p_usc_g4p_tbo;
+   if (t->op != nir_texop_txf || (t->sampler_dim != GLSL_SAMPLER_DIM_2D && !buf) || t->is_array || t->is_shadow ||
        t->def.num_components != 4 || t->def.bit_size != 32)
       return false;
-   const int ci = nir_tex_instr_src_index(t, nir_tex_src_coord), li = nir_tex_instr_src_index(t, nir_tex_src_lod);
+   const int li = nir_tex_instr_src_index(t, nir_tex_src_lod);
+   const int ci = nir_tex_instr_src_index(t, buf ? nir_tex_src_backend1 : nir_tex_src_coord);
    const int ti = nir_tex_instr_src_index(t, nir_tex_src_texture_deref);
-   if (ci < 0 || ti < 0 || t->num_srcs != 2 + (li >= 0))
+   if (ci < 0 || ti < 0 || t->num_srcs != 2 + (li >= 0) + buf)
+      return false;
+   if (buf && b->shader->info.stage != MESA_SHADER_FRAGMENT)
       return false;
    if (li >= 0 && !nir_src_is_const(t->src[li].src))
       return false;
@@ -6738,17 +6745,21 @@ static bool a8_fetch_as_sample(nir_builder *b, nir_tex_instr *t, void *data)
    if (level && g5p_usc_g4p_texfetch_level == 2)
       coord = nir_fmul_imm(b, coord, (double)(1u << level));
    nir_deref_instr *deref = nir_src_as_deref(t->src[ti].src);
-   nir_tex_instr *s = nir_tex_instr_create(b->shader, 3);
+   /* a texture without a sampler (a texel buffer's textureBuffer): the sample names the texture alone, its sampler
+    * slot the fetch sampler (tex_bindings(): the texture's binding) */
+   const bool sampler = glsl_type_is_sampler(glsl_without_array(deref->type));
+   nir_tex_instr *s = nir_tex_instr_create(b->shader, 2 + sampler);
    s->op = nir_texop_tex;
    s->sampler_dim = GLSL_SAMPLER_DIM_2D;
    s->dest_type = t->dest_type;
    s->coord_components = 2;
    s->texture_index = t->texture_index;
    s->sampler_index = t->texture_index;
-   s->backend_flags = t->backend_flags | G5P_TEX_FETCH | level << G5P_TEX_FETCH_LEVEL_SHIFT;
+   s->backend_flags = (t->backend_flags & ~PVR_G5P_TBO_NIR_FOLDED) | G5P_TEX_FETCH | level << G5P_TEX_FETCH_LEVEL_SHIFT;
    s->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord, coord);
    s->src[1] = nir_tex_src_for_ssa(nir_tex_src_texture_deref, &deref->def);
-   s->src[2] = nir_tex_src_for_ssa(nir_tex_src_sampler_deref, &deref->def);
+   if (sampler)
+      s->src[2] = nir_tex_src_for_ssa(nir_tex_src_sampler_deref, &deref->def);
    nir_def_init(&s->instr, &s->def, 4, 32);
    nir_builder_instr_insert(b, &s->instr);
    nir_def_replace(&t->def, &s->def);
@@ -6878,9 +6889,10 @@ static bool lower(nir_shader *nir, bool preserve_cf)
    NIR_PASS(_, nir, nir_lower_tex, &txp);
    NIR_PASS(_, nir, nir_shader_tex_pass, ms_as_2d, nir_metadata_control_flow, NULL);
    NIR_PASS(_, nir, nir_shader_tex_pass, layer0_as_2d, nir_metadata_control_flow, NULL);
+   pvr_g5p_tbo_lower(nir);
+   /* after the texel-buffer fold, which it also draws as a sample */
    if (g5p_usc_g4p && g5p_usc_g4p_texfetch && nir->info.stage == MESA_SHADER_FRAGMENT)
       NIR_PASS(_, nir, nir_shader_tex_pass, a8_fetch_as_sample, nir_metadata_control_flow, NULL);
-   pvr_g5p_tbo_lower(nir);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const, nir_address_format_32bit_offset);
    NIR_PASS(_, nir, nir_lower_flrp, 32, false);
    bool flattened = flatten_limit(nir, preserve_cf ? 0 : UINT_MAX);

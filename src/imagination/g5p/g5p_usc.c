@@ -14,6 +14,7 @@ bool g5p_usc_g4p_a9_forms;
 int g5p_usc_g4p_texfetch;
 int g5p_usc_g4p_texfetch_level;
 bool g5p_usc_g4p_vtex;
+bool g5p_usc_g4p_tbo;
 
 const char *const g5p_binop_name[G5P_BIN_COUNT] = {"fadd", "fmul", "iadd", "imul", "and", "or", "xor", "ishr",
                                                        "isub"};

@@ -2051,6 +2051,25 @@ fs_uploads(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_pipeline *g, 
                            u->set, u->binding, u->element, lb->descriptor_count);
       const uint32_t *desc = (const uint32_t *)((const uint8_t *)set->mapping + lb->offset +
                                                 (size_t)u->element * lb->stride);
+      if (lb->type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER &&
+          PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g4p)) {
+         /* the A8's texel buffer (pvr_arch_image.c CreateBufferView): Rogue's four state dwords, the element count
+          * for the size, the fetch sampler for its read (the fold's 2D fetch, pco_g5p_general.c a8_fetch_as_sample) */
+         bool ok = desc[7] == PVR_G5P_TBO_MAGIC && desc[6];
+         if (ok && u->kind == PCO_G5P_UPLOAD_IMAGE && u->dwords == 4)
+            memcpy(out, desc, 16);
+         else if (ok && u->kind == PCO_G5P_UPLOAD_IMAGE_SIZE && u->dwords == 4 && !u->offset) {
+            out[0] = desc[6];
+            out[1] = 0;
+            out[2] = out[3] = 1;
+         } else if (ok && u->kind == PCO_G5P_UPLOAD_SAMPLER && u->dwords == 4 && (u->offset & PCO_G5P_UPLOAD_SAMPLER_FETCH))
+            pvr_g5p_a8_fetch_sampler(out, NULL, 0);
+         else
+            return G5P_REFUSE(cmd_buffer, "A8 texel-buffer upload (kind %d, %u dwords, offset %#x) at set %u binding %u "
+                              "element %u", (int)u->kind, u->dwords, u->offset, u->set, u->binding, u->element);
+         copied[i] = true;
+         continue;
+      }
       if (lb->type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER) {
          if (!pvr_g5p_tbo_upload(u->kind, u->offset, u->dwords, desc, out))
             return G5P_REFUSE(cmd_buffer, "unqualified texel-buffer upload at set %u binding %u element %u",

@@ -21,6 +21,9 @@
 #include "pvr_physical_device.h"
 #include "pvr_tex_state.h"
 #include "pvr_ycbcr.h"
+#include "g5p_texel_defs.h"
+#include "util/log.h"
+#include "vk_enum_to_str.h"
 
 static void pvr_adjust_non_compressed_view(const struct pvr_image *image,
                                            const struct pvr_image_plane *plane,
@@ -348,9 +351,31 @@ PVR_PER_ARCH(CreateBufferView)(VkDevice _device,
    format_swizzle = pvr_get_format_swizzle(info.format);
    memcpy(info.swizzle, format_swizzle, sizeof(info.swizzle));
 
+   /* the A8: the A9's texel-buffer contract (g5p_texel_defs.h) over Rogue's state, a plain linear 2D image
+    * PVR_G5P_TBO_WIDTH texels wide (no index lookup), which the program reads at the folded coordinate as a 2D
+    * fetch; the element count and the marker in the descriptor's software words (pvr_g5p_texel_buffer.c) */
+   const bool a8 = PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p);
+   if (a8) {
+      info.extent.width = PVR_G5P_TBO_WIDTH;
+      info.extent.height = DIV_ROUND_UP(bview->vk.elements, PVR_G5P_TBO_WIDTH);
+      info.stride = PVR_G5P_TBO_WIDTH;
+      info.flags = 0;
+      if (info.addr.addr % PVR_G5P_TBO_ALIGN || !bview->vk.elements || bview->vk.elements > PVR_G5P_TBO_LIMIT) {
+         mesa_loge("G5P refuses: %s texel buffer: base %% 64 = %u, %u elements (64-byte base, 1..65536)",
+                   vk_Format_to_str(info.format), (unsigned)(info.addr.addr % PVR_G5P_TBO_ALIGN),
+                   (unsigned)bview->vk.elements);
+         result = vk_error(device, VK_ERROR_FORMAT_NOT_SUPPORTED);
+         goto err_vk_buffer_view_destroy;
+      }
+   }
+
    result = pvr_arch_pack_tex_state(device, &info, &bview->image_state);
    if (result != VK_SUCCESS)
       goto err_vk_buffer_view_destroy;
+   if (a8) {
+      bview->image_state.meta[2] = bview->vk.elements;
+      bview->image_state.meta[3] = PVR_G5P_TBO_MAGIC;
+   }
 
    *pView = pvr_buffer_view_to_handle(bview);
 
