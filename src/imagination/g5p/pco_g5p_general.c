@@ -4340,6 +4340,14 @@ static void drc_flush(struct gctx *c, struct drc *d)
 static bool drc_take(struct gctx *c, struct drc *d)
 {
    tex_flush(c);
+   /* The A8 has no captured counter-1 iterator (g5p_usc.c iterator_g4p()): its reads stay on counter 0, a full
+    * batch of eight waited for before the next, as AGXMetalA8's programs wait `4d 00` */
+   if (g5p_usc_g4p) {
+      if (d->n[0] == 8)
+         drc_flush(c, d);
+      d->n[0]++;
+      return false;
+   }
    if (d->n[0] == 8 && d->n[1] == 8)
       drc_flush(c, d);
    if (d->n[0] < 8) {
