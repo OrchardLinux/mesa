@@ -9,6 +9,7 @@
 #include "pvr_device.h"
 #include "pvr_free_list.h"
 #include "pvr_g5p.h"
+#include "pvr_physical_device.h"
 
 static void pvr_rt_rgn_headers_data_fini(struct pvr_rt_dataset *rt_dataset)
 {
@@ -98,6 +99,9 @@ void pvr_render_target_dataset_destroy(struct pvr_rt_dataset *rt_dataset)
  */
 #define PVR_RT_DATASET_CACHE_MAX 64
 #define PVR_RT_DATASET_CACHE_BYTES (32ull << 20)
+/* The A8 (1 GB shared by the CPU and GPU): an A8 dataset owns the region-header ring (16 frames of the target's
+ * headers, 128 KiB at 640x1136) besides the small BOs, so 8 MiB holds some 30 full-screen datasets. */
+#define PVR_RT_DATASET_CACHE_BYTES_A8 (8ull << 20)
 
 struct pvr_rt_dataset *
 pvr_render_target_dataset_cache_take(struct pvr_device *device,
@@ -143,7 +147,9 @@ void pvr_render_target_dataset_release(struct pvr_rt_dataset *rt_dataset)
    device->rt_dataset_cache_bytes += rt_dataset->cache_bytes;
    while (device->rt_dataset_cache_count > PVR_RT_DATASET_CACHE_MAX ||
           (device->rt_dataset_cache_count > 1 &&
-           device->rt_dataset_cache_bytes > PVR_RT_DATASET_CACHE_BYTES)) {
+           device->rt_dataset_cache_bytes > (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p)
+                                                ? PVR_RT_DATASET_CACHE_BYTES_A8
+                                                : PVR_RT_DATASET_CACHE_BYTES))) {
       struct pvr_rt_dataset *evict =
          list_last_entry(&device->rt_dataset_cache,
                          struct pvr_rt_dataset,

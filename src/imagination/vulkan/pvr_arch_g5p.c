@@ -574,7 +574,10 @@ PVR_PER_ARCH(g5p_device_init)(struct pvr_device *device)
 
    /* The parameter manager pool every render asks for (pvr_g5p.h); the
     * kernel builds at most 16 MiB */
-   const int64_t fl_mb = debug_get_num_option("PVR_G5P_FREE_LIST_MB", PVR_G5P_FREE_LIST_SIZE >> 20);
+   /* The A8's kernel sizes its pool itself (powervr.a8_pm_blocks) and does not read this list: it keeps
+    * the 4 MiB the iPod's renders ran with. */
+   const bool a8 = PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p);
+   const int64_t fl_mb = debug_get_num_option("PVR_G5P_FREE_LIST_MB", a8 ? 4 : PVR_G5P_FREE_LIST_SIZE >> 20);
    const uint32_t fl_size = (uint32_t)CLAMP(fl_mb, 1, 16) << 20;
 
    VkResult result = g5p_upload_programs(device, &device->g5p->programs);
