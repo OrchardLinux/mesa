@@ -32,6 +32,7 @@
 #include "pco_uscgen_programs.h"
 #include "pvr_g5p_ds_hooks.h"
 #include "pvr_g5p_ds.h"
+#include "pvr_g5p_tex.h"
 #include "pvr_device.h"
 #include "pvr_dump_info.h"
 #include "pvr_entrypoints.h"
@@ -1403,6 +1404,8 @@ VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
        * read back right with them, at seven sizes from 640x1136 to 37x29. */
       pvr_g5p_ds_pot_extents = true;
       pvr_g5p_ds_rect_planes = true;
+      /* single-level non-power-of-two colour images stay linear (pvr_g5p_tex.h) */
+      pvr_g5p_image_a8_linear = true;
    }
 
    pdevice->skip_refused_work = PVR_HAS_FEATURE(&pdevice->dev_info, apple_g5p) &&

@@ -72,5 +72,8 @@ void PVR_PER_ARCH(g5p_combine_sampler)(struct pvr_combined_image_sampler_descrip
  */
 #define PVR_G5P_IMAGE_BIG_LAYER 16384u
 void pvr_g5p_image_layout(struct pvr_image *image, unsigned stride_align);
+/* On the A8, single-level colour images whose sides are not both powers of two stay linear
+ * (pvr_g5p_image_layout()) */
+extern bool pvr_g5p_image_a8_linear;
 
 #endif /* PVR_G5P_TEX_H */

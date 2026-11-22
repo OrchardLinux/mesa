@@ -49,6 +49,8 @@
 #include "pvr_physical_device.h"
 #include "g5p/g5p_usc.h"
 
+bool pvr_g5p_image_a8_linear;
+
 void
 pvr_g5p_image_layout(struct pvr_image *image, unsigned stride_align)
 {
@@ -72,7 +74,12 @@ pvr_g5p_image_layout(struct pvr_image *image, unsigned stride_align)
                           * the A8's LOAD background is captured for a twiddled target only, so a linear one-level
                           * target (Zink's GL textures and renderbuffers) could not be drawn twice. Images shared
                           * outside the driver stay linear. */
-                         (g5p_usc_g4p && !image->vk.external_handle_types);
+                         (g5p_usc_g4p && !image->vk.external_handle_types &&
+                          /* a single-level image whose sides are not both powers of two
+                           * stays linear, as on the A9, instead of padding each side to a power of two (the A8
+                           * renders, LOADs and samples linear colour images: shared buffers take that path) */
+                          !(pvr_g5p_image_a8_linear && (!util_is_power_of_two_nonzero(image->vk.extent.width) ||
+                                                        !util_is_power_of_two_nonzero(image->vk.extent.height))));
 
    if (!twiddled) {
       const unsigned cpp = vk_format_get_blocksize(image->vk.format);
