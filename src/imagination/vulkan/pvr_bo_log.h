@@ -19,7 +19,7 @@ void pvr_bo_log_summary(struct pvr_device *device, const char *why);
 /* PVR_BO_LOG_PERIOD_S's summary when the period has passed (called per queue submission) */
 void pvr_bo_log_tick(struct pvr_device *device);
 /* a render with a depth/stencil attachment, and whether its ZLS loads or stores it */
-void pvr_bo_log_zls(struct pvr_device *device, bool load, bool store);
+void pvr_bo_log_zls(struct pvr_device *device, uint32_t w, uint32_t h, bool load, bool store);
 void pvr_bo_log_driver_alloc(struct pvr_device *device,
                              const char *tag,
                              struct pvr_winsys_heap *heap,

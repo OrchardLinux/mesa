@@ -67,6 +67,7 @@ struct pvr_bo_log {
    uint64_t failed;
    uint64_t tracking_failed;
    uint64_t zls_passes, zls_load, zls_store, zls_neither;
+   struct { uint32_t w, h; uint64_t passes, load, store; } zls_size[8]; /* the first eight attachment sizes */
 };
 
 static struct list_head logs = { &logs, &logs };
@@ -206,6 +207,10 @@ static void summary_locked(struct pvr_bo_log *log, const char *why, bool tables)
    mesa_logi("pvr bo summary-zls passes=%" PRIu64 " load=%" PRIu64 " store=%" PRIu64 " neither=%" PRIu64
              " (renders with a depth/stencil attachment; neither: memory a lazy allocation would never commit)\n",
              log->zls_passes, log->zls_load, log->zls_store, log->zls_neither);
+   for (unsigned i = 0; i < ARRAY_SIZE(log->zls_size) && log->zls_size[i].passes; i++)
+      mesa_logi("pvr bo summary-zls-size %ux%u passes=%" PRIu64 " load=%" PRIu64 " store=%" PRIu64 "\n",
+                log->zls_size[i].w, log->zls_size[i].h, log->zls_size[i].passes, log->zls_size[i].load,
+                log->zls_size[i].store);
    mesa_logi("pvr bo summary-pad images=%" PRIu64 " total_kib=%" PRIu64
            " tight_kib=%" PRIu64 " pad_kib=%" PRId64 "\n",
            images,
@@ -313,10 +318,20 @@ static void summary_period_locked(struct pvr_bo_log *log)
    }
 }
 
-void pvr_bo_log_zls(struct pvr_device *device, bool load, bool store)
+void pvr_bo_log_zls(struct pvr_device *device, uint32_t w, uint32_t h, bool load, bool store)
 {
    struct pvr_bo_log *log = device->bo_log;
    simple_mtx_lock(&log->mutex);
+   for (unsigned i = 0; i < ARRAY_SIZE(log->zls_size); i++) {
+      if (log->zls_size[i].passes && (log->zls_size[i].w != w || log->zls_size[i].h != h))
+         continue;
+      log->zls_size[i].w = w;
+      log->zls_size[i].h = h;
+      log->zls_size[i].passes++;
+      log->zls_size[i].load += load;
+      log->zls_size[i].store += store;
+      break;
+   }
    log->zls_passes++;
    log->zls_load += load;
    log->zls_store += store;

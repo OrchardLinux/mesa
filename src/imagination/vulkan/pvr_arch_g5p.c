@@ -1437,7 +1437,8 @@ PVR_PER_ARCH(g5p_frag_stream)(const struct pvr_device *device, const struct pvr_
    pvr_arch_g5p_ds_pass(job, PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p), &zls);
    /* bo_log: how often a depth/stencil attachment is loaded or stored (what lazily allocated memory would save) */
    if (unlikely(device->bo_log) && job->ds.iview && (job->has_depth_attachment || job->has_stencil_attachment))
-      pvr_bo_log_zls((struct pvr_device *)device, job->ds.load.d || job->ds.load.s,
+      pvr_bo_log_zls((struct pvr_device *)device, job->ds.iview->vk.extent.width, job->ds.iview->vk.extent.height,
+                     job->ds.load.d || job->ds.load.s,
                      job->ds.store.d || job->ds.store.s);
 
    g5p_put64(&s, scissor);
