@@ -778,6 +778,24 @@ VkResult pvr_arch_render_target_dataset_create(
    if (result != VK_SUCCESS)
       goto err_pvr_rt_datas_fini;
 
+   struct pvr_bo *cache_bos[] = {
+      rt_dataset->vheap_rtc_bo,
+      rt_dataset->tpc_bo,
+      rt_dataset->rgn_headers_bo,
+      rt_dataset->mlist_bo,
+      rt_dataset->mta_bo,
+   };
+
+   for (uint32_t i = 0; i < ARRAY_SIZE(cache_bos); i++) {
+      if (cache_bos[i])
+         rt_dataset->cache_bytes += cache_bos[i]->bo->size;
+   }
+
+   if (rt_dataset->local_free_list->bo &&
+       rt_dataset->local_free_list != device->g9p.free_list &&
+       !(device->g5p && rt_dataset->local_free_list == device->g5p->free_list))
+      rt_dataset->cache_bytes += rt_dataset->local_free_list->bo->bo->size;
+
    *rt_dataset_out = rt_dataset;
    if (PVR_HAS_FEATURE(dev_info, apple_g9p) && getenv("G9P_SYNC")) {
       static unsigned n;

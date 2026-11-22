@@ -258,6 +258,7 @@ struct pvr_device {
    simple_mtx_t rt_cache_mtx;
    struct list_head rt_dataset_cache;
    uint32_t rt_dataset_cache_count;
+   uint64_t rt_dataset_cache_bytes;
 
    /* Data Source for GPU tracing */
    struct pvr_ds_device ds;

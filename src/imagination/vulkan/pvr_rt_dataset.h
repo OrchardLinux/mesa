@@ -27,6 +27,7 @@ struct pvr_rt_dataset {
 
    /* In pvr_device::rt_dataset_cache while unused. */
    struct list_head cache_link;
+   uint64_t cache_bytes;
 
    /* RT dataset information */
    uint32_t width;

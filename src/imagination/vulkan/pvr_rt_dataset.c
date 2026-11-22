@@ -79,10 +79,25 @@ void pvr_render_target_dataset_destroy(struct pvr_rt_dataset *rt_dataset)
    vk_free(&device->vk.alloc, rt_dataset);
 }
 
-/* Unused datasets kept per device: enough for a compositor's outputs and
- * the offscreen sizes it renders at, bounded so that memory stays small.
+/* Cache demand is passes per command buffer, not distinct sizes: each pass
+ * takes its own dataset. For example, glmark2 terrain has four 256x256 passes
+ * and three 2048x1536 passes, among about 24-29 passes including mip renders.
+ * Zink returns a batch's datasets together when it resets the finished command
+ * buffer (pvr_cmd_buffer_free_sub_cmd -> pvr_rstate_entry_remove), before
+ * recording the next batch. Keep enough for a batch, with room for a second
+ * burst. Matching remains exact in width, height, samples and layers.
+ *
+ * A9 datasets share the device's local free list and own five small BOs,
+ * rounded to at least 16 KiB each. Only region headers scale with size
+ * (3072 tiles * 5 bytes at 2048x1536), so roughly 0.1-0.2 MiB per dataset
+ * makes the count limit bind first (about 13 MiB for 64). Rogue datasets own
+ * a local free list too, so bound their total BO bytes as well. Keep a single
+ * oversized dataset to avoid repeated allocation for a large target.
+ * Only released datasets are cached; rendering one or two sizes does not
+ * itself fill the cache.
  */
-#define PVR_RT_DATASET_CACHE_MAX 4
+#define PVR_RT_DATASET_CACHE_MAX 64
+#define PVR_RT_DATASET_CACHE_BYTES (32ull << 20)
 
 struct pvr_rt_dataset *
 pvr_render_target_dataset_cache_take(struct pvr_device *device,
@@ -102,6 +117,7 @@ pvr_render_target_dataset_cache_take(struct pvr_device *device,
           rt_dataset->samples == samples && rt_dataset->layers == layers) {
          list_del(&rt_dataset->cache_link);
          device->rt_dataset_cache_count--;
+         device->rt_dataset_cache_bytes -= rt_dataset->cache_bytes;
          found = rt_dataset;
          break;
       }
@@ -117,21 +133,32 @@ pvr_render_target_dataset_cache_take(struct pvr_device *device,
 void pvr_render_target_dataset_release(struct pvr_rt_dataset *rt_dataset)
 {
    struct pvr_device *device = rt_dataset->device;
-   struct pvr_rt_dataset *evict = NULL;
+   struct list_head evicted;
+
+   list_inithead(&evicted);
 
    simple_mtx_lock(&device->rt_cache_mtx);
    list_add(&rt_dataset->cache_link, &device->rt_dataset_cache);
-   if (++device->rt_dataset_cache_count > PVR_RT_DATASET_CACHE_MAX) {
-      evict = list_last_entry(&device->rt_dataset_cache,
-                              struct pvr_rt_dataset,
-                              cache_link);
+   device->rt_dataset_cache_count++;
+   device->rt_dataset_cache_bytes += rt_dataset->cache_bytes;
+   while (device->rt_dataset_cache_count > PVR_RT_DATASET_CACHE_MAX ||
+          (device->rt_dataset_cache_count > 1 &&
+           device->rt_dataset_cache_bytes > PVR_RT_DATASET_CACHE_BYTES)) {
+      struct pvr_rt_dataset *evict =
+         list_last_entry(&device->rt_dataset_cache,
+                         struct pvr_rt_dataset,
+                         cache_link);
       list_del(&evict->cache_link);
       device->rt_dataset_cache_count--;
+      device->rt_dataset_cache_bytes -= evict->cache_bytes;
+      list_addtail(&evict->cache_link, &evicted);
    }
    simple_mtx_unlock(&device->rt_cache_mtx);
 
-   if (evict)
+   list_for_each_entry_safe (struct pvr_rt_dataset, evict, &evicted, cache_link) {
+      list_del(&evict->cache_link);
       pvr_render_target_dataset_destroy(evict);
+   }
 }
 
 void pvr_render_target_dataset_cache_finish(struct pvr_device *device)
@@ -144,5 +171,6 @@ void pvr_render_target_dataset_cache_finish(struct pvr_device *device)
       pvr_render_target_dataset_destroy(rt_dataset);
    }
    device->rt_dataset_cache_count = 0;
+   device->rt_dataset_cache_bytes = 0;
    simple_mtx_destroy(&device->rt_cache_mtx);
 }
