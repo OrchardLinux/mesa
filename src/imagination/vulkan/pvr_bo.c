@@ -710,6 +710,14 @@ VkResult pvr_bo_suballoc(struct pvr_suballocator *allocator,
    if (allocator->bo) {
       uint32_t aligned_offset = ALIGN_POT(allocator->next_offset, align);
 
+      /* Every sub-allocation of the current buffer has been freed: start it
+       * over instead of freeing it and creating another one.
+       */
+      if (aligned_offset + aligned_size > allocator->bo->bo->size &&
+          aligned_size <= allocator->bo->bo->size &&
+          p_atomic_read(&allocator->bo->ref_count) == 1)
+         aligned_offset = 0;
+
       if (aligned_offset + aligned_size <= allocator->bo->bo->size) {
          suballoc_bo->allocator = allocator;
          suballoc_bo->bo = pvr_bo_get_ref(allocator->bo);
