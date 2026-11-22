@@ -602,6 +602,32 @@ static inline uint64_t pvr_suballoc_cache_max(const struct pvr_suballocator *a)
    return 2 * (uint64_t)a->default_size;
 }
 
+/* The caller holds allocator->mtx. Logging can run from pvr_bo_alloc/free
+ * under that same mutex, so publish counters atomically for its snapshots.
+ */
+static void pvr_suballoc_log_bo_add(struct pvr_suballocator *allocator,
+                                  const struct pvr_bo *bo)
+{
+   if (likely(!allocator->device->bo_log))
+      return;
+
+   p_atomic_inc(&allocator->live_bos);
+   p_atomic_add(&allocator->live_bo_bytes, bo->bo->size);
+   p_atomic_set(&allocator->peak_bo_bytes,
+                MAX2(p_atomic_read(&allocator->peak_bo_bytes),
+                     p_atomic_read(&allocator->live_bo_bytes)));
+}
+
+static void pvr_suballoc_log_bo_remove(struct pvr_suballocator *allocator,
+                                     const struct pvr_bo *bo)
+{
+   if (likely(!allocator->device->bo_log))
+      return;
+
+   p_atomic_dec(&allocator->live_bos);
+   p_atomic_add(&allocator->live_bo_bytes, -bo->bo->size);
+}
+
 /**
  * \brief Interface to sub-allocate buffer objects.
  *
@@ -662,6 +688,10 @@ VkResult pvr_bo_suballoc(struct pvr_suballocator *allocator,
          return result;
       }
 
+      pvr_suballoc_log_bo_add(allocator, bo);
+      if (unlikely(allocator->device->bo_log))
+         p_atomic_add(&allocator->live_bytes, aligned_size);
+
       suballoc_bo->allocator = allocator;
       suballoc_bo->bo = bo;
       suballoc_bo->dev_addr = bo->vma->dev_addr;
@@ -689,6 +719,8 @@ VkResult pvr_bo_suballoc(struct pvr_suballocator *allocator,
          suballoc_bo->size = aligned_size;
 
          allocator->next_offset = aligned_offset + aligned_size;
+         if (unlikely(allocator->device->bo_log))
+            p_atomic_add(&allocator->live_bytes, aligned_size);
 
          if (zero_on_alloc)
             memset(pvr_bo_suballoc_get_map_addr(suballoc_bo), 0, aligned_size);
@@ -698,6 +730,8 @@ VkResult pvr_bo_suballoc(struct pvr_suballocator *allocator,
 
          return VK_SUCCESS;
       } else {
+         if (p_atomic_read(&allocator->bo->ref_count) == 1)
+            pvr_suballoc_log_bo_remove(allocator, allocator->bo);
          pvr_bo_free(allocator->device, allocator->bo);
          allocator->bo = NULL;
       }
@@ -712,10 +746,12 @@ VkResult pvr_bo_suballoc(struct pvr_suballocator *allocator,
       result = VK_SUCCESS;
       if (allocator->device->ws->ops->buffer_set_purgeable)
          result = allocator->device->ws->ops->buffer_set_purgeable(bo_cached, false, &retained);
-      if (result == VK_SUCCESS && retained && alloc_size <= bo_cached->size)
+      if (result == VK_SUCCESS && retained && alloc_size <= bo_cached->size) {
          allocator->bo = allocator->bo_cached;
-      else
+         pvr_suballoc_log_bo_add(allocator, allocator->bo);
+      } else {
          pvr_bo_free(allocator->device, allocator->bo_cached);
+      }
 
       allocator->bo_cached = NULL;
    }
@@ -732,7 +768,11 @@ VkResult pvr_bo_suballoc(struct pvr_suballocator *allocator,
          simple_mtx_unlock(&allocator->mtx);
          return result;
       }
+      pvr_suballoc_log_bo_add(allocator, allocator->bo);
    }
+
+   if (unlikely(allocator->device->bo_log))
+      p_atomic_add(&allocator->live_bytes, aligned_size);
 
    suballoc_bo->allocator = allocator;
    suballoc_bo->bo = pvr_bo_get_ref(allocator->bo);
@@ -764,6 +804,11 @@ void pvr_bo_suballoc_free(struct pvr_suballoc_bo *suballoc_bo)
       return;
 
    simple_mtx_lock(&suballoc_bo->allocator->mtx);
+
+   if (unlikely(suballoc_bo->allocator->device->bo_log))
+      p_atomic_add(&suballoc_bo->allocator->live_bytes, -(uint64_t)suballoc_bo->size);
+   if (p_atomic_read(&suballoc_bo->bo->ref_count) == 1)
+      pvr_suballoc_log_bo_remove(suballoc_bo->allocator, suballoc_bo->bo);
 
    if (p_atomic_read(&suballoc_bo->bo->ref_count) == 1 &&
        !suballoc_bo->allocator->bo_cached &&

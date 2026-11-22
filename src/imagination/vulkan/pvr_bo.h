@@ -70,6 +70,15 @@ struct pvr_suballocator {
    /* Mutex to protect access to all of the members below this point */
    simple_mtx_t mtx;
 
+   /* Updated under mtx; atomic accesses let BO logging sample these without
+    * taking mtx while the log mutex is held (alloc/free can already hold mtx).
+    * Empty cached BOs are excluded until reused.
+    */
+   uint32_t live_bos;
+   uint64_t live_bo_bytes;
+   uint64_t live_bytes;
+   uint64_t peak_bo_bytes;
+
    /* Current buffer object where sub-allocations are made from */
    struct pvr_bo *bo;
    /* Previous buffer that can be used when a new buffer object is needed */

@@ -17,6 +17,7 @@
 #include "pvr_image.h"
 #include "util/hash_table.h"
 #include "util/list.h"
+#include "util/os_time.h"
 #include "util/simple_mtx.h"
 #include "util/u_math.h"
 #include "util/log.h"
@@ -51,6 +52,8 @@ struct pvr_bo_log_binding {
 struct pvr_bo_log {
    struct list_head link;
    simple_mtx_t mutex;
+   struct pvr_device *device;
+   uint64_t last_summary_ns;
    struct hash_table *entries;
    struct hash_table *bindings;
    uint64_t min_size;
@@ -68,6 +71,7 @@ struct pvr_bo_log {
 static struct list_head logs = { &logs, &logs };
 static simple_mtx_t logs_mutex = SIMPLE_MTX_INITIALIZER;
 DEBUG_GET_ONCE_NUM_OPTION(pvr_bo_log_min_kib, "PVR_BO_LOG_MIN_KIB", 64)
+DEBUG_GET_ONCE_NUM_OPTION(pvr_bo_log_period_s, "PVR_BO_LOG_PERIOD_S", 0)
 
 static const char *thread_name(char buf[17])
 {
@@ -163,6 +167,27 @@ static void summary_locked(struct pvr_bo_log *log, const char *why, bool tables)
    if (!tables) {
 
       return;
+   }
+
+   const struct {
+      const char *name;
+      struct pvr_suballocator *allocator;
+   } suballocators[] = {
+      { "general", &log->device->suballoc_general },
+      { "pds", &log->device->suballoc_pds },
+      { "transfer", &log->device->suballoc_transfer },
+      { "usc", &log->device->suballoc_usc },
+      { "vis_test", &log->device->suballoc_vis_test },
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(suballocators); i++) {
+      const struct pvr_suballocator *a = suballocators[i].allocator;
+      mesa_logi("pvr bo summary-suballoc name=%s bos=%u bo_kib=%" PRIu64
+                " live_kib=%" PRIu64 " peak_bo_kib=%" PRIu64,
+                suballocators[i].name,
+                p_atomic_read(&a->live_bos),
+                p_atomic_read(&a->live_bo_bytes) >> 10,
+                p_atomic_read(&a->live_bytes) >> 10,
+                p_atomic_read(&a->peak_bo_bytes) >> 10);
    }
 
    uint64_t images = 0, total = 0, tight = 0;
@@ -265,6 +290,22 @@ static void summary_locked(struct pvr_bo_log *log, const char *why, bool tables)
 
 }
 
+static void summary_period_locked(struct pvr_bo_log *log)
+{
+   if (!PVR_IS_DEBUG_SET(BO_LOG))
+      return;
+
+   const int64_t period_s = debug_get_option_pvr_bo_log_period_s();
+   if (period_s <= 0)
+      return;
+
+   const uint64_t now = os_time_get_nano();
+   if ((now - log->last_summary_ns) / 1000000000ULL >= (uint64_t)period_s) {
+      summary_locked(log, "period", true);
+      log->last_summary_ns = now;
+   }
+}
+
 void pvr_bo_log_summary(struct pvr_device *device, const char *why)
 {
    struct pvr_bo_log *log = device->bo_log;
@@ -289,6 +330,8 @@ void pvr_bo_log_device_init(struct pvr_device *device)
       free(log);
       return;
    }
+   log->device = device;
+   log->last_summary_ns = os_time_get_nano();
    log->min_size = MAX2(0, debug_get_option_pvr_bo_log_min_kib());
    log->min_size = MIN2(log->min_size, UINT64_MAX / 1024) * 1024;
    simple_mtx_init(&log->mutex, mtx_plain);
@@ -372,6 +415,7 @@ static void record_alloc(struct pvr_bo_log *log,
       summary_locked(log, "peak", false);
    if (result != VK_SUCCESS && log->failed <= 3)
       summary_locked(log, "alloc-failed", true);
+   summary_period_locked(log);
    simple_mtx_unlock(&log->mutex);
 }
 
@@ -479,6 +523,7 @@ void pvr_bo_log_free(struct pvr_device *device, const void *key)
       free(e);
       _mesa_hash_table_remove(log->entries, h);
    }
+   summary_period_locked(log);
    simple_mtx_unlock(&log->mutex);
 }
 
