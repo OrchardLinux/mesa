@@ -3717,6 +3717,41 @@ static void emit_ibin(struct gctx *c, nir_alu_instr *a)
 static void emit_isub(struct gctx *c, nir_alu_instr *a)
 {
    bool neg = a->op == nir_op_ineg;
+   if (g5p_usc_g4p && !c->vs) {
+      /* The A8: the A9's register subtract (op a5) gives x - y = x on the iPod touch 6 (a remainder a - 3q read
+       * back a while 3q and the quotient read right), so x - y is x + y * -1, with the integer multiply and add the
+       * A8 runs right; -1 is a MOVI */
+      uint8_t raw[G5P_USC_MAX];
+      struct ref x = neg ? (struct ref){0} : alu_src(c, a, 0), y = alu_src(c, a, neg ? 0 : 1);
+      const unsigned m1 = scratch_imm(c, 0xffffffffu);
+      const unsigned xr = neg ? 0 : reg_of(c, x, "isub");
+      const unsigned yr = reg_of(c, y, "isub");
+      const unsigned gy = vgrp(c, y);
+      const bool dy = dies(c, y);
+      free_dying(c, &y, 1);
+      const unsigned p = alloc_reg(c, dy ? (int)yr : -1);
+      struct g5p_alu f = G5P_ALU(2 * p);
+      f.a = gsrc(c, yr, (struct ref){0}, gy);
+      f.b = gsrc(c, m1, (struct ref){0}, 1);
+      put(c, raw, g5p_usc_binary(raw, G5P_BIN_IMUL, &f), "isub: y * -1");
+      if (neg) {
+         c->p->evidence |= PCO_G5P_EV_FS_ALU;
+         define(c, &a->def, p);
+         return;
+      }
+      const unsigned gx = vgrp(c, x);
+      const bool dx = dies(c, x);
+      free_dying(c, &x, 1);
+      c->scratch |= BITFIELD64_BIT(p);
+      const unsigned dst = alloc_reg(c, dx ? (int)xr : -1);
+      struct g5p_alu g = G5P_ALU(2 * dst);
+      g.a = gsrc(c, xr, (struct ref){0}, gx);
+      g.b = gsrc(c, p, (struct ref){0}, 1);
+      put(c, raw, g5p_usc_binary(raw, G5P_BIN_IADD, &g), "isub: x + (-y)");
+      c->p->evidence |= PCO_G5P_EV_FS_ALU;
+      define(c, &a->def, dst);
+      return;
+   }
    struct ref r[2] = {neg ? (struct ref){0} : alu_src(c, a, 0), alu_src(c, a, neg ? 0 : 1)};
    unsigned ra = neg ? zero_reg(c) : reg_of(c, r[0], "isub");
    unsigned rb = reg_of(c, r[1], "isub");
@@ -6660,6 +6695,42 @@ static bool sink_vs_stores(nir_shader *nir)
    return nir_progress(any, impl, nir_metadata_control_flow);
 }
 
+/* The A8: a remainder from the quotient (umod/irem/imod -> a - (a / b) * b, imod's sign then that of b), the form
+ * that reads right on the iPod touch 6 together with the subtract below (emit_isub()). */
+static bool a8_mod_from_div(nir_builder *b, nir_alu_instr *alu, void *data)
+{
+   if (alu->op != nir_op_umod && alu->op != nir_op_imod && alu->op != nir_op_irem)
+      return false;
+   b->cursor = nir_before_instr(&alu->instr);
+   nir_def *x = nir_ssa_for_alu_src(b, alu, 0), *y = nir_ssa_for_alu_src(b, alu, 1);
+   nir_def *q = alu->op == nir_op_umod ? nir_udiv(b, x, y) : nir_idiv(b, x, y);
+   /* q * y: a constant divisor's product in shifts and adds, a register divisor's by the multiply */
+   nir_def *qy = NULL;
+   if (nir_src_is_const(alu->src[1].src) && y->num_components == 1 && y->bit_size == 32) {
+      const uint32_t k = (uint32_t)nir_alu_src_as_uint(alu->src[1]);
+      const uint32_t m = (int32_t)k < 0 && alu->op != nir_op_umod ? -k : k;
+      for (unsigned bit = 0; bit < 32; bit++)
+         if (m >> bit & 1) {
+            nir_def *t = bit ? nir_ishl_imm(b, q, bit) : q;
+            qy = qy ? nir_iadd(b, qy, t) : t;
+         }
+      if (!qy)
+         qy = nir_imm_int(b, 0);
+      if (m != k)
+         qy = nir_ineg(b, qy);
+   } else {
+      qy = nir_imul(b, q, y);
+   }
+   nir_def *r = nir_isub(b, x, qy);
+   if (alu->op == nir_op_imod) {
+      /* GLSL/SPIR-V SMod: the result takes the divisor's sign */
+      nir_def *fix = nir_iand(b, nir_ine_imm(b, r, 0), nir_ine(b, nir_ilt_imm(b, r, 0), nir_ilt_imm(b, y, 0)));
+      r = nir_bcsel(b, fix, nir_iadd(b, r, y), r);
+   }
+   nir_def_replace(&alu->def, r);
+   return true;
+}
+
 /* iabs as imax(x, -x): lower_iabs's rule is in nir_opt_algebraic_late,
  * which this backend does not run. */
 static bool lower_iabs_instr(nir_builder *b, nir_alu_instr *a, void *data)
@@ -7031,7 +7102,13 @@ static bool lower(nir_shader *nir, bool preserve_cf)
     * register divisor and a magic multiply for a constant
     * (tools/mesa-a9-hypr-re f_udiv_reg, f_udiv_const), with forms we have
     * not decoded; these use ops we encode. */
-   NIR_PASS(_, nir, nir_opt_idiv_const, 32);
+   /* The A8 divides by a constant as by a register (the float reciprocal and two integer corrections,
+    * nir_lower_idiv) and builds remainders from the quotient (a8_mod_from_div()): the configuration that reads
+    * right on the iPod touch 6. */
+   if (!g5p_usc_g4p)
+      NIR_PASS(_, nir, nir_opt_idiv_const, 32);
+   else
+      NIR_PASS(_, nir, nir_shader_alu_pass, a8_mod_from_div, nir_metadata_control_flow, NULL);
    NIR_PASS(_, nir, nir_lower_idiv, &(nir_lower_idiv_options){.allow_fp16 = false});
    /* PCO already lowers signed MSB and LSB to unsigned MSB. Finish that
     * graph with integer fill/count instead of an unqualified native CLZ. */
