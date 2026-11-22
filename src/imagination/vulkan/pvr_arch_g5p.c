@@ -22,6 +22,7 @@
 #include "vk_log.h"
 
 #include "util/ralloc.h"
+#include "util/u_debug.h"
 #include "util/u_dynarray.h"
 #include "util/u_math.h"
 
@@ -571,9 +572,14 @@ PVR_PER_ARCH(g5p_device_init)(struct pvr_device *device)
    /* vkCmdClearAttachments' clear quad: its pipelines are made at first use (pvr_arch_g5p_gfx.c) */
    simple_mtx_init(&device->g5p->clear_lock, mtx_plain);
 
+   /* The parameter manager pool every render asks for (pvr_g5p.h); the
+    * kernel builds at most 16 MiB */
+   const int64_t fl_mb = debug_get_num_option("PVR_G5P_FREE_LIST_MB", PVR_G5P_FREE_LIST_SIZE >> 20);
+   const uint32_t fl_size = (uint32_t)CLAMP(fl_mb, 1, 16) << 20;
+
    VkResult result = g5p_upload_programs(device, &device->g5p->programs);
    if (result == VK_SUCCESS)
-      result = pvr_free_list_create(device, PVR_G5P_FREE_LIST_SIZE, PVR_G5P_FREE_LIST_SIZE, 0, 0,
+      result = pvr_free_list_create(device, fl_size, fl_size, 0, 0,
                                     device->global_free_list, &device->g5p->free_list);
    if (result == VK_SUCCESS)
       result = PVR_PER_ARCH(g5p_meta_init)(device);

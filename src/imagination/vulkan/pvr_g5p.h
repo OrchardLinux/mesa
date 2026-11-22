@@ -174,12 +174,18 @@ struct pvr_g5p_programs {
 
 /*
  * The parameter buffer of a render (bytes): what the device's free list asks
- * the kernel for. On the A9 the list holds no pages; its size is the size of
- * the parameter manager's pool, which the kernel raises to what the render
- * target's tiles need and which does not grow during a render. 4 MiB (32
- * blocks of 128 KiB) is the pool the device's renders ran with.
+ * the kernel for. On the A9 the list holds no pages; its size is the smallest
+ * parameter manager pool the kernel builds for the render, which it raises to
+ * what the render target's tiles need, at most 128 blocks of 128 KiB.
+ *
+ * The pool does not grow during a scene, and the kernel has no partial
+ * render: a scene whose geometry needs more parameter memory than the pool
+ * stops the geometry job without a fault, and the job times out. A pool sized
+ * from a small target's tiles (4 MiB, 32 blocks, below 974 tiles) can be too
+ * small for a 3D scene drawn into it. Ask for the largest pool the kernel
+ * builds, 16 MiB. PVR_G5P_FREE_LIST_MB overrides it.
  */
-#define PVR_G5P_FREE_LIST_SIZE (4U * 1024U * 1024U)
+#define PVR_G5P_FREE_LIST_SIZE (16U * 1024U * 1024U)
 
 /* G5P's per-device state (pvr_device::g5p), allocated by g5p_device_init() */
 struct pvr_g5p_device {
