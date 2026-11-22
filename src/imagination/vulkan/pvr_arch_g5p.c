@@ -1466,7 +1466,12 @@ PVR_PER_ARCH(g5p_frag_stream)(const struct pvr_device *device, const struct pvr_
    /* ISP_CTL: kernel K1 reads only bit 17, keeping its other bits and MSAA form.
     * Older kernels ignore this field and continue processing every tile.
     */
-   g5p_put32(&s, 0x0021000f | (g->skip_empty_tiles ? 0 : 1u << 17));
+   /* The A8's kernel writes its own ISP_CTL (3D record +0x3c8, PROCESS_EMPTY_TILES set): this word stays 0 on the
+    * A8 until a kernel reads bit 17 from it for the A8 too. */
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p))
+      g5p_put32(&s, 0);
+   else
+      g5p_put32(&s, 0x0021000f | (g->skip_empty_tiles ? 0 : 1u << 17));
    g5p_put32(&s, 0); /* EVENT_PIXEL_PDS_INFO: in the extension's end-of-tile words */
    g5p_put32(&s, 0);
    g5p_put32(&s, 0);
