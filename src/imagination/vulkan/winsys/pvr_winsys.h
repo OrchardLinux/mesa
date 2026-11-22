@@ -389,6 +389,9 @@ struct pvr_winsys_ops {
                                      int fd,
                                      struct pvr_winsys_bo **const bo_out);
    void (*buffer_destroy)(struct pvr_winsys_bo *bo);
+   /* Only idle cached chunks may be advised. Replace a non-retained BO. */
+   VkResult (*buffer_set_purgeable)(struct pvr_winsys_bo *bo, bool purgeable,
+                                   bool *retained);
 
    VkResult (*buffer_get_fd)(struct pvr_winsys_bo *bo, int *const fd_out);
 

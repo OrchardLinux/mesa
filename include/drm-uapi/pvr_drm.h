@@ -109,6 +109,26 @@ struct drm_pvr_obj_array {
 #define DRM_IOCTL_PVR_DESTROY_HWRT_DATASET PVR_IOCTL(0x0c, DRM_IOW, destroy_hwrt_dataset)
 #define DRM_IOCTL_PVR_SUBMIT_JOBS PVR_IOCTL(0x0d, DRM_IOW, submit_jobs)
 
+/* Proposed BO_MADVISE UAPI: replace with the merged kernel header. */
+#define DRM_IOCTL_PVR_BO_MADVISE PVR_IOCTL(0x0e, DRM_IOWR, bo_madvise)
+
+#define DRM_PVR_MADV_WILLNEED 0
+#define DRM_PVR_MADV_DONTNEED 1
+
+/**
+ * struct drm_pvr_ioctl_bo_madvise_args - Mark an idle BO's contents purgeable
+ * @handle: GEM handle.
+ * @madv: DRM_PVR_MADV_WILLNEED or DRM_PVR_MADV_DONTNEED.
+ * @retained: Output, zero if purged; the caller must free and replace the BO.
+ * @_pad: Reserved, must be zero.
+ */
+struct drm_pvr_ioctl_bo_madvise_args {
+	__u32 handle;
+	__u32 madv;
+	__u32 retained;
+	__u32 _pad;
+};
+
 /**
  * DOC: PowerVR IOCTL DEV_QUERY interface
  */

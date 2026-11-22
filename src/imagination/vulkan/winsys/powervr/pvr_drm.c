@@ -513,6 +513,7 @@ static const struct pvr_winsys_ops drm_winsys_ops = {
    .buffer_create = pvr_drm_winsys_buffer_create,
    .buffer_create_from_fd = pvr_drm_winsys_buffer_create_from_fd,
    .buffer_destroy = pvr_drm_winsys_buffer_destroy,
+   .buffer_set_purgeable = pvr_drm_winsys_buffer_set_purgeable,
    .buffer_get_fd = pvr_drm_winsys_buffer_get_fd,
    .buffer_map = pvr_drm_winsys_buffer_map,
    .buffer_unmap = pvr_drm_winsys_buffer_unmap,

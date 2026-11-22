@@ -54,6 +54,7 @@ struct pvr_drm_winsys {
    /* pvr_drm_winsys_create(query_only) on the A8: device queries only, no VM context */
    bool query_only;
    uint64_t caps;
+   int madvise_warning;
    int64_t retry_log_time;
    /* The kernel sets a job fence's error when it resets (pvr_apple.c);
     * upstream pvr_queue.c does not.

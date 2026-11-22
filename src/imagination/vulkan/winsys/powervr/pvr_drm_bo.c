@@ -333,6 +333,29 @@ void pvr_drm_winsys_buffer_destroy(struct pvr_winsys_bo *bo)
    pvr_drm_buffer_release(drm_bo);
 }
 
+VkResult pvr_drm_winsys_buffer_set_purgeable(struct pvr_winsys_bo *bo,
+                                             bool purgeable, bool *retained)
+{
+   struct pvr_drm_winsys *ws = to_pvr_drm_winsys(bo->ws);
+   struct pvr_drm_winsys_bo *drm_bo = to_pvr_drm_winsys_bo(bo);
+   *retained = true;
+   if (!(ws->caps & PVR_DRM_CAP_BO_MADVISE) || bo->is_imported ||
+       (drm_bo->flags & DRM_PVR_BO_PM_FW_PROTECT))
+      return VK_SUCCESS;
+   struct drm_pvr_ioctl_bo_madvise_args args = {
+      .handle = drm_bo->handle,
+      .madv = purgeable ? DRM_PVR_MADV_DONTNEED : DRM_PVR_MADV_WILLNEED,
+   };
+   if (drmIoctl(ws->base.render_fd, DRM_IOCTL_PVR_BO_MADVISE, &args)) {
+      const int err = errno;
+      if (purgeable && p_atomic_cmpxchg(&ws->madvise_warning, 0, 1) == 0)
+         mesa_logw("pvr: DONTNEED failed (errno %d)", err);
+      return vk_error(NULL, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+   }
+   *retained = args.retained;
+   return VK_SUCCESS;
+}
+
 VkResult pvr_drm_winsys_buffer_get_fd(struct pvr_winsys_bo *bo,
                                       int *const fd_out)
 {

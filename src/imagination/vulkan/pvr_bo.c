@@ -708,7 +708,11 @@ VkResult pvr_bo_suballoc(struct pvr_suballocator *allocator,
    if (allocator->bo_cached) {
       struct pvr_winsys_bo *bo_cached = allocator->bo_cached->bo;
 
-      if (alloc_size <= bo_cached->size)
+      bool retained = true;
+      result = VK_SUCCESS;
+      if (allocator->device->ws->ops->buffer_set_purgeable)
+         result = allocator->device->ws->ops->buffer_set_purgeable(bo_cached, false, &retained);
+      if (result == VK_SUCCESS && retained && alloc_size <= bo_cached->size)
          allocator->bo = allocator->bo_cached;
       else
          pvr_bo_free(allocator->device, allocator->bo_cached);
@@ -765,6 +769,12 @@ void pvr_bo_suballoc_free(struct pvr_suballoc_bo *suballoc_bo)
        !suballoc_bo->allocator->bo_cached &&
        suballoc_bo->bo->bo->size <= pvr_suballoc_cache_max(suballoc_bo->allocator)) {
       suballoc_bo->allocator->bo_cached = suballoc_bo->bo;
+      if (suballoc_bo->allocator->device->ws->ops->buffer_set_purgeable) {
+         bool retained;
+         VkResult ignored = suballoc_bo->allocator->device->ws->ops->buffer_set_purgeable(
+            suballoc_bo->bo->bo, true, &retained);
+         (void)ignored; /* The winsys warns once if DONTNEED fails. */
+      }
    } else {
       pvr_bo_free(suballoc_bo->allocator->device, suballoc_bo->bo);
    }

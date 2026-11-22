@@ -65,6 +65,8 @@ pvr_drm_winsys_buffer_create_from_fd(struct pvr_winsys *ws,
                                      int fd,
                                      struct pvr_winsys_bo **const bo_out);
 void pvr_drm_winsys_buffer_destroy(struct pvr_winsys_bo *bo);
+VkResult pvr_drm_winsys_buffer_set_purgeable(struct pvr_winsys_bo *bo,
+                                             bool purgeable, bool *retained);
 
 VkResult pvr_drm_winsys_buffer_get_fd(struct pvr_winsys_bo *bo,
                                       int *const fd_out);
