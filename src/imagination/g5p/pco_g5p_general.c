@@ -180,6 +180,8 @@ struct gctx {
    unsigned hi_inline;
    uint64_t tex_pending, tex_coord_pending;
    unsigned tex_batch;
+   bool a8_slots; /* the A8's multi-image layout (plan_common) */
+   unsigned tex_batch_image; /* a8_slots: the common dword of the batch's last sampled image */
    nir_shader *nir;
    nir_function_impl *impl;
    bool vs, half_output;
@@ -367,6 +369,18 @@ static void tex_flush(struct gctx *c)
    c->busy |= c->scratch;
    c->tex_pending = c->tex_coord_pending = 0;
    c->tex_batch = 0;
+}
+
+/* The A8 waits `4d 04` before a sample of another image while samples are outstanding: Apple's two-texture
+ * program (iOS capture, USC heap 0x1_02328000 + 0x6210) is sample t0, 4d 04, sample t1, 4d 00, and its 3- and
+ * 4-texture programs (+0x73ea, +0x7c22) put 4d 04 between every two samples of different images, while its blit
+ * (+0xf66) samples one image eight times back to back. Only the multi-image programs. */
+static void a8_image_order(struct gctx *c, unsigned image)
+{
+   if (!c->a8_slots || !c->tex_batch || image == c->tex_batch_image)
+      return;
+   uint8_t raw[G5P_USC_MAX];
+   put(c, raw, g5p_usc_wait(raw, 4), "wait (another image, Apple's 4d 04)");
 }
 
 /* ---- vertex register banks (docs/gpu/vs-two-bank-allocator.md) ----
@@ -2362,8 +2376,32 @@ static void plan_common(struct gctx *c)
    }
    unsigned image_base = align(next, 8), sampler_base = image_base + 8 * c->ntex;
    unsigned sampler_cursor = sampler_base;
+   /* The A8's programs sampling two or more images (g5p_usc.h g5p_tex.a8_slots), in Apple's layout (iOS 12.4,
+    * AGXMetalA8's programs sampling two to seven textures, a8-passcap): the images in four-dword slots from
+    * common dword 0, then the samplers, one slot each; the sample names its sampler's slot in byte 1 bits 7:6 and
+    * byte 5 bits 2:1 (g5p_usc.c sample_g4p). With one shared sampler Apple puts it at slot N after N images,
+    * with a sampler per texture texture j's at slot N + j; the seven-texture program's PDS DMAs 28 dwords of
+    * images to common 0 and its sampler to 28. A sampler per texture while the last one's slot is at most 11
+    * (slots up to 9 are witnessed; 10 and 11 combine byte-5 05 with byte-1 values witnessed at other slots), else
+    * Apple's one shared sampler, texture 0's (seven images; byte 5 07 for slots 12-15 is not captured). On the
+    * iPod every multi-texture test passed this way, 2-5 images with one sampler or a sampler each (own-filter
+    * checkers). Other shapes keep the per-texture eight-dword layout. */
+   const unsigned slot_base = 0, base_slot = 0;
+   const bool a8_multi = g5p_usc_g4p && !c->vs && !qualified && !next && c->ntex >= 2;
+   const bool a8_each = base_slot + 2 * c->ntex - 1 <= 11, a8_shared = base_slot + c->ntex <= 11;
+   c->a8_slots = a8_multi && (a8_each || a8_shared);
    c->fetch_sampler_common = sampler_base + sdw * sampler_count;
-   for (unsigned i = 0; i < c->ntex; i++) {
+   for (unsigned i = 0; c->a8_slots && i < c->ntex; i++) {
+      struct tex_bind *t = &c->tex[i];
+      t->image = slot_base + 4 * i;
+      t->sampler = slot_base + 4 * c->ntex + (a8_each ? 4 * i : 0);
+      add_upload(c, PCO_G5P_UPLOAD_IMAGE, t->set, t->binding, t->element, t->image_flags, idw, t->image);
+      if (!i || a8_each)
+         add_upload(c, PCO_G5P_UPLOAD_SAMPLER, t->sset, t->sbinding, t->selement, 32, sdw, t->sampler);
+   }
+   if (c->a8_slots) /* the common plan's span of the textures: eight dwords each, the compact plan's samplers after */
+      next = align(next, 8) + 8 * c->ntex + (compact ? sdw * sampler_count : 0);
+   for (unsigned i = 0; !c->a8_slots && i < c->ntex; i++) {
       struct tex_bind *t = &c->tex[i];
       t->image = compact ? image_base + 8 * i : align(next, 8);
       t->sampler = compact ? ((!qualified || t->needs_sampler) ? sampler_cursor : c->fetch_sampler_common) : t->image + idw;
@@ -5306,7 +5344,7 @@ static void emit_tex_ms_own_sample(struct gctx *c, nir_tex_instr *t, struct tex_
    put(c, raw, g5p_usc_move(raw, 2 * coord + 2, 2 * yr, 0, vgrp(c, y), 1), "coordinate y");
    put(c, raw, g5p_usc_ms_own_sample(raw, 2 * coord + 4), "the task's own sample");
    c->scratch |= BITFIELD64_RANGE(coord, 3);
-   struct g5p_tex s = {.image_qword = b->image / 2, .sampler_qword = g5p_usc_g4p ? b->sampler : b->sampler / 2, .coord_dword = coord,
+   struct g5p_tex s = {.image_qword = c->a8_slots ? b->image : b->image / 2, .a8_slots = c->a8_slots, .sampler_qword = g5p_usc_g4p ? b->sampler : b->sampler / 2, .coord_dword = coord,
                        .coord_control = true, .dim = G5P_TEX_2D_MS, .narrow = true, .dst_half = 0};
    put(c, raw, g5p_usc_sample(raw, &s), "texture sample (2D multisample)");
    c->tex_coord_pending |= BITFIELD64_RANGE(coord, 3);
@@ -5343,7 +5381,7 @@ static void emit_tex_cube_g4p(struct gctx *c, nir_tex_instr *t)
          put(c, raw, g5p_usc_move(raw, 2 * (coord + k), 2 * reg[k], 0, vgrp(c, r[k]), 1), "cube direction");
       c->scratch |= BITFIELD64_RANGE(coord, 3);
    }
-   struct g5p_tex s = {.image_qword = b->image / 2, .sampler_qword = b->sampler, .coord_dword = coord,
+   struct g5p_tex s = {.image_qword = c->a8_slots ? b->image : b->image / 2, .a8_slots = c->a8_slots, .sampler_qword = b->sampler, .coord_dword = coord,
                        .coord_control = true, .dim = G5P_TEX_CUBE, .narrow = true};
    put(c, raw, g5p_usc_sample(raw, &s), "cube sample");
    c->tex_coord_pending |= BITFIELD64_RANGE(coord, 3);
@@ -5411,17 +5449,19 @@ static void emit_tex(struct gctx *c, nir_tex_instr *t)
       }
       c->p->evidence |= PCO_G5P_EV_TEX_COMPUTED;
    }
-   struct g5p_tex s = {.image_qword = b->image / 2, .sampler_qword = g5p_usc_g4p ? b->sampler : b->sampler / 2, .coord_dword = coord,
+   struct g5p_tex s = {.image_qword = c->a8_slots ? b->image : b->image / 2, .a8_slots = c->a8_slots, .sampler_qword = g5p_usc_g4p ? b->sampler : b->sampler / 2, .coord_dword = coord,
                        .coord_control = true, .dim = G5P_TEX_2D, .narrow = narrow};
    unsigned dst = 0;
    if (!narrow) {
       dst = alloc_run(c, 4, "texture result");
    }
    s.dst_half = 2 * dst;
+   a8_image_order(c, b->image);
    put(c, raw, g5p_usc_sample(raw, &s), "texture sample");
    c->tex_coord_pending |= BITFIELD64_RANGE(coord, 2);
    c->tex_pending |= BITFIELD64_RANGE(dst, 4);
    c->tex_batch++;
+   c->tex_batch_image = b->image;
    if (narrow)
       tex_flush(c);
    c->p->evidence |= narrow ? PCO_G5P_EV_TEX_CAPTURE : PCO_G5P_EV_TEX_F32;

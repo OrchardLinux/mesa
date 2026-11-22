@@ -1136,6 +1136,28 @@ static unsigned sample_g4p(uint8_t *out, const struct g5p_tex *t)
     * coordinate dword, no cube-coordinate instruction (AGXMetalA8's f_tex_cube, passcap USC 0x6076: two FMAs and a
     * move build r0..r2, then 1a 59 00 41 00 01 c8 01 00 01 00 80). Only the narrow form is captured. */
    CHECK(t->dim != G5P_TEX_CUBE || t->narrow, "A8 cube sample captured only in the narrow form (result straight to the output)");
+   /* The A8's multi-image sample, Apple's form (iOS 12.4, AGXMetalA8's programs sampling two to seven textures
+    * with one shared sampler or one per texture, captured with a8-passcap; USC heap 0x1_002cc000 +
+    * 0x8a08..0x97dc): byte 4 is the image's common dword * 2, and the sampler's four-dword common slot S
+    * (dword 4S) is byte 1 bits 7:6 | byte 5 bits 2:1 << 2; byte 6 is 0x88 in every sample. Apple's four-texture
+    * programs with one sampler and with four differ only in byte 1 bits 7:6 (S = 4 shared; 4, 5, 6, 7 per
+    * texture); five textures with five samplers have S = 5..9 (byte 5 03, 05), and seven textures' shared
+    * sampler is S = 7 (b1 c1/e9/f1, byte 5 03) at dword 28, where its PDS DMAs it. The single-image forms agree:
+    * 0x59/0x79 are S = 1 (dword 4). Byte 1 bit 5 is the 32-bit result and bits 4:3 the components written minus
+    * one (Apple writes .r as 0, .g as 1, .b as 2); this writes four. On the iPod touch 6 every multi-texture
+    * test passed with it. */
+   if (t->a8_slots) {
+      const unsigned image_dword = t->image_qword, sampler_dword = t->sampler_qword; /* dwords (g5p_tex) */
+      CHECK(t->dim == G5P_TEX_2D, "A8 multi-image sample: 2D only (Apple's form is captured for 2D)");
+      CHECK(!(image_dword % 4) && image_dword <= 124, "A8 multi-image sample: image dword a multiple of 4 below 128");
+      CHECK(!(sampler_dword % 4) && sampler_dword / 4 <= 11, "A8 multi-image sample: sampler slot 0..11");
+      CHECK(t->coord_dword <= 31 && !(t->dst_half & 1) && t->dst_half < 64, "A8 sample: coordinate/destination range");
+      const unsigned slot = sampler_dword / 4;
+      const uint8_t raw[12] = {0x1a, (uint8_t)((slot & 3) << 6 | (t->narrow ? 0x19 : 0x39)), (uint8_t)t->dst_half,
+                               0x41, (uint8_t)(2 * image_dword), (uint8_t)(1 | (slot >> 2) << 1), 0x88, 0x01,
+                               (uint8_t)(t->coord_dword << 1), 0x01, 0x00, 0x80};
+      return finish_g4p(out, raw, sizeof(raw));
+   }
    /* Another image or sampler slot: the A8 form's image field has one witnessed value (bytes 3-4 41 00 at qword 0)
     * and its sampler field three bits of dwords. With PVR_A8_A9_FORMS the sample is the A9's own six-byte
     * instruction (g5p_usc_sample()'s A9 branch: image and sampler qwords in bytes 3 and 4, the coordinate from

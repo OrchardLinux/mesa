@@ -174,6 +174,10 @@ struct g5p_tex {
    unsigned lod_bank, lod_dword;
    bool gradient, lod_control;
    unsigned length; /* 0 = minimum */
+   /* The A8's multi-image form (Apple's, from an iOS capture): byte 4 = the image's common dword * 2, the
+    * sampler's four-dword slot in byte 1 bits 7:6 and byte 5 bits 2:1. image_qword and sampler_qword then hold
+    * dwords. */
+   bool a8_slots;
 };
 unsigned g5p_usc_sample(uint8_t *out, const struct g5p_tex *t);
 /* The 2D-multisample fetch's sample operand "the task's own sample" (a sample-rate program reads the
