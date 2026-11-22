@@ -37,6 +37,7 @@
 #include "pdsc_internal.h"
 #include "pdsc_isa_pack.h"
 #include "pdsc_ops.h"
+#include "pvr_bo_log.h"
 #include "pvr_bo.h"
 #include "pvr_cmd_buffer.h"
 #include "pvr_csb.h"
@@ -1434,6 +1435,10 @@ PVR_PER_ARCH(g5p_frag_stream)(const struct pvr_device *device, const struct pvr_
     * (pvr_arch_g5p_ds.c; without one, depth 1.0f and tag | mask) */
    struct pvr_g5p_zls_words zls;
    pvr_arch_g5p_ds_pass(job, PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p), &zls);
+   /* bo_log: how often a depth/stencil attachment is loaded or stored (what lazily allocated memory would save) */
+   if (unlikely(device->bo_log) && job->ds.iview && (job->has_depth_attachment || job->has_stencil_attachment))
+      pvr_bo_log_zls((struct pvr_device *)device, job->ds.load.d || job->ds.load.s,
+                     job->ds.store.d || job->ds.store.s);
 
    g5p_put64(&s, scissor);
    g5p_put64(&s, dbias);

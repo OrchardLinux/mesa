@@ -66,6 +66,7 @@ struct pvr_bo_log {
    uint64_t peak;
    uint64_t failed;
    uint64_t tracking_failed;
+   uint64_t zls_passes, zls_load, zls_store, zls_neither;
 };
 
 static struct list_head logs = { &logs, &logs };
@@ -202,6 +203,9 @@ static void summary_locked(struct pvr_bo_log *log, const char *why, bool tables)
          tight += b->tight;
       }
    }
+   mesa_logi("pvr bo summary-zls passes=%" PRIu64 " load=%" PRIu64 " store=%" PRIu64 " neither=%" PRIu64
+             " (renders with a depth/stencil attachment; neither: memory a lazy allocation would never commit)\n",
+             log->zls_passes, log->zls_load, log->zls_store, log->zls_neither);
    mesa_logi("pvr bo summary-pad images=%" PRIu64 " total_kib=%" PRIu64
            " tight_kib=%" PRIu64 " pad_kib=%" PRId64 "\n",
            images,
@@ -307,6 +311,17 @@ static void summary_period_locked(struct pvr_bo_log *log)
       summary_locked(log, "period", true);
       log->last_summary_ns = now;
    }
+}
+
+void pvr_bo_log_zls(struct pvr_device *device, bool load, bool store)
+{
+   struct pvr_bo_log *log = device->bo_log;
+   simple_mtx_lock(&log->mutex);
+   log->zls_passes++;
+   log->zls_load += load;
+   log->zls_store += store;
+   log->zls_neither += !load && !store;
+   simple_mtx_unlock(&log->mutex);
 }
 
 void pvr_bo_log_tick(struct pvr_device *device)
