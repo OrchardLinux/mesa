@@ -5459,7 +5459,20 @@ static void emit_tex(struct gctx *c, nir_tex_instr *t)
    }
    s.dst_half = 2 * dst;
    a8_image_order(c, b->image);
-   put(c, raw, g5p_usc_sample(raw, &s), "texture sample");
+   const unsigned tex_n = g5p_usc_sample(raw, &s);
+   if (!tex_n && g5p_usc_g4p)
+      refuse(c, "texture sample: encoder rejects the fields (%s) [A8: image set %u binding %u[%u] at common dword "
+                "%u, sampler set %u binding %u at %u, %u images, %s layout, common store starts at %u; sampler dim %d%s, "
+                "texop %d%s%s%s%s%s, %s result]",
+             g5p_usc_error ? g5p_usc_error : "?", b->set, b->binding, b->element, b->image, b->sset, b->sbinding,
+             b->sampler, c->ntex, c->a8_slots ? "Apple multi-image" : "per-texture", c->ntex ? c->tex[0].image : 0,
+             (int)t->sampler_dim, t->is_array ? " array" : "", (int)t->op,
+             nir_tex_instr_src_index(t, nir_tex_src_lod) >= 0 ? " lod" : "",
+             nir_tex_instr_src_index(t, nir_tex_src_bias) >= 0 ? " bias" : "",
+             nir_tex_instr_src_index(t, nir_tex_src_ddx) >= 0 ? " grad" : "",
+             nir_tex_instr_src_index(t, nir_tex_src_offset) >= 0 ? " offset" : "",
+             nir_tex_instr_src_index(t, nir_tex_src_comparator) >= 0 ? " compare" : "", narrow ? "narrow" : "32-bit");
+   put(c, raw, tex_n, "texture sample");
    c->tex_coord_pending |= BITFIELD64_RANGE(coord, 2);
    c->tex_pending |= BITFIELD64_RANGE(dst, 4);
    c->tex_batch++;
