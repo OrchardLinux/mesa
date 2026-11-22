@@ -2097,8 +2097,12 @@ fs_uploads(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_pipeline *g, 
             return G5P_REFUSE(cmd_buffer, "set %u binding %u: a sampler without A9 words", u->set, u->binding);
          memcpy(out, desc, 4 * u->dwords);
          /* the A8's texelFetch drawn as a sample: the binding's sampler as a fetch sampler */
-         if ((u->offset & PCO_G5P_UPLOAD_SAMPLER_FETCH) && u->dwords == 4)
-            pvr_g5p_a8_fetch_sampler(out, desc, (u->offset >> PCO_G5P_UPLOAD_SAMPLER_FETCH_LEVEL_SHIFT) & 0xf);
+         if ((u->offset & PCO_G5P_UPLOAD_SAMPLER_FETCH) && u->dwords == 4) {
+            if (u->offset & PCO_G5P_UPLOAD_SAMPLER_READ) /* Apple's read form: its constant read sampler */
+               pvr_g5p_a8_read_sampler(out);
+            else
+               pvr_g5p_a8_fetch_sampler(out, desc, (u->offset >> PCO_G5P_UPLOAD_SAMPLER_FETCH_LEVEL_SHIFT) & 0xf);
+         }
          break;
       case PCO_G5P_UPLOAD_IMAGE_SIZE:
          if (u->dwords != 4 || !pvr_g5p_tex_size(desc, u->offset, out))

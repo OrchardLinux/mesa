@@ -14,6 +14,7 @@ bool g5p_usc_g4p_a9_forms;
 int g5p_usc_g4p_texfetch;
 int g5p_usc_g4p_texfetch_level;
 bool g5p_usc_g4p_vtex;
+bool g5p_usc_g4p_vtex_apple;
 bool g5p_usc_g4p_tbo;
 
 const char *const g5p_binop_name[G5P_BIN_COUNT] = {"fadd", "fmul", "iadd", "imul", "and", "or", "xor", "ishr",
@@ -1140,6 +1141,11 @@ static unsigned sample_g4p(uint8_t *out, const struct g5p_tex *t)
     * coordinate dword, no cube-coordinate instruction (AGXMetalA8's f_tex_cube, passcap USC 0x6076: two FMAs and a
     * move build r0..r2, then 1a 59 00 41 00 01 c8 01 00 01 00 80). Only the narrow form is captured. */
    CHECK(t->dim != G5P_TEX_CUBE || t->narrow, "A8 cube sample captured only in the narrow form (result straight to the output)");
+   /* the explicit level in the register after the coordinate (Apple's sample at a varying level, iOS capture, USC
+    * heap 0x1_02328000 + 0x8814: the iterated coordinate in r0..r1, r2 = r0 * 4.0, then
+    * 1a 59 00 41 00 01 a8 09 00 01 00 80): byte 6 mode 2, byte 7 0x09, byte 10 0. 2D only. */
+   CHECK(!t->lod_reg || t->dim == G5P_TEX_2D, "A8 explicit-level sample captured for 2D only");
+   const uint8_t lod_mode = t->lod_reg ? 2 << 4 : 0, lod_byte7 = t->lod_reg ? 0x09 : 0x01;
    /* The A8's multi-image sample, Apple's form (iOS 12.4, AGXMetalA8's programs sampling two to seven textures
     * with one shared sampler or one per texture, captured with a8-passcap; USC heap 0x1_002cc000 +
     * 0x8a08..0x97dc): byte 4 is the image's common dword * 2, and the sampler's four-dword common slot S
@@ -1159,7 +1165,7 @@ static unsigned sample_g4p(uint8_t *out, const struct g5p_tex *t)
       const unsigned slot = sampler_dword / 4;
       const uint8_t raw[12] = {0x1a, (uint8_t)((slot & 3) << 6 | (t->narrow ? 0x19 : 0x39)), (uint8_t)t->dst_half,
                                0x41, (uint8_t)(2 * image_dword), (uint8_t)(1 | (slot >> 2) << 1),
-                               (uint8_t)(0x88 | (t->read_flag ? 4 : 0)), 0x01,
+                               (uint8_t)(0x88 | lod_mode | (t->read_flag ? 4 : 0)), lod_byte7,
                                (uint8_t)(t->coord_dword << 1), 0x01, 0x00, 0x80};
       return finish_g4p(out, raw, sizeof(raw));
    }
@@ -1169,6 +1175,7 @@ static unsigned sample_g4p(uint8_t *out, const struct g5p_tex *t)
     * registers), over the A8's state words at the same common-store positions. */
    if (t->image_qword != 0 || t->sampler_qword > 7 || (t->sampler_qword & 1)) {
       CHECK(g5p_usc_g4p_a9_forms, "A8 sample captured only with the image descriptor at common qword 0");
+      CHECK(!t->lod_reg, "A8 explicit-level sample: no A9 form");
       CHECK(t->dim == G5P_TEX_2D, "A8 sample in another image slot: the A9 form is taken for 2D only");
       CHECK(!(t->sampler_qword & 1), "A8 sample in another image slot: the sampler must start a qword");
       struct g5p_tex a9 = *t;
@@ -1191,10 +1198,10 @@ static unsigned sample_g4p(uint8_t *out, const struct g5p_tex *t)
     * and bit 0 by its 0x3000 sample (89), neither decoded, so an odd dword could alias a flag */
    CHECK(!(t->sampler_qword & 1), "A8 sample: odd sampler dword (byte 6 bit 1 is set by Apple's undecoded array sample)");
    CHECK(t->coord_dword <= 31 && !(t->dst_half & 1) && t->dst_half < 64, "A8 sample: coordinate/destination range");
-   const uint8_t mode = t->dim == G5P_TEX_CUBE ? 4 : 0;
+   const uint8_t mode = t->dim == G5P_TEX_CUBE ? 4 : t->lod_reg ? 2 : 0;
    const uint8_t raw[12] = {0x1a, t->narrow ? 0x59 : 0x79, (uint8_t)t->dst_half, 0x41, 0x00, 0x01,
                             (uint8_t)(0x80 | mode << 4 | t->sampler_qword << 1 | (t->read_flag ? 4 : 0)),
-                            0x01, (uint8_t)(t->coord_dword << 1), 0x01, 0x00, 0x80};
+                            lod_byte7, (uint8_t)(t->coord_dword << 1), 0x01, 0x00, 0x80};
    return finish_g4p(out, raw, sizeof(raw));
 }
 

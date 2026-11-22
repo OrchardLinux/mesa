@@ -1407,13 +1407,15 @@ VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
       /* single-level non-power-of-two colour images stay linear (pvr_g5p_tex.h) */
       pvr_g5p_image_a8_linear = true;
       /* texelFetch (g5p_usc.h): Apple's read form, which reads every texel right on the iPod touch 6 at level 0
-       * (RGBA8, RGBA32F, RGBA32I); a level above 0 with PVR_A8_TEXFETCH_LEVEL=level|scale */
+       * (RGBA8, RGBA32F, RGBA32I); a level above 0 with PVR_A8_TEXFETCH_LEVEL=level|scale|apple */
       g5p_usc_g4p_texfetch = 2;
       const char *level = getenv("PVR_A8_TEXFETCH_LEVEL");
-      g5p_usc_g4p_texfetch_level = !level ? 0 : !strcmp(level, "level") ? 1 : !strcmp(level, "scale") ? 2 : 0;
+      g5p_usc_g4p_texfetch_level = !level ? 0 : !strcmp(level, "level") ? 1 : !strcmp(level, "scale") ? 2 :
+                                   !strcmp(level, "apple") ? 3 : 0;
       /* vertex textures: refused by default; PVR_A8_VTEX=1 takes the A9's recipe on the A8's words, which does not
-       * work yet (g5p_usc.h) */
-      g5p_usc_g4p_vtex = debug_get_bool_option("PVR_A8_VTEX", false);
+       * work yet, PVR_A8_VTEX_APPLE=1 Apple's form (g5p_usc.h) */
+      g5p_usc_g4p_vtex_apple = debug_get_bool_option("PVR_A8_VTEX_APPLE", false);
+      g5p_usc_g4p_vtex = debug_get_bool_option("PVR_A8_VTEX", false) || g5p_usc_g4p_vtex_apple;
       /* fragment texel-buffer reads (g5p_usc.h) */
       g5p_usc_g4p_tbo = debug_get_bool_option("PVR_A8_TBO", true);
    }

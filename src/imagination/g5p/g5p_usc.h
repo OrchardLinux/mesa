@@ -42,7 +42,12 @@ extern bool g5p_usc_g4p_a9_forms;
  * the texture's sampler, as Apple's read (an iOS capture of a Metal read()): the integer coordinate as a float,
  * byte 6 bit 2 set (g5p_usc_g4p_texfetch = 2; 1, the texel's centre without the bit, reads the same on the iPod
  * touch 6). A constant level above 0 (the sampler's LOD range clamped to it) only with PVR_A8_TEXFETCH_LEVEL:
- *   1 ("level"): the coordinate in the level's texels; 2 ("scale"): in level 0's texels (times 2^level).
+ *   1 ("level"): the coordinate in the level's texels; 2 ("scale"): in level 0's texels (times 2^level);
+ *   3 ("apple"): every fetch in Apple's read form (AGXCompilerCore's read(): an explicit level, 0 when the source
+ *   names none): byte 6 0xac (mode 2 + bit 2), the level as an f32 in the register after the coordinate (byte 7
+ *   0x09, as in an iOS capture of a Metal sample at a varying level), through Apple's constant read sampler
+ *   (normalized, clamped to the edge, point, LOD 0..max; PCO_G5P_UPLOAD_SAMPLER_READ), the coordinate unscaled.
+ *   Not yet run on the hardware.
  */
 extern int g5p_usc_g4p_texfetch;
 extern int g5p_usc_g4p_texfetch_level;
@@ -53,6 +58,14 @@ extern int g5p_usc_g4p_texfetch_level;
  * otherwise the A9's.
  */
 extern bool g5p_usc_g4p_vtex;
+/*
+ * PVR_A8_VTEX_APPLE=1 (not yet run on the hardware): vertex textures in Apple's form instead (it enables them on its
+ * own). AGXCompilerCore samples a stage without derivatives at an explicit level (0.0 when the source names none) and
+ * AGXMetalA8 DMAs the vertex stage's image and sampler words as the fragment stage's, so the vertex sample is the
+ * A8's 12-byte sample in mode 2 with the level in the register after the coordinate, the image and sampler named by
+ * their common dwords; a texelFetch is the read form above. No capture shows an A8 vertex sample's bytes.
+ */
+extern bool g5p_usc_g4p_vtex_apple;
 /* A fragment texel-buffer read on the A8 (st/mesa's pixel-buffer uploads) as a 2D texelFetch of the buffer's linear
  * state (PVR_A8_TBO, on by default; 0 refuses it) */
 extern bool g5p_usc_g4p_tbo;
@@ -199,6 +212,10 @@ struct g5p_tex {
    bool a8_slots;
    /* g5p_usc_g4p_texfetch = 2: Apple's read flag, byte 6 bit 2 */
    bool read_flag;
+   /* Apple's explicit level in a register (an iOS capture of a Metal sample at a varying level:
+    * 1a 59 00 41 00 01 a8 09 00 01 00 80): mode 2, byte 7 0x09, the level an f32 in the register after the
+    * coordinate's two */
+   bool lod_reg;
 };
 unsigned g5p_usc_sample(uint8_t *out, const struct g5p_tex *t);
 /* The 2D-multisample fetch's sample operand "the task's own sample" (a sample-rate program reads the

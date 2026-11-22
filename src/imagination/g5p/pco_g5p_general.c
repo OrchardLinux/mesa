@@ -102,6 +102,7 @@ struct tex_bind {
    bool needs_sampler, needs_fetch_sampler;
    bool fetch; /* A8: a texelFetch drawn as a sample (G5P_TEX_FETCH): its own sampler slot, the fetch sampler */
    unsigned fetch_level; /* the level that fetch reads */
+   bool fetch_read; /* that fetch in Apple's read form (G5P_TEX_LOD_REG): Apple's read sampler */
    unsigned image_flags; /* PCO_G5P_UPLOAD_IMAGE_AS_2D / _ARRAY: how its samples read the state */
 };
 
@@ -119,6 +120,9 @@ enum { BLEND_NONE, BLEND_PREMULT, BLEND_STRAIGHT_OVER, BLEND_REPLACE, BLEND_GENE
 #define G5P_TEX_FETCH (1u << 27)
 /* and the level it reads, bits 23-26 */
 #define G5P_TEX_FETCH_LEVEL_SHIFT 23
+/* nir_tex_instr.backend_flags: the A8 sample in Apple's explicit-level form (g5p_tex.lod_reg), a fetch through Apple's
+ * read sampler (PVR_A8_TEXFETCH_LEVEL=apple, PVR_A8_VTEX_APPLE) */
+#define G5P_TEX_LOD_REG (1u << 22)
 
 /* The general blend epilogue (g5p_blend.c, hyprland-gpu.md §11.2) for
  * settings without a measured epilogue. Premultiplied, straight-over and
@@ -998,6 +1002,24 @@ static const char *vs_tex_refusal(const nir_tex_instr *t)
    return NULL;
 }
 
+/* The shapes emit_vertex_tex_g4p() takes (PVR_A8_VTEX_APPLE): a 2D sample at an implicit or explicit level, or a texelFetch
+ * drawn as Apple's read (a8_fetch_as_sample()) */
+static const char *a8_vs_tex_refusal(const nir_tex_instr *t)
+{
+   const bool fetch = t->backend_flags & G5P_TEX_FETCH;
+   if (t->op == nir_texop_txf)
+      return "A8 vertex texelFetch: 2D, 4 x 32-bit, at a constant level (Apple's read form)";
+   if ((t->op != nir_texop_tex && t->op != nir_texop_txl) || t->sampler_dim != GLSL_SAMPLER_DIM_2D || t->is_array ||
+       t->is_shadow || t->def.num_components != 4 || t->def.bit_size != 32 ||
+       (nir_alu_type_get_base_type(t->dest_type) != nir_type_float && !fetch))
+      return "A8 vertex texture: only Apple's 2D sample and read";
+   for (unsigned i = 0; i < t->num_srcs; i++)
+      if (t->src[i].src_type != nir_tex_src_coord && t->src[i].src_type != nir_tex_src_lod &&
+          t->src[i].src_type != nir_tex_src_texture_deref && t->src[i].src_type != nir_tex_src_sampler_deref)
+         return "A8 vertex texture: a source other than the coordinate and level";
+   return NULL;
+}
+
 static const char *vs_qualified_tex_refusal(const nir_tex_instr *t)
 {
    if (t->sampler_dim == GLSL_SAMPLER_DIM_BUF)
@@ -1290,7 +1312,8 @@ static void scan_cf(struct gctx *c, struct exec_list *list, struct unsupported *
          }
          case nir_instr_type_tex: {
             nir_tex_instr *t = nir_instr_as_tex(ins);
-            const char *why = c->vs ? (g5p_vtex_qualified() ? vs_qualified_tex_refusal(t) : !g5p_vtex_probe() ? "vertex stage" : vs_tex_refusal(t)) :
+            const char *why = c->vs ? (g5p_usc_g4p && g5p_usc_g4p_vtex_apple && !size_query(t) ? a8_vs_tex_refusal(t) :
+                                       g5p_vtex_qualified() ? vs_qualified_tex_refusal(t) : !g5p_vtex_probe() ? "vertex stage" : vs_tex_refusal(t)) :
                               plain_tex(t) ? NULL : tex_shape_refusal(t, true, t->sampler_dim == GLSL_SAMPLER_DIM_3D, true);
             if (why) {
                snprintf(buf, sizeof(buf), "tex(op %u, dim %u%s%s): %s", t->op, t->sampler_dim,
@@ -2123,6 +2146,13 @@ static void tex_bindings(struct gctx *c, nir_tex_instr *t, struct tex_bind *b)
    b->needs_fetch_sampler = t->op == nir_texop_txf;
    b->fetch = t->backend_flags & G5P_TEX_FETCH;
    b->fetch_level = b->fetch ? (t->backend_flags >> G5P_TEX_FETCH_LEVEL_SHIFT) & 0xf : 0;
+   b->fetch_read = b->fetch && (t->backend_flags & G5P_TEX_LOD_REG);
+   /* the A8's vertex reads in Apple's form (PVR_A8_VTEX_APPLE) share one sampler, Apple's constant read sampler (one per program in Apple's
+    * constant data), in the fetch sampler's place (PCO_G5P_UPLOAD_FETCH_SAMPLER) */
+   if (c->vs && b->fetch_read) {
+      b->needs_sampler = false;
+      b->needs_fetch_sampler = true;
+   }
    b->image_flags = (t->backend_flags & PCO_G5P_TEX_ONE_LAYER_AS_2D) ? PCO_G5P_UPLOAD_IMAGE_ONE_LAYER :
                     (t->backend_flags & G5P_TEX_LAYER0_AS_2D) ? PCO_G5P_UPLOAD_IMAGE_AS_2D :
                     t->is_array ? PCO_G5P_UPLOAD_IMAGE_ARRAY : 0;
@@ -2135,7 +2165,8 @@ static struct tex_bind *tex_for(struct gctx *c, nir_tex_instr *t)
    for (unsigned i = 0; i < c->ntex; i++)
       if (c->tex[i].set == b.set && c->tex[i].binding == b.binding && c->tex[i].sset == b.sset &&
           c->tex[i].sbinding == b.sbinding && c->tex[i].element == b.element && c->tex[i].selement == b.selement &&
-          c->tex[i].image_flags == b.image_flags && c->tex[i].fetch == b.fetch && c->tex[i].fetch_level == b.fetch_level)
+          c->tex[i].image_flags == b.image_flags && c->tex[i].fetch == b.fetch && c->tex[i].fetch_level == b.fetch_level &&
+          c->tex[i].fetch_read == b.fetch_read)
          { c->tex[i].needs_sampler |= b.needs_sampler;
            c->tex[i].needs_fetch_sampler |= b.needs_fetch_sampler;
            return &c->tex[i]; }
@@ -2360,7 +2391,8 @@ static void plan_common(struct gctx *c)
             push_dwords += (r->hi - r->lo) / 4;
          }
       }
-      if (!g5p_stage_common_plan(next, c->ntex, sampler_count + fetch_sampler, idw, sdw,
+      if (!g5p_stage_common_plan_stride(next, c->ntex, sampler_count + fetch_sampler, idw, sdw,
+                                        g5p_usc_g4p && c->vs && g5p_usc_g4p_vtex_apple ? 4 : 0,
                                  compact, c->nuptr, c->nsize, ubos,
                                  ubo_dwords, push_dwords + ssbo_reserve, &common_plan))
          refuse(c, "common layout cannot fit pointers below 32 and data below 256 dwords");
@@ -2386,7 +2418,10 @@ static void plan_common(struct gctx *c)
          assert(next == common_plan.pointer_end);
       }
    }
-   unsigned image_base = align(next, 8), sampler_base = image_base + 8 * c->ntex;
+   /* the A8's vertex textures in Apple's form (PVR_A8_VTEX_APPLE) in Apple's spacing: four-dword images, then the
+    * samplers */
+   const unsigned istride = g5p_usc_g4p && c->vs && g5p_usc_g4p_vtex_apple ? 4 : 8;
+   unsigned image_base = align(next, 8), sampler_base = image_base + istride * c->ntex;
    unsigned sampler_cursor = sampler_base;
    /* The A8's programs sampling two or more images, or one after other common data (g5p_usc.h g5p_tex.a8_slots),
     * in Apple's layout (iOS 12.4, AGXMetalA8's programs sampling two to seven textures, a8-passcap): the images in
@@ -2413,14 +2448,15 @@ static void plan_common(struct gctx *c)
       if (!i || a8_each)
          add_upload(c, PCO_G5P_UPLOAD_SAMPLER, t->sset, t->sbinding, t->selement,
                     32 | (t->fetch ? PCO_G5P_UPLOAD_SAMPLER_FETCH |
-                                       t->fetch_level << PCO_G5P_UPLOAD_SAMPLER_FETCH_LEVEL_SHIFT : 0),
+                                       t->fetch_level << PCO_G5P_UPLOAD_SAMPLER_FETCH_LEVEL_SHIFT |
+                                       (t->fetch_read ? PCO_G5P_UPLOAD_SAMPLER_READ : 0) : 0),
                     sdw, t->sampler);
    }
    if (c->a8_slots) /* the common plan's span of the textures: eight dwords each, the compact plan's samplers after */
       next = align(next, 8) + 8 * c->ntex + (compact ? sdw * sampler_count : 0);
    for (unsigned i = 0; !c->a8_slots && i < c->ntex; i++) {
       struct tex_bind *t = &c->tex[i];
-      t->image = compact ? image_base + 8 * i : align(next, 8);
+      t->image = compact ? image_base + istride * i : align(next, 8);
       t->sampler = compact ? ((!qualified || t->needs_sampler) ? sampler_cursor : c->fetch_sampler_common) : t->image + idw;
       sampler_cursor += compact && (!qualified || t->needs_sampler) ? sdw : 0;
       next = compact ? c->fetch_sampler_common + (g5p_usc_g4p ? sdw : 2) * (qualified && fetch_sampler)
@@ -2431,7 +2467,8 @@ static void plan_common(struct gctx *c)
       if (!qualified || t->needs_sampler)
          add_upload(c, PCO_G5P_UPLOAD_SAMPLER, t->sset, t->sbinding, t->selement,
                     32 | (t->fetch ? PCO_G5P_UPLOAD_SAMPLER_FETCH |
-                                       t->fetch_level << PCO_G5P_UPLOAD_SAMPLER_FETCH_LEVEL_SHIFT : 0),
+                                       t->fetch_level << PCO_G5P_UPLOAD_SAMPLER_FETCH_LEVEL_SHIFT |
+                                       (t->fetch_read ? PCO_G5P_UPLOAD_SAMPLER_READ : 0) : 0),
                     sdw, t->sampler);
    }
    if (qualified && fetch_sampler)
@@ -5436,12 +5473,93 @@ static void emit_tex_cube_g4p(struct gctx *c, nir_tex_instr *t)
    c->p->evidence |= PCO_G5P_EV_TEX_CAPTURE;
 }
 
+/* The A8's vertex-stage sample in Apple's form (PVR_A8_VTEX_APPLE). AGXCompilerCore (agc_lower_air_texture_sample_read,
+ * 0x1a27a624c) samples in a stage without derivatives at an explicit level, 0.0 when the source names none, and its
+ * read() is that sample with the read bit; AGXMetalA8 builds the vertex stage's PDS data as the fragment stage's
+ * (a8_emit_vertex_stage_pds_data 0x1a1452a10 / a8_emit_fragment_stage_pds_data 0x1a1452d58: the same image and
+ * sampler words DMA'd into the common store). So: the A8's 12-byte sample, the image and sampler named by their common
+ * dwords (the multi-image form), mode 2 with the f32 level in the register after the coordinate (g5p_tex.lod_reg). Its
+ * operands are bank-0 temps, as every A8 sample's are in fragment programs (no capture shows a vertex sample's
+ * bytes); the result is copied to bank 1 after the wait. 2D, no array, compare, offset or gradient. */
+static void emit_vertex_tex_g4p(struct gctx *c, nir_tex_instr *t)
+{
+   uint8_t raw[G5P_USC_MAX];
+   const bool fetch = t->backend_flags & G5P_TEX_FETCH;
+   const int li = nir_tex_instr_src_index(t, nir_tex_src_lod);
+   const char *why = a8_vs_tex_refusal(t);
+   if (why) {
+      refuse(c, "%s", why);
+      return;
+   }
+   struct tex_bind *b = tex_for(c, t);
+   nir_def *cd = nir_get_tex_src(t, nir_tex_src_coord);
+   tex_flush(c);
+   const bool saved_bank0 = c->tex_bank0;
+   c->tex_bank0 = true;
+   /* the result over the coordinate, as Apple's f_tex writes its result to the coordinate's registers */
+   const unsigned coord = alloc_run(c, 4, "A8 vertex sample coordinate, level and result"), dst = coord;
+   c->tex_bank0 = saved_bank0;
+   vertex_qualified_copy(c, coord, cd, 0);
+   vertex_qualified_copy(c, coord + 1, cd, 1);
+   if (li >= 0 && !fetch) {
+      vertex_qualified_copy(c, coord + 2, t->src[li].src.ssa, 0);
+   } else {
+      const float level = fetch ? (float)((t->backend_flags >> G5P_TEX_FETCH_LEVEL_SHIFT) & 0xf) : 0.0f;
+      put(c, raw, g5p_usc_immediate(raw, H(c, coord + 2), fui(level), vbank(c, coord + 2), -1), "vertex level (f32)");
+   }
+   struct g5p_tex s = {.image_qword = b->image, .a8_slots = true, .sampler_qword = b->sampler,
+                       .coord_dword = H(c, coord) / 2, .coord_control = true, .dim = G5P_TEX_2D, .narrow = false,
+                       .read_flag = fetch, .lod_reg = true, .dst_half = H(c, dst)};
+   const unsigned n = g5p_usc_sample(raw, &s);
+   if (!n)
+      refuse(c, "A8 vertex sample: encoder rejects the fields (%s) [image at common dword %u, sampler at %u]",
+             g5p_usc_error ? g5p_usc_error : "?", b->image, b->sampler);
+   put(c, raw, n, "A8 vertex sample (Apple's explicit level)");
+   c->tex_pending |= BITFIELD64_RANGE(dst, 4);
+   c->tex_batch++;
+   tex_flush(c);
+   /* each used component to a free bank-1 register, leaving bank 0 to the next sample; with none free, the
+    * bank-two retry (vs_bank0) keeps it in bank 0 */
+   for (unsigned k = 0; k < 4; k++) {
+      struct val *v = V(c, &t->def, k);
+      if (!v->uses) {
+         c->busy &= ~BITFIELD64_BIT(dst + k);
+         continue;
+      }
+      int r = -1;
+      for (unsigned i = 0; i < NUM_DWORDS && r < 0; i++)
+         if (!((c->busy | c->reserved | c->tex_coord_pending | c->tex_pending) & BITFIELD64_BIT(i)))
+            r = i;
+      if (r < 0 && !c->vs_bank0) {
+         refuse(c, "register pressure: the A8 vertex sample result has no bank-1 register");
+         return;
+      }
+      v->state = VAL_REG;
+      v->held = true;
+      v->reg = dst + k;
+      if (r >= 0) {
+         c->busy |= BITFIELD64_BIT(r);
+         c->max_dword = MAX2(c->max_dword, (unsigned)r + 1);
+         c->max_written = MAX2(c->max_written, (unsigned)r + 1);
+         put(c, raw, g5p_usc_move(raw, H(c, r), H(c, dst + k), vbank(c, r), 1, vhdr(c, 0x21, dst + k, -1, -1)),
+             "A8 vertex sample result to bank 1");
+         c->busy &= ~BITFIELD64_BIT(dst + k);
+         v->reg = r;
+      }
+   }
+   c->p->evidence |= PCO_G5P_EV_TEX_F32;
+}
+
 static void emit_tex(struct gctx *c, nir_tex_instr *t)
 {
    if (c->tex_batch == 4 || c->vs || !plain_tex(t) || size_query(t) || c->narrow_tex == t)
       tex_flush(c);
    if (size_query(t)) {
       emit_size(c, t);
+      return;
+   }
+   if (c->vs && g5p_usc_g4p && g5p_usc_g4p_vtex_apple) {
+      emit_vertex_tex_g4p(c, t);
       return;
    }
    if (c->vs && g5p_vtex_qualified()) {
@@ -5465,7 +5583,20 @@ static void emit_tex(struct gctx *c, nir_tex_instr *t)
       emit_tex_ms_own_sample(c, t, b, narrow);
       return;
    }
-   if (slot >= 0) {
+   const bool lod_reg = t->backend_flags & G5P_TEX_LOD_REG;
+   if (lod_reg) {
+      /* Apple's explicit level (g5p_tex.lod_reg): the coordinate and the f32 level in a run of three */
+      nir_def *cd = nir_get_tex_src(t, nir_tex_src_coord);
+      struct ref x = resolve_value(c, cd, 0), y = resolve_value(c, cd, 1);
+      unsigned xr = reg_of(c, x, "texture coordinate"), yr = reg_of(c, y, "texture coordinate");
+      coord = alloc_run(c, 3, "texture coordinate and level");
+      put(c, raw, g5p_usc_move(raw, 2 * coord, 2 * xr, 0, vgrp(c, x), 1), "coordinate x");
+      put(c, raw, g5p_usc_move(raw, 2 * coord + 2, 2 * yr, 0, vgrp(c, y), 1), "coordinate y");
+      const float level = (float)((t->backend_flags >> G5P_TEX_FETCH_LEVEL_SHIFT) & 0xf);
+      put(c, raw, g5p_usc_immediate(raw, 2 * coord + 4, fui(level), 0, -1), "level (f32)");
+      c->scratch |= BITFIELD64_RANGE(coord, 3);
+      c->p->evidence |= PCO_G5P_EV_TEX_COMPUTED;
+   } else if (slot >= 0) {
       tex_flush(c);
       coord = narrow ? 0 : alloc_run(c, 2, "texture coordinate");
       put(c, raw, g5p_usc_coord_iterator(raw, 2 * coord, slot, 2), "coordinate iterator");
@@ -5497,7 +5628,8 @@ static void emit_tex(struct gctx *c, nir_tex_instr *t)
    }
    struct g5p_tex s = {.image_qword = c->a8_slots ? b->image : b->image / 2, .a8_slots = c->a8_slots, .sampler_qword = g5p_usc_g4p ? b->sampler : b->sampler / 2, .coord_dword = coord,
                        .coord_control = true, .dim = G5P_TEX_2D, .narrow = narrow,
-                       .read_flag = (t->backend_flags & G5P_TEX_FETCH) && g5p_usc_g4p_texfetch == 2};
+                       .read_flag = (t->backend_flags & G5P_TEX_FETCH) && (g5p_usc_g4p_texfetch == 2 || lod_reg),
+                       .lod_reg = lod_reg};
    unsigned dst = 0;
    if (!narrow) {
       dst = alloc_run(c, 4, "texture result");
@@ -5518,7 +5650,7 @@ static void emit_tex(struct gctx *c, nir_tex_instr *t)
              nir_tex_instr_src_index(t, nir_tex_src_offset) >= 0 ? " offset" : "",
              nir_tex_instr_src_index(t, nir_tex_src_comparator) >= 0 ? " compare" : "", narrow ? "narrow" : "32-bit");
    put(c, raw, tex_n, "texture sample");
-   c->tex_coord_pending |= BITFIELD64_RANGE(coord, 2);
+   c->tex_coord_pending |= BITFIELD64_RANGE(coord, lod_reg ? 3 : 2);
    c->tex_pending |= BITFIELD64_RANGE(dst, 4);
    c->tex_batch++;
    c->tex_batch_image = b->image;
@@ -6734,15 +6866,18 @@ static bool a8_fetch_as_sample(nir_builder *b, nir_tex_instr *t, void *data)
       return false;
    if (li >= 0 && !nir_src_is_const(t->src[li].src))
       return false;
-   /* a constant level above 0 only with PVR_A8_TEXFETCH_LEVEL */
+   /* Apple's read form (G5P_TEX_LOD_REG): PVR_A8_TEXFETCH_LEVEL=apple, and every vertex-stage fetch (this pass runs
+    * on vertex programs only with PVR_A8_VTEX_APPLE) */
+   const bool apple = b->shader->info.stage == MESA_SHADER_VERTEX || g5p_usc_g4p_texfetch_level == 3;
+   /* a constant level above 0 only with PVR_A8_TEXFETCH_LEVEL or in Apple's form */
    const unsigned level = li >= 0 ? nir_src_as_uint(t->src[li].src) : 0;
-   if (level > 14 || (level && !g5p_usc_g4p_texfetch_level))
+   if (level > 14 || (level && !g5p_usc_g4p_texfetch_level && !apple))
       return false;
    b->cursor = nir_before_instr(&t->instr);
    nir_def *coord = nir_i2f32(b, t->src[ci].src.ssa);
-   if (g5p_usc_g4p_texfetch != 2)
+   if (g5p_usc_g4p_texfetch != 2 && !apple)
       coord = nir_fadd_imm(b, coord, 0.5);
-   if (level && g5p_usc_g4p_texfetch_level == 2)
+   if (level && g5p_usc_g4p_texfetch_level == 2 && !apple)
       coord = nir_fmul_imm(b, coord, (double)(1u << level));
    nir_deref_instr *deref = nir_src_as_deref(t->src[ti].src);
    /* a texture without a sampler (a texel buffer's textureBuffer): the sample names the texture alone, its sampler
@@ -6755,7 +6890,8 @@ static bool a8_fetch_as_sample(nir_builder *b, nir_tex_instr *t, void *data)
    s->coord_components = 2;
    s->texture_index = t->texture_index;
    s->sampler_index = t->texture_index;
-   s->backend_flags = (t->backend_flags & ~PVR_G5P_TBO_NIR_FOLDED) | G5P_TEX_FETCH | level << G5P_TEX_FETCH_LEVEL_SHIFT;
+   s->backend_flags = (t->backend_flags & ~PVR_G5P_TBO_NIR_FOLDED) | G5P_TEX_FETCH | level << G5P_TEX_FETCH_LEVEL_SHIFT |
+                      (apple ? G5P_TEX_LOD_REG : 0);
    s->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord, coord);
    s->src[1] = nir_tex_src_for_ssa(nir_tex_src_texture_deref, &deref->def);
    if (sampler)
@@ -6891,7 +7027,8 @@ static bool lower(nir_shader *nir, bool preserve_cf)
    NIR_PASS(_, nir, nir_shader_tex_pass, layer0_as_2d, nir_metadata_control_flow, NULL);
    pvr_g5p_tbo_lower(nir);
    /* after the texel-buffer fold, which it also draws as a sample */
-   if (g5p_usc_g4p && g5p_usc_g4p_texfetch && nir->info.stage == MESA_SHADER_FRAGMENT)
+   if (g5p_usc_g4p && ((g5p_usc_g4p_texfetch && nir->info.stage == MESA_SHADER_FRAGMENT) ||
+                       (g5p_usc_g4p_vtex_apple && nir->info.stage == MESA_SHADER_VERTEX)))
       NIR_PASS(_, nir, nir_shader_tex_pass, a8_fetch_as_sample, nir_metadata_control_flow, NULL);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const, nir_address_format_32bit_offset);
    NIR_PASS(_, nir, nir_lower_flrp, 32, false);

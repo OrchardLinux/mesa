@@ -39,4 +39,33 @@ pvr_g5p_a8_fetch_sampler(uint32_t out[4], const uint32_t *app, unsigned level)
    memcpy(out + 2, &w1, sizeof(w1));
 }
 
+/* Apple's read() sampler (PCO_G5P_UPLOAD_SAMPLER_READ): AGXCompilerCore gives a read a constant sampler,
+ * 0x807bff0000002049 for 2D (clamp to edge on all three axes, nearest min/mag/mip, normalized, LOD 0..65504), which
+ * AGXMetalA8 decodes and encodes (g4p_encode_sampler_words, 0x1a13fb4a0) into the program's constant data. As Rogue
+ * words: point, mip nearest, CLAMP_TO_EDGE, normalized, minlod 0, maxlod MAX (959), no LOD bias, word 1 zero
+ * (0x02002401df800fff, word 1 0). The texel addressing comes from the sample's read bit (byte 6 bit 2), the level from
+ * its register. */
+static inline void
+pvr_g5p_a8_read_sampler(uint32_t out[4])
+{
+   uint64_t w0 = 0;
+   struct ROGUE_TEXSTATE_SAMPLER_WORD0 s;
+
+   memset(&s, 0, sizeof(s));
+   s.minfilter = ROGUE_TEXSTATE_FILTER_POINT;
+   s.magfilter = ROGUE_TEXSTATE_FILTER_POINT;
+   s.mipfilter = false;
+   s.anisoctl = ROGUE_TEXSTATE_ANISOCTL_DISABLED;
+   s.addrmode_u = ROGUE_TEXSTATE_ADDRMODE_CLAMP_TO_EDGE;
+   s.addrmode_v = ROGUE_TEXSTATE_ADDRMODE_CLAMP_TO_EDGE;
+   s.addrmode_w = ROGUE_TEXSTATE_ADDRMODE_CLAMP_TO_EDGE;
+   s.non_normalized_coords = false;
+   s.minlod = ROGUE_TEXSTATE_CLAMP_MIN;
+   s.maxlod = ROGUE_TEXSTATE_CLAMP_MAX;
+   s.dadjust = ROGUE_TEXSTATE_DADJUST_ZERO_UINT;
+   ROGUE_TEXSTATE_SAMPLER_WORD0_pack(&w0, &s);
+   memcpy(out, &w0, sizeof(w0));
+   out[2] = out[3] = 0;
+}
+
 #endif

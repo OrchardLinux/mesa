@@ -184,6 +184,11 @@ enum pco_g5p_upload_kind {
 #define PCO_G5P_UPLOAD_SAMPLER_FETCH 0x4000u
 /* with it, the level the fetch reads in offset bits 8-11 (the sampler's LOD range clamped to it) */
 #define PCO_G5P_UPLOAD_SAMPLER_FETCH_LEVEL_SHIFT 8
+/* with it (PVR_A8_TEXFETCH_LEVEL=apple, PVR_A8_VTEX_APPLE): not the binding's sampler but Apple's constant read()
+ * sampler (AGXCompilerCore's constant sampler 0x807bff0000002049, encoded by AGXMetalA8 into the program's constant
+ * data: clamp to edge, point, nearest mip, normalized, LOD 0..max; vulkan/pvr_g5p_a8_fetch.h); the sample takes its
+ * level in a register */
+#define PCO_G5P_UPLOAD_SAMPLER_READ 0x8000u
 #define PCO_G5P_UPLOAD_IMAGE_AS_2D 1u
 #define PCO_G5P_UPLOAD_IMAGE_ARRAY 2u
 /* ONE_LAYER: an array sample at any layer of a one-layer view, drawn as a 2D
