@@ -2376,18 +2376,20 @@ static void plan_common(struct gctx *c)
    }
    unsigned image_base = align(next, 8), sampler_base = image_base + 8 * c->ntex;
    unsigned sampler_cursor = sampler_base;
-   /* The A8's programs sampling two or more images (g5p_usc.h g5p_tex.a8_slots), in Apple's layout (iOS 12.4,
-    * AGXMetalA8's programs sampling two to seven textures, a8-passcap): the images in four-dword slots from
-    * common dword 0, then the samplers, one slot each; the sample names its sampler's slot in byte 1 bits 7:6 and
+   /* The A8's programs sampling two or more images, or one after other common data (g5p_usc.h g5p_tex.a8_slots),
+    * in Apple's layout (iOS 12.4, AGXMetalA8's programs sampling two to seven textures, a8-passcap): the images in
+    * four-dword slots from the base (the next four-dword boundary after the blend colour or storage pointers), then
+    * the samplers, one slot each; the sample names its sampler's slot in byte 1 bits 7:6 and
     * byte 5 bits 2:1 (g5p_usc.c sample_g4p). With one shared sampler Apple puts it at slot N after N images,
     * with a sampler per texture texture j's at slot N + j; the seven-texture program's PDS DMAs 28 dwords of
     * images to common 0 and its sampler to 28. A sampler per texture while the last one's slot is at most 11
     * (slots up to 9 are witnessed; 10 and 11 combine byte-5 05 with byte-1 values witnessed at other slots), else
     * Apple's one shared sampler, texture 0's (seven images; byte 5 07 for slots 12-15 is not captured). On the
-    * iPod every multi-texture test passed this way, 2-5 images with one sampler or a sampler each (own-filter
-    * checkers). Other shapes keep the per-texture eight-dword layout. */
-   const unsigned slot_base = 0, base_slot = 0;
-   const bool a8_multi = g5p_usc_g4p && !c->vs && !qualified && !next && c->ntex >= 2;
+    * iPod every multi-texture test passed this way: 2-5 images, a sampler each (own-filter checkers) and four
+    * images after the blend colour (images at 4..16). Shapes past slot 11 keep the per-texture eight-dword layout
+    * and the A9 form. */
+   const unsigned slot_base = next ? align(next, 4) : 0, base_slot = slot_base / 4;
+   const bool a8_multi = g5p_usc_g4p && !c->vs && !qualified && c->ntex && (next || c->ntex >= 2);
    const bool a8_each = base_slot + 2 * c->ntex - 1 <= 11, a8_shared = base_slot + c->ntex <= 11;
    c->a8_slots = a8_multi && (a8_each || a8_shared);
    c->fetch_sampler_common = sampler_base + sdw * sampler_count;
