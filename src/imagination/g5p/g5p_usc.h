@@ -31,6 +31,12 @@ extern _Thread_local const char *g5p_usc_error;
  * A8 compiler emits the A9's way (the vertex programs byte for byte).
  */
 extern bool g5p_usc_g4p;
+/*
+ * On the A8, the A9's instruction where the A8 form captured from Apple cannot express the operands (today: a
+ * texture sample whose image is not at common qword 0, or whose sampler is beyond common dword 7). Set by the
+ * driver for an A8 (PVR_A8_A9_FORMS, default on). These are A9 instructions no A8 capture has witnessed.
+ */
+extern bool g5p_usc_g4p_a9_forms;
 
 enum g5p_binop {
    G5P_BIN_FADD, G5P_BIN_FMUL, G5P_BIN_IADD, G5P_BIN_IMUL,

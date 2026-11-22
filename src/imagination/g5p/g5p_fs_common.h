@@ -40,7 +40,9 @@ g5p_stage_common_plan(unsigned start, unsigned textures, unsigned samplers, unsi
          p->pointer_end = next;
       }
       if (textures && p->compact) {
-         next = g5p_common_align(next, 8) + image_dwords * textures + sampler_dwords * samplers;
+         /* compact images sit eight dwords apart (pco_g5p_general.c plan_common: the A9's eight-dword state,
+          * the A8's four-dword state padded) */
+         next = g5p_common_align(next, 8) + g5p_common_align(image_dwords, 8) * textures + sampler_dwords * samplers;
       } else {
          for (unsigned i = 0; i < textures; i++)
             next = g5p_common_align(next, 8) + image_dwords + sampler_dwords;

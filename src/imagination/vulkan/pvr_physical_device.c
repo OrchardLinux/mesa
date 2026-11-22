@@ -20,6 +20,7 @@
 #include "util/disk_cache.h"
 #include "util/ralloc.h"
 #include "util/os_misc.h"
+#include "util/u_debug.h"
 
 #include "vk_util.h"
 #include "vk_log.h"
@@ -1392,8 +1393,11 @@ VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
    }
 
    /* The A8's USC forms (g5p_usc.h); one process drives one Apple GPU */
-   if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g4p))
+   if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g4p)) {
       g5p_usc_g4p = true;
+      /* the A9's instructions where the A8's captured forms cannot express the operands (g5p_usc.h) */
+      g5p_usc_g4p_a9_forms = debug_get_bool_option("PVR_A8_A9_FORMS", true);
+   }
 
    pdevice->skip_refused_work = PVR_HAS_FEATURE(&pdevice->dev_info, apple_g5p) &&
                                  instance->drirc.misc.pvr_skip_refused_work;

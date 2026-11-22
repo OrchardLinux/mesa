@@ -10,6 +10,7 @@
 
 _Thread_local const char *g5p_usc_error;
 bool g5p_usc_g4p;
+bool g5p_usc_g4p_a9_forms;
 
 const char *const g5p_binop_name[G5P_BIN_COUNT] = {"fadd", "fmul", "iadd", "imul", "and", "or", "xor", "ishr",
                                                        "isub"};
@@ -1135,7 +1136,23 @@ static unsigned sample_g4p(uint8_t *out, const struct g5p_tex *t)
     * coordinate dword, no cube-coordinate instruction (AGXMetalA8's f_tex_cube, passcap USC 0x6076: two FMAs and a
     * move build r0..r2, then 1a 59 00 41 00 01 c8 01 00 01 00 80). Only the narrow form is captured. */
    CHECK(t->dim != G5P_TEX_CUBE || t->narrow, "A8 cube sample captured only in the narrow form (result straight to the output)");
-   CHECK(t->image_qword == 0, "A8 sample captured only with the image descriptor at common qword 0");
+   /* Another image or sampler slot: the A8 form's image field has one witnessed value (bytes 3-4 41 00 at qword 0)
+    * and its sampler field three bits of dwords. With PVR_A8_A9_FORMS the sample is the A9's own six-byte
+    * instruction (g5p_usc_sample()'s A9 branch: image and sampler qwords in bytes 3 and 4, the coordinate from
+    * registers), over the A8's state words at the same common-store positions. */
+   if (t->image_qword != 0 || t->sampler_qword > 7 || (t->sampler_qword & 1)) {
+      CHECK(g5p_usc_g4p_a9_forms, "A8 sample captured only with the image descriptor at common qword 0");
+      CHECK(t->dim == G5P_TEX_2D, "A8 sample in another image slot: the A9 form is taken for 2D only");
+      CHECK(!(t->sampler_qword & 1), "A8 sample in another image slot: the sampler must start a qword");
+      struct g5p_tex a9 = *t;
+      a9.sampler_qword = t->sampler_qword / 2; /* the A8 callers pass the sampler's dword */
+      uint8_t raw[G5P_USC_MAX];
+      if (!texture_base(raw, &a9))
+         return 0;
+      if (t->narrow)
+         raw[0] &= ~2;
+      return finish(out, raw, 6);
+   }
    /* the A8 names the sampler by its common DWORD (Apple's 0x88 reads the sampler at dword 4 in tex_plain and in
     * the load background): the caller passes the dword in sampler_qword */
    /* byte 6 is 0x80 | mode << 4 | sampler dword << 1: Apple's tex_lod, tex_bias, tex_grad and tex_cube samples

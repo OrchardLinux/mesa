@@ -2308,7 +2308,7 @@ static void plan_common(struct gctx *c)
     * TEXSTATE_SAMPLER_WORD0/1, four dwords each, the sampler right after the image (AGXMetalA8's tex_plain and load:
     * texture state then sampler in one 8-dword block, the sample's sampler field naming dword 4) */
    const unsigned sdw = g5p_usc_g4p ? 4 : 2, idw = g5p_usc_g4p ? 4 : 8;
-   if (g5p_usc_g4p && compact && c->ntex)
+   if (g5p_usc_g4p && !g5p_usc_g4p_a9_forms && compact && c->ntex)
       refuse(c, "the A8 samples one image slot (common dword 0); more than four textures or vertex textures are "
                 "not captured");
    unsigned sampler_count = 0;
