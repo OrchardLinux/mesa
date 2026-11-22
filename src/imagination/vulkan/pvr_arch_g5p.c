@@ -1267,6 +1267,26 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
                                           ROGUE_CR_PDS_BGRND3_SIZEINFO_USC_SHAREDSIZE_UNIT_SIZE);
       }
    }
+   /* Apple's record +0x640 (D6ad) processes empty tiles only for a resolve:
+    * the captured clear/LOAD/MRT/4x-store passes have 0, resolves have 1.
+    * Skip them when no attachment is CLEARed: an untouched tile is neither
+    * loaded nor stored and keeps its memory, which is the LOAD result
+    * (don't-care: undefined). A CLEAR must still reach empty tiles.
+    */
+   bool keep = g->msaa_resolve || getenv("G5P_ALL_TILES");
+   for (unsigned i = 0; i < hw_render->color_init_count; i++)
+      keep |= hw_render->color_init[i].op == VK_ATTACHMENT_LOAD_OP_CLEAR;
+   for (unsigned i = 0; i < hw_render->eot_surface_count; i++)
+      keep |= hw_render->eot_surfaces[i].need_resolve;
+   if (hw_render->ds_attach_idx != VK_ATTACHMENT_UNUSED) {
+      keep |= hw_render->depth_init == VK_ATTACHMENT_LOAD_OP_CLEAR ||
+              hw_render->stencil_init == VK_ATTACHMENT_LOAD_OP_CLEAR ||
+              hw_render->ds_attach_resolve_idx != VK_ATTACHMENT_UNUSED ||
+              hw_render->depth_resolve_mode != VK_RESOLVE_MODE_NONE ||
+              hw_render->stencil_resolve_mode != VK_RESOLVE_MODE_NONE;
+   }
+   g->skip_empty_tiles = !keep;
+
    memcpy(g->background, bgnd, sizeof(g->background));
    g->eot[0] = eot_data.data_offset;
    g->eot[1] = p->eot.code_offset;
@@ -1433,8 +1453,11 @@ PVR_PER_ARCH(g5p_frag_stream)(const struct pvr_device *device, const struct pvr_
    g5p_put32(&s, 0);    /* USC pixel output control */
    g5p_put32(&s, zls.bgobj_depth); /* ISP_BGOBJDEPTH */
    g5p_put32(&s, zls.bgobj_vals);  /* ISP_BGOBJVALS */
-   g5p_put32(&s, 0); /* ISP_AA, ISP_CTL: the kernel's, from the dataset's samples */
-   g5p_put32(&s, 0);
+   g5p_put32(&s, 0); /* ISP_AA: the kernel's, from the dataset's samples */
+   /* ISP_CTL: kernel K1 reads only bit 17, keeping its other bits and MSAA form.
+    * Older kernels ignore this field and continue processing every tile.
+    */
+   g5p_put32(&s, 0x0021000f | (g->skip_empty_tiles ? 0 : 1u << 17));
    g5p_put32(&s, 0); /* EVENT_PIXEL_PDS_INFO: in the extension's end-of-tile words */
    g5p_put32(&s, 0);
    g5p_put32(&s, 0);
