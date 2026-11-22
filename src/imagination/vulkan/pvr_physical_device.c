@@ -1416,8 +1416,13 @@ VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
       g5p_usc_g4p_vtex = debug_get_bool_option("PVR_A8_VTEX", false);
    }
 
+   /* The A8 skips refused work by default: a refused program or pass loses its draws (named on stderr) instead of
+    * failing the command buffer, which Zink turns into a lost context for the whole application. PVR_A8_STRICT=1
+    * restores the failure. */
    pdevice->skip_refused_work = PVR_HAS_FEATURE(&pdevice->dev_info, apple_g5p) &&
-                                 instance->drirc.misc.pvr_skip_refused_work;
+                                 (instance->drirc.misc.pvr_skip_refused_work ||
+                                  (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g4p) &&
+                                   !debug_get_bool_option("PVR_A8_STRICT", false)));
 
    pdevice->sync_type = ws->syncobj_type;
    if (ws->job_sync_size) {

@@ -27,21 +27,45 @@ static inline VkResult pvr_refusal_to_api(VkResult result)
    return result == VK_ERROR_FEATURE_NOT_PRESENT ? VK_ERROR_OUT_OF_HOST_MEMORY : result;
 }
 
+#include <stdio.h>
 #include "util/log.h"
 #include "util/u_atomic.h"
 #include "vk_log.h"
 
+/* Whether a refusal's text is new at its call site: a small table of text hashes (racing threads can at worst
+ * print one twice); a full table leaves only the count rule below. */
+static inline bool pvr_g5p_refusal_new(uint32_t *seen, unsigned n, const char *text)
+{
+   uint32_t h = 2166136261u;
+   for (const char *p = text; *p; p++)
+      h = (h ^ (uint8_t)*p) * 16777619u;
+   h |= !h;
+   for (unsigned i = 0; i < n; i++) {
+      const uint32_t v = p_atomic_read(&seen[i]);
+      if (v == h)
+         return false;
+      if (!v && p_atomic_cmpxchg(&seen[i], 0, h) == 0)
+         return true;
+   }
+   return false;
+}
+
 /* Refusal kinds are keyed by their call site (pipeline validation or pass/draw
- * validation). Count atomically across recording threads; warn on occurrences
- * 1, 2, 4, ... so tolerant workloads cannot emit one warning per draw. Keep
- * vk_errorf for debug callbacks and preserve the internal refusal result. */
+ * validation). Every distinct reason is printed once; a repeated one on
+ * occurrences 1, 2, 4, ... of its call site, so tolerant workloads cannot emit
+ * one warning per draw (a pipeline refused again for the same program is such
+ * a repeat). Keep vk_errorf for debug callbacks and preserve the internal
+ * refusal result. */
 #define G5P_REFUSE(obj, ...)                                                  \
    ({                                                                        \
-      static uint32_t refusal_count;                                         \
+      static uint32_t refusal_count, refusal_seen[32];                       \
+      char refusal_text[768];                                                \
+      snprintf(refusal_text, sizeof(refusal_text), __VA_ARGS__);             \
       uint32_t occurrence = p_atomic_inc_return(&refusal_count);              \
-      if (occurrence && !(occurrence & (occurrence - 1)))                     \
-         mesa_logw("G5P refuses: " __VA_ARGS__);                              \
-      vk_errorf((obj), VK_ERROR_FEATURE_NOT_PRESENT, "G5P: " __VA_ARGS__);     \
+      if (pvr_g5p_refusal_new(refusal_seen, 32, refusal_text) ||             \
+          (occurrence && !(occurrence & (occurrence - 1))))                   \
+         mesa_logw("G5P refuses: %s", refusal_text);                          \
+      vk_errorf((obj), VK_ERROR_FEATURE_NOT_PRESENT, "G5P: %s", refusal_text); \
    })
 
 #include "pvr_common.h"

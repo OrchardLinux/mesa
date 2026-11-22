@@ -5046,6 +5046,23 @@ static void emit_tex_ext(struct gctx *c, nir_tex_instr *t)
       emit_fragment_cube_gradient(c, t);
       return;
    }
+   /* the A8 draws fragment textures only as its own sample (sample_g4p()): name what this one is */
+   if (g5p_usc_g4p && !c->vs) {
+      const int li = nir_tex_instr_src_index(t, nir_tex_src_lod);
+      refuse(c, "A8 fragment %s not in a captured form: op %d, dim %d%s%s%s, %s result%s%s%s%s%s%s",
+             t->op == nir_texop_txf ? "texel read" : "texture sample", (int)t->op, (int)t->sampler_dim,
+             t->is_array ? " array" : "", t->is_shadow ? " shadow" : "",
+             (t->backend_flags & PVR_G5P_TBO_NIR_FOLDED) ? " (texel buffer)" : "",
+             nir_alu_type_get_base_type(t->dest_type) == nir_type_float ? "float" :
+             nir_alu_type_get_base_type(t->dest_type) == nir_type_int ? "int" : "uint",
+             li < 0 ? "" : nir_src_is_const(t->src[li].src) ? ", constant level" : ", variable level",
+             nir_tex_instr_src_index(t, nir_tex_src_offset) >= 0 ? ", offset" : "",
+             nir_tex_instr_src_index(t, nir_tex_src_bias) >= 0 ? ", bias" : "",
+             nir_tex_instr_src_index(t, nir_tex_src_ddx) >= 0 ? ", gradient" : "",
+             nir_tex_instr_src_index(t, nir_tex_src_ms_index) >= 0 ? ", sample index" : "",
+             t->def.num_components != 4 ? ", not four components" : "");
+      return;
+   }
    bool saved_bank = c->tex_bank0;
    c->tex_bank0 = c->vs;
    uint8_t raw[G5P_USC_MAX];
