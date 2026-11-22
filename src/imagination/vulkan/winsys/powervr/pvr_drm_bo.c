@@ -538,7 +538,7 @@ VkResult pvr_drm_winsys_vma_map(struct pvr_winsys_vma *vma,
       return vk_error(NULL, VK_ERROR_MEMORY_MAP_FAILED);
    }
 
-   if (drmIoctl(drm_ws->base.render_fd, DRM_IOCTL_PVR_VM_MAP, &args)) {
+   if (pvr_drm_ioctl_retry(drm_ws, DRM_IOCTL_PVR_VM_MAP, &args)) {
       const int err = errno;
       const char *message = strerror(err);
       return vk_errorf(NULL,

@@ -63,11 +63,51 @@ void pvr_drm_report_loss(struct pvr_drm_winsys *ws, const char *job_type,
    }
 }
 
+/* A capable kernel restores a VM before accepting a submit or bind. Reclaim may need time
+ * to catch up, but retrying any other error could repeat accepted work.
+ */
+int pvr_drm_ioctl_retry(struct pvr_drm_winsys *ws, unsigned long request,
+                        void *args)
+{
+   int ret = drmIoctl(ws->base.render_fd, request, args);
+   if (!ret || errno != ENOMEM || !(ws->caps & PVR_DRM_CAP_RETRY_ENOMEM))
+      return ret;
+
+   const int64_t start = os_time_get_nano();
+   const int64_t deadline = start + 2000000000LL;
+   unsigned delay_us = 500;
+   int err = ENOMEM;
+   int64_t now;
+
+   while ((now = os_time_get_nano()) < deadline) {
+      os_time_sleep(MIN2(delay_us, (deadline - now + 999) / 1000));
+      ret = drmIoctl(ws->base.render_fd, request, args);
+      err = ret ? errno : 0;
+      if (err != ENOMEM)
+         break;
+      delay_us = MIN2(delay_us * 2, 50000);
+   }
+
+   now = os_time_get_nano();
+   if (now - start >= 100000000 || err == ENOMEM) {
+      const int64_t last = p_atomic_read(&ws->retry_log_time);
+      if (now - last >= 1000000000LL &&
+          p_atomic_cmpxchg(&ws->retry_log_time, last, now) == last) {
+         mesa_logw("pvr: %s residency retry took %.1f ms (errno %d)",
+                   request == DRM_IOCTL_PVR_SUBMIT_JOBS ? "SUBMIT_JOBS" : "VM_MAP",
+                   (now - start) / 1000000.0, err);
+      }
+   }
+
+   errno = err;
+   return ret;
+}
+
 VkResult pvr_drm_submit_jobs(struct pvr_drm_winsys *ws,
                              struct drm_pvr_ioctl_submit_jobs_args *args,
                              const char *job_type)
 {
-   if (drmIoctl(ws->base.render_fd, DRM_IOCTL_PVR_SUBMIT_JOBS, args) == 0)
+   if (pvr_drm_ioctl_retry(ws, DRM_IOCTL_PVR_SUBMIT_JOBS, args) == 0)
       return VK_SUCCESS;
    const int err = errno;
    if (err == EIO)
@@ -778,6 +818,16 @@ VkResult pvr_drm_winsys_create(const int render_fd,
    drm_ws->base.render_fd = render_fd;
    drm_ws->base.display_fd = display_fd;
    drm_ws->base.alloc = alloc;
+
+   struct drm_pvr_dev_query_caps caps = { 0 };
+   struct drm_pvr_ioctl_dev_query_args caps_query = {
+      .type = DRM_PVR_DEV_QUERY_CAPS_GET,
+      .size = sizeof(caps),
+      .pointer = (uintptr_t)&caps,
+   };
+   if (!drmIoctl(render_fd, DRM_IOCTL_PVR_DEV_QUERY, &caps_query))
+      drm_ws->caps = caps.caps;
+   /* An unknown query on an older kernel leaves capabilities disabled. */
 
    os_get_page_size(&drm_ws->base.page_size);
    drm_ws->base.log2_page_size = util_logbase2(drm_ws->base.page_size);

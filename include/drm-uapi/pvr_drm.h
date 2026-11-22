@@ -440,6 +440,13 @@ struct drm_pvr_dev_query_static_data_areas {
  *
  * Append only. Do not reorder.
  */
+/* Proposed capability query UAPI: replace with the merged kernel header. */
+#define DRM_PVR_CAP_RETRY_ENOMEM (1ULL << 0)
+#define DRM_PVR_CAP_BO_MADVISE (1ULL << 1)
+struct drm_pvr_dev_query_caps {
+   __u64 caps;
+};
+
 enum drm_pvr_dev_query {
 	/**
 	 * @DRM_PVR_DEV_QUERY_GPU_INFO_GET: The dev query args contain a pointer
@@ -476,6 +483,7 @@ enum drm_pvr_dev_query {
 	 * a pointer to &struct drm_pvr_dev_query_static_data_areas.
 	 */
 	DRM_PVR_DEV_QUERY_STATIC_DATA_AREAS_GET,
+	DRM_PVR_DEV_QUERY_CAPS_GET,
 };
 
 /**
