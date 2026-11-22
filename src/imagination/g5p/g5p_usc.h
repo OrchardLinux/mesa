@@ -37,6 +37,15 @@ extern bool g5p_usc_g4p;
  * driver for an A8 (PVR_A8_A9_FORMS, default on). These are A9 instructions no A8 capture has witnessed.
  */
 extern bool g5p_usc_g4p_a9_forms;
+/*
+ * texelFetch on the A8: a fragment 2D fetch is drawn as the A8's sample with a point, non-normalized, clamped copy of
+ * the texture's sampler, as Apple's read (an iOS capture of a Metal read()): the integer coordinate as a float,
+ * byte 6 bit 2 set (g5p_usc_g4p_texfetch = 2; 1, the texel's centre without the bit, reads the same on the iPod
+ * touch 6). A constant level above 0 (the sampler's LOD range clamped to it) only with PVR_A8_TEXFETCH_LEVEL:
+ *   1 ("level"): the coordinate in the level's texels; 2 ("scale"): in level 0's texels (times 2^level).
+ */
+extern int g5p_usc_g4p_texfetch;
+extern int g5p_usc_g4p_texfetch_level;
 
 enum g5p_binop {
    G5P_BIN_FADD, G5P_BIN_FMUL, G5P_BIN_IADD, G5P_BIN_IMUL,
@@ -178,6 +187,8 @@ struct g5p_tex {
     * sampler's four-dword slot in byte 1 bits 7:6 and byte 5 bits 2:1. image_qword and sampler_qword then hold
     * dwords. */
    bool a8_slots;
+   /* g5p_usc_g4p_texfetch = 2: Apple's read flag, byte 6 bit 2 */
+   bool read_flag;
 };
 unsigned g5p_usc_sample(uint8_t *out, const struct g5p_tex *t);
 /* The 2D-multisample fetch's sample operand "the task's own sample" (a sample-rate program reads the

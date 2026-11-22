@@ -100,6 +100,8 @@ struct tex_bind {
    unsigned element, selement; /* array elements of the texture / sampler binding */
    unsigned image, sampler; /* common dwords */
    bool needs_sampler, needs_fetch_sampler;
+   bool fetch; /* A8: a texelFetch drawn as a sample (G5P_TEX_FETCH): its own sampler slot, the fetch sampler */
+   unsigned fetch_level; /* the level that fetch reads */
    unsigned image_flags; /* PCO_G5P_UPLOAD_IMAGE_AS_2D / _ARRAY: how its samples read the state */
 };
 
@@ -113,6 +115,10 @@ struct range {
 enum { BLEND_NONE, BLEND_PREMULT, BLEND_STRAIGHT_OVER, BLEND_REPLACE, BLEND_GENERAL };
 /* nir_tex_instr.backend_flags: an array sample of layer 0 drawn as 2D (layer0_as_2d()) */
 #define G5P_TEX_LAYER0_AS_2D (1u << 30)
+/* nir_tex_instr.backend_flags: an A8 texelFetch drawn as a sample (a8_fetch_as_sample()) */
+#define G5P_TEX_FETCH (1u << 27)
+/* and the level it reads, bits 23-26 */
+#define G5P_TEX_FETCH_LEVEL_SHIFT 23
 
 /* The general blend epilogue (g5p_blend.c, hyprland-gpu.md §11.2) for
  * settings without a measured epilogue. Premultiplied, straight-over and
@@ -840,8 +846,10 @@ static bool offset_only(nir_def *d)
 /* The round-18 sample: 2D float, implicit LOD, coordinates only. */
 static bool plain_tex(const nir_tex_instr *t)
 {
+   /* an A8 texelFetch drawn as a sample reads integer textures too: the 32-bit result is the texel's bits */
+   const bool fetch = t->backend_flags & G5P_TEX_FETCH;
    if (t->op != nir_texop_tex || t->sampler_dim != GLSL_SAMPLER_DIM_2D || t->is_array || t->is_shadow ||
-       t->def.num_components != 4 || nir_alu_type_get_base_type(t->dest_type) != nir_type_float)
+       t->def.num_components != 4 || (nir_alu_type_get_base_type(t->dest_type) != nir_type_float && !fetch))
       return false;
    for (unsigned i = 0; i < t->num_srcs; i++)
       if (t->src[i].src_type != nir_tex_src_coord && t->src[i].src_type != nir_tex_src_texture_deref &&
@@ -2113,6 +2121,8 @@ static void tex_bindings(struct gctx *c, nir_tex_instr *t, struct tex_bind *b)
                           sv->data.binding, element, selement};
    b->needs_sampler = t->op != nir_texop_txf;
    b->needs_fetch_sampler = t->op == nir_texop_txf;
+   b->fetch = t->backend_flags & G5P_TEX_FETCH;
+   b->fetch_level = b->fetch ? (t->backend_flags >> G5P_TEX_FETCH_LEVEL_SHIFT) & 0xf : 0;
    b->image_flags = (t->backend_flags & PCO_G5P_TEX_ONE_LAYER_AS_2D) ? PCO_G5P_UPLOAD_IMAGE_ONE_LAYER :
                     (t->backend_flags & G5P_TEX_LAYER0_AS_2D) ? PCO_G5P_UPLOAD_IMAGE_AS_2D :
                     t->is_array ? PCO_G5P_UPLOAD_IMAGE_ARRAY : 0;
@@ -2125,7 +2135,7 @@ static struct tex_bind *tex_for(struct gctx *c, nir_tex_instr *t)
    for (unsigned i = 0; i < c->ntex; i++)
       if (c->tex[i].set == b.set && c->tex[i].binding == b.binding && c->tex[i].sset == b.sset &&
           c->tex[i].sbinding == b.sbinding && c->tex[i].element == b.element && c->tex[i].selement == b.selement &&
-          c->tex[i].image_flags == b.image_flags)
+          c->tex[i].image_flags == b.image_flags && c->tex[i].fetch == b.fetch && c->tex[i].fetch_level == b.fetch_level)
          { c->tex[i].needs_sampler |= b.needs_sampler;
            c->tex[i].needs_fetch_sampler |= b.needs_fetch_sampler;
            return &c->tex[i]; }
@@ -2399,7 +2409,10 @@ static void plan_common(struct gctx *c)
       t->sampler = slot_base + 4 * c->ntex + (a8_each ? 4 * i : 0);
       add_upload(c, PCO_G5P_UPLOAD_IMAGE, t->set, t->binding, t->element, t->image_flags, idw, t->image);
       if (!i || a8_each)
-         add_upload(c, PCO_G5P_UPLOAD_SAMPLER, t->sset, t->sbinding, t->selement, 32, sdw, t->sampler);
+         add_upload(c, PCO_G5P_UPLOAD_SAMPLER, t->sset, t->sbinding, t->selement,
+                    32 | (t->fetch ? PCO_G5P_UPLOAD_SAMPLER_FETCH |
+                                       t->fetch_level << PCO_G5P_UPLOAD_SAMPLER_FETCH_LEVEL_SHIFT : 0),
+                    sdw, t->sampler);
    }
    if (c->a8_slots) /* the common plan's span of the textures: eight dwords each, the compact plan's samplers after */
       next = align(next, 8) + 8 * c->ntex + (compact ? sdw * sampler_count : 0);
@@ -2413,7 +2426,10 @@ static void plan_common(struct gctx *c)
          refuse(c, "texture descriptors beyond the bounded qualified selectors");
       add_upload(c, PCO_G5P_UPLOAD_IMAGE, t->set, t->binding, t->element, t->image_flags, idw, t->image);
       if (!qualified || t->needs_sampler)
-         add_upload(c, PCO_G5P_UPLOAD_SAMPLER, t->sset, t->sbinding, t->selement, 32, sdw, t->sampler);
+         add_upload(c, PCO_G5P_UPLOAD_SAMPLER, t->sset, t->sbinding, t->selement,
+                    32 | (t->fetch ? PCO_G5P_UPLOAD_SAMPLER_FETCH |
+                                       t->fetch_level << PCO_G5P_UPLOAD_SAMPLER_FETCH_LEVEL_SHIFT : 0),
+                    sdw, t->sampler);
    }
    if (qualified && fetch_sampler)
       add_upload(c, PCO_G5P_UPLOAD_FETCH_SAMPLER, 0, 0, 0, 0, 2, c->fetch_sampler_common);
@@ -5460,7 +5476,8 @@ static void emit_tex(struct gctx *c, nir_tex_instr *t)
       c->p->evidence |= PCO_G5P_EV_TEX_COMPUTED;
    }
    struct g5p_tex s = {.image_qword = c->a8_slots ? b->image : b->image / 2, .a8_slots = c->a8_slots, .sampler_qword = g5p_usc_g4p ? b->sampler : b->sampler / 2, .coord_dword = coord,
-                       .coord_control = true, .dim = G5P_TEX_2D, .narrow = narrow};
+                       .coord_control = true, .dim = G5P_TEX_2D, .narrow = narrow,
+                       .read_flag = (t->backend_flags & G5P_TEX_FETCH) && g5p_usc_g4p_texfetch == 2};
    unsigned dst = 0;
    if (!narrow) {
       dst = alloc_run(c, 4, "texture result");
@@ -5860,7 +5877,8 @@ static void plan_fs_output(struct gctx *c)
               V(c, c->out[k].def, k)->uses == 1;
    if (plain) {
       nir_instr *p = nir_def_instr(c->out[0].def);
-      if (p->type == nir_instr_type_tex && (plain_tex(nir_instr_as_tex(p)) || a8_cube_tex(nir_instr_as_tex(p)))) {
+      if (p->type == nir_instr_type_tex && (plain_tex(nir_instr_as_tex(p)) || a8_cube_tex(nir_instr_as_tex(p))) &&
+          nir_alu_type_get_base_type(nir_instr_as_tex(p)->dest_type) == nir_type_float) {
          c->narrow_tex = nir_instr_as_tex(p);
          return;
       }
@@ -6674,6 +6692,49 @@ static bool layer0_as_2d(nir_builder *b, nir_tex_instr *t, void *data)
    return true;
 }
 
+/* The A8's texelFetch (g5p_usc.h): a fragment texelFetch of a 2D texture at a constant level drawn as the A8's
+ * sample. The coordinate becomes a float (the texel's centre in mode 1; the integer itself in mode 2, as Apple's
+ * read converts it), the op a sample through the binding with a fetch sampler in its own slot (point,
+ * non-normalized, clamped, level 0: PCO_G5P_UPLOAD_SAMPLER_FETCH), marked G5P_TEX_FETCH. */
+static bool a8_fetch_as_sample(nir_builder *b, nir_tex_instr *t, void *data)
+{
+   if (t->op != nir_texop_txf || t->sampler_dim != GLSL_SAMPLER_DIM_2D || t->is_array || t->is_shadow ||
+       t->def.num_components != 4 || t->def.bit_size != 32)
+      return false;
+   const int ci = nir_tex_instr_src_index(t, nir_tex_src_coord), li = nir_tex_instr_src_index(t, nir_tex_src_lod);
+   const int ti = nir_tex_instr_src_index(t, nir_tex_src_texture_deref);
+   if (ci < 0 || ti < 0 || t->num_srcs != 2 + (li >= 0))
+      return false;
+   if (li >= 0 && !nir_src_is_const(t->src[li].src))
+      return false;
+   /* a constant level above 0 only with PVR_A8_TEXFETCH_LEVEL */
+   const unsigned level = li >= 0 ? nir_src_as_uint(t->src[li].src) : 0;
+   if (level > 14 || (level && !g5p_usc_g4p_texfetch_level))
+      return false;
+   b->cursor = nir_before_instr(&t->instr);
+   nir_def *coord = nir_i2f32(b, t->src[ci].src.ssa);
+   if (g5p_usc_g4p_texfetch != 2)
+      coord = nir_fadd_imm(b, coord, 0.5);
+   if (level && g5p_usc_g4p_texfetch_level == 2)
+      coord = nir_fmul_imm(b, coord, (double)(1u << level));
+   nir_deref_instr *deref = nir_src_as_deref(t->src[ti].src);
+   nir_tex_instr *s = nir_tex_instr_create(b->shader, 3);
+   s->op = nir_texop_tex;
+   s->sampler_dim = GLSL_SAMPLER_DIM_2D;
+   s->dest_type = t->dest_type;
+   s->coord_components = 2;
+   s->texture_index = t->texture_index;
+   s->sampler_index = t->texture_index;
+   s->backend_flags = t->backend_flags | G5P_TEX_FETCH | level << G5P_TEX_FETCH_LEVEL_SHIFT;
+   s->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord, coord);
+   s->src[1] = nir_tex_src_for_ssa(nir_tex_src_texture_deref, &deref->def);
+   s->src[2] = nir_tex_src_for_ssa(nir_tex_src_sampler_deref, &deref->def);
+   nir_def_init(&s->instr, &s->def, 4, 32);
+   nir_builder_instr_insert(b, &s->instr);
+   nir_def_replace(&t->def, &s->def);
+   return true;
+}
+
 /* A 4-sample texture (texture_multisampled_2d, sampler2DMS) is sampled as the 2W x 2H 2D
  * texture of its samples (pvr_arch_g5p_tex.c): sample s of texel p is texel
  * 2p + (s >> 1, s & 1); its size is half that texture's; it has 4 samples. */
@@ -6797,6 +6858,8 @@ static bool lower(nir_shader *nir, bool preserve_cf)
    NIR_PASS(_, nir, nir_lower_tex, &txp);
    NIR_PASS(_, nir, nir_shader_tex_pass, ms_as_2d, nir_metadata_control_flow, NULL);
    NIR_PASS(_, nir, nir_shader_tex_pass, layer0_as_2d, nir_metadata_control_flow, NULL);
+   if (g5p_usc_g4p && g5p_usc_g4p_texfetch && nir->info.stage == MESA_SHADER_FRAGMENT)
+      NIR_PASS(_, nir, nir_shader_tex_pass, a8_fetch_as_sample, nir_metadata_control_flow, NULL);
    pvr_g5p_tbo_lower(nir);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const, nir_address_format_32bit_offset);
    NIR_PASS(_, nir, nir_lower_flrp, 32, false);

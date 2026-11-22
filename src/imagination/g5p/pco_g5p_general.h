@@ -179,6 +179,11 @@ enum pco_g5p_upload_kind {
 /* PCO_G5P_UPLOAD_SSBO_ADDR at this offset: not the buffer's address but its
  * bound size in bytes (one dword; get_ssbo_size, WGSL arrayLength) */
 #define PCO_G5P_SSBO_SIZE_OFFSET 0xfffcu
+/* PCO_G5P_UPLOAD_SAMPLER offset flag (the A8's texelFetch): the binding's sampler made a point, non-normalized,
+ * clamped sampler at level 0 for a texelFetch drawn as a sample (the offset's other bits: the sampler's place) */
+#define PCO_G5P_UPLOAD_SAMPLER_FETCH 0x4000u
+/* with it, the level the fetch reads in offset bits 8-11 (the sampler's LOD range clamped to it) */
+#define PCO_G5P_UPLOAD_SAMPLER_FETCH_LEVEL_SHIFT 8
 #define PCO_G5P_UPLOAD_IMAGE_AS_2D 1u
 #define PCO_G5P_UPLOAD_IMAGE_ARRAY 2u
 /* ONE_LAYER: an array sample at any layer of a one-layer view, drawn as a 2D

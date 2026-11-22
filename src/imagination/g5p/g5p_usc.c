@@ -11,6 +11,8 @@
 _Thread_local const char *g5p_usc_error;
 bool g5p_usc_g4p;
 bool g5p_usc_g4p_a9_forms;
+int g5p_usc_g4p_texfetch;
+int g5p_usc_g4p_texfetch_level;
 
 const char *const g5p_binop_name[G5P_BIN_COUNT] = {"fadd", "fmul", "iadd", "imul", "and", "or", "xor", "ishr",
                                                        "isub"};
@@ -1154,7 +1156,8 @@ static unsigned sample_g4p(uint8_t *out, const struct g5p_tex *t)
       CHECK(t->coord_dword <= 31 && !(t->dst_half & 1) && t->dst_half < 64, "A8 sample: coordinate/destination range");
       const unsigned slot = sampler_dword / 4;
       const uint8_t raw[12] = {0x1a, (uint8_t)((slot & 3) << 6 | (t->narrow ? 0x19 : 0x39)), (uint8_t)t->dst_half,
-                               0x41, (uint8_t)(2 * image_dword), (uint8_t)(1 | (slot >> 2) << 1), 0x88, 0x01,
+                               0x41, (uint8_t)(2 * image_dword), (uint8_t)(1 | (slot >> 2) << 1),
+                               (uint8_t)(0x88 | (t->read_flag ? 4 : 0)), 0x01,
                                (uint8_t)(t->coord_dword << 1), 0x01, 0x00, 0x80};
       return finish_g4p(out, raw, sizeof(raw));
    }
@@ -1188,7 +1191,7 @@ static unsigned sample_g4p(uint8_t *out, const struct g5p_tex *t)
    CHECK(t->coord_dword <= 31 && !(t->dst_half & 1) && t->dst_half < 64, "A8 sample: coordinate/destination range");
    const uint8_t mode = t->dim == G5P_TEX_CUBE ? 4 : 0;
    const uint8_t raw[12] = {0x1a, t->narrow ? 0x59 : 0x79, (uint8_t)t->dst_half, 0x41, 0x00, 0x01,
-                            (uint8_t)(0x80 | mode << 4 | t->sampler_qword << 1),
+                            (uint8_t)(0x80 | mode << 4 | t->sampler_qword << 1 | (t->read_flag ? 4 : 0)),
                             0x01, (uint8_t)(t->coord_dword << 1), 0x01, 0x00, 0x80};
    return finish_g4p(out, raw, sizeof(raw));
 }
