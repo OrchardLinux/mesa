@@ -136,10 +136,8 @@ vtex_descriptor(struct pvr_cmd_buffer *cmd, const struct pco_g5p_upload *u, uint
          if (u->dwords != 4 || !pvr_g5p_sampler_valid(desc))
             return VTEX_REFUSE(cmd, "set %u binding %u has no A8 sampler state", u->set, u->binding);
          memcpy(out, desc, 16);
-         /* a texelFetch in Apple's read form (G5P_TEX_LOD_REG): Apple's constant read sampler */
-         if ((u->offset & PCO_G5P_UPLOAD_SAMPLER_FETCH) && (u->offset & PCO_G5P_UPLOAD_SAMPLER_READ))
-            pvr_g5p_a8_read_sampler(out);
-         else if (u->offset & PCO_G5P_UPLOAD_SAMPLER_FETCH)
+         /* a vertex texelFetch: the fetch sampler, Apple's read sampler words (an iOS capture) */
+         if (u->offset & PCO_G5P_UPLOAD_SAMPLER_FETCH)
             pvr_g5p_a8_fetch_sampler(out, desc, (u->offset >> PCO_G5P_UPLOAD_SAMPLER_FETCH_LEVEL_SHIFT) & 0xf);
          return VK_SUCCESS;
       }
@@ -187,12 +185,9 @@ PVR_PER_ARCH(g5p_vtex_draw)(struct pvr_cmd_buffer *cmd, const struct pvr_g5p_sta
          break;
       case PCO_G5P_UPLOAD_FETCH_SAMPLER: {
          if (u->dwords == 4 && PVR_HAS_FEATURE(&cmd->device->pdevice->dev_info, apple_g4p)) {
-            /* the A8: Rogue sampler words, point, non-normalized, clamped, level 0 (the A9's recipe); in Apple's form
-             * (PVR_A8_VTEX_APPLE) its vertex reads' shared sampler, Apple's read sampler */
-            if (g5p_usc_g4p_vtex_apple)
-               pvr_g5p_a8_read_sampler(dst);
-            else
-               pvr_g5p_a8_fetch_sampler(dst, NULL, 0);
+            /* the A8: Rogue sampler words, point, non-normalized, clamped, level 0: Apple's read sampler, the constant
+             * 0x0202240000000fff of its vertex and fragment reads (from an iOS capture) */
+            pvr_g5p_a8_fetch_sampler(dst, NULL, 0);
             break;
          }
          if (u->dwords != 2) return VTEX_REFUSE(cmd, "invalid samplerless read policy size");

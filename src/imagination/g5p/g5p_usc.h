@@ -60,10 +60,11 @@ extern int g5p_usc_g4p_texfetch_level;
 extern bool g5p_usc_g4p_vtex;
 /*
  * PVR_A8_VTEX_APPLE=1 (not yet run on the hardware): vertex textures in Apple's form instead (it enables them on its
- * own). AGXCompilerCore samples a stage without derivatives at an explicit level (0.0 when the source names none) and
- * AGXMetalA8 DMAs the vertex stage's image and sampler words as the fragment stage's, so the vertex sample is the
- * A8's 12-byte sample in mode 2 with the level in the register after the coordinate, the image and sampler named by
- * their common dwords; a texelFetch is the read form above. No capture shows an A8 vertex sample's bytes.
+ * own), as an iOS capture shows it for AGXMetalA8's vertex programs (a sample, a read of RGBA32Float and of
+ * RGBA32Sint): the A8's 12-byte sample with the coordinate and the result in bank 1 and Apple's constant level 0,
+ * 1a 7d 00 41 00 01 a8|ac|a4 05 00 01 1c 80 (g5p_tex.vtx), the image and sampler at common dwords 0 and 4; a read's
+ * sampler is the fetch sampler's words, as Apple's (0x0202240000000fff). The A9's recipe (PVR_A8_VTEX=1) uses the A9's
+ * own sample instruction (1a f5 .. 01 08 85 c6 01 80 81, a coupled f16 level), which no A8 program contains.
  */
 extern bool g5p_usc_g4p_vtex_apple;
 /* A fragment texel-buffer read on the A8 (st/mesa's pixel-buffer uploads) as a 2D texelFetch of the buffer's linear
@@ -216,6 +217,12 @@ struct g5p_tex {
     * 1a 59 00 41 00 01 a8 09 00 01 00 80): mode 2, byte 7 0x09, the level an f32 in the register after the
     * coordinate's two */
    bool lod_reg;
+   /* Apple's vertex-stage sample (an iOS capture, AGXMetalA8's v_sample / v_read_f32 / v_read_i32:
+    * 1a 7d 00 41 00 01 a8|ac|a4 05 00 01 1c 80): the coordinate and the result in bank 1 (byte 1 bit 2, byte 7
+    * bit 2), mode 2 with Apple's constant level 0 (byte 10 0x1c); byte 6 0xa8 for a sample, 0xac for a read of a float
+    * or normalized texture, 0xa4 (int_result) for a read of an integer one */
+   bool vtx;
+   bool int_result;
 };
 unsigned g5p_usc_sample(uint8_t *out, const struct g5p_tex *t);
 /* The 2D-multisample fetch's sample operand "the task's own sample" (a sample-rate program reads the

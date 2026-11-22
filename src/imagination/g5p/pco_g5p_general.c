@@ -1017,6 +1017,11 @@ static const char *a8_vs_tex_refusal(const nir_tex_instr *t)
       if (t->src[i].src_type != nir_tex_src_coord && t->src[i].src_type != nir_tex_src_lod &&
           t->src[i].src_type != nir_tex_src_texture_deref && t->src[i].src_type != nir_tex_src_sampler_deref)
          return "A8 vertex texture: a source other than the coordinate and level";
+   /* Apple's vertex form samples at its constant level 0 (byte 10 0x1c) */
+   const int li = nir_tex_instr_src_index(t, nir_tex_src_lod);
+   if ((li >= 0 && (!nir_src_is_const(t->src[li].src) || nir_src_as_float(t->src[li].src) != 0.0f)) ||
+       (fetch && ((t->backend_flags >> G5P_TEX_FETCH_LEVEL_SHIFT) & 0xf)))
+      return "A8 vertex texture: Apple's vertex form is captured at level 0 only";
    return NULL;
 }
 
@@ -5473,19 +5478,18 @@ static void emit_tex_cube_g4p(struct gctx *c, nir_tex_instr *t)
    c->p->evidence |= PCO_G5P_EV_TEX_CAPTURE;
 }
 
-/* The A8's vertex-stage sample in Apple's form (PVR_A8_VTEX_APPLE). AGXCompilerCore (agc_lower_air_texture_sample_read,
- * 0x1a27a624c) samples in a stage without derivatives at an explicit level, 0.0 when the source names none, and its
- * read() is that sample with the read bit; AGXMetalA8 builds the vertex stage's PDS data as the fragment stage's
- * (a8_emit_vertex_stage_pds_data 0x1a1452a10 / a8_emit_fragment_stage_pds_data 0x1a1452d58: the same image and
- * sampler words DMA'd into the common store). So: the A8's 12-byte sample, the image and sampler named by their common
- * dwords (the multi-image form), mode 2 with the f32 level in the register after the coordinate (g5p_tex.lod_reg). Its
- * operands are bank-0 temps, as every A8 sample's are in fragment programs (no capture shows a vertex sample's
- * bytes); the result is copied to bank 1 after the wait. 2D, no array, compare, offset or gradient. */
+/* The A8's vertex-stage sample in Apple's form (PVR_A8_VTEX_APPLE), as AGXMetalA8 compiles v_sample, v_read_f32 and
+ * v_read_i32 (an iOS capture, USC heap 0x1_007c8000 + 0xa166 / 0xa40a / 0xa8a6): the coordinate as two f32 in
+ * bank-1 temps (a read's integer coordinate converted to float first, as in the fragment read), then
+ * 1a 7d 00 41 00 01 a8|ac|a4 05 00 01 1c 80 (g5p_tex.vtx): the result over the coordinate in bank 1, mode 2 at
+ * Apple's constant level 0, then the wait. The image and sampler are named by their common dwords (Apple: image at 0,
+ * sampler at 4, slot 1); a read's sampler is Apple's read sampler, the fetch sampler's words (point, non-normalized,
+ * clamped, level 0: the capture's constant 0x0202240000000fff). 2D at level 0 only; no array, compare, offset or
+ * gradient. */
 static void emit_vertex_tex_g4p(struct gctx *c, nir_tex_instr *t)
 {
    uint8_t raw[G5P_USC_MAX];
    const bool fetch = t->backend_flags & G5P_TEX_FETCH;
-   const int li = nir_tex_instr_src_index(t, nir_tex_src_lod);
    const char *why = a8_vs_tex_refusal(t);
    if (why) {
       refuse(c, "%s", why);
@@ -5494,58 +5498,37 @@ static void emit_vertex_tex_g4p(struct gctx *c, nir_tex_instr *t)
    struct tex_bind *b = tex_for(c, t);
    nir_def *cd = nir_get_tex_src(t, nir_tex_src_coord);
    tex_flush(c);
+   /* bank 1, as Apple's: the coordinate in the first two registers, the result over them */
    const bool saved_bank0 = c->tex_bank0;
-   c->tex_bank0 = true;
-   /* the result over the coordinate, as Apple's f_tex writes its result to the coordinate's registers */
-   const unsigned coord = alloc_run(c, 4, "A8 vertex sample coordinate, level and result"), dst = coord;
+   c->tex_bank0 = false;
+   const unsigned coord = alloc_run(c, 4, "A8 vertex sample coordinate and result"), dst = coord;
    c->tex_bank0 = saved_bank0;
+   if (vbank(c, coord) != 1)
+      refuse(c, "A8 vertex sample: Apple's form takes bank-1 registers");
    vertex_qualified_copy(c, coord, cd, 0);
    vertex_qualified_copy(c, coord + 1, cd, 1);
-   if (li >= 0 && !fetch) {
-      vertex_qualified_copy(c, coord + 2, t->src[li].src.ssa, 0);
-   } else {
-      const float level = fetch ? (float)((t->backend_flags >> G5P_TEX_FETCH_LEVEL_SHIFT) & 0xf) : 0.0f;
-      put(c, raw, g5p_usc_immediate(raw, H(c, coord + 2), fui(level), vbank(c, coord + 2), -1), "vertex level (f32)");
-   }
    struct g5p_tex s = {.image_qword = b->image, .a8_slots = true, .sampler_qword = b->sampler,
                        .coord_dword = H(c, coord) / 2, .coord_control = true, .dim = G5P_TEX_2D, .narrow = false,
-                       .read_flag = fetch, .lod_reg = true, .dst_half = H(c, dst)};
+                       .read_flag = fetch, .vtx = true,
+                       .int_result = nir_alu_type_get_base_type(t->dest_type) != nir_type_float,
+                       .dst_half = H(c, dst)};
    const unsigned n = g5p_usc_sample(raw, &s);
    if (!n)
       refuse(c, "A8 vertex sample: encoder rejects the fields (%s) [image at common dword %u, sampler at %u]",
              g5p_usc_error ? g5p_usc_error : "?", b->image, b->sampler);
-   put(c, raw, n, "A8 vertex sample (Apple's explicit level)");
+   put(c, raw, n, "A8 vertex sample (Apple's form)");
    c->tex_pending |= BITFIELD64_RANGE(dst, 4);
    c->tex_batch++;
    tex_flush(c);
-   /* each used component to a free bank-1 register, leaving bank 0 to the next sample; with none free, the
-    * bank-two retry (vs_bank0) keeps it in bank 0 */
    for (unsigned k = 0; k < 4; k++) {
       struct val *v = V(c, &t->def, k);
       if (!v->uses) {
          c->busy &= ~BITFIELD64_BIT(dst + k);
          continue;
       }
-      int r = -1;
-      for (unsigned i = 0; i < NUM_DWORDS && r < 0; i++)
-         if (!((c->busy | c->reserved | c->tex_coord_pending | c->tex_pending) & BITFIELD64_BIT(i)))
-            r = i;
-      if (r < 0 && !c->vs_bank0) {
-         refuse(c, "register pressure: the A8 vertex sample result has no bank-1 register");
-         return;
-      }
       v->state = VAL_REG;
       v->held = true;
       v->reg = dst + k;
-      if (r >= 0) {
-         c->busy |= BITFIELD64_BIT(r);
-         c->max_dword = MAX2(c->max_dword, (unsigned)r + 1);
-         c->max_written = MAX2(c->max_written, (unsigned)r + 1);
-         put(c, raw, g5p_usc_move(raw, H(c, r), H(c, dst + k), vbank(c, r), 1, vhdr(c, 0x21, dst + k, -1, -1)),
-             "A8 vertex sample result to bank 1");
-         c->busy &= ~BITFIELD64_BIT(dst + k);
-         v->reg = r;
-      }
    }
    c->p->evidence |= PCO_G5P_EV_TEX_F32;
 }

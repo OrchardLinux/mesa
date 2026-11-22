@@ -1163,6 +1163,15 @@ static unsigned sample_g4p(uint8_t *out, const struct g5p_tex *t)
       CHECK(!(sampler_dword % 4) && sampler_dword / 4 <= 11, "A8 multi-image sample: sampler slot 0..11");
       CHECK(t->coord_dword <= 31 && !(t->dst_half & 1) && t->dst_half < 64, "A8 sample: coordinate/destination range");
       const unsigned slot = sampler_dword / 4;
+      if (t->vtx) {
+         /* Apple's vertex form (g5p_tex.vtx) */
+         CHECK(!t->narrow && !t->lod_reg && t->coord_dword <= 31, "A8 vertex sample: 32-bit, Apple's constant level");
+         const uint8_t b6 = 0xa0 | (!t->read_flag ? 0x08 : t->int_result ? 0x04 : 0x0c);
+         const uint8_t vraw[12] = {0x1a, (uint8_t)((slot & 3) << 6 | 0x3d), (uint8_t)t->dst_half, 0x41,
+                                   (uint8_t)(2 * image_dword), (uint8_t)(1 | (slot >> 2) << 1), b6, 0x05,
+                                   (uint8_t)(t->coord_dword << 1), 0x01, 0x1c, 0x80};
+         return finish_g4p(out, vraw, sizeof(vraw));
+      }
       const uint8_t raw[12] = {0x1a, (uint8_t)((slot & 3) << 6 | (t->narrow ? 0x19 : 0x39)), (uint8_t)t->dst_half,
                                0x41, (uint8_t)(2 * image_dword), (uint8_t)(1 | (slot >> 2) << 1),
                                (uint8_t)(0x88 | lod_mode | (t->read_flag ? 4 : 0)), lod_byte7,
