@@ -52,6 +52,11 @@ struct pvr_g5p_ds_plane {
 
 bool pvr_g5p_ds_layout(VkFormat format, uint32_t width, uint32_t height, uint32_t samples,
                        struct pvr_g5p_ds_plane *out);
+/* The planes take the ZLS's rectangle (each side 32-aligned, then a power of two) instead of the larger side's
+ * square. Set by the driver on the A8. */
+extern bool pvr_g5p_ds_rect_planes;
+/* The A8's ZLSCTL extents in tiles rounded up to powers of two (pvr_g5p_ds_zls()); set by the driver on the A8 */
+extern bool pvr_g5p_ds_pot_extents;
 
 /* The depth/stencil attachment of one render, as the ZLS sees it */
 struct pvr_g5p_ds_target {

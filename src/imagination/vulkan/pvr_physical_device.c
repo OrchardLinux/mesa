@@ -31,6 +31,7 @@
 #include "pco/pco.h"
 #include "pco_uscgen_programs.h"
 #include "pvr_g5p_ds_hooks.h"
+#include "pvr_g5p_ds.h"
 #include "pvr_device.h"
 #include "pvr_dump_info.h"
 #include "pvr_entrypoints.h"
@@ -1397,6 +1398,11 @@ VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
       g5p_usc_g4p = true;
       /* the A9's instructions where the A8's captured forms cannot express the operands (g5p_usc.h) */
       g5p_usc_g4p_a9_forms = debug_get_bool_option("PVR_A8_A9_FORMS", true);
+      /* The A8's depth/stencil layout (pvr_g5p_ds.h): ZLS extents rounded up to powers of two and planes over the
+       * ZLS's rectangle. On the iPod every depth and stencil buffer stored by one render and loaded by the next
+       * read back right with them, at seven sizes from 640x1136 to 37x29. */
+      pvr_g5p_ds_pot_extents = true;
+      pvr_g5p_ds_rect_planes = true;
    }
 
    pdevice->skip_refused_work = PVR_HAS_FEATURE(&pdevice->dev_info, apple_g5p) &&

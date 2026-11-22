@@ -80,6 +80,9 @@ pvr_g5p_ds_format(VkFormat format)
    return NULL;
 }
 
+bool pvr_g5p_ds_rect_planes;
+bool pvr_g5p_ds_pot_extents;
+
 bool
 pvr_g5p_ds_layout(VkFormat format, uint32_t width, uint32_t height, uint32_t samples,
                   struct pvr_g5p_ds_plane *out)
@@ -90,7 +93,13 @@ pvr_g5p_ds_layout(VkFormat format, uint32_t width, uint32_t height, uint32_t sam
    if (!f || !width || !height || (samples != 1 && samples != 4))
       return false;
    out->side = g5p_pot(g5p_align(width > height ? width : height, 32));
-   const uint64_t texels = (uint64_t)out->side * out->side * samples;
+   /* With pvr_g5p_ds_rect_planes, each plane takes the rectangle the ZLS addresses: its Morton order runs over
+    * each side 32-aligned and padded to its own power of two (proven on the A9 by sampling and CPU copies of
+    * unequal-side planes, pvr_g5p_ds_texture_plane() and the CPU transfers' rectangular order), so the square
+    * of the larger side holds that rectangle and the rest. */
+   const uint64_t texels = pvr_g5p_ds_rect_planes
+                              ? (uint64_t)g5p_pot(g5p_align(width, 32)) * g5p_pot(g5p_align(height, 32)) * samples
+                              : (uint64_t)out->side * out->side * samples;
    out->depth_bytes = f->depth ? texels * f->depth_bytes : 0;
    if (f->stencil)
       out->stencil_offset = (out->depth_bytes + PVR_G5P_ZLS_PLANE_ALIGN - 1) & ~(uint64_t)(PVR_G5P_ZLS_PLANE_ALIGN - 1);
@@ -155,9 +164,14 @@ pvr_g5p_ds_zls(const struct pvr_g5p_ds_target *t, struct pvr_g5p_zls_words *out)
    if (t->g4p) {
       /* The A8 (Rogue's form, no ZLS_PIXELS): the extent in 32-pixel tiles minus 1 in ZLSCTL. iPod touch 6,
        * iOS 12.4, a8-passcap at 64x64: 0x080e200c depth+stencil clear/store, 0x080ee00e loaded, 0x080a200c
-       * depth only (x_z = y_z = 1) */
-      ctl.zlsextent_x_z = DIV_ROUND_UP(t->width, 32) - 1;
-      ctl.zlsextent_y_z = DIV_ROUND_UP(t->height, 32) - 1;
+       * depth only (x_z = y_z = 1). A stored depth or stencil read back wrong on the iPod at every size whose
+       * tile count is not a power of two on both sides (640x1136, 528x80, 640x52, 528x464, 100x75 failed;
+       * 37x29 and 64x64 passed) while the extent was the plain tile count. Each extent is now its tile count
+       * rounded up to a power of two, as Rogue's ZLSCTL documents for twiddled mode ("zlsextent uses above
+       * result and rounds the value up to the nearest value which is power of 2"); every size then passed. */
+      const uint32_t tx = DIV_ROUND_UP(t->width, 32), ty = DIV_ROUND_UP(t->height, 32);
+      ctl.zlsextent_x_z = (pvr_g5p_ds_pot_extents ? g5p_pot(tx) : tx) - 1;
+      ctl.zlsextent_y_z = (pvr_g5p_ds_pot_extents ? g5p_pot(ty) : ty) - 1;
    }
    ROGUE_CR_ISP_ZLSCTL_pack(dw, &ctl);
    out->zls[0] = g5p_dw64(dw);
