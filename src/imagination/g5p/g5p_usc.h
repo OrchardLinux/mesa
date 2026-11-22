@@ -46,6 +46,13 @@ extern bool g5p_usc_g4p_a9_forms;
  */
 extern int g5p_usc_g4p_texfetch;
 extern int g5p_usc_g4p_texfetch_level;
+/*
+ * Vertex-stage textures on the A8, refused by default. PVR_A8_VTEX=1 takes the A9's qualified vertex recipe over the
+ * A8's four-dword image and sampler words. It does not work yet: on the iPod touch 6 a vertex texelFetch read zeros
+ * and a vertex textureLod locked the TA. No capture shows an A8 vertex texture; the A8's vertex programs are
+ * otherwise the A9's.
+ */
+extern bool g5p_usc_g4p_vtex;
 
 enum g5p_binop {
    G5P_BIN_FADD, G5P_BIN_FMUL, G5P_BIN_IADD, G5P_BIN_IMUL,
@@ -232,6 +239,7 @@ struct g5p_tex_ext {
    unsigned extras_half;
    enum g5p_tex_tuple tuple;
    bool lod_shared; /* prefix level source: common store instead of register */
+   bool vertex;     /* a vertex-stage sample (the A8 takes the A9's recipe there, g5p_usc_g4p_vtex) */
 };
 /* A9 compute's register-level array or cube sample and fetch: the coupled temporary-level tuple, the fetch's
  * coordinate kept live (fields at the encoder). */

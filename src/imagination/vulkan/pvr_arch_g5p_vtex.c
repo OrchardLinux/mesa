@@ -25,6 +25,7 @@
 #include "pvr_bo.h"
 #include "pvr_cmd_buffer.h"
 #include "pvr_csb.h"
+#include "pvr_g5p_a8_fetch.h"
 #include "pvr_descriptor_set.h"
 #include "pvr_device.h"
 #include "pvr_physical_device.h"
@@ -120,6 +121,23 @@ vtex_descriptor(struct pvr_cmd_buffer *cmd, const struct pco_g5p_upload *u, uint
       return VK_SUCCESS;
    }
    bool image = lb->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || lb->type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+   /* the A8: its Rogue words as the fragment stage takes them, four dwords of image state, four of
+    * sampler state at +32 in a combined descriptor */
+   if (PVR_HAS_FEATURE(&cmd->device->pdevice->dev_info, apple_g4p)) {
+      if (u->kind == PCO_G5P_UPLOAD_IMAGE) {
+         if (!image || u->dwords != 4 || !pvr_g5p_tex_state_valid(desc))
+            return VTEX_REFUSE(cmd, "set %u binding %u has no A8 image state", u->set, u->binding);
+         memcpy(out, desc, 16);
+         return VK_SUCCESS;
+      }
+      if (u->kind == PCO_G5P_UPLOAD_SAMPLER) {
+         if (lb->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) desc += 8;
+         if (u->dwords != 4 || !pvr_g5p_sampler_valid(desc))
+            return VTEX_REFUSE(cmd, "set %u binding %u has no A8 sampler state", u->set, u->binding);
+         memcpy(out, desc, 16);
+         return VK_SUCCESS;
+      }
+   }
    if (u->kind == PCO_G5P_UPLOAD_IMAGE) {
       if (!image || u->dwords != 8 || !pvr_g5p_tex_state_valid(desc))
          return VTEX_REFUSE(cmd, "set %u binding %u has no A9 image state", u->set, u->binding);
@@ -162,6 +180,11 @@ PVR_PER_ARCH(g5p_vtex_draw)(struct pvr_cmd_buffer *cmd, const struct pvr_g5p_sta
          if (result != VK_SUCCESS) return result;
          break;
       case PCO_G5P_UPLOAD_FETCH_SAMPLER: {
+         if (u->dwords == 4 && PVR_HAS_FEATURE(&cmd->device->pdevice->dev_info, apple_g4p)) {
+            /* the A8: Rogue sampler words, point, non-normalized, clamped, level 0 */
+            pvr_g5p_a8_fetch_sampler(dst, NULL, 0);
+            break;
+         }
          if (u->dwords != 2) return VTEX_REFUSE(cmd, "invalid samplerless read policy size");
          uint64_t policy = pvr_g5p_fetch_sampler_word();
          memcpy(dst, &policy, sizeof(policy));

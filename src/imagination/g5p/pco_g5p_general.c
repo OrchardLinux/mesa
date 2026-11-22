@@ -2332,7 +2332,8 @@ static void plan_common(struct gctx *c)
     * TEXSTATE_SAMPLER_WORD0/1, four dwords each, the sampler right after the image (AGXMetalA8's tex_plain and load:
     * texture state then sampler in one 8-dword block, the sample's sampler field naming dword 4) */
    const unsigned sdw = g5p_usc_g4p ? 4 : 2, idw = g5p_usc_g4p ? 4 : 8;
-   if (g5p_usc_g4p && !g5p_usc_g4p_a9_forms && compact && c->ntex)
+   /* vertex textures on the A8 (g5p_usc_g4p_vtex): the compact layout */
+   if (g5p_usc_g4p && !g5p_usc_g4p_a9_forms && compact && c->ntex && !(c->vs && g5p_usc_g4p_vtex))
       refuse(c, "the A8 samples one image slot (common dword 0); more than four textures or vertex textures are "
                 "not captured");
    unsigned sampler_count = 0;
@@ -2341,8 +2342,9 @@ static void plan_common(struct gctx *c)
       sampler_count += !qualified || c->tex[i].needs_sampler;
       fetch_sampler |= qualified && c->tex[i].needs_fetch_sampler;
    }
-   /* the samplerless read's sampler policy is the A9's one-qword word (pvr_g5p_fetch_sampler_word()) */
-   if (g5p_usc_g4p && fetch_sampler)
+   /* the samplerless read's sampler policy is the A9's one-qword word (pvr_g5p_fetch_sampler_word()); the A8's,
+    * with vertex textures, four dwords of Rogue sampler words (point, non-normalized, clamped) */
+   if (g5p_usc_g4p && fetch_sampler && !g5p_usc_g4p_vtex)
       refuse(c, "a samplerless texture read on the A8 (its fetch sampler is the A9's word, not Rogue's)");
    struct g5p_fs_common_plan common_plan = {0};
    bool planned = !c->vs || qualified;
@@ -2421,7 +2423,8 @@ static void plan_common(struct gctx *c)
       t->image = compact ? image_base + 8 * i : align(next, 8);
       t->sampler = compact ? ((!qualified || t->needs_sampler) ? sampler_cursor : c->fetch_sampler_common) : t->image + idw;
       sampler_cursor += compact && (!qualified || t->needs_sampler) ? sdw : 0;
-      next = compact ? c->fetch_sampler_common + 2 * (qualified && fetch_sampler) : t->image + idw + sdw;
+      next = compact ? c->fetch_sampler_common + (g5p_usc_g4p ? sdw : 2) * (qualified && fetch_sampler)
+                     : t->image + idw + sdw;
       if (t->image / 2 > (compact ? 120 : 28) || t->sampler / 2 > (compact ? 124 : 32))
          refuse(c, "texture descriptors beyond the bounded qualified selectors");
       add_upload(c, PCO_G5P_UPLOAD_IMAGE, t->set, t->binding, t->element, t->image_flags, idw, t->image);
@@ -2432,7 +2435,7 @@ static void plan_common(struct gctx *c)
                     sdw, t->sampler);
    }
    if (qualified && fetch_sampler)
-      add_upload(c, PCO_G5P_UPLOAD_FETCH_SAMPLER, 0, 0, 0, 0, 2, c->fetch_sampler_common);
+      add_upload(c, PCO_G5P_UPLOAD_FETCH_SAMPLER, 0, 0, 0, 0, g5p_usc_g4p ? sdw : 2, c->fetch_sampler_common);
    /* Pointer pairs of register-indexed UBO arrays: even dwords below 32 (the
     * addr.add_shift base field, 0x81 | 4 * dword). */
    for (unsigned i = 0; i < c->nuptr; i++) {
@@ -5290,7 +5293,7 @@ static void emit_vertex_qualified_texture(struct gctx *c, nir_tex_instr *t)
       .sampler_qword=(read ? c->fetch_sampler_common : b->sampler)/2,
       .coord_dword=H(c,block)/2,
       .dim=cube ? G5P_TEX_CUBE : t->sampler_dim==GLSL_SAMPLER_DIM_3D ? G5P_TEX_3D : array ? G5P_TEX_2D_ARRAY : G5P_TEX_2D,
-      .mask=compare ? 1 : 15, .read=read, .compare=compare,
+      .mask=compare ? 1 : 15, .read=read, .compare=compare, .vertex=true,
       .lod=gradient ? G5P_TEX_LOD_GRAD : G5P_TEX_LOD_LEVEL,
       .lod_dword=buffer ? c->tsize[size_for(c,t)].common + 1 : H(c,level)/2, .lod_shared=buffer,
       .offset=packed >= 0, .extras_half=compare || packed >= 0 ? extras : 0,

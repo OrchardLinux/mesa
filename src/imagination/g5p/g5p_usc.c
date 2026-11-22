@@ -13,6 +13,7 @@ bool g5p_usc_g4p;
 bool g5p_usc_g4p_a9_forms;
 int g5p_usc_g4p_texfetch;
 int g5p_usc_g4p_texfetch_level;
+bool g5p_usc_g4p_vtex;
 
 const char *const g5p_binop_name[G5P_BIN_COUNT] = {"fadd", "fmul", "iadd", "imul", "and", "or", "xor", "ishr",
                                                        "isub"};
@@ -1304,7 +1305,8 @@ unsigned g5p_usc_gather(uint8_t *out, const struct g5p_tex *t)
 unsigned g5p_usc_sample_ext(uint8_t *out, const struct g5p_tex_ext *t)
 {
    /* The A8 takes only the narrow implicit-LOD 2D sample (sample_g4p()) */
-   CHECK(!g5p_usc_g4p, "A8 texture sample form not captured");
+   /* a vertex sample takes the A9's recipe on the A8 (g5p_usc.h g5p_usc_g4p_vtex) */
+   CHECK(!g5p_usc_g4p || (t->vertex && g5p_usc_g4p_vtex), "A8 texture sample form not captured");
    const bool coupled = t->tuple != G5P_TEX_TUPLE_ORDINARY;
    CHECK((unsigned)t->tuple <= G5P_TEX_TUPLE_COUPLED_TEMP_LEVEL_COMPARE_OFFSET, "unqualified texture recipe");
    CHECK(!coupled || t->lod_shared == (t->tuple == G5P_TEX_TUPLE_COUPLED_SHARED_LEVEL),

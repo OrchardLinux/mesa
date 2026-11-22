@@ -1411,6 +1411,9 @@ VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
       g5p_usc_g4p_texfetch = 2;
       const char *level = getenv("PVR_A8_TEXFETCH_LEVEL");
       g5p_usc_g4p_texfetch_level = !level ? 0 : !strcmp(level, "level") ? 1 : !strcmp(level, "scale") ? 2 : 0;
+      /* vertex textures: refused by default; PVR_A8_VTEX=1 takes the A9's recipe on the A8's words, which does not
+       * work yet (g5p_usc.h) */
+      g5p_usc_g4p_vtex = debug_get_bool_option("PVR_A8_VTEX", false);
    }
 
    pdevice->skip_refused_work = PVR_HAS_FEATURE(&pdevice->dev_info, apple_g5p) &&
