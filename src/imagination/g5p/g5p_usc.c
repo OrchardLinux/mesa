@@ -19,6 +19,7 @@ bool g5p_usc_g4p_tbo;
 bool g5p_usc_g4p_fge_swap;
 bool g5p_usc_g4p_pos_iter;
 bool g5p_usc_g4p_r8_load;
+bool g5p_usc_g4p_cube_alu;
 
 const char *const g5p_binop_name[G5P_BIN_COUNT] = {"fadd", "fmul", "iadd", "imul", "and", "or", "xor", "ishr",
                                                        "isub"};
@@ -1150,8 +1151,11 @@ static unsigned sample_g4p(uint8_t *out, const struct g5p_tex *t)
          "A8 sample captured only as a 2D or cube sample with an implicit LOD");
    /* the cube sample: mode 4 (byte 6 0xc8 with the sampler at dword 4), the direction in three temps from the
     * coordinate dword, no cube-coordinate instruction (AGXMetalA8's f_tex_cube, passcap USC 0x6076: two FMAs and a
-    * move build r0..r2, then 1a 59 00 41 00 01 c8 01 00 01 00 80). Only the narrow form is captured. */
-   CHECK(t->dim != G5P_TEX_CUBE || t->narrow, "A8 cube sample captured only in the narrow form (result straight to the output)");
+    * move build r0..r2, then 1a 59 00 41 00 01 c8 01 00 01 00 80). The 32-bit form is byte 1 0x79, as for 2D
+    * (f_tex_cube_mul, an iOS capture: 1a 79 00 41 00 01 c8 01 00 01 00 80, then 4d 00 and the multiply); with
+    * PVR_A8_CUBE_ALU=0 only the narrow form is taken. */
+   CHECK(t->dim != G5P_TEX_CUBE || t->narrow || g5p_usc_g4p_cube_alu,
+         "A8 cube sample: the 32-bit form is off (PVR_A8_CUBE_ALU=0)");
    /* the explicit level in the register after the coordinate (Apple's sample at a varying level, iOS capture, USC
     * heap 0x1_02328000 + 0x8814: the iterated coordinate in r0..r1, r2 = r0 * 4.0, then
     * 1a 59 00 41 00 01 a8 09 00 01 00 80): byte 6 mode 2, byte 7 0x09, byte 10 0. 2D only. */

@@ -5495,15 +5495,21 @@ static void emit_tex_ms_own_sample(struct gctx *c, nir_tex_instr *t, struct tex_
 }
 
 /* The A8's cube sample, as AGXMetalA8's f_tex_cube: the direction in three consecutive temps (computed: FMAs and a
- * move, no cube-coordinate instruction; the hardware selects the face), then the narrow sample in mode 4 */
+ * move, no cube-coordinate instruction; the hardware selects the face), then the sample in mode 4: narrow when the
+ * result goes straight to the output, else (PVR_A8_CUBE_ALU) Apple's 32-bit form, as f_tex_cube_mul (a8-passcap
+ * tex_cube_mul, USC heap 0x1bf6): 1a 79 00 41 00 01 c8 01 00 01 00 80, the wait 4d 00, then the ALU that reads the
+ * four 32-bit results. Only Apple's single-image layout (image at common dword 0, sampler at dword 4) is captured. */
 static void emit_tex_cube_g4p(struct gctx *c, nir_tex_instr *t)
 {
    uint8_t raw[G5P_USC_MAX];
    struct tex_bind *b = tex_for(c, t);
    const bool narrow = c->narrow_tex == t;
-   if (!narrow)
-      refuse(c, "A8 cube sample whose result feeds arithmetic (only the narrow form, straight to the output, is "
-                "captured)");
+   if (!narrow && !g5p_usc_g4p_cube_alu)
+      refuse(c, "A8 cube sample whose result feeds arithmetic (PVR_A8_CUBE_ALU=0)");
+   if (c->a8_slots)
+      refuse(c, "A8 cube sample in Apple's multi-image layout (image at common dword %u, sampler at %u, %u images; "
+                "%s result): the cube sample is captured only with the image at dword 0 and the sampler at dword 4",
+             b->image, b->sampler, c->ntex, narrow ? "narrow" : "32-bit");
    nir_def *cd = nir_get_tex_src(t, nir_tex_src_coord);
    struct ref r[3];
    unsigned reg[3];
@@ -5523,12 +5529,26 @@ static void emit_tex_cube_g4p(struct gctx *c, nir_tex_instr *t)
       c->scratch |= BITFIELD64_RANGE(coord, 3);
    }
    struct g5p_tex s = {.image_qword = c->a8_slots ? b->image : b->image / 2, .a8_slots = c->a8_slots, .sampler_qword = b->sampler, .coord_dword = coord,
-                       .coord_control = true, .dim = G5P_TEX_CUBE, .narrow = true};
+                       .coord_control = true, .dim = G5P_TEX_CUBE, .narrow = narrow};
+   unsigned dst = 0;
+   if (!narrow)
+      dst = alloc_run(c, 4, "cube sample result");
+   s.dst_half = 2 * dst;
    put(c, raw, g5p_usc_sample(raw, &s), "cube sample");
    c->tex_coord_pending |= BITFIELD64_RANGE(coord, 3);
    c->tex_batch++;
+   if (!narrow) {
+      /* Apple waits right after the sample, before the ALU that reads it */
+      c->tex_pending |= BITFIELD64_RANGE(dst, 4);
+      for (unsigned k = 0; k < 4; k++) {
+         struct val *v = V(c, &t->def, k);
+         v->state = VAL_REG;
+         v->reg = dst + k;
+         v->held = true;
+      }
+   }
    tex_flush(c);
-   c->p->evidence |= PCO_G5P_EV_TEX_CAPTURE;
+   c->p->evidence |= narrow ? PCO_G5P_EV_TEX_CAPTURE : PCO_G5P_EV_TEX_F32;
 }
 
 /* The A8's vertex-stage sample in Apple's form (PVR_A8_VTEX_APPLE), as AGXMetalA8 compiles v_sample, v_read_f32 and

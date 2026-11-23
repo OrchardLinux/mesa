@@ -82,6 +82,9 @@ extern bool g5p_usc_g4p_pos_iter;
 /* An R8 colour target with loadOp LOAD on the A8, in Apple's form (g5p_mrt_load_usc_g4p_r8(); PVR_A8_R8_LOAD, on by
  * default; 0 refuses it, as before) */
 extern bool g5p_usc_g4p_r8_load;
+/* The A8's cube sample with 32-bit results that ALU reads after the wait, Apple's
+ * 1a 79 00 41 00 01 c8 01 CC 01 00 80 (sample_g4p(); PVR_A8_CUBE_ALU, on by default; 0 refuses it, as before) */
+extern bool g5p_usc_g4p_cube_alu;
 
 enum g5p_binop {
    G5P_BIN_FADD, G5P_BIN_FMUL, G5P_BIN_IADD, G5P_BIN_IMUL,
