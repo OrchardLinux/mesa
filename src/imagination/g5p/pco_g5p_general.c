@@ -4473,7 +4473,7 @@ static void read_varying(struct gctx *c, nir_intrinsic_instr *in, struct drc *d)
     * locations, exact on the A9). */
    const bool flat_iterated = v->interp == PCO_G5P_INTERP_FLAT && 4 * (slot + n - 1) + 2 >= 256;
    if (v->interp == PCO_G5P_INTERP_FLAT && !flat_iterated) {
-      /* The C term of each component's coefficient set (Apple's `14 23`). */
+      /* The C term of each component's coefficient set (Apple's `14 23`; the A8's `18 09 .. 01`). */
       for (unsigned j = 0; j < n; j++) {
          struct val *val = V(c, &in->def, j);
          if (!val->uses)

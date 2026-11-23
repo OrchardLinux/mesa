@@ -641,6 +641,14 @@ unsigned g5p_usc_coeff_load(uint8_t *out, unsigned dst_half, unsigned coeff_dwor
 {
    CHECK(!(dst_half % 2) && dst_half < 256, "coefficient load destination must be an even u8 half");
    CHECK(coeff_dword < 256 && coeff_dword % 4 == 2, "coefficient load reads a C term (4 * set + 2, u8)");
+   if (g5p_usc_g4p) {
+      /* The A8's flat read: 18 09 DD 01 AA 01 60 00 (AGXMetalA8's f_iter in an iOS capture: 18 09 00 01 0e 01 60 00,
+       * set 3). The A9's 14 23 does not exist on the A8 in this form (on the iPod a flat varying's first component
+       * read 0 with it). */
+      CHECK(!drc1, "A8 flat read on the second dependent-read counter not captured");
+      const uint8_t g4[8] = {0x18, 0x09, (uint8_t)dst_half, 0x01, (uint8_t)coeff_dword, 0x01, 0x60, 0x00};
+      return finish_g4p(out, g4, 8);
+   }
    uint8_t raw[8] = {drc1 ? 0x15 : 0x14, 0x23, dst_half, 0x01, coeff_dword, 0x01, 0x00, 0x02};
    return finish(out, raw, 8);
 }

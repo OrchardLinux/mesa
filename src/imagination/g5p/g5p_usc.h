@@ -171,7 +171,8 @@ unsigned g5p_usc_iterator_flags(uint8_t *out, unsigned dst_half, unsigned slot, 
                                 bool narrow, bool saturate, unsigned flags);
 /* Flat varying component: load the C coefficient of a coefficient set,
  * `14 23 DD 01 AA 01 00 02` (AA = coefficient dword 4 * set + 2; b0 bit 0 =
- * the second dependent-read counter). */
+ * the second dependent-read counter). The A8 form is Apple's `18 09 DD 01 AA
+ * 01 60 00` (f_iter), on the first counter only. */
 unsigned g5p_usc_coeff_load(uint8_t *out, unsigned dst_half, unsigned coeff_dword, bool drc1);
 unsigned g5p_usc_coord_iterator(uint8_t *out, unsigned dst_half, unsigned slot, unsigned count);
 unsigned g5p_usc_emit(uint8_t *out, unsigned words, unsigned source_half);
