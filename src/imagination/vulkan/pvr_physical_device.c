@@ -1415,9 +1415,11 @@ VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
       const char *level = getenv("PVR_A8_TEXFETCH_LEVEL");
       g5p_usc_g4p_texfetch_level = !level ? 0 : !strcmp(level, "level") ? 1 : !strcmp(level, "scale") ? 2 :
                                    !strcmp(level, "apple") ? 3 : 0;
-      /* vertex textures: refused by default; PVR_A8_VTEX=1 takes the A9's recipe on the A8's words, which does not
-       * work yet, PVR_A8_VTEX_APPLE=1 Apple's form (g5p_usc.h) */
-      g5p_usc_g4p_vtex_apple = debug_get_bool_option("PVR_A8_VTEX_APPLE", false);
+      /* vertex textures in Apple's form, on by default: on the iPod (through Zink) its vertex read passed through a
+       * smooth varying and through the position. PVR_A8_VTEX_APPLE=0 turns them off (refused, as before); with it,
+       * PVR_A8_VTEX=1 takes the A9's recipe, which read zeros for a vertex texelFetch and whose textureLod locked the
+       * TA (g5p_usc.h) */
+      g5p_usc_g4p_vtex_apple = debug_get_bool_option("PVR_A8_VTEX_APPLE", true);
       g5p_usc_g4p_vtex = debug_get_bool_option("PVR_A8_VTEX", false) || g5p_usc_g4p_vtex_apple;
       /* fragment texel-buffer reads (g5p_usc.h) */
       g5p_usc_g4p_tbo = debug_get_bool_option("PVR_A8_TBO", true);

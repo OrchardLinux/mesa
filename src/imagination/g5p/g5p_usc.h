@@ -52,19 +52,20 @@ extern bool g5p_usc_g4p_a9_forms;
 extern int g5p_usc_g4p_texfetch;
 extern int g5p_usc_g4p_texfetch_level;
 /*
- * Vertex-stage textures on the A8, refused by default. PVR_A8_VTEX=1 takes the A9's qualified vertex recipe over the
- * A8's four-dword image and sampler words. It does not work yet: on the iPod touch 6 a vertex texelFetch read zeros
- * and a vertex textureLod locked the TA. No capture shows an A8 vertex texture; the A8's vertex programs are
- * otherwise the A9's.
+ * Vertex-stage textures on the A8, in Apple's form by default (PVR_A8_VTEX_APPLE, below; PVR_A8_VTEX_APPLE=0 refuses
+ * them). With PVR_A8_VTEX_APPLE=0, PVR_A8_VTEX=1 takes the A9's qualified vertex recipe over the A8's four-dword image
+ * and sampler words. That does not work: on the iPod touch 6 its vertex texelFetch read zeros and its textureLod
+ * locked the TA. Its sample is the A9's own instruction (1a f5 .. 01 08 85 c6 01 80 81, a coupled f16 level), which
+ * Apple's A8 programs never contain.
  */
 extern bool g5p_usc_g4p_vtex;
 /*
- * PVR_A8_VTEX_APPLE=1 (not yet run on the hardware): vertex textures in Apple's form instead (it enables them on its
- * own), as an iOS capture shows it for AGXMetalA8's vertex programs (a sample, a read of RGBA32Float and of
- * RGBA32Sint): the A8's 12-byte sample with the coordinate and the result in bank 1 and Apple's constant level 0,
- * 1a 7d 00 41 00 01 a8|ac|a4 05 00 01 1c 80 (g5p_tex.vtx), the image and sampler at common dwords 0 and 4; a read's
- * sampler is the fetch sampler's words, as Apple's (0x0202240000000fff). The A9's recipe (PVR_A8_VTEX=1) uses the A9's
- * own sample instruction (1a f5 .. 01 08 85 c6 01 80 81, a coupled f16 level), which no A8 program contains.
+ * PVR_A8_VTEX_APPLE (on by default; its vertex read passed on the iPod): Apple's vertex form, as an iOS capture shows
+ * it for AGXMetalA8's vertex programs (a sample, a read of RGBA32Float and of RGBA32Sint): the A8's 12-byte sample
+ * with the coordinate and the result in bank 1 and Apple's constant level 0.0 from the common store,
+ * 1a 7d 00 41 00 01 a8|ac|a4 05 00 01 LL 80 (g5p_tex.vtx, LL the level's half index), the image and sampler at
+ * common dwords 0 and 4, each block by its own DOUTD; a read takes Apple's vertex read sampler
+ * (pvr_g5p_a8_vread_sampler()).
  */
 extern bool g5p_usc_g4p_vtex_apple;
 /* A fragment texel-buffer read on the A8 (st/mesa's pixel-buffer uploads) as a 2D texelFetch of the buffer's linear
