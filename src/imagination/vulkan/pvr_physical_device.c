@@ -1427,6 +1427,8 @@ VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
       g5p_usc_g4p_fge_swap = debug_get_bool_option("PVR_A8_FGE_SWAP", true);
       /* gl_FragCoord.z/w by the A8's varying iterator (g5p_usc.h) */
       g5p_usc_g4p_pos_iter = debug_get_bool_option("PVR_A8_POS_ITER", true);
+      /* an R8 target's LOAD in Apple's form, from an iOS capture (g5p_usc.h) */
+      g5p_usc_g4p_r8_load = debug_get_bool_option("PVR_A8_R8_LOAD", true);
    }
 
    /* The A8 skips refused work by default: a refused program or pass loses its draws (named on stderr) instead of

@@ -18,6 +18,7 @@ bool g5p_usc_g4p_vtex_apple;
 bool g5p_usc_g4p_tbo;
 bool g5p_usc_g4p_fge_swap;
 bool g5p_usc_g4p_pos_iter;
+bool g5p_usc_g4p_r8_load;
 
 const char *const g5p_binop_name[G5P_BIN_COUNT] = {"fadd", "fmul", "iadd", "imul", "and", "or", "xor", "ishr",
                                                        "isub"};

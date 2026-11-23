@@ -79,6 +79,9 @@ extern bool g5p_usc_g4p_fge_swap;
  * coefficient sets (g5p_usc_position_zw()), in place of the A9's position iterator `08 09 ..`, which no A8 capture
  * has and which reads 0 on the iPod touch 6. PVR_A8_POS_ITER, on by default; 0 gives the A9 form. */
 extern bool g5p_usc_g4p_pos_iter;
+/* An R8 colour target with loadOp LOAD on the A8, in Apple's form (g5p_mrt_load_usc_g4p_r8(); PVR_A8_R8_LOAD, on by
+ * default; 0 refuses it, as before) */
+extern bool g5p_usc_g4p_r8_load;
 
 enum g5p_binop {
    G5P_BIN_FADD, G5P_BIN_FMUL, G5P_BIN_IADD, G5P_BIN_IMUL,

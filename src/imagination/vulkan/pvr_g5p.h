@@ -188,6 +188,9 @@ struct pvr_g5p_programs {
    /* the A8's colour LOAD background (g5p_mrt_load_usc_g4p()): its USC, kick and the three-DOUTD loader */
    struct pvr_suballoc_bo *a8_load_usc;
    struct pvr_pds_upload a8_load_kick, a8_load_dma;
+   /* its one-target R8 form (g5p_mrt_load_usc_g4p_r8(), lazy: the device's other allocations keep their order) */
+   struct pvr_suballoc_bo *a8_load_r8_usc;
+   struct pvr_pds_upload a8_load_r8_kick;
    /* raw clear programs by total output words: 2, 4, 8 (two 32-bit integer targets) */
    struct pvr_suballoc_bo *raw_clear_usc[4]; /*2/4/8 words, then scalar1 */
    /* raw end-of-tile programs by target count: 1, 2 */
