@@ -164,6 +164,28 @@ vtex_descriptor(struct pvr_cmd_buffer *cmd, const struct pco_g5p_upload *u, uint
 }
 
 VkResult
+PVR_PER_ARCH(g5p_vtex_words)(struct pvr_cmd_buffer *cmd, const struct pco_g5p_upload *u, uint32_t *out)
+{
+   switch (u->kind) {
+   case PCO_G5P_UPLOAD_IMAGE: case PCO_G5P_UPLOAD_SAMPLER: case PCO_G5P_UPLOAD_IMAGE_SIZE:
+      return vtex_descriptor(cmd, u, out);
+   case PCO_G5P_UPLOAD_ZERO:
+      memset(out, 0, 4 * u->dwords);
+      return VK_SUCCESS;
+   case PCO_G5P_UPLOAD_FETCH_SAMPLER:
+      if (u->dwords != 4)
+         return VTEX_REFUSE(cmd, "A8 fetch sampler of %u dwords", u->dwords);
+      if (g5p_usc_g4p_vtex_apple)
+         pvr_g5p_a8_vread_sampler(out);
+      else
+         pvr_g5p_a8_fetch_sampler(out, NULL, 0);
+      return VK_SUCCESS;
+   default:
+      return VTEX_REFUSE(cmd, "not a texture upload (kind %u)", u->kind);
+   }
+}
+
+VkResult
 PVR_PER_ARCH(g5p_vtex_draw)(struct pvr_cmd_buffer *cmd, const struct pvr_g5p_stage_uploads *up,
                             struct pvr_g5p_vs_upload_draw *out)
 {

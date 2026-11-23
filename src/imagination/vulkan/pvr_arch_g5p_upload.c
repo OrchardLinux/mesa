@@ -23,6 +23,7 @@
 #include "util/u_math.h"
 
 #include "pco_g5p_general.h"
+#include "g5p_usc.h"
 #include "pdsc.h"
 #include "pdsc_internal.h"
 #include "pdsc_isa_pack.h"
@@ -92,7 +93,11 @@ PVR_PER_ARCH(g5p_vs_uploads_create)(struct pvr_device *device, const struct pco_
    *out = NULL;
    if (!vs->num_uploads)
       return VK_SUCCESS;
-   if (g5p_vtex_probe() || g5p_vtex_qualified()) {
+   /* The A8 with Apple's vertex form: one DOUTD per upload, as Apple's vertex PDS data (an iOS capture: image state
+    * to common 0..3 by 10000004, constants to 8..14 by 10010007, sampler to 4..7 by 90008004), not the coalesced
+    * copy of the vertex-texture path below */
+   const bool a8_apple = PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p) && g5p_usc_g4p_vtex_apple;
+   if (!a8_apple && (g5p_vtex_probe() || g5p_vtex_qualified())) {
       for (unsigned i = 0; i < vs->num_uploads; i++)
          if (vs->uploads[i].kind == PCO_G5P_UPLOAD_IMAGE || vs->uploads[i].kind == PCO_G5P_UPLOAD_IMAGE_SIZE)
             return pvr_arch_g5p_vtex_create(device, vs, out);
@@ -110,6 +115,11 @@ PVR_PER_ARCH(g5p_vs_uploads_create)(struct pvr_device *device, const struct pco_
       case PCO_G5P_UPLOAD_SSBO_ADDR:
       case PCO_G5P_UPLOAD_XFB:
          break;
+      case PCO_G5P_UPLOAD_IMAGE: case PCO_G5P_UPLOAD_SAMPLER: case PCO_G5P_UPLOAD_FETCH_SAMPLER:
+      case PCO_G5P_UPLOAD_ZERO: case PCO_G5P_UPLOAD_IMAGE_SIZE:
+         if (a8_apple)
+            break;
+         FALLTHROUGH;
       default:
          /* textures and samplers in a vertex program: lane b's descriptor
           * words exist, the vertex stage does not take them yet */
@@ -266,6 +276,24 @@ PVR_PER_ARCH(g5p_vs_uploads_draw)(struct pvr_cmd_buffer *cmd_buffer, const struc
                                  g5p_up_kind_str(u->kind), u->dwords, u->offset, size);
          const uint64_t va = addr + (u->kind == PCO_G5P_UPLOAD_UBO_ADDR ? u->offset : 0);
          result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, &va, sizeof(va), &bo);
+         if (result != VK_SUCCESS)
+            return result;
+         src[i] = bo->dev_addr.addr;
+         break;
+      }
+      case PCO_G5P_UPLOAD_IMAGE: case PCO_G5P_UPLOAD_SAMPLER: case PCO_G5P_UPLOAD_FETCH_SAMPLER:
+      case PCO_G5P_UPLOAD_ZERO: case PCO_G5P_UPLOAD_IMAGE_SIZE: {
+         /* the A8 with Apple's vertex form: the state block's words, its own DOUTD */
+         uint32_t words[8] = {0};
+         if (u->dwords > 8)
+            return G5P_REFUSE(cmd_buffer, "vertex %s of %u dwords", g5p_up_kind_str(u->kind), u->dwords);
+         const struct pco_g5p_upload pu = { .kind = u->kind, .set = u->set, .binding = u->binding,
+                                            .element = u->element, .offset = u->offset, .dwords = u->dwords,
+                                            .common = u->common };
+         result = pvr_arch_g5p_vtex_words(cmd_buffer, &pu, words);
+         if (result != VK_SUCCESS)
+            return result;
+         result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, words, bytes, &bo);
          if (result != VK_SUCCESS)
             return result;
          src[i] = bo->dev_addr.addr;
