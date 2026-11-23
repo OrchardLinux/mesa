@@ -35,7 +35,7 @@ pvr_g5p_vtex_plan(const struct pco_g5p_upload *uploads, unsigned count, unsigned
       case PCO_G5P_UPLOAD_IMAGE: case PCO_G5P_UPLOAD_SAMPLER: case PCO_G5P_UPLOAD_IMAGE_SIZE:
       case PCO_G5P_UPLOAD_FETCH_SAMPLER:
       case PCO_G5P_UPLOAD_PUSH: case PCO_G5P_UPLOAD_UBO: case PCO_G5P_UPLOAD_UBO_ADDR:
-      case PCO_G5P_UPLOAD_SSBO_ADDR: case PCO_G5P_UPLOAD_XFB:
+      case PCO_G5P_UPLOAD_SSBO_ADDR: case PCO_G5P_UPLOAD_XFB: case PCO_G5P_UPLOAD_ZERO:
          break;
       default:
          return "unqualified source kind";

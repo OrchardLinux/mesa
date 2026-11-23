@@ -224,6 +224,7 @@ struct g5p_tex {
     * or normalized texture, 0xa4 (int_result) for a read of an integer one */
    bool vtx;
    bool int_result;
+   unsigned lod_common; /* vtx: the common dword holding the f32 level (byte 10 = its half index, 2 * dword) */
 };
 unsigned g5p_usc_sample(uint8_t *out, const struct g5p_tex *t);
 /* The 2D-multisample fetch's sample operand "the task's own sample" (a sample-rate program reads the

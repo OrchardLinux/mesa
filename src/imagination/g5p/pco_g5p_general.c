@@ -269,6 +269,7 @@ struct gctx {
    /* common store */
    struct tex_bind tex[16];
    unsigned ntex, fetch_sampler_common;
+   int vtx_lod_common; /* the A8 vertex sample's level 0.0 in the common store (PCO_G5P_UPLOAD_ZERO), -1 without */
    bool cube_gradient; /* fixed native bank0 r0..r8 operand tuple */
    struct { unsigned set, binding, element, lod, common; } tsize[4]; /* textureSize/QueryLevels */
    unsigned nsize;
@@ -2359,6 +2360,8 @@ static void plan_common(struct gctx *c)
     * plan reserves their dwords (plus one for alignment) at its end. */
    const unsigned ssbo_reserve = c->ssbo_high ? 2 * c->nssbo + 1 : 0;
    bool qualified = c->vs && g5p_vtex_qualified();
+   /* Apple's vertex sample reads its level from the common store: one zero dword after the uniforms */
+   const unsigned a8_vlod = g5p_usc_g4p && c->vs && g5p_usc_g4p_vtex_apple && c->ntex;
    /* Preserve the flown <=4-texture layout. Larger fragment programs use
     * Apple's f16 capacity layout: all eight-dword images, then samplers.
     * Interleaving wastes six dwords per binding and exceeds the selectors. */
@@ -2399,7 +2402,7 @@ static void plan_common(struct gctx *c)
       if (!g5p_stage_common_plan_stride(next, c->ntex, sampler_count + fetch_sampler, idw, sdw,
                                         g5p_usc_g4p && c->vs && g5p_usc_g4p_vtex_apple ? 4 : 0,
                                  compact, c->nuptr, c->nsize, ubos,
-                                 ubo_dwords, push_dwords + ssbo_reserve, &common_plan))
+                                 ubo_dwords, push_dwords + ssbo_reserve + a8_vlod, &common_plan))
          refuse(c, "common layout cannot fit pointers below 32 and data below 256 dwords");
       compact = common_plan.compact;
       if (common_plan.low_pointers) {
@@ -2534,6 +2537,15 @@ static void plan_common(struct gctx *c)
          refuse(c, "uniforms exceed %u common-store dwords", limit);
       add_upload(c, r->kind, r->set, r->binding, r->element, r->lo,
                  (r->hi - r->lo) / 4, r->common);
+   }
+   /* the A8 vertex sample's constant level 0.0 (Apple's form, g5p_tex.lod_common), after the uniforms */
+   c->vtx_lod_common = -1;
+   if (a8_vlod) {
+      if (next > 63)
+         refuse(c, "A8 vertex sample: its level constant past common dword 63");
+      c->vtx_lod_common = next;
+      add_upload(c, PCO_G5P_UPLOAD_ZERO, 0, 0, 0, 0, 1, next);
+      next++;
    }
    if (planned)
       assert(next + ssbo_reserve == common_plan.end);
@@ -5544,7 +5556,7 @@ static void emit_vertex_tex_g4p(struct gctx *c, nir_tex_instr *t)
    vertex_qualified_copy(c, coord + 1, cd, 1);
    struct g5p_tex s = {.image_qword = b->image, .a8_slots = true, .sampler_qword = b->sampler,
                        .coord_dword = H(c, coord) / 2, .coord_control = true, .dim = G5P_TEX_2D, .narrow = false,
-                       .read_flag = fetch, .vtx = true,
+                       .read_flag = fetch, .vtx = true, .lod_common = (unsigned)MAX2(c->vtx_lod_common, 0),
                        .int_result = nir_alu_type_get_base_type(t->dest_type) != nir_type_float,
                        .dst_half = H(c, dst)};
    const unsigned n = g5p_usc_sample(raw, &s);

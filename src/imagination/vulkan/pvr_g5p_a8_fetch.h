@@ -66,4 +66,31 @@ pvr_g5p_a8_read_sampler(uint32_t out[4])
    out[2] = out[3] = 0;
 }
 
+/* Apple's vertex read() sampler, from an iOS capture (AGXMetalA8's vread2_f32: the program's constant data, DMA'd to
+ * vertex common dwords 4..7): 0x04004801df800fff, word 1 0 -- point, mip off, CLAMP_TO_BORDER on u/v/w,
+ * normalized, LOD 0..MAX, no LOD bias. The sample's read bit (byte 6 bit 2) addresses texels; the level is Apple's
+ * constant 0.0 in the common store. */
+static inline void
+pvr_g5p_a8_vread_sampler(uint32_t out[4])
+{
+   uint64_t w0 = 0;
+   struct ROGUE_TEXSTATE_SAMPLER_WORD0 s;
+
+   memset(&s, 0, sizeof(s));
+   s.minfilter = ROGUE_TEXSTATE_FILTER_POINT;
+   s.magfilter = ROGUE_TEXSTATE_FILTER_POINT;
+   s.mipfilter = false;
+   s.anisoctl = ROGUE_TEXSTATE_ANISOCTL_DISABLED;
+   s.addrmode_u = ROGUE_TEXSTATE_ADDRMODE_CLAMP_TO_BORDER;
+   s.addrmode_v = ROGUE_TEXSTATE_ADDRMODE_CLAMP_TO_BORDER;
+   s.addrmode_w = ROGUE_TEXSTATE_ADDRMODE_CLAMP_TO_BORDER;
+   s.non_normalized_coords = false;
+   s.minlod = ROGUE_TEXSTATE_CLAMP_MIN;
+   s.maxlod = ROGUE_TEXSTATE_CLAMP_MAX;
+   s.dadjust = ROGUE_TEXSTATE_DADJUST_ZERO_UINT;
+   ROGUE_TEXSTATE_SAMPLER_WORD0_pack(&w0, &s);
+   memcpy(out, &w0, sizeof(w0));
+   out[2] = out[3] = 0;
+}
+
 #endif

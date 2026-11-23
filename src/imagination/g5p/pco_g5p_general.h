@@ -165,6 +165,9 @@ enum pco_g5p_upload_kind {
     * pvr_sampler_descriptor::meta (load_smp_meta_pco; the LOD-bias variant reads the sampler's mipLodBias,
     * PVR_G5P_SAMPLER_META_LOD_BIAS) */
    PCO_G5P_UPLOAD_SAMPLER_META,
+   /* `dwords` zero dwords: the A8 vertex sample's constant level 0.0 (Apple's AGXMetalA8 vertex programs read it from
+    * the common store, byte 10 of the sample = its half index: 0x1c = common dword 14 in an iOS capture) */
+   PCO_G5P_UPLOAD_ZERO,
 };
 /* nir_tex_instr.backend_flags, set by the driver's LOD-bias lowering (pvr_g5p_nir.c lod_bias_lower()): the
  * sample adds its sampler's mipLodBias (pco_g5p_program::lod_samplers[].biased) */

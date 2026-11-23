@@ -1174,10 +1174,11 @@ static unsigned sample_g4p(uint8_t *out, const struct g5p_tex *t)
       if (t->vtx) {
          /* Apple's vertex form (g5p_tex.vtx) */
          CHECK(!t->narrow && !t->lod_reg && t->coord_dword <= 31, "A8 vertex sample: 32-bit, Apple's constant level");
+         CHECK(t->lod_common && t->lod_common <= 63, "A8 vertex sample: its level constant's common dword");
          const uint8_t b6 = 0xa0 | (!t->read_flag ? 0x08 : t->int_result ? 0x04 : 0x0c);
          const uint8_t vraw[12] = {0x1a, (uint8_t)((slot & 3) << 6 | 0x3d), (uint8_t)t->dst_half, 0x41,
                                    (uint8_t)(2 * image_dword), (uint8_t)(1 | (slot >> 2) << 1), b6, 0x05,
-                                   (uint8_t)(t->coord_dword << 1), 0x01, 0x1c, 0x80};
+                                   (uint8_t)(t->coord_dword << 1), 0x01, (uint8_t)(2 * t->lod_common), 0x80};
          return finish_g4p(out, vraw, sizeof(vraw));
       }
       const uint8_t raw[12] = {0x1a, (uint8_t)((slot & 3) << 6 | (t->narrow ? 0x19 : 0x39)), (uint8_t)t->dst_half,

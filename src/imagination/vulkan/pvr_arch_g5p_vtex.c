@@ -183,11 +183,17 @@ PVR_PER_ARCH(g5p_vtex_draw)(struct pvr_cmd_buffer *cmd, const struct pvr_g5p_sta
          result = vtex_descriptor(cmd, u, dst);
          if (result != VK_SUCCESS) return result;
          break;
+      case PCO_G5P_UPLOAD_ZERO:
+         memset(dst, 0, bytes);
+         break;
       case PCO_G5P_UPLOAD_FETCH_SAMPLER: {
          if (u->dwords == 4 && PVR_HAS_FEATURE(&cmd->device->pdevice->dev_info, apple_g4p)) {
             /* the A8: Rogue sampler words, point, non-normalized, clamped, level 0: Apple's read sampler, the constant
              * 0x0202240000000fff of its vertex and fragment reads (from an iOS capture) */
-            pvr_g5p_a8_fetch_sampler(dst, NULL, 0);
+            if (g5p_usc_g4p_vtex_apple)
+               pvr_g5p_a8_vread_sampler(dst); /* Apple's vertex read sampler (pvr_g5p_a8_fetch.h) */
+            else
+               pvr_g5p_a8_fetch_sampler(dst, NULL, 0);
             break;
          }
          if (u->dwords != 2) return VTEX_REFUSE(cmd, "invalid samplerless read policy size");
