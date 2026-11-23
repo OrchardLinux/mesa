@@ -22,6 +22,7 @@
 #include "vk_log.h"
 
 #include "util/ralloc.h"
+#include "util/u_debug.h"
 #include "util/u_dynarray.h"
 #include "util/u_math.h"
 
@@ -36,10 +37,12 @@
 #include "pdsc_internal.h"
 #include "pdsc_isa_pack.h"
 #include "pdsc_ops.h"
+#include "pvr_bo_log.h"
 #include "pvr_bo.h"
 #include "pvr_cmd_buffer.h"
 #include "pvr_csb.h"
 #include "pvr_device.h"
+#include "pvr_physical_device.h"
 #include "pvr_free_list.h"
 #include "pvr_g5p.h"
 #include "pvr_g5p_dgl.h"
@@ -102,10 +105,10 @@ g5p_pds_pack(pdsc_program *p, uint32_t *dest)
 
 /* DOUTU from data dwords 0-1, then HALT: the code of a kick */
 static unsigned
-g5p_pds_kick_code(uint32_t *code)
+g5p_pds_kick_code(uint32_t *code, enum pdsc_feature features)
 {
    pdsc_init();
-   pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-kick");
+   pdsc_program *p = pdsc_program_create(NULL, features, "g5p-kick");
    pdsc_dout(p, pdsc_ref_const64(0), pdsc_ref_null(), pdsc_ref_null(), .dstdout = PDSC_DSTDOUT_U,
              .end = true);
    pdsc_halt(p);
@@ -117,10 +120,10 @@ g5p_pds_kick_code(uint32_t *code)
 /* DOUTD from data dwords 0-1 with the control in dword 2, then (eot) DOUTU
  * from dwords 4-5; HALT (pdsc's const indices count dwords) */
 static unsigned
-g5p_pds_dma_code(uint32_t *code, bool eot)
+g5p_pds_dma_code(uint32_t *code, bool eot, enum pdsc_feature features)
 {
    pdsc_init();
-   pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, eot ? "g5p-eot" : "g5p-clear-dma");
+   pdsc_program *p = pdsc_program_create(NULL, features, eot ? "g5p-eot" : "g5p-clear-dma");
    pdsc_dout(p, pdsc_ref_const64(0), pdsc_ref_const32(2), pdsc_ref_null(), .dstdout = PDSC_DSTDOUT_D,
              .end = !eot);
    if (eot) /* pdsc's const64 index counts dwords: dwords 4-5 */
@@ -135,10 +138,10 @@ g5p_pds_dma_code(uint32_t *code, bool eot)
 /* n DOUTDs, source i from data dwords 2i..2i+1 and its control in dword
  * 2n + 2i, the last one ending; HALT (the A9 ICD's uniform loader) */
 static unsigned
-g5p_pds_loader_code(uint32_t *code, unsigned n)
+g5p_pds_loader_code(uint32_t *code, unsigned n, enum pdsc_feature features)
 {
    pdsc_init();
-   pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-loader");
+   pdsc_program *p = pdsc_program_create(NULL, features, "g5p-loader");
    for (unsigned i = 0; i < n; i++)
       pdsc_dout(p, pdsc_ref_const64(2 * i), pdsc_ref_const32(2 * n + 2 * i), pdsc_ref_null(),
                 .dstdout = PDSC_DSTDOUT_D, .end = i == n - 1);
@@ -151,35 +154,35 @@ g5p_pds_loader_code(uint32_t *code, unsigned n)
 static uint64_t
 g5p_doutu_src0(uint32_t exe_off, unsigned temps)
 {
-   pdsc_init();
-   pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-doutu");
+   /* packing a field reads only the feature set: no program allocation per draw */
+   static const pdsc_program pack = { .name = "g5p-doutu", .features = PDSC_FEATURE_DOUT_EXT };
+   const pdsc_program *p = &pack;
    struct pdsc_doutu_src0 s = { .exe_off = exe_off, .temps = temps };
    const uint64_t v = pdsc_doutu_src0_pack(p, &s);
-   ralloc_free(p);
    return v;
 }
 
 static uint32_t
 g5p_doutd_control_at(unsigned common, unsigned dwords, bool last)
 {
-   pdsc_init();
-   pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-doutd");
+   /* packing a field reads only the feature set: no program allocation per draw */
+   static const pdsc_program pack = { .name = "g5p-doutd", .features = PDSC_FEATURE_DOUT_EXT };
+   const pdsc_program *p = &pack;
    struct pdsc_doutd_src1 s = { .last_issue = last, .store_dest = PDSC_STORE_DEST_COMMON, .ao = common,
                                 .bsize = dwords };
    const uint32_t v = pdsc_doutd_src1_pack(p, &s);
-   ralloc_free(p);
    return v;
 }
 
 static uint32_t
 g5p_doutd_control(unsigned dwords)
 {
-   pdsc_init();
-   pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-doutd");
+   /* packing a field reads only the feature set: no program allocation per draw */
+   static const pdsc_program pack = { .name = "g5p-doutd", .features = PDSC_FEATURE_DOUT_EXT };
+   const pdsc_program *p = &pack;
    struct pdsc_doutd_src1 s = { .last_issue = true, .store_dest = PDSC_STORE_DEST_COMMON, .ao = 0,
                                 .bsize = dwords };
    const uint32_t v = pdsc_doutd_src1_pack(p, &s);
-   ralloc_free(p);
    return v;
 }
 
@@ -187,7 +190,7 @@ g5p_doutd_control(unsigned dwords)
 static uint32_t
 g5p_usc_off(const struct pvr_device *device, const struct pvr_suballoc_bo *bo)
 {
-   return (uint32_t)(bo->dev_addr.addr - device->heaps.usc_heap->base_addr.addr);
+   return (uint32_t)(bo->dev_addr.addr - PVR_G5P_USC_EXEC_BASE(device));
 }
 
 /* A kick of a USC program, its code at data + 0x20 as the registers expect;
@@ -199,7 +202,7 @@ g5p_upload_kick_temps(struct pvr_device *device, const struct pvr_suballoc_bo *u
    const uint64_t doutu = pvr_g5p_msaa_doutu(g5p_doutu_src0(g5p_usc_off(device, usc), temps), samples);
    const uint32_t data[4] = { (uint32_t)doutu, (uint32_t)(doutu >> 32), 0, 0 };
    uint32_t code[8];
-   const unsigned n = g5p_pds_kick_code(code);
+   const unsigned n = g5p_pds_kick_code(code, PVR_G5P_PDS_FEATURES(&device->pdevice->dev_info));
    VkResult result = pvr_gpu_upload_pds(device, data, ARRAY_SIZE(data), 16, code, n, G5P_KICK_CODE,
                                         64, out);
    if (result == VK_SUCCESS && out->code_offset != out->data_offset + G5P_KICK_CODE)
@@ -224,6 +227,17 @@ g5p_free_programs(struct pvr_device *device, struct pvr_g5p_programs *p)
       pvr_bo_suballoc_free(p->clear_usc[i]);
       pvr_bo_suballoc_free(p->clear_kick[i].pvr_bo);
    }
+   for (unsigned i = 0; i < 2; i++) {
+      pvr_bo_suballoc_free(p->clear_usc_narrow[i]);
+      pvr_bo_suballoc_free(p->clear_kick_narrow[i].pvr_bo);
+   }
+   pvr_bo_suballoc_free(p->clear_usc_rgba8ui);
+   pvr_bo_suballoc_free(p->clear_kick_rgba8ui.pvr_bo);
+   pvr_bo_suballoc_free(p->clear_usc_r32f);
+   pvr_bo_suballoc_free(p->clear_kick_r32f.pvr_bo);
+   pvr_bo_suballoc_free(p->a8_load_usc);
+   pvr_bo_suballoc_free(p->a8_load_kick.pvr_bo);
+   pvr_bo_suballoc_free(p->a8_load_dma.pvr_bo);
    for (unsigned i = 0; i < ARRAY_SIZE(p->raw_load); i++) {
       if (p->raw_load[i]) {
          g5p_free_programs(device, p->raw_load[i]);
@@ -317,7 +331,7 @@ g5p_upload_load(struct pvr_device *device, struct pvr_g5p_programs *p, unsigned 
    if (result != VK_SUCCESS)
       return result;
    uint32_t code[2 * ARRAY_SIZE(p->load_upload) + 2];
-   const unsigned n = g5p_pds_loader_code(code, p->load_uploads);
+   const unsigned n = g5p_pds_loader_code(code, p->load_uploads, PVR_G5P_PDS_FEATURES(&device->pdevice->dev_info));
    return pvr_gpu_upload_pds(device, NULL, 0, 0, code, n, 16, 64, &p->load_dma);
 }
 
@@ -349,6 +363,9 @@ g5p_raw_programs_unlocked(struct pvr_device *device, unsigned raw, unsigned word
 {
    struct pvr_g5p_programs *p = &device->g5p->programs;
    VkResult result;
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p))
+      return vk_errorf(device, VK_ERROR_FEATURE_NOT_PRESENT,
+                       "G5P: an integer colour pass on the A8 (its end of tile is captured for float targets only)");
    const unsigned variant = g5p_raw_variant(words);
    if (!p->raw_clear_usc[variant]) {
       uint8_t code[6 * G5P_USC_MAX];
@@ -413,8 +430,13 @@ g5p_upload_programs(struct pvr_device *device, struct pvr_g5p_programs *p)
       return vk_errorf(device, VK_ERROR_INITIALIZATION_FAILED, "G5P: the HALT's code is at data + %#x, not + 0x10",
                        p->halt.code_offset - p->halt.data_offset);
 
+   /* The A8 builds the forms captured on it: one colour target, one sample, no LOAD (its texture sample
+    * is not decoded); the others stay unbuilt and their passes are refused by name */
+   const bool g4p = PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p);
    for (unsigned i = 0; i < PVR_G5P_MRT_VARIANTS; i++) {
       const unsigned n = g5p_mrt_variant_targets[i];
+      if (g4p && ((n != 1 && n != 2) || i >= 7))
+         continue;
       uint8_t code[MAX2(G5P_MRT_CLEAR_USC_MAX, G5P_MRT_EOT_USC_MAX)];
       /* variants 7..10: the RGBA8 byte order of the compact clear */
       unsigned size = i >= 7 ? g5p_mrt_clear_compact(code, n, false) : g5p_mrt_clear_usc(code, n);
@@ -430,9 +452,64 @@ g5p_upload_programs(struct pvr_device *device, struct pvr_g5p_programs *p)
       if (result != VK_SUCCESS)
          return result;
    }
+   /* the A8's R8 and RG8 background programs */
+   for (unsigned i = 0; g4p && i < 2; i++) {
+      uint8_t code[G5P_MRT_CLEAR_USC_MAX];
+      const unsigned size = g5p_mrt_clear_usc_g4p_narrow(code, i + 1);
+      if (!size)
+         return vk_errorf(device, VK_ERROR_UNKNOWN, "G5P: A8 narrow clear: %s", g5p_usc_error);
+      result = pvr_gpu_upload_usc(device, code, size, 64, &p->clear_usc_narrow[i]);
+      if (result != VK_SUCCESS)
+         return result;
+      result = g5p_upload_kick(device, p->clear_usc_narrow[i], 1, &p->clear_kick_narrow[i]);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+   /* the A8's RGBA8UI background program */
+   if (g4p) {
+      uint8_t code[G5P_MRT_CLEAR_USC_MAX];
+      const unsigned size = g5p_mrt_clear_usc_g4p_rgba8ui(code);
+      if (!size)
+         return vk_errorf(device, VK_ERROR_UNKNOWN, "G5P: A8 RGBA8UI clear: %s", g5p_usc_error);
+      result = pvr_gpu_upload_usc(device, code, size, 64, &p->clear_usc_rgba8ui);
+      if (result != VK_SUCCESS)
+         return result;
+      result = g5p_upload_kick(device, p->clear_usc_rgba8ui, 1, &p->clear_kick_rgba8ui);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+   /* the A8's colour LOAD background: Apple's program, its kick, and the loader of its three uploads */
+   if (g4p) {
+      uint8_t code[G5P_A8_LOAD_USC_BYTES];
+      const unsigned size = g5p_mrt_load_usc_g4p(code);
+      result = pvr_gpu_upload_usc(device, code, size, 64, &p->a8_load_usc);
+      if (result != VK_SUCCESS)
+         return result;
+      result = g5p_upload_kick(device, p->a8_load_usc, 1, &p->a8_load_kick);
+      if (result != VK_SUCCESS)
+         return result;
+      uint32_t pds[8];
+      const unsigned n = g5p_pds_loader_code(pds, 3, PVR_G5P_PDS_FEATURES(&device->pdevice->dev_info));
+      result = pvr_gpu_upload_pds(device, NULL, 0, 0, pds, n, 16, 64, &p->a8_load_dma);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+   /* the A8's R32F background program */
+   if (g4p) {
+      uint8_t code[G5P_MRT_CLEAR_USC_MAX];
+      const unsigned size = g5p_mrt_clear_usc_g4p_r32f(code);
+      if (!size)
+         return vk_errorf(device, VK_ERROR_UNKNOWN, "G5P: A8 R32F clear: %s", g5p_usc_error);
+      result = pvr_gpu_upload_usc(device, code, size, 64, &p->clear_usc_r32f);
+      if (result != VK_SUCCESS)
+         return result;
+      result = g5p_upload_kick(device, p->clear_usc_r32f, 1, &p->clear_kick_r32f);
+      if (result != VK_SUCCESS)
+         return result;
+   }
    /* 4x (one target): the multisample store's end of tile, and the clear's
     * kick at sample rate */
-   {
+   if (!g4p) {
       uint8_t code[G5P_MRT_EOT_USC_MAX];
       const unsigned size = pvr_g5p_msaa_eot_usc(code);
       result = pvr_gpu_upload_usc(device, code, size, 64, &p->eot_usc_ms);
@@ -444,11 +521,11 @@ g5p_upload_programs(struct pvr_device *device, struct pvr_g5p_programs *p)
    }
 
    uint32_t pds[8];
-   unsigned n = g5p_pds_dma_code(pds, false);
+   unsigned n = g5p_pds_dma_code(pds, false, PVR_G5P_PDS_FEATURES(&device->pdevice->dev_info));
    result = pvr_gpu_upload_pds(device, NULL, 0, 0, pds, n, 16, 64, &p->clear_dma);
    if (result != VK_SUCCESS)
       return result;
-   n = g5p_pds_dma_code(pds, true);
+   n = g5p_pds_dma_code(pds, true, PVR_G5P_PDS_FEATURES(&device->pdevice->dev_info));
    result = pvr_gpu_upload_pds(device, NULL, 0, 0, pds, n, 16, 64, &p->eot);
    if (result != VK_SUCCESS)
       return result;
@@ -476,7 +553,7 @@ g5p_upload_programs(struct pvr_device *device, struct pvr_g5p_programs *p)
       result = g5p_upload_zeroed(device, G5P_SCISSOR_POOL_BYTES, &p->scissor_pool);
    if (result == VK_SUCCESS)
       result = g5p_upload_zeroed(device, G5P_DBIAS_POOL_BYTES, &p->dbias_pool);
-   if (result == VK_SUCCESS)
+   if (result == VK_SUCCESS && !g4p)
       result = g5p_upload_load(device, p, 0);
    return result;
 }
@@ -496,9 +573,17 @@ PVR_PER_ARCH(g5p_device_init)(struct pvr_device *device)
    /* vkCmdClearAttachments' clear quad: its pipelines are made at first use (pvr_arch_g5p_gfx.c) */
    simple_mtx_init(&device->g5p->clear_lock, mtx_plain);
 
+   /* The parameter manager pool every render asks for (pvr_g5p.h); the
+    * kernel builds at most 16 MiB */
+   /* The A8's kernel sizes its pool itself (powervr.a8_pm_blocks) and does not read this list: it keeps
+    * the 4 MiB the iPod's renders ran with. */
+   const bool a8 = PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p);
+   const int64_t fl_mb = debug_get_num_option("PVR_G5P_FREE_LIST_MB", a8 ? 4 : PVR_G5P_FREE_LIST_SIZE >> 20);
+   const uint32_t fl_size = (uint32_t)CLAMP(fl_mb, 1, 16) << 20;
+
    VkResult result = g5p_upload_programs(device, &device->g5p->programs);
    if (result == VK_SUCCESS)
-      result = pvr_free_list_create(device, PVR_G5P_FREE_LIST_SIZE, PVR_G5P_FREE_LIST_SIZE, 0, 0,
+      result = pvr_free_list_create(device, fl_size, fl_size, 0, 0,
                                     device->global_free_list, &device->g5p->free_list);
    if (result == VK_SUCCESS)
       result = PVR_PER_ARCH(g5p_meta_init)(device);
@@ -632,6 +717,51 @@ g5p_load_background(struct pvr_cmd_buffer *cmd_buffer, const uint64_t state[][4]
    return VK_SUCCESS;
 }
 
+/*
+ * The A8's colour LOAD background (AGXMetalA8, a8-passcap load): Apple's program (g5p_mrt_load_usc_g4p()) reads, by
+ * three DOUTDs of 4 + 4 + 6 dwords into common dwords 0, 4 and 8, the target's texture state (its first two qwords),
+ * Apple's load sampler (00000fff 02022400 0 0: the passcap's words) and the 2x3 matrix from the fragment position to the
+ * sample coordinate (identity: 1, 0, 0, 1, 0, 0). Data controls 10000004, 10008004, 90010006; uniform size 3 units,
+ * common-store size 14 dwords, as Apple's record has them.
+ */
+static VkResult
+g5p_load_background_g4p(struct pvr_cmd_buffer *cmd_buffer, const uint64_t state[4], uint64_t bgnd[4],
+                        const struct pvr_g5p_programs *p)
+{
+   static const uint32_t sampler[4] = { 0x00000fff, 0x02022400, 0, 0 };
+   static const float matrix[6] = { 1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f };
+   static const struct { unsigned common, dwords; } up[3] = { { 0, 4 }, { 4, 4 }, { 8, 6 } };
+   struct pvr_suballoc_bo *bo[3];
+   const void *src[3] = { state, sampler, matrix };
+   const size_t bytes[3] = { 16, sizeof(sampler), sizeof(matrix) };
+   uint32_t data[12] = { 0 };
+   for (unsigned i = 0; i < 3; i++) {
+      VkResult result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, src[i], bytes[i], &bo[i]);
+      if (result != VK_SUCCESS)
+         return result;
+      data[2 * i] = (uint32_t)bo[i]->dev_addr.addr;
+      data[2 * i + 1] = (uint32_t)(bo[i]->dev_addr.addr >> 32);
+      data[6 + 2 * i] = g5p_doutd_control_at(up[i].common, up[i].dwords, i == 2);
+   }
+   struct pvr_pds_upload load_data;
+   VkResult result = pvr_arch_cmd_buffer_upload_pds(cmd_buffer, data, ARRAY_SIZE(data), 16, NULL, 0, 0, 16,
+                                                    &load_data);
+   if (result != VK_SUCCESS)
+      return result;
+   pvr_csb_pack (&bgnd[0], CR_PDS_BGRND0_BASE, b0) {
+      b0.shader_addr = PVR_DEV_ADDR(p->a8_load_kick.data_offset);
+      b0.texunicode_addr = PVR_DEV_ADDR(p->a8_load_dma.code_offset);
+   }
+   pvr_csb_pack (&bgnd[2], CR_PDS_BGRND2_BASE, b2) {
+      b2.uniformdata_addr = PVR_DEV_ADDR(load_data.data_offset);
+   }
+   pvr_csb_pack (&bgnd[3], CR_PDS_BGRND3_SIZEINFO, b3) {
+      b3.pds_uniformsize = DIV_ROUND_UP(ARRAY_SIZE(data), ROGUE_CR_PDS_BGRND3_SIZEINFO_PDS_UNIFORMSIZE_UNIT_SIZE);
+      b3.usc_sharedsize = DIV_ROUND_UP(14, ROGUE_CR_PDS_BGRND3_SIZEINFO_USC_SHAREDSIZE_UNIT_SIZE);
+   }
+   return VK_SUCCESS;
+}
+
 VkResult
 PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd_gfx *sub_cmd,
                            const struct pvr_renderpass_hwsetup_render *hw_render,
@@ -708,6 +838,17 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
    const bool byte_source = first_format == VK_FORMAT_R8_UINT || first_format == VK_FORMAT_R8_SINT;
    if (byte_source)
       raw = first_format == VK_FORMAT_R8_SINT ? 11 : 10;
+   /* The A8's RGBA8UI is a float-shaped pass (AGXMetalA8, a8-passcap rgba8u): the one-target end of tile with the
+    * integer conversion in its state word (below), the four clear uints DMA'd as the float colours are and packed
+    * by the A8 integer background program (g5p_mrt_clear_usc_g4p_rgba8ui()) */
+   const bool a8_rgba8ui = PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p) && n == 1 &&
+                           first_format == VK_FORMAT_R8G8B8A8_UINT;
+   if (a8_rgba8ui)
+      raw = 0;
+   /* and its R32F (a8-passcap r32f): the float pass with the f32 end-of-tile state word, one output word, the clear
+    * moving the red f32 (g5p_mrt_clear_usc_g4p_r32f()) */
+   const bool a8_r32f = PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p) && n == 1 &&
+                        first_format == VK_FORMAT_R32_SFLOAT;
    const bool narrow = raw >= 5 &&
       (byte_source || first_format == VK_FORMAT_R16_UINT || first_format == VK_FORMAT_R16_SINT ||
        first_format == VK_FORMAT_R8G8_UINT || first_format == VK_FORMAT_R8G8_SINT);
@@ -746,6 +887,8 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
       g->width = info->rstate->width;
       g->height = info->rstate->height;
    }
+   uint64_t target0_addr = 0; /* the A8's end of tile takes the target's address (below) */
+   bool a8_load_twiddled = false; /* the A8's LOAD samples a twiddled target only (Apple's capture) */
    for (unsigned t = 0; t < n && !null_target; t++) {
       const struct pvr_image_view *iview = info->attachments[hw_render->eot_surfaces[t].attachment_idx];
       const struct pvr_image *image = pvr_image_view_get_image(iview);
@@ -753,6 +896,8 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
       const struct pvr_mip_level *level = &plane->mip_levels[iview->vk.base_mip_level];
       const uint64_t addr = image->dev_addr.addr + plane->offset + level->offset +
                             iview->vk.base_array_layer * plane->layer_size;
+      if (!t)
+         target0_addr = addr;
       uint32_t key;
       bool srgb;
       /* 4x (admitted above: one target): the samples stored as they are, or the PBE resolve into the
@@ -760,6 +905,8 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
       const bool ms_store = g->samples == 4 && !hw_render->eot_surfaces[t].need_resolve;
 
       const bool twiddled=image->memlayout!=PVR_MEMLAYOUT_LINEAR && !ms_store;
+      if (!t)
+         a8_load_twiddled = twiddled;
       /* A twiddled 2D target (a mip level, an array layer or a cube face, one
        * layer per render): q0 bit 3 and no row pitch, as the native A9
        * captures store (g5p_pbe.h). Device-proven as the L11 probe (36 CTS
@@ -776,6 +923,66 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
       }
       if (!g5p_pbe_key(iview->vk.format, &key, &srgb))
          return G5P_REFUSE(cmd_buffer, "colour target format %s", vk_Format_to_str(iview->vk.format));
+      if (t == 1 && PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p)) {
+         /* The A8's second target (a8-passcap mrt2: BGRA8 + RGBA8): its own PBE pair, and the EOT format word
+          * with 0x120 (Apple's 0x122 for RGBA8; its meaning is not decoded, so only this shape is admitted) */
+         const VkFormat f = iview->vk.format;
+         if (f != VK_FORMAT_B8G8R8A8_UNORM && f != VK_FORMAT_R8G8B8A8_UNORM)
+            return G5P_REFUSE(cmd_buffer, "A8 second colour target format %s (RGBA8/BGRA8 UNORM are captured)",
+                              vk_Format_to_str(f));
+         g->a8_eot_format_t1 = ROGUE_PBESTATE_PACKMODE_U8U8U8U8 << 16 | 0x120 | 2;
+         g->a8_t1_addr = addr;
+         g5p_pbe_a8_reg_words(g->a8_pbe_t1, iview->vk.extent.width, iview->vk.extent.height,
+                              f == VK_FORMAT_B8G8R8A8_UNORM ? G5P_PBE_A8_SWIZZLE_BGRA : G5P_PBE_A8_SWIZZLE_RGBA,
+                              twiddled, level->pitch / 4);
+      }
+      if (!t && PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p)) {
+         /* The A8's PBE words for target 0 (the kernel's 3D record W+0x118): the formats captured on the A8 */
+         /*
+          * The formats whose A8 encoding the iPod captures prove:
+          * the end of tile's state word is the PBE packmode << 16 | the conversion (2 normalised, 0 float), the
+          * fragment program, clear and end-of-tile USC are BGRA8's for every 4-channel single target, and the
+          * PBE swizzle is BGRA8's or the identity
+          */
+         const VkFormat f = iview->vk.format;
+         g->a8_narrow_halves = 0;
+         switch (f) {
+         case VK_FORMAT_B8G8R8A8_UNORM:
+         case VK_FORMAT_R8G8B8A8_UNORM:
+            g->a8_eot_format = ROGUE_PBESTATE_PACKMODE_U8U8U8U8 << 16 | 2;
+            break;
+         case VK_FORMAT_R16G16B16A16_SFLOAT:
+            g->a8_eot_format = ROGUE_PBESTATE_PACKMODE_F16F16F16F16 << 16 | 0; /* Apple: 0x000a0000 */
+            break;
+         case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+            g->a8_eot_format = ROGUE_PBESTATE_PACKMODE_A2R10B10G10 << 16 | 2; /* Apple: 0x000e0002 */
+            break;
+         case VK_FORMAT_R8_UNORM:
+            g->a8_eot_format = ROGUE_PBESTATE_PACKMODE_U8 << 16 | 2; /* Apple: 0x002f0002 */
+            g->a8_narrow_halves = 1;
+            break;
+         case VK_FORMAT_R8G8_UNORM:
+            g->a8_eot_format = ROGUE_PBESTATE_PACKMODE_U8U8 << 16 | 2; /* Apple: 0x00230002 */
+            g->a8_narrow_halves = 2;
+            break;
+         case VK_FORMAT_R8G8B8A8_UINT:
+            g->a8_eot_format = ROGUE_PBESTATE_PACKMODE_U8U8U8U8 << 16 | 8; /* Apple: 0x00000008, integer */
+            break;
+         case VK_FORMAT_R32_SFLOAT:
+            g->a8_eot_format = ROGUE_PBESTATE_PACKMODE_F32 << 16 | 0; /* Apple: 0x00360000 */
+            break;
+         default:
+            return G5P_REFUSE(cmd_buffer, "A8 colour target format %s (captured: BGRA8/RGBA8 UNORM, RGBA16F, RGB10A2)",
+                              vk_Format_to_str(f));
+         }
+         g5p_pbe_a8_reg_words(g->a8_pbe, iview->vk.extent.width, iview->vk.extent.height,
+                              f == VK_FORMAT_B8G8R8A8_UNORM ? G5P_PBE_A8_SWIZZLE_BGRA
+                              : f == VK_FORMAT_R8G8_UNORM  ? 04510u /* Apple's RG8 swizzle 0x948 */
+                              : f == VK_FORMAT_R8_UNORM || f == VK_FORMAT_R32_SFLOAT ? 04550u /* Apple's R8 and R32F
+                                                                                              * swizzle 0x968 */
+                                                           : G5P_PBE_A8_SWIZZLE_RGBA,
+                              twiddled, level->pitch / 4);
+      }
       if ((level->pitch % 16 && !ms_store && !twiddled) || addr % 64)
          return G5P_REFUSE(cmd_buffer, "a colour target at %#" PRIx64 " with pitch %u (64-byte base, 16-byte rows)",
                            addr, level->pitch);
@@ -815,7 +1022,14 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
          }
       }
       if (!t || compact) {
-         if(twiddled) {
+         if (!ms_store && PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p)) {
+            /* the A8 loads through Rogue's texture state: the view's own (pvr_arch_image.c keeps the Rogue words on
+             * the A8; Apple's load pass DMAs TEXSTATE_IMAGE_WORD0/1). A linear target (every image shared outside
+             * the driver: GBM/dmabuf, so the compositor's output buffers) has the stride form of the same two
+             * words, the ones the A8 already samples linear textures with. */
+            load_state[t][0] = iview->image_state[PVR_TEXTURE_STATE_SAMPLE].words[0];
+            load_state[t][1] = iview->image_state[PVR_TEXTURE_STATE_SAMPLE].words[1];
+         } else if(twiddled) {
             struct pvr_image_descriptor desc;
             /* A one-layer array attachment is still a 2D store/restore
              * surface. Bake its base-layer offset into a 2D LOAD view;
@@ -927,7 +1141,7 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
       if (lr != VK_SUCCESS)
          return lr;
    }
-   if (load && !load_program->load_usc)
+   if (load && !load_program->load_usc && !PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p))
       return G5P_REFUSE(cmd_buffer, "LOAD of a %scolour attachment%s: the load program: %s",
                         g->samples == 4 ? "4x " : "", partial ? " (a partial render area)" : "",
                         load_program->load_refusal);
@@ -961,8 +1175,39 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
    struct pvr_suballoc_bo *floats, *block;
    uint32_t pbe_words[G5P_MRT_PBE_STRIDE * G5P_MRT_MAX];
    /* each target's source: output half 4t (8-bit RGBA, two dwords), 8t (raw32, four words) */
-   const unsigned pbe_dwords = g5p_mrt_pbe_block_halves(pbe_words, nt, (const uint64_t(*)[3])pbe,
-                                                        raw ? 2 * raw_words : compact ? 2 : 4);
+   unsigned pbe_dwords = g5p_mrt_pbe_block_halves(pbe_words, nt, (const uint64_t(*)[3])pbe,
+                                                  raw ? 2 * raw_words : compact ? 2 : 4);
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p)) {
+      /*
+       * The A8's end of tile DMAs four dwords: the target's address and 2, 0
+       * (iPod touch 6, iOS 12.4, a8-shadercap: the EOT PDS data's DOUTD source
+       * for a one-target 64x64 BGRA8 pass; the program is g5p_mrt_eot_usc(),
+       * Apple's 1e010070). Its format, size and stride are not in these words:
+       * the A8 3D record's +0x118 block carries them (the kernel
+       * fills it). Only that pass shape is captured.
+       */
+      if ((nt != 1 && nt != 2) || raw || compact || null_target || g->samples != 1 || (nt == 2 && g->a8_narrow_halves))
+         return G5P_REFUSE(cmd_buffer, "A8 end of tile for %u targets, %u samples%s: one or two single-sample "
+                           "colour targets are captured", nt, g->samples, raw ? ", integer" : "");
+      pbe_words[0] = (uint32_t)target0_addr;
+      pbe_words[1] = (uint32_t)(target0_addr >> 32);
+      pbe_words[2] = g->a8_eot_format; /* packmode << 16 | conversion */
+      pbe_words[3] = 0;
+      pbe_dwords = 4;
+      if (nt == 2) {
+         /* the second target's block (Apple's mrt2: {t1, 0x122, 0}), one 8-dword DMA */
+         pbe_words[4] = (uint32_t)g->a8_t1_addr;
+         pbe_words[5] = (uint32_t)(g->a8_t1_addr >> 32);
+         pbe_words[6] = g->a8_eot_format_t1;
+         pbe_words[7] = 0;
+         pbe_dwords = 8;
+         /* its clear colours in reverse target order (g5p_mrt_clear_usc()) */
+         float t0[4];
+         memcpy(t0, clear[0], sizeof(t0));
+         memcpy(clear[0], clear[1], sizeof(t0));
+         memcpy(clear[1], t0, sizeof(t0));
+      }
+   }
    VkResult result = pvr_arch_cmd_buffer_upload_general(cmd_buffer, clear, 16 * nt, &floats);
    if (result != VK_SUCCESS)
       return result;
@@ -994,7 +1239,22 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
 
    /* PDS_BGRND0..3: the clear kick, the clear DMA, its data; sizes */
    uint64_t bgnd[4] = { 0 };
-   if (load) {
+   if (load && PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p)) {
+      /* Apple's capture: one single-sample twiddled BGRA8 target (8-bit UNORM targets share the program; the
+       * texture state carries the format) */
+      const VkFormat f = first_format;
+      /* a linear target loads through its stride texture state (above): Apple's load program samples whatever the
+       * state describes. Without it, a compositor's damage-only redraw into its (linear, shared) output buffer was
+       * refused and the frame never drawn. */
+      if (nt != 1 || raw || compact || g->samples != 1 || g->a8_narrow_halves ||
+          (f != VK_FORMAT_B8G8R8A8_UNORM && f != VK_FORMAT_R8G8B8A8_UNORM))
+         return G5P_REFUSE(cmd_buffer, "A8 LOAD of %s (%u targets, %u samples%s): one single-sample "
+                           "BGRA8/RGBA8 target is captured", vk_Format_to_str(f), nt, g->samples,
+                           a8_load_twiddled ? "" : ", linear");
+      result = g5p_load_background_g4p(cmd_buffer, load_state[0], bgnd, p);
+      if (result != VK_SUCCESS)
+         return result;
+   } else if (load) {
       result = g5p_load_background(cmd_buffer, (const uint64_t(*)[4])load_state, g->width, g->height, bgnd,
                                    load_program);
       if (result != VK_SUCCESS)
@@ -1002,6 +1262,9 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
    } else {
       pvr_csb_pack (&bgnd[0], CR_PDS_BGRND0_BASE, b0) {
          b0.shader_addr = PVR_DEV_ADDR(raw ? p->raw_clear_kick[g5p_raw_variant(raw_total)].data_offset : g->samples == 4 ? p->clear_kick_ms.data_offset
+                                                     : g->a8_narrow_halves ? p->clear_kick_narrow[g->a8_narrow_halves - 1].data_offset
+                                                     : a8_rgba8ui ? p->clear_kick_rgba8ui.data_offset
+                                                     : a8_r32f ? p->clear_kick_r32f.data_offset
                                                      : p->clear_kick[v].data_offset);
          b0.texunicode_addr = PVR_DEV_ADDR(p->clear_dma.code_offset);
       }
@@ -1014,10 +1277,30 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
                                           ROGUE_CR_PDS_BGRND3_SIZEINFO_USC_SHAREDSIZE_UNIT_SIZE);
       }
    }
+   /* Apple's record +0x640 (D6ad) processes empty tiles only for a resolve:
+    * the captured clear/LOAD/MRT/4x-store passes have 0, resolves have 1.
+    * Skip them when no attachment is CLEARed: an untouched tile is neither
+    * loaded nor stored and keeps its memory, which is the LOAD result
+    * (don't-care: undefined). A CLEAR must still reach empty tiles.
+    */
+   bool keep = g->msaa_resolve || getenv("G5P_ALL_TILES");
+   for (unsigned i = 0; i < hw_render->color_init_count; i++)
+      keep |= hw_render->color_init[i].op == VK_ATTACHMENT_LOAD_OP_CLEAR;
+   for (unsigned i = 0; i < hw_render->eot_surface_count; i++)
+      keep |= hw_render->eot_surfaces[i].need_resolve;
+   if (hw_render->ds_attach_idx != VK_ATTACHMENT_UNUSED) {
+      keep |= hw_render->depth_init == VK_ATTACHMENT_LOAD_OP_CLEAR ||
+              hw_render->stencil_init == VK_ATTACHMENT_LOAD_OP_CLEAR ||
+              hw_render->ds_attach_resolve_idx != VK_ATTACHMENT_UNUSED ||
+              hw_render->depth_resolve_mode != VK_RESOLVE_MODE_NONE ||
+              hw_render->stencil_resolve_mode != VK_RESOLVE_MODE_NONE;
+   }
+   g->skip_empty_tiles = !keep;
+
    memcpy(g->background, bgnd, sizeof(g->background));
    g->eot[0] = eot_data.data_offset;
    g->eot[1] = p->eot.code_offset;
-   g->eot[2] = g5p_mrt_eot_info(nt);
+   g->eot[2] = PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p) ? g5p_mrt_eot_info_g4p(nt) : g5p_mrt_eot_info(nt);
    g->enabled = true;
    return VK_SUCCESS;
 }
@@ -1151,7 +1434,12 @@ PVR_PER_ARCH(g5p_frag_stream)(const struct pvr_device *device, const struct pvr_
    /* the depth/stencil attachment's ZLS words and background object
     * (pvr_arch_g5p_ds.c; without one, depth 1.0f and tag | mask) */
    struct pvr_g5p_zls_words zls;
-   pvr_arch_g5p_ds_pass(job, &zls);
+   pvr_arch_g5p_ds_pass(job, PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p), &zls);
+   /* bo_log: how often a depth/stencil attachment is loaded or stored (what lazily allocated memory would save) */
+   if (unlikely(device->bo_log) && job->ds.iview && (job->has_depth_attachment || job->has_stencil_attachment))
+      pvr_bo_log_zls((struct pvr_device *)device, job->ds.iview->vk.extent.width, job->ds.iview->vk.extent.height,
+                     job->ds.load.d || job->ds.load.s,
+                     job->ds.store.d || job->ds.store.s);
 
    g5p_put64(&s, scissor);
    g5p_put64(&s, dbias);
@@ -1159,8 +1447,19 @@ PVR_PER_ARCH(g5p_frag_stream)(const struct pvr_device *device, const struct pvr_
    g5p_put64(&s, 0); /* ZLSCTL and the load/store bases: in the extension */
    g5p_put64(&s, 0);
    g5p_put64(&s, 0);
-   for (unsigned i = 0; i < 8 * 3; i++)
-      g5p_put64(&s, 0); /* PBE words: in the end-of-tile program's data */
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p)) {
+      /* The A8's PBE words, Rogue's pbe_word[8][3]: target 0's REG_WORD0/1, then the empty pair Apple writes for
+       * every unused target; word 2 is 0 (the kernel copies words 0-1 to W+0x118 + 16 i) */
+      for (unsigned i = 0; i < 8; i++) {
+         const bool t1 = i == 1 && g->a8_t1_addr;
+         g5p_put64(&s, i ? (t1 ? g->a8_pbe_t1[0] : G5P_PBE_A8_EMPTY0) : g->a8_pbe[0]);
+         g5p_put64(&s, i ? (t1 ? g->a8_pbe_t1[1] : G5P_PBE_A8_EMPTY1) : g->a8_pbe[1]);
+         g5p_put64(&s, 0);
+      }
+   } else {
+      for (unsigned i = 0; i < 8 * 3; i++)
+         g5p_put64(&s, 0); /* PBE words: in the end-of-tile program's data */
+   }
    g5p_put64(&s, 0);    /* border colour table */
    for (unsigned i = 0; i < 6; i++)
       g5p_put64(&s, 0); /* Rogue background words: in the extension */
@@ -1169,8 +1468,16 @@ PVR_PER_ARCH(g5p_frag_stream)(const struct pvr_device *device, const struct pvr_
    g5p_put32(&s, 0);    /* USC pixel output control */
    g5p_put32(&s, zls.bgobj_depth); /* ISP_BGOBJDEPTH */
    g5p_put32(&s, zls.bgobj_vals);  /* ISP_BGOBJVALS */
-   g5p_put32(&s, 0); /* ISP_AA, ISP_CTL: the kernel's, from the dataset's samples */
-   g5p_put32(&s, 0);
+   g5p_put32(&s, 0); /* ISP_AA: the kernel's, from the dataset's samples */
+   /* ISP_CTL: kernel K1 reads only bit 17, keeping its other bits and MSAA form.
+    * Older kernels ignore this field and continue processing every tile.
+    */
+   /* The A8's kernel writes its own ISP_CTL (3D record +0x3c8, PROCESS_EMPTY_TILES set): this word stays 0 on the
+    * A8 until a kernel reads bit 17 from it for the A8 too. */
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p))
+      g5p_put32(&s, 0);
+   else
+      g5p_put32(&s, 0x0021000f | (g->skip_empty_tiles ? 0 : 1u << 17));
    g5p_put32(&s, 0); /* EVENT_PIXEL_PDS_INFO: in the extension's end-of-tile words */
    g5p_put32(&s, 0);
    g5p_put32(&s, 0);

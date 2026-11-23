@@ -211,7 +211,7 @@ g5p_ds_plane(const struct g5p_surface *s, VkImageAspectFlagBits aspect,
       p->available -= off;
       p->bpp = p->cpp;
       p->twiddled = true;
-      /* The allocation pads to a square, but ZLS stores rectangular
+      /* The A9's allocation pads to a square (the A8's to the rectangle), but ZLS stores rectangular
        * Morton order over independently 32-pixel-aligned sides (R17's
        * device-proven unequal-side sampling). Match that order in CPU
        * clears/copies too; the unused allocation tail remains padding. */

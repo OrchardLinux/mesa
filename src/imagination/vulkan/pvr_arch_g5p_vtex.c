@@ -18,6 +18,7 @@
 #include "util/u_dynarray.h"
 #include "util/u_math.h"
 #include "pco_g5p_general.h"
+#include "g5p_usc.h"
 #include "pdsc.h"
 #include "pdsc_internal.h"
 #include "pdsc_isa_pack.h"
@@ -25,8 +26,10 @@
 #include "pvr_bo.h"
 #include "pvr_cmd_buffer.h"
 #include "pvr_csb.h"
+#include "pvr_g5p_a8_fetch.h"
 #include "pvr_descriptor_set.h"
 #include "pvr_device.h"
+#include "pvr_physical_device.h"
 #include "pvr_g5p_tex.h"
 #include "pvr_g5p_tex_encode.h"
 #include "pvr_g5p_vtex.h"
@@ -40,12 +43,13 @@ static_assert(VTEX_COMMON >= PCO_G5P_COMMON_DWORDS, "vertex common-store plan bo
 
 static uint32_t vtex_control(unsigned common, unsigned dwords, bool last)
 {
-   pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-vtex-control");
+   /* packing a field reads only the feature set: no program allocation per draw */
+   static const pdsc_program pack = { .name = "g5p-vtex-control", .features = PDSC_FEATURE_DOUT_EXT };
+   const pdsc_program *p = &pack;
    struct pdsc_doutd_src1 s = {
       .last_issue = last, .store_dest = PDSC_STORE_DEST_COMMON, .ao = common, .bsize = dwords,
    };
    uint32_t word = pdsc_doutd_src1_pack(p, &s);
-   ralloc_free(p);
    return word;
 }
 
@@ -69,7 +73,7 @@ PVR_PER_ARCH(g5p_vtex_create)(struct pvr_device *device, const struct pco_g5p_pr
    up->count = plan.dmas;
    up->common_dwords = vs->common_dwords;
    pdsc_init();
-   pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-vtex-loader");
+   pdsc_program *p = pdsc_program_create(NULL, PVR_G5P_PDS_FEATURES(&device->pdevice->dev_info), "g5p-vtex-loader");
    for (unsigned i = 0; i < plan.dmas; i++)
       pdsc_dout(p, pdsc_ref_const64(2*i), pdsc_ref_const32(2*plan.dmas + 2*i), pdsc_ref_null(),
                 .dstdout = PDSC_DSTDOUT_D, .end = i == plan.dmas - 1);
@@ -118,6 +122,26 @@ vtex_descriptor(struct pvr_cmd_buffer *cmd, const struct pco_g5p_upload *u, uint
       return VK_SUCCESS;
    }
    bool image = lb->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || lb->type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+   /* the A8: its Rogue words as the fragment stage takes them, four dwords of image state, four of
+    * sampler state at +32 in a combined descriptor */
+   if (PVR_HAS_FEATURE(&cmd->device->pdevice->dev_info, apple_g4p)) {
+      if (u->kind == PCO_G5P_UPLOAD_IMAGE) {
+         if (!image || u->dwords != 4 || !pvr_g5p_tex_state_valid(desc))
+            return VTEX_REFUSE(cmd, "set %u binding %u has no A8 image state", u->set, u->binding);
+         memcpy(out, desc, 16);
+         return VK_SUCCESS;
+      }
+      if (u->kind == PCO_G5P_UPLOAD_SAMPLER) {
+         if (lb->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) desc += 8;
+         if (u->dwords != 4 || !pvr_g5p_sampler_valid(desc))
+            return VTEX_REFUSE(cmd, "set %u binding %u has no A8 sampler state", u->set, u->binding);
+         memcpy(out, desc, 16);
+         /* a vertex texelFetch: the fetch sampler, Apple's read sampler words (an iOS capture) */
+         if (u->offset & PCO_G5P_UPLOAD_SAMPLER_FETCH)
+            pvr_g5p_a8_fetch_sampler(out, desc, (u->offset >> PCO_G5P_UPLOAD_SAMPLER_FETCH_LEVEL_SHIFT) & 0xf);
+         return VK_SUCCESS;
+      }
+   }
    if (u->kind == PCO_G5P_UPLOAD_IMAGE) {
       if (!image || u->dwords != 8 || !pvr_g5p_tex_state_valid(desc))
          return VTEX_REFUSE(cmd, "set %u binding %u has no A9 image state", u->set, u->binding);
@@ -140,6 +164,28 @@ vtex_descriptor(struct pvr_cmd_buffer *cmd, const struct pco_g5p_upload *u, uint
 }
 
 VkResult
+PVR_PER_ARCH(g5p_vtex_words)(struct pvr_cmd_buffer *cmd, const struct pco_g5p_upload *u, uint32_t *out)
+{
+   switch (u->kind) {
+   case PCO_G5P_UPLOAD_IMAGE: case PCO_G5P_UPLOAD_SAMPLER: case PCO_G5P_UPLOAD_IMAGE_SIZE:
+      return vtex_descriptor(cmd, u, out);
+   case PCO_G5P_UPLOAD_ZERO:
+      memset(out, 0, 4 * u->dwords);
+      return VK_SUCCESS;
+   case PCO_G5P_UPLOAD_FETCH_SAMPLER:
+      if (u->dwords != 4)
+         return VTEX_REFUSE(cmd, "A8 fetch sampler of %u dwords", u->dwords);
+      if (g5p_usc_g4p_vtex_apple)
+         pvr_g5p_a8_vread_sampler(out);
+      else
+         pvr_g5p_a8_fetch_sampler(out, NULL, 0);
+      return VK_SUCCESS;
+   default:
+      return VTEX_REFUSE(cmd, "not a texture upload (kind %u)", u->kind);
+   }
+}
+
+VkResult
 PVR_PER_ARCH(g5p_vtex_draw)(struct pvr_cmd_buffer *cmd, const struct pvr_g5p_stage_uploads *up,
                             struct pvr_g5p_vs_upload_draw *out)
 {
@@ -159,7 +205,19 @@ PVR_PER_ARCH(g5p_vtex_draw)(struct pvr_cmd_buffer *cmd, const struct pvr_g5p_sta
          result = vtex_descriptor(cmd, u, dst);
          if (result != VK_SUCCESS) return result;
          break;
+      case PCO_G5P_UPLOAD_ZERO:
+         memset(dst, 0, bytes);
+         break;
       case PCO_G5P_UPLOAD_FETCH_SAMPLER: {
+         if (u->dwords == 4 && PVR_HAS_FEATURE(&cmd->device->pdevice->dev_info, apple_g4p)) {
+            /* the A8: Rogue sampler words, point, non-normalized, clamped, level 0: Apple's read sampler, the constant
+             * 0x0202240000000fff of its vertex and fragment reads (from an iOS capture) */
+            if (g5p_usc_g4p_vtex_apple)
+               pvr_g5p_a8_vread_sampler(dst); /* Apple's vertex read sampler (pvr_g5p_a8_fetch.h) */
+            else
+               pvr_g5p_a8_fetch_sampler(dst, NULL, 0);
+            break;
+         }
          if (u->dwords != 2) return VTEX_REFUSE(cmd, "invalid samplerless read policy size");
          uint64_t policy = pvr_g5p_fetch_sampler_word();
          memcpy(dst, &policy, sizeof(policy));

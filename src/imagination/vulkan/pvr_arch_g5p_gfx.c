@@ -45,6 +45,7 @@
 #include "pvr_descriptor_set.h"
 #include "pvr_cmd_buffer.h"
 #include "pvr_csb.h"
+#include "pvr_g5p_a8_fetch.h"
 #include "pvr_device.h"
 #include "pvr_physical_device.h"
 #include "pvr_framebuffer.h"
@@ -96,11 +97,11 @@ pds_pack(pdsc_program *p, uint32_t *dest)
 static uint64_t
 doutu_src0(uint32_t exe_off, unsigned temps)
 {
-   pdsc_init();
-   pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-doutu");
+   /* packing a field reads only the feature set: no program allocation per draw */
+   static const pdsc_program pack = { .name = "g5p-doutu", .features = PDSC_FEATURE_DOUT_EXT };
+   const pdsc_program *p = &pack;
    struct pdsc_doutu_src0 s = { .exe_off = exe_off, .temps = temps };
    const uint64_t v = pdsc_doutu_src0_pack(p, &s);
-   ralloc_free(p);
    return v;
 }
 
@@ -108,23 +109,23 @@ doutu_src0(uint32_t exe_off, unsigned temps)
 static uint32_t
 doutw_control(unsigned reg, bool upper, bool last)
 {
-   pdsc_init();
-   pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-doutw");
+   /* packing a field reads only the feature set: no program allocation per draw */
+   static const pdsc_program pack = { .name = "g5p-doutw", .features = PDSC_FEATURE_DOUT_EXT };
+   const pdsc_program *p = &pack;
    struct pdsc_doutw_src1 s = { .last_issue = last, .store_dest = PDSC_STORE_DEST_UNIFIED, .ao = reg,
                                 .bsize = upper ? PDSC_DOUTW_BSIZE_UPPER : PDSC_DOUTW_BSIZE_LOWER };
    const uint32_t v = pdsc_doutw_src1_pack(p, &s);
-   ralloc_free(p);
    return v;
 }
 
 static uint64_t
 ddmad_src3(unsigned dwords, unsigned ao, bool last)
 {
-   pdsc_init();
-   pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-ddmad");
+   /* packing a field reads only the feature set: no program allocation per draw */
+   static const pdsc_program pack = { .name = "g5p-ddmad", .features = PDSC_FEATURE_DOUT_EXT };
+   const pdsc_program *p = &pack;
    struct pdsc_ddmad_src3 s = { .last_issue = last, .bsize = dwords, .ao = ao };
    const uint64_t v = pdsc_ddmad_src3_pack(p, &s);
-   ralloc_free(p);
    return v;
 }
 
@@ -133,12 +134,12 @@ ddmad_src3(unsigned dwords, unsigned ao, bool last)
 static uint32_t
 doutd_control(unsigned common, unsigned dwords, bool last)
 {
-   pdsc_init();
-   pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-doutd");
+   /* packing a field reads only the feature set: no program allocation per draw */
+   static const pdsc_program pack = { .name = "g5p-doutd", .features = PDSC_FEATURE_DOUT_EXT };
+   const pdsc_program *p = &pack;
    struct pdsc_doutd_src1 s = { .last_issue = last, .store_dest = PDSC_STORE_DEST_COMMON, .ao = common,
                                 .bsize = dwords };
    const uint32_t v = pdsc_doutd_src1_pack(p, &s);
-   ralloc_free(p);
    return v;
 }
 
@@ -149,10 +150,10 @@ doutd_control(unsigned common, unsigned dwords, bool last)
  * the UNIFORMDATABASE pointer.
  */
 static unsigned
-loader_program(uint32_t *dest, unsigned n)
+loader_program(uint32_t *dest, unsigned n, enum pdsc_feature features)
 {
    pdsc_init();
-   pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-fs-loader");
+   pdsc_program *p = pdsc_program_create(NULL, features, "g5p-fs-loader");
    for (unsigned i = 0; i < n; i++)
       pdsc_dout(p, pdsc_ref_const64(2 * i), pdsc_ref_const32(2 * n + 2 * i), pdsc_ref_null(),
                 .dstdout = PDSC_DSTDOUT_D, .end = i == n - 1);
@@ -252,7 +253,8 @@ fetch_reads_instance(const struct pvr_g5p_pipeline *g)
 }
 
 static unsigned
-fetch_program(uint32_t *dest, const struct pvr_g5p_pipeline *g, bool base_instance, bool indirect)
+fetch_program(uint32_t *dest, const struct pvr_g5p_pipeline *g, bool base_instance, bool indirect,
+              enum pdsc_feature features)
 {
    const struct pvr_g5p_fetch *list = g->fetch_list;
    const unsigned fetches = g->fetch_count, id_mask = g->vs_id_mask;
@@ -260,7 +262,7 @@ fetch_program(uint32_t *dest, const struct pvr_g5p_pipeline *g, bool base_instan
    unsigned slot[PVR_G5P_MAX_FETCH];
    const unsigned ndiv = fetch_divisors(g, div, slot);
    pdsc_init();
-   pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-vertex-fetch");
+   pdsc_program *p = pdsc_program_create(NULL, features, "g5p-vertex-fetch");
    /* A9's indirect base-instance variant reads persistent temporary 1
     * (encoded selector 0xc1), not a CPU-specialized data constant. */
    const pdsc_ref base = indirect ? pdsc_ref_ptemp32(1) : pdsc_ref_const32(fetch_base_instance(fetches));
@@ -313,10 +315,10 @@ fetch_program(uint32_t *dest, const struct pvr_g5p_pipeline *g, bool base_instan
 /* The fragment launch: one DOUTU.end from c0:1, no CC and no HALT (the
  * captured form) */
 static unsigned
-launch_program(uint32_t *dest)
+launch_program(uint32_t *dest, enum pdsc_feature features)
 {
    pdsc_init();
-   pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-fragment");
+   pdsc_program *p = pdsc_program_create(NULL, features, "g5p-fragment");
    pdsc_dout(p, pdsc_ref_const64(0), pdsc_ref_null(), pdsc_ref_null(), .dstdout = PDSC_DSTDOUT_U, .end = true);
    const unsigned n = pds_pack(p, dest);
    ralloc_free(p);
@@ -343,10 +345,10 @@ static_assert(4 * PCO_G5P_MAX_FS_VARYINGS == 112, "G5P varying components");
 
 static unsigned
 varying_program(const struct pco_g5p_program *fs, const struct pco_g5p_program *vs, uint32_t *data,
-                uint32_t *code, unsigned *code_dwords, unsigned pv)
+                uint32_t *code, unsigned *code_dwords, unsigned pv, enum pdsc_feature features)
 {
    pdsc_init();
-   pdsc_program *p = pdsc_program_create(NULL, PDSC_FEATURE_DOUT_EXT, "g5p-varying");
+   pdsc_program *p = pdsc_program_create(NULL, features, "g5p-varying");
    struct pdsc_douti_src0 item[2 + PCO_G5P_MAX_FS_VARYINGS];
    unsigned items = 0;
    /* Apple's item order: position Z, then W, then the varyings (the A9
@@ -397,7 +399,7 @@ varying_program(const struct pco_g5p_program *fs, const struct pco_g5p_program *
 static uint32_t
 usc_off(const struct pvr_device *device, const struct pvr_suballoc_bo *bo)
 {
-   return (uint32_t)(bo->dev_addr.addr - device->heaps.usc_heap->base_addr.addr);
+   return (uint32_t)(bo->dev_addr.addr - PVR_G5P_USC_EXEC_BASE(device));
 }
 
 /* ---- pipelines ---- */
@@ -579,6 +581,13 @@ g5p_check_state(struct pvr_device *device, const VkGraphicsPipelineCreateInfo *c
    }
    if (raw32)
       key->color_output = raw32 == 2 ? PCO_G5P_COLOR_SINT32 : PCO_G5P_COLOR_UINT32;
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p) && colors == 1 &&
+       (cf == VK_FORMAT_R8_UNORM || cf == VK_FORMAT_R8G8_UNORM))
+      key->a8_narrow_halves = cf == VK_FORMAT_R8_UNORM ? 1 : 2;
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p) && colors == 1 && cf == VK_FORMAT_R8G8B8A8_UINT)
+      key->a8_packed_word = true;
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p) && colors == 1 && cf == VK_FORMAT_R32_SFLOAT)
+      key->color_output = PCO_G5P_COLOR_F32;
    /* no colour attachment: the program writes no colour (the no-colour ISP form: depth/stencil only, a
     * discarding program still runs for its feedback) */
    if (!colors)
@@ -969,18 +978,18 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
 
    /* PDS: vertex fetch code */
    uint32_t code[96 + 4 * PVR_G5P_MAX_FS_UPLOADS], data[2 * (1 + PCO_G5P_MAX_FS_VARYINGS) + 4];
-   unsigned n = fetch_program(code, g, false, false);
+   unsigned n = fetch_program(code, g, false, false, PVR_G5P_PDS_FEATURES(&device->pdevice->dev_info));
    result = pvr_gpu_upload_pds(device, NULL, 0, 0, code, n, 16, 64, &g->fetch);
    if (result != VK_SUCCESS)
       return result;
    if (fetch_reads_instance(g)) {
-      n = fetch_program(code, g, true, false);
+      n = fetch_program(code, g, true, false, PVR_G5P_PDS_FEATURES(&device->pdevice->dev_info));
       result = pvr_gpu_upload_pds(device, NULL, 0, 0, code, n, 16, 64, &g->fetch_base);
       if (result != VK_SUCCESS)
          return result;
    }
 
-   n = fetch_program(code, g, fetch_reads_instance(g), true);
+   n = fetch_program(code, g, fetch_reads_instance(g), true, PVR_G5P_PDS_FEATURES(&device->pdevice->dev_info));
    result = pvr_gpu_upload_pds(device, NULL, 0, 0, code, n, 16, 64, &g->fetch_indirect);
    if (result != VK_SUCCESS)
       return result;
@@ -990,7 +999,7 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
       /* at 4x the fragment program runs at sample rate (pvr_g5p_msaa_doutu()) */
       const uint64_t doutu = pvr_g5p_msaa_doutu(doutu_src0(usc_off(device, g->fs_usc), g->fs_temps), g->samples);
       const uint32_t launch_data[4] = { (uint32_t)doutu, (uint32_t)(doutu >> 32), 0, 0 };
-      n = launch_program(code);
+      n = launch_program(code, PVR_G5P_PDS_FEATURES(&device->pdevice->dev_info));
       result = pvr_gpu_upload_pds(device, launch_data, ARRAY_SIZE(launch_data), 16, code, n, 0x20, 64,
                                   &g->fs_launch);
       if (result != VK_SUCCESS)
@@ -1004,12 +1013,12 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
    unsigned varying_data_dwords = 0;
    if (fs->num_varyings || fs->w_set || fs->z_set) {
       unsigned code_dwords;
-      varying_data_dwords = varying_program(fs, vs, data, code, &code_dwords, 0);
+      varying_data_dwords = varying_program(fs, vs, data, code, &code_dwords, 0, PVR_G5P_PDS_FEATURES(&device->pdevice->dev_info));
       result = pvr_gpu_upload_pds(device, data, varying_data_dwords, 16, code, code_dwords, 16, 64, &g->varying);
       if (result != VK_SUCCESS)
          return result;
       for (unsigned pv = 1; g->fs_flat && pv <= 2; pv++) {
-         varying_program(fs, vs, data, code, &code_dwords, pv);
+         varying_program(fs, vs, data, code, &code_dwords, pv, PVR_G5P_PDS_FEATURES(&device->pdevice->dev_info));
          result = pvr_gpu_upload_pds(device, data, varying_data_dwords, 16, code, code_dwords, 16, 64,
                                      &g->varying_pv[pv - 1]);
          if (result != VK_SUCCESS)
@@ -1022,7 +1031,7 @@ g5p_pipeline_build(struct pvr_device *device, const VkGraphicsPipelineCreateInfo
 
    /* PDS: the uniform/texture loader (the device HALT without uploads) */
    if (g->fs_num_uploads) {
-      n = loader_program(code, g->fs_num_dmas);
+      n = loader_program(code, g->fs_num_dmas, PVR_G5P_PDS_FEATURES(&device->pdevice->dev_info));
       result = pvr_gpu_upload_pds(device, NULL, 0, 0, code, n, 16, 64, &g->fs_loader);
       if (result != VK_SUCCESS)
          return result;
@@ -2042,6 +2051,25 @@ fs_uploads(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_pipeline *g, 
                            u->set, u->binding, u->element, lb->descriptor_count);
       const uint32_t *desc = (const uint32_t *)((const uint8_t *)set->mapping + lb->offset +
                                                 (size_t)u->element * lb->stride);
+      if (lb->type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER &&
+          PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g4p)) {
+         /* the A8's texel buffer (pvr_arch_image.c CreateBufferView): Rogue's four state dwords, the element count
+          * for the size, the fetch sampler for its read (the fold's 2D fetch, pco_g5p_general.c a8_fetch_as_sample) */
+         bool ok = desc[7] == PVR_G5P_TBO_MAGIC && desc[6];
+         if (ok && u->kind == PCO_G5P_UPLOAD_IMAGE && u->dwords == 4)
+            memcpy(out, desc, 16);
+         else if (ok && u->kind == PCO_G5P_UPLOAD_IMAGE_SIZE && u->dwords == 4 && !u->offset) {
+            out[0] = desc[6];
+            out[1] = 0;
+            out[2] = out[3] = 1;
+         } else if (ok && u->kind == PCO_G5P_UPLOAD_SAMPLER && u->dwords == 4 && (u->offset & PCO_G5P_UPLOAD_SAMPLER_FETCH))
+            pvr_g5p_a8_fetch_sampler(out, NULL, 0);
+         else
+            return G5P_REFUSE(cmd_buffer, "A8 texel-buffer upload (kind %d, %u dwords, offset %#x) at set %u binding %u "
+                              "element %u", (int)u->kind, u->dwords, u->offset, u->set, u->binding, u->element);
+         copied[i] = true;
+         continue;
+      }
       if (lb->type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER) {
          if (!pvr_g5p_tbo_upload(u->kind, u->offset, u->dwords, desc, out))
             return G5P_REFUSE(cmd_buffer, "unqualified texel-buffer upload at set %u binding %u element %u",
@@ -2064,10 +2092,17 @@ fs_uploads(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_pipeline *g, 
          /* a combined descriptor's sampler is at +32 (the upload's offset),
           * a standalone sampler's at +0 */
          if (lb->type != VK_DESCRIPTOR_TYPE_SAMPLER)
-            desc += u->offset / 4;
+            desc += (u->offset & 0xffu) / 4;
          if (!pvr_g5p_sampler_valid(desc))
             return G5P_REFUSE(cmd_buffer, "set %u binding %u: a sampler without A9 words", u->set, u->binding);
          memcpy(out, desc, 4 * u->dwords);
+         /* the A8's texelFetch drawn as a sample: the binding's sampler as a fetch sampler */
+         if ((u->offset & PCO_G5P_UPLOAD_SAMPLER_FETCH) && u->dwords == 4) {
+            if (u->offset & PCO_G5P_UPLOAD_SAMPLER_READ) /* Apple's read form: its constant read sampler */
+               pvr_g5p_a8_read_sampler(out);
+            else
+               pvr_g5p_a8_fetch_sampler(out, desc, (u->offset >> PCO_G5P_UPLOAD_SAMPLER_FETCH_LEVEL_SHIFT) & 0xf);
+         }
          break;
       case PCO_G5P_UPLOAD_IMAGE_SIZE:
          if (u->dwords != 4 || !pvr_g5p_tex_size(desc, u->offset, out))
@@ -2086,6 +2121,22 @@ fs_uploads(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_pipeline *g, 
       }
       default:
          return G5P_REFUSE(cmd_buffer, "fragment upload kind %u", u->kind);
+      }
+      /* read once: this runs for every texture upload of every draw */
+      static int texdiag = -1;
+      if (texdiag < 0)
+         texdiag = getenv("PVR_G5P_TEXDIAG") != NULL;
+      if (texdiag && (u->kind == PCO_G5P_UPLOAD_IMAGE || u->kind == PCO_G5P_UPLOAD_SAMPLER)) {
+         /* the texture and sampler words a fragment program's DOUTDs take into the common store */
+         fprintf(stderr, "G5P texdiag: %s set %u binding %u -> common %u, %u dwords:", u->kind == PCO_G5P_UPLOAD_IMAGE ?
+                 "image" : "sampler", u->set, u->binding, u->common, u->dwords);
+         for (unsigned k = 0; k < u->dwords; k++)
+            fprintf(stderr, " %08x", out[k]);
+         if (u->kind == PCO_G5P_UPLOAD_IMAGE && u->dwords >= 4) {
+            const uint64_t w1 = out[2] | (uint64_t)out[3] << 32;
+            fprintf(stderr, " (Rogue texaddr %#" PRIx64 ")", (uint64_t)(((w1 >> 16) & ((UINT64_C(1) << 38) - 1)) << 2));
+         }
+         fprintf(stderr, "\n");
       }
       copied[i] = true;
    }
@@ -2271,6 +2322,11 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
 
    if (!g)
       return G5P_REFUSE(cmd_buffer, "a draw of a pipeline without G5P programs (refused at creation, named there)");
+   /* Apple's A8 driver has no indirect draw: AGXMetalA8's render encoders raise APINotSupported for both
+    * indirect draws (0x1a144b89c, 0x1a144b8dc; the sampled encoder 0x1a145176c, 0x1a14517ac), so there is no
+    * A8 form to follow and the VDM's indirect index list is untested on the A8. */
+   if (draw->indirect_addr && PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p))
+      return G5P_REFUSE(cmd_buffer, "an indirect draw on the A8 (Apple's A8 driver has none; not hardware-proven)");
    /* transform feedback: while capturing, the pipeline's capturing variant
     * (pvr_g5p_xfb.h); a pipeline that captures nothing draws as it is */
    const bool xfb = g->xfb && pvr_arch_g5p_xfb_capturing(cmd_buffer);
@@ -2709,6 +2765,11 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
          c.clip_mode = (enum ROGUE_TA_CLIP_MODE)clip_mode;
          c.flatshade_vtx = ROGUE_TA_FLATSHADE_VTX_VERTEX_0;
          c.wclampen = true;
+         /* The A8 draws clipped edges: AGXMetalA8's render encoder init writes
+          * PPP_CTRL 0x6a0 (0x1a1450cb8) and no setter clears bit 9 (cull
+          * 0x1a1449a90, clip mode 0x1a1449b00, 0x1a144ac2c, 0x1a144ac90). The
+          * A9 captures carry 0x4a0. */
+         c.drawclippededges = PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p);
          if (dyn->rs.cull_mode == VK_CULL_MODE_BACK_BIT || dyn->rs.cull_mode == VK_CULL_MODE_FRONT_BIT) {
             /* Rogue's rule (pvr_setup_ppp_control) */
             const bool ccw = dyn->rs.front_face == VK_FRONT_FACE_COUNTER_CLOCKWISE;
@@ -2739,7 +2800,10 @@ PVR_PER_ARCH(g5p_cmd_draw)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g
       pvr_csb_pack (&w[1], TA_STATE_STREAM_OUT0, s0) {
          s0.stream0_ta_output = true;
       }
-      w[2] = G5P_STREAM_OUT1;
+      /* The A8: PDS data 1, temps 1, no bit 14. AGXMetalA8 0x1a144f654 sets
+       * the low 10 bits to 0x11 over a default of 0 (0x1a1459500), for the
+       * same 16 zero bytes + HALT program (0x1a144f61c). */
+      w[2] = PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p) ? 0x11u : G5P_STREAM_OUT1;
       pvr_csb_pack (&w[3], TA_STATE_STREAM_OUT2, s2) {
          s2.pds_data_addr = PVR_DEV_ADDR(dp->halt.data_offset);
       }

@@ -63,11 +63,51 @@ void pvr_drm_report_loss(struct pvr_drm_winsys *ws, const char *job_type,
    }
 }
 
+/* A capable kernel restores a VM before accepting a submit or bind. Reclaim may need time
+ * to catch up, but retrying any other error could repeat accepted work.
+ */
+int pvr_drm_ioctl_retry(struct pvr_drm_winsys *ws, unsigned long request,
+                        void *args)
+{
+   int ret = drmIoctl(ws->base.render_fd, request, args);
+   if (!ret || errno != ENOMEM || !(ws->caps & PVR_DRM_CAP_RETRY_ENOMEM))
+      return ret;
+
+   const int64_t start = os_time_get_nano();
+   const int64_t deadline = start + 2000000000LL;
+   unsigned delay_us = 500;
+   int err = ENOMEM;
+   int64_t now;
+
+   while ((now = os_time_get_nano()) < deadline) {
+      os_time_sleep(MIN2(delay_us, (deadline - now + 999) / 1000));
+      ret = drmIoctl(ws->base.render_fd, request, args);
+      err = ret ? errno : 0;
+      if (err != ENOMEM)
+         break;
+      delay_us = MIN2(delay_us * 2, 50000);
+   }
+
+   now = os_time_get_nano();
+   if (now - start >= 100000000 || err == ENOMEM) {
+      const int64_t last = p_atomic_read(&ws->retry_log_time);
+      if (now - last >= 1000000000LL &&
+          p_atomic_cmpxchg(&ws->retry_log_time, last, now) == last) {
+         mesa_logw("pvr: %s residency retry took %.1f ms (errno %d)",
+                   request == DRM_IOCTL_PVR_SUBMIT_JOBS ? "SUBMIT_JOBS" : "VM_MAP",
+                   (now - start) / 1000000.0, err);
+      }
+   }
+
+   errno = err;
+   return ret;
+}
+
 VkResult pvr_drm_submit_jobs(struct pvr_drm_winsys *ws,
                              struct drm_pvr_ioctl_submit_jobs_args *args,
                              const char *job_type)
 {
-   if (drmIoctl(ws->base.render_fd, DRM_IOCTL_PVR_SUBMIT_JOBS, args) == 0)
+   if (pvr_drm_ioctl_retry(ws, DRM_IOCTL_PVR_SUBMIT_JOBS, args) == 0)
       return VK_SUCCESS;
    const int err = errno;
    if (err == EIO)
@@ -154,6 +194,9 @@ static void pvr_drm_winsys_destroy(struct pvr_winsys *ws)
       .handle = drm_ws->vm_context,
    };
 
+   if (drm_ws->query_only)
+      goto out;
+
    pvr_winsys_helper_free_static_memory(drm_ws->general_vma,
                                         drm_ws->pds_vma,
                                         drm_ws->usc_vma);
@@ -165,6 +208,7 @@ static void pvr_drm_winsys_destroy(struct pvr_winsys *ws)
              &destroy_vm_context_args,
              VK_ERROR_UNKNOWN);
 
+out:
    util_sparse_array_finish(&drm_ws->bo_map);
    u_rwlock_destroy(&drm_ws->dmabuf_bo_lock);
 
@@ -469,6 +513,7 @@ static const struct pvr_winsys_ops drm_winsys_ops = {
    .buffer_create = pvr_drm_winsys_buffer_create,
    .buffer_create_from_fd = pvr_drm_winsys_buffer_create_from_fd,
    .buffer_destroy = pvr_drm_winsys_buffer_destroy,
+   .buffer_set_purgeable = pvr_drm_winsys_buffer_set_purgeable,
    .buffer_get_fd = pvr_drm_winsys_buffer_get_fd,
    .buffer_map = pvr_drm_winsys_buffer_map,
    .buffer_unmap = pvr_drm_winsys_buffer_unmap,
@@ -476,6 +521,7 @@ static const struct pvr_winsys_ops drm_winsys_ops = {
    .heap_free = pvr_drm_winsys_heap_free,
    .vma_map = pvr_drm_winsys_vma_map,
    .vma_unmap = pvr_drm_winsys_vma_unmap,
+   .vma_map_mirror = pvr_drm_winsys_vma_map_mirror,
    .free_list_create = pvr_drm_winsys_free_list_create,
    .free_list_destroy = pvr_drm_winsys_free_list_destroy,
    .render_target_dataset_create = pvr_drm_render_target_dataset_create,
@@ -750,6 +796,7 @@ err_pvr_drm_heap_finish_all_heaps:
 
 VkResult pvr_drm_winsys_create(const int render_fd,
                                const int display_fd,
+                               const bool query_only,
                                const VkAllocationCallbacks *alloc,
                                struct pvr_winsys **const ws_out)
 {
@@ -772,6 +819,16 @@ VkResult pvr_drm_winsys_create(const int render_fd,
    drm_ws->base.render_fd = render_fd;
    drm_ws->base.display_fd = display_fd;
    drm_ws->base.alloc = alloc;
+
+   struct drm_pvr_dev_query_caps caps = { 0 };
+   struct drm_pvr_ioctl_dev_query_args caps_query = {
+      .type = DRM_PVR_DEV_QUERY_CAPS_GET,
+      .size = sizeof(caps),
+      .pointer = (uintptr_t)&caps,
+   };
+   if (!drmIoctl(render_fd, DRM_IOCTL_PVR_DEV_QUERY, &caps_query))
+      drm_ws->caps = caps.caps;
+   /* An unknown query on an older kernel leaves capabilities disabled. */
 
    os_get_page_size(&drm_ws->base.page_size);
    drm_ws->base.log2_page_size = util_logbase2(drm_ws->base.page_size);
@@ -803,6 +860,14 @@ VkResult pvr_drm_winsys_create(const int render_fd,
                                  PVR_HAS_FEATURE(&info, apple_g9p);
       drm_ws->base.job_sync_size = drm_ws->job_fence_errors
                                     ? sizeof(struct pvr_drm_job_sync) : 0;
+      /* The A8's physical-device winsys answers device queries only: no VM context, heaps or static memory, so
+       * a process holds one VM (its VkDevice's) instead of two. powervr's A8 variant gives every VM the hardware
+       * object window, the zero and data pages and a user slot, and a client that never submits needs none. */
+      drm_ws->query_only = query_only && PVR_HAS_FEATURE(&info, apple_g4p);
+   }
+   if (drm_ws->query_only) {
+      *ws_out = &drm_ws->base;
+      return VK_SUCCESS;
    }
 
    result = pvr_ioctl(render_fd,

@@ -52,6 +52,11 @@ struct pvr_g5p_ds_plane {
 
 bool pvr_g5p_ds_layout(VkFormat format, uint32_t width, uint32_t height, uint32_t samples,
                        struct pvr_g5p_ds_plane *out);
+/* The planes take the ZLS's rectangle (each side 32-aligned, then a power of two) instead of the larger side's
+ * square. Set by the driver on the A8. */
+extern bool pvr_g5p_ds_rect_planes;
+/* The A8's ZLSCTL extents in tiles rounded up to powers of two (pvr_g5p_ds_zls()); set by the driver on the A8 */
+extern bool pvr_g5p_ds_pot_extents;
 
 /* The depth/stencil attachment of one render, as the ZLS sees it */
 struct pvr_g5p_ds_target {
@@ -65,6 +70,7 @@ struct pvr_g5p_ds_target {
    bool zload, zstore, sload, sstore;
    float depth_clear;       /* ISP_BGOBJDEPTH */
    uint8_t stencil_clear;   /* ISP_BGOBJVALS.stencil */
+   bool g4p;                /* the A8: ZLS extent in ZLSCTL, no ZLS_PIXELS */
 };
 
 /* The ZLS words of a render's fragment stream (pvr_arch_g5p.c):
@@ -130,6 +136,7 @@ const char *pvr_g5p_ds_texture_plane(VkFormat format, VkImageAspectFlags aspect,
  * 32-bit float texture, and ES 3.0 asks none of DEPTH_COMPONENT32F), and no
  * transfers (the planes are in the ZLS's Morton order). */
 VkFormatFeatureFlags2 pvr_g5p_ds_format_features(VkFormat format);
+bool pvr_g5p_ds_a8_attachment(VkFormat format);
 
 /* pvr_image_init(): a depth/stencil image of a ZLS format takes exactly the
  * ZLS planes' size (pvr_g5p_ds_layout()), not upstream's larger D32F_S8
@@ -157,7 +164,7 @@ struct vk_dynamic_graphics_state;
 VkResult PVR_PER_ARCH(g5p_ds_admit)(struct pvr_cmd_buffer *cmd_buffer,
                                     const struct pvr_renderpass_hwsetup_render *hw_render);
 /* frag_stream: the job's ZLS and background words from pvr_render_job::ds */
-void PVR_PER_ARCH(g5p_ds_pass)(const struct pvr_render_job *job, struct pvr_g5p_zls_words *out);
+void PVR_PER_ARCH(g5p_ds_pass)(const struct pvr_render_job *job, bool g4p, struct pvr_g5p_zls_words *out);
 /* the draw: w[0..4] as pvr_g5p_ds_isp(), from the dynamic state */
 void PVR_PER_ARCH(g5p_ds_isp)(const struct vk_dynamic_graphics_state *dyn, VkImageAspectFlags aspects,
                               uint32_t samples, bool lines, uint32_t passtype, bool scissor, bool dbias,

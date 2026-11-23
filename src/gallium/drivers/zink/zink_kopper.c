@@ -23,12 +23,15 @@
  */
 
 #include "util/detect_os.h"
+#include "util/u_debug.h"
 
 #include "zink_context.h"
 #include "zink_screen.h"
 #include "zink_surface.h"
 #include "zink_resource.h"
 #include "zink_kopper.h"
+
+DEBUG_GET_ONCE_NUM_OPTION(g5p_swapchain_images, "PVR_G5P_SWAPCHAIN_IMAGES", 0)
 
 static void
 zink_kopper_set_present_mode_for_interval(struct kopper_displaytarget *cdt, int interval)
@@ -326,6 +329,14 @@ kopper_CreateSwapchain(struct zink_screen *screen, struct kopper_displaytarget *
     */
    if (screen->frames_in_flight > 1) {
       uint32_t want = MAX2(cswap->scci.minImageCount, screen->frames_in_flight + 2);
+      if (screen->is_g5p) {
+         /* A/B knob for the drawable count (CAMetalLayer defaults to 3).
+          * Keep the default rule until measurements decide the image count.
+          */
+         const int64_t images = debug_get_option_g5p_swapchain_images();
+         if (images >= 2 && images <= 8)
+            want = MAX2(cswap->scci.minImageCount, (uint32_t)images);
+      }
       if (cdt->caps.maxImageCount)
          want = MIN2(want, cdt->caps.maxImageCount);
       cswap->scci.minImageCount = want;

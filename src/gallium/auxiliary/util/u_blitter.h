@@ -176,6 +176,13 @@ struct pipe_context *util_blitter_get_pipe(struct blitter_context *blitter)
 void util_blitter_set_texture_multisample(struct blitter_context *blitter,
                                           bool supported);
 
+/**
+ * Override whether single-sample blits may fetch texels (TXF) instead of
+ * sampling with NEAREST filtering, for a driver whose texel fetch is slower
+ * or missing. Multisample sources always fetch.
+ */
+void util_blitter_set_txf(struct blitter_context *blitter, bool supported);
+
 /* The default function to draw a rectangle. This can only be used
  * inside of the draw_rectangle callback if the driver overrides it. */
 void util_blitter_draw_rectangle(struct blitter_context *blitter,

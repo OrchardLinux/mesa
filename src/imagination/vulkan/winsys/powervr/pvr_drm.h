@@ -51,6 +51,11 @@ struct pvr_drm_winsys {
    uint64_t bvnc;
 
    bool is_g5p;
+   /* pvr_drm_winsys_create(query_only) on the A8: device queries only, no VM context */
+   bool query_only;
+   uint64_t caps;
+   int madvise_warning;
+   int64_t retry_log_time;
    /* The kernel sets a job fence's error when it resets (pvr_apple.c);
     * upstream pvr_queue.c does not.
     */
@@ -100,6 +105,10 @@ struct pvr_drm_winsys {
 
    uint32_t vm_context;
 };
+
+#define PVR_DRM_CAP_RETRY_ENOMEM DRM_PVR_CAP_RETRY_ENOMEM
+#define PVR_DRM_CAP_BO_MADVISE DRM_PVR_CAP_BO_MADVISE
+int pvr_drm_ioctl_retry(struct pvr_drm_winsys *ws, unsigned long request, void *args);
 
 struct drm_pvr_ioctl_submit_jobs_args;
 VkResult pvr_drm_submit_jobs(struct pvr_drm_winsys *ws,

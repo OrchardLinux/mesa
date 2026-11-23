@@ -70,6 +70,15 @@ struct pvr_suballocator {
    /* Mutex to protect access to all of the members below this point */
    simple_mtx_t mtx;
 
+   /* Updated under mtx; atomic accesses let BO logging sample these without
+    * taking mtx while the log mutex is held (alloc/free can already hold mtx).
+    * Empty cached BOs are excluded until reused.
+    */
+   uint32_t live_bos;
+   uint64_t live_bo_bytes;
+   uint64_t live_bytes;
+   uint64_t peak_bo_bytes;
+
    /* Current buffer object where sub-allocations are made from */
    struct pvr_bo *bo;
    /* Previous buffer that can be used when a new buffer object is needed */
@@ -125,6 +134,14 @@ VkResult pvr_bo_alloc_tagged(const char *tag,
                              uint64_t flags,
                              struct pvr_bo **const bo_out);
 #define pvr_bo_alloc(...) pvr_bo_alloc_tagged(__func__, __VA_ARGS__)
+/* A GPU-only buffer of size bytes mapped twice back to back (at vma->dev_addr and vma->dev_addr + size, the vma
+ * 2 * size long): winsys vma_map_mirror(). pvr_bo_free() releases it. */
+VkResult pvr_bo_alloc_mirrored(struct pvr_device *device,
+                               struct pvr_winsys_heap *heap,
+                               uint64_t size,
+                               uint64_t alignment,
+                               uint64_t flags,
+                               struct pvr_bo **const pvr_bo_out);
 
 VkResult pvr_bo_cpu_map(struct pvr_device *device, struct pvr_bo *bo);
 void pvr_bo_cpu_unmap(struct pvr_device *device, struct pvr_bo *bo);

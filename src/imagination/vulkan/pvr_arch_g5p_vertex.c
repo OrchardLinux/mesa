@@ -22,6 +22,7 @@
 #include "pvr_cmd_buffer.h"
 #include "pvr_csb.h"
 #include "pvr_device.h"
+#include "pvr_physical_device.h"
 #include "pvr_g5p.h"
 #include "pvr_pipeline.h"
 #include "pvr_g5p_vertex.h"
@@ -85,14 +86,20 @@ PVR_PER_ARCH(g5p_vertex_index_list)(struct pvr_cmd_buffer *cmd_buffer, const str
          v1.cut_index = isize == 1 ? 0xff : isize == 2 ? 0xffff : 0xffffffff;
       }
    }
+   /* The A8 sends no split count, and index_size 0 when not indexed:
+    * AGXMetalA8 emits 0x6e000000 | topology, count, instances - 1, start
+    * (0x1a144b3c8, 0x1a144b484) and, indexed, 0x7e000000 | topology | index
+    * size (0x20000 / 0x40000) | address (0x1a144b684, 0x1a144b830). */
+   const bool g4p = PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g4p);
    pvr_csb_pack (&w[(*n)++], VDMCTRL_INDEX_LIST0, l0) {
       l0.index_count_present = true;
       l0.index_instance_count_present = true;
       l0.index_offset_present = true;
-      l0.split_count_present = true;
-      l0.index_size = isize == 1   ? ROGUE_VDMCTRL_INDEX_SIZE_B8
-                      : isize == 2 ? ROGUE_VDMCTRL_INDEX_SIZE_B16
-                                   : ROGUE_VDMCTRL_INDEX_SIZE_B32;
+      l0.split_count_present = !g4p;
+      l0.index_size = (g4p && !draw->indexed) ? ROGUE_VDMCTRL_INDEX_SIZE_B8
+                      : isize == 1            ? ROGUE_VDMCTRL_INDEX_SIZE_B8
+                      : isize == 2            ? ROGUE_VDMCTRL_INDEX_SIZE_B16
+                                              : ROGUE_VDMCTRL_INDEX_SIZE_B32;
       l0.primitive_topology = hw_topology;
       if (draw->indexed) {
          l0.index_addr_present = true;
@@ -109,7 +116,8 @@ PVR_PER_ARCH(g5p_vertex_index_list)(struct pvr_cmd_buffer *cmd_buffer, const str
    /* indexed: the vertex offset (added to every index, so the PDS's vertex
     * index is gl_VertexIndex); else the first vertex */
    w[(*n)++] = draw->indexed ? (uint32_t)draw->vertex_offset : draw->first;
-   w[(*n)++] = split;
+   if (!g4p)
+      w[(*n)++] = split;
    return VK_SUCCESS;
 }
 

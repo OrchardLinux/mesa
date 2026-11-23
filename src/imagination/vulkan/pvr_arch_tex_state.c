@@ -111,6 +111,15 @@ static uint32_t setup_pck_info(VkFormat vk_format)
    return pck_info;
 }
 
+/* The A8 (AGXMetalA8, every texture state of the a8-passcap tex_* and load passes: BGRA8 and RGBA8, one level and
+ * mipmapped) leaves alpha_msb clear for 8-bit-per-channel formats, where upstream sets it for any alpha-in-W format */
+static bool pvr_tex_state_a8_no_alpha_msb(const struct pvr_device_info *dev_info, VkFormat format)
+{
+   const struct util_format_description *desc = vk_format_description(format);
+   return PVR_HAS_FEATURE(dev_info, apple_g4p) && desc->nr_channels == 4 && desc->block.bits == 32 &&
+          desc->channel[0].size == 8 && desc->channel[3].size == 8;
+}
+
 VkResult pvr_arch_pack_tex_state(struct pvr_device *device,
                                  const struct pvr_texture_state_info *info,
                                  struct pvr_image_descriptor *state)
@@ -254,7 +263,7 @@ VkResult pvr_arch_pack_tex_state(struct pvr_device *device,
 
          word1.texaddr = PVR_DEV_ADDR_OFFSET(info->addr, info->offset);
 
-         if (vk_format_is_alpha_on_msb(info->format))
+         if (vk_format_is_alpha_on_msb(info->format) && !pvr_tex_state_a8_no_alpha_msb(dev_info, info->format))
             word1.alpha_msb = true;
 
          if (!PVR_HAS_FEATURE(dev_info, tpu_extended_integer_lookup) &&
@@ -275,7 +284,10 @@ VkResult pvr_arch_pack_tex_state(struct pvr_device *device,
    } else {
       pvr_csb_pack (&state->words[1], TEXSTATE_IMAGE_WORD1, word1) {
          word1.num_mip_levels = info->mip_levels;
-         word1.mipmaps_present = info->mipmaps_present;
+         /* the A8 sets mipmaps_present only for a state of several levels (AGXMetalA8: 0 for the one-level load
+          * target, 1 with seven levels in tex_plain); a one-level view of a mipmapped image is one level to it */
+         word1.mipmaps_present = info->mipmaps_present &&
+                                 (!PVR_HAS_FEATURE(dev_info, apple_g4p) || info->mip_levels > 1);
          word1.baselevel = info->base_level;
 
          if (iview_type == VK_IMAGE_VIEW_TYPE_3D ||
@@ -287,7 +299,10 @@ VkResult pvr_arch_pack_tex_state(struct pvr_device *device,
          } else {
             uint32_t array_layers = info->array_size;
 
-            if (iview_type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY)
+            /* the A8 counts cubes, not faces, for a cube view as well (AGXMetalA8's tex_cube state: word1 depth 0
+             * for one 6-face cube, passcap round 1: 60008863 003f00fc 30008007 000040b0) */
+            if (iview_type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY ||
+                (iview_type == VK_IMAGE_VIEW_TYPE_CUBE && PVR_HAS_FEATURE(dev_info, apple_g4p)))
                array_layers /= 6;
 
             if (array_layers > 0)
@@ -309,7 +324,7 @@ VkResult pvr_arch_pack_tex_state(struct pvr_device *device,
          if (info->flags & PVR_TEXFLAGS_BORDER)
             word1.border = true;
 
-         if (vk_format_is_alpha_on_msb(info->format))
+         if (vk_format_is_alpha_on_msb(info->format) && !pvr_tex_state_a8_no_alpha_msb(dev_info, info->format))
             word1.alpha_msb = true;
 
          if (PVR_HAS_FEATURE(dev_info, tpu_image_state_v2) &&

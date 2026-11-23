@@ -119,7 +119,9 @@ static VkResult g5p_upload_alloc(struct pvr_cmd_buffer *cmd_buffer, unsigned idx
    offset = cmd_buffer->g5p_upload[idx].block ? ALIGN_POT(cmd_buffer->g5p_upload[idx].used, align) : 0;
    if (!cmd_buffer->g5p_upload[idx].block ||
        offset + aligned_size > cmd_buffer->g5p_upload[idx].block->size) {
-      struct pvr_suballocator *allocator = idx ? &device->suballoc_pds : &device->suballoc_general;
+      struct pvr_suballocator *allocator =
+         idx ? pvr_cmd_suballocator(device, &device->suballoc_pds)
+             : pvr_cmd_suballocator(device, &device->suballoc_general);
       struct pvr_suballoc_bo *block;
       VkResult result = pvr_bo_suballoc(allocator, G5P_UPLOAD_BLOCK_SIZE, line, false, &block);
       if (result != VK_SUCCESS)
@@ -3076,6 +3078,7 @@ pvr_arch_cmd_buffer_alloc_mem(struct pvr_cmd_buffer *cmd_buffer,
    else
       UNREACHABLE("Unknown heap type");
 
+   allocator = pvr_cmd_suballocator(cmd_buffer->device, allocator);
    result =
       pvr_bo_suballoc(allocator, size, cache_line_size, false, &suballoc_bo);
    if (result != VK_SUCCESS)

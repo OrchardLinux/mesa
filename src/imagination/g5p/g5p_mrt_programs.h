@@ -66,6 +66,15 @@ static inline uint32_t g5p_mrt_eot_info(unsigned n)
    return ((g5p_mrt_pbe_dwords(n) + 15) / 16) * 0x400 | 2;
 }
 
+/* The A8's EVENT_PIXEL_PDS_INFO: usc_sr_size in Rogue's unit, DIV_ROUND_UP(dwords,
+ * 16) at bit 9, not twice that. Captured 0x202 for a one-target 64x64 BGRA8 pass
+ * (iPod touch 6, 3D record +0x3c4, from a live iOS dump),
+ * where the A9 writes 0x402. Two or more targets are not captured on the A8. */
+static inline uint32_t g5p_mrt_eot_info_g4p(unsigned n)
+{
+   return ((g5p_mrt_pbe_dwords(n) + 15) / 16) << 9 | 2;
+}
+
 /* Partial-render restore SIZEINFO (restore[1], record+0x51c): usc_sharedsize
  * of Apple's N-image restore loader, 0x800000 per target (1, 2, 4 units). */
 static inline uint32_t g5p_mrt_restore1(unsigned n)
@@ -126,20 +135,121 @@ static inline unsigned g5p_mrt_clear_compact(uint8_t *out, unsigned n, bool bgra
 }
 
 /* The clear program. Returns its size, 16 * 4N + 6. */
+/*
+ * The A8's background program for one R8 (halves 1) or RG8 (halves 2) target: AGXMetalA8's (iOS 12.4, a8-passcap):
+ * the clear colour's low channels converted as for four (g5p_mrt_clear_usc()), for R8 a zero into half 1
+ * (0188 0101 0101 0120 0128 0039), then the one-word emitpix 111c 0900 8200 and END
+ */
+static inline unsigned g5p_mrt_clear_usc_g4p_narrow(uint8_t *out, unsigned halves)
+{
+   unsigned o = 0;
+   for (int c = (int)halves - 1; c >= 0; c--) {
+      const uint8_t h = (uint8_t)c;
+      const uint8_t ins[16] = {0x8a, 0x01, h, 0x01, 0x01, 0x01, 0xa0, 0x01,
+                               (uint8_t)(4 * h + 1), 0x01, 0x40, 0x41, 0x04, 0x01, 0xb0, 0x00};
+      memcpy(out + o, ins, sizeof(ins));
+      o += sizeof(ins);
+   }
+   if (halves == 1) {
+      static const uint8_t zero_g[12] = {0x88, 0x01, 0x01, 0x01, 0x01, 0x01, 0x20, 0x01, 0x28, 0x01, 0x39, 0x00};
+      memcpy(out + o, zero_g, sizeof(zero_g));
+      o += sizeof(zero_g);
+   }
+   const unsigned len = g5p_usc_emit(out + o, 1, 0);
+   if (!len)
+      return 0;
+   return o + len + g5p_usc_special(out + o + len, true);
+}
+
+/* The A8's RGBA8UI background program (AGXMetalA8, a8-passcap rgba8u): the four clear uints in common-store
+ * dwords 0..3 clamped to 255 and packed into one output word R | G << 8 | B << 16 | A << 24, high half first:
+ * r0 = umin(255, B), r1 = umin(255, A), h1 = h0 | h2 << 8; r1 = umin(255, R), r2 = umin(255, G),
+ * h0 = h2 | h4 << 8; emitpix one word. The second clamp carries Apple's destination control 0x80. */
+static inline unsigned g5p_mrt_clear_usc_g4p_rgba8ui(uint8_t *out)
+{
+   static const struct { uint8_t dst, ctl, dword; } clamp[2][2] = {
+      { { 0, 0, 2 }, { 2, 0x80, 3 } },
+      { { 2, 0, 0 }, { 4, 0, 1 } },
+   };
+   unsigned o = 0, len;
+   for (unsigned i = 0; i < 2; i++) {
+      for (unsigned k = 0; k < 2; k++) {
+         len = g5p_usc_minmax_literal_shared(out + o, G5P_UMIN, clamp[i][k].dst, clamp[i][k].ctl, 255,
+                                             clamp[i][k].dword);
+         if (!len)
+            return 0;
+         o += len;
+      }
+      len = g5p_usc_pack_byte_half(out + o, 1 - i, clamp[i][0].dst, clamp[i][1].dst, 8);
+      if (!len)
+         return 0;
+      o += len;
+   }
+   len = g5p_usc_emit(out + o, 1, 0);
+   if (!len)
+      return 0;
+   return o + len + g5p_usc_special(out + o + len, true);
+}
+
+/* The A8's R32F background program (AGXMetalA8, a8-passcap r32f): the clear colour's red f32 (common-store
+ * dword 0) moved into output word 0, emitpix one word. */
+static inline unsigned g5p_mrt_clear_usc_g4p_r32f(uint8_t *out)
+{
+   unsigned o = g5p_usc_mov_shared(out, 0, 0, 0), len;
+   if (!o)
+      return 0;
+   len = g5p_usc_emit(out + o, 1, 0);
+   if (!len)
+      return 0;
+   return o + len + g5p_usc_special(out + o + len, true);
+}
+
+/* The A8's colour LOAD background (AGXMetalA8, a8-passcap load: passcap USC heap 0x2180, the same bytes before and
+ * after commit): the fragment position converted and transformed by the 2x3 matrix in common-store dwords 8..13, the A8
+ * narrow 2D sample of the texture state in dwords 0..3 with the sampler in dwords 4..7, emitpix of two words (the f16
+ * pair BGRA8's end of tile takes). Its inputs are the three DOUTDs of the background data (pvr_arch_g5p.c). The bytes are
+ * Apple's: the conversion and FMA forms with common-store operands have no encoder here yet. */
+#define G5P_A8_LOAD_USC_BYTES 124
+static inline unsigned g5p_mrt_load_usc_g4p(uint8_t *out)
+{
+   static const uint8_t usc[G5P_A8_LOAD_USC_BYTES] = {
+      0x1c, 0x21, 0x00, 0x68, 0x4d, 0x00, 0x99, 0x01, 0x00, 0x01, 0x15, 0x81, 0x20, 0x01, 0x68, 0x04, 0x99, 0x01,
+      0x04, 0x81, 0x01, 0x81, 0x30, 0x51, 0x48, 0x09, 0x70, 0x00, 0x99, 0x01, 0x00, 0x01, 0x15, 0x85, 0x20, 0x01,
+      0x68, 0x04, 0x99, 0x01, 0x00, 0x81, 0x01, 0x81, 0x30, 0x51, 0x48, 0x09, 0x70, 0x00, 0x9e, 0x41, 0x02, 0x01,
+      0xa5, 0x09, 0x00, 0x41, 0xb5, 0x01, 0x00, 0x41, 0x4c, 0x00, 0x9e, 0x41, 0x02, 0x01, 0xad, 0x01, 0x00, 0x41,
+      0x84, 0x01, 0x4c, 0x00, 0x9a, 0x01, 0x04, 0x01, 0xa1, 0x89, 0x00, 0x41, 0xb1, 0x01, 0x00, 0x41, 0x4c, 0x00,
+      0x9a, 0x01, 0x00, 0x01, 0xa9, 0x81, 0x00, 0x41, 0x88, 0x01, 0x4c, 0x00, 0x1a, 0x59, 0x00, 0x41, 0x00, 0x01,
+      0x88, 0x01, 0x00, 0x01, 0x00, 0x80, 0x4d, 0x00, 0x1c, 0x21, 0x00, 0x09, 0x00, 0x82, 0x00, 0x80
+   };
+   memcpy(out, usc, sizeof(usc));
+   return sizeof(usc);
+}
+
 static inline unsigned g5p_mrt_clear_usc(uint8_t *out, unsigned n)
 {
    if (n > 4)
       return g5p_mrt_clear_compact(out, n, true);
    unsigned o = 0;
-   for (unsigned t = 0; t < n; t++)
+   /* The A8 (AGXMetalA8, a8-passcap mrt2) converts the last target first and reads target t's clear colour from
+    * slot n - 1 - t of the clear DMA (its colours in reverse target order); the A9 in order */
+   for (unsigned i = 0; i < n; i++)
       for (int c = 3; c >= 0; c--) {
+         const unsigned t = g5p_usc_g4p ? n - 1 - i : i, slot = g5p_usc_g4p ? n - 1 - t : t;
          uint8_t h = 4 * t + c;
+         const uint8_t src = (uint8_t)(4 * slot + c);
          const uint8_t ins[16] = {0x8a, 0x01, h, 0x01, 0x01, 0x01, 0xa0, 0x01,
-                                  (uint8_t)(4 * h + 1), 0x01, 0x40, 0x41, 0x04, 0x01, 0xb0, 0x00};
+                                  (uint8_t)(4 * src + 1), 0x01, 0x40, 0x41, 0x04, 0x01, 0xb0, 0x00};
          memcpy(out + o, ins, sizeof(ins));
          o += sizeof(ins);
       }
-   /* emitpix of 2N words (the 3-bit field wraps: 8 is 0), then END */
+   /* emitpix of 2N words (the 3-bit field wraps: 8 is 0), then END. The A8 takes the long emitpix
+    * (g5p_usc_emit()); its background program for one target is otherwise these bytes (Apple's, iOS 12.4) */
+   if (g5p_usc_g4p) {
+      const unsigned len = g5p_usc_emit(out + o, 2 * n, 0);
+      if (!len)
+         return 0;
+      return o + len + g5p_usc_special(out + o + len, true);
+   }
    const uint8_t tail[6] = {0x1c, (uint8_t)(((2 * n) & 7) << 4 | 1), 0x00, 0x08, 0x00, 0x80};
    memcpy(out + o, tail, sizeof(tail));
    return o + sizeof(tail);
@@ -150,6 +260,31 @@ static inline unsigned g5p_mrt_clear_usc(uint8_t *out, unsigned n)
 static inline unsigned g5p_mrt_eot_usc_mode(uint8_t *out, unsigned n, bool integer)
 {
    unsigned o = 0;
+   if (g5p_usc_g4p) {
+      /* The A8's end of tile for one target: 1e 01 00 70, which takes the target from the common store
+       * (its address and 2, 0: the EOT DMA), then the A9's branch to an END at the next 64-byte boundary
+       * (Apple's program, iOS 12.4, a8-shadercap). Other target counts and the integer form are not
+       * captured. */
+      if ((n != 1 && n != 2) || integer) {
+         g5p_usc_error = "A8 end of tile captured for one or two float targets only";
+         return 0;
+      }
+      /* two targets (Apple's, a8-passcap mrt2): 1c 01 00 70 (target 0), 4c 04, 1e 01 00 71 08 00 (target 1, its
+       * state from the second EOT DMA block), then the branch to the END at byte 64 */
+      static const uint8_t g4_1[10] = {0x1e, 0x01, 0x00, 0x70, 0x00, 0x01, 0x3c, 0x01, 0x00, 0x00};
+      static const uint8_t g4_2[18] = {0x1c, 0x01, 0x00, 0x70, 0x4c, 0x04, 0x1e, 0x01, 0x00, 0x71,
+                                       0x08, 0x00, 0x00, 0x01, 0x34, 0x01, 0x00, 0x00};
+      const uint8_t *g4 = n == 2 ? g4_2 : g4_1;
+      const unsigned g4_len = n == 2 ? sizeof(g4_2) : sizeof(g4_1);
+      memcpy(out, g4, g4_len);
+      for (o = g4_len; o < 64; o += 2) {
+         out[o] = 0x00;
+         out[o + 1] = 0xc0;
+      }
+      out[o] = 0x00;
+      out[o + 1] = 0x80;
+      return o + 2;
+   }
    for (unsigned k = 0; k < n; k++) {
       /* output half 2 * (n - 1 - k) = target k's output-half offset (in its PBE block) */
       const unsigned len = g5p_usc_mov_shared_half(out + o, 2 * (n - 1 - k),

@@ -10,6 +10,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "g5p_usc.h"
 #include "pvr_physical_device.h"
 
 #include <sys/sysmacros.h>
@@ -19,6 +20,7 @@
 #include "util/disk_cache.h"
 #include "util/ralloc.h"
 #include "util/os_misc.h"
+#include "util/u_debug.h"
 
 #include "vk_util.h"
 #include "vk_log.h"
@@ -29,6 +31,8 @@
 #include "pco/pco.h"
 #include "pco_uscgen_programs.h"
 #include "pvr_g5p_ds_hooks.h"
+#include "pvr_g5p_ds.h"
+#include "pvr_g5p_tex.h"
 #include "pvr_device.h"
 #include "pvr_dump_info.h"
 #include "pvr_entrypoints.h"
@@ -256,8 +260,9 @@ static void pvr_physical_device_get_supported_features(
       .sampleRateShading = true,
       .dualSrcBlend = false,
       .logicOp = true,
-      .multiDrawIndirect = true,
-      .drawIndirectFirstInstance = true,
+      /* the A8: no indirect draw in Apple's driver; vkCmdDraw*Indirect is refused by name (pvr_arch_g5p_gfx.c) */
+      .multiDrawIndirect = !PVR_HAS_FEATURE(dev_info, apple_g4p),
+      .drawIndirectFirstInstance = !PVR_HAS_FEATURE(dev_info, apple_g4p),
       .depthClamp = false,
       .depthBiasClamp = true,
       .fillModeNonSolid = false,
@@ -1252,7 +1257,7 @@ VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
    pdevice->render_devid = render_stat.st_rdev;
 
    result =
-      pvr_winsys_create(render_path, display_path, true,
+      pvr_winsys_create(render_path, display_path, true, true,
                         &instance->vk.alloc, &ws);
    if (result != VK_SUCCESS)
       goto err_vk_free_display_path;
@@ -1389,8 +1394,44 @@ VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
       goto err_vk_physical_device_finish;
    }
 
+   /* The A8's USC forms (g5p_usc.h); one process drives one Apple GPU */
+   if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g4p)) {
+      g5p_usc_g4p = true;
+      /* the A9's instructions where the A8's captured forms cannot express the operands (g5p_usc.h) */
+      g5p_usc_g4p_a9_forms = debug_get_bool_option("PVR_A8_A9_FORMS", true);
+      /* The A8's depth/stencil layout (pvr_g5p_ds.h): ZLS extents rounded up to powers of two and planes over the
+       * ZLS's rectangle. On the iPod every depth and stencil buffer stored by one render and loaded by the next
+       * read back right with them, at seven sizes from 640x1136 to 37x29. */
+      pvr_g5p_ds_pot_extents = true;
+      pvr_g5p_ds_rect_planes = true;
+      /* single-level non-power-of-two colour images stay linear (pvr_g5p_tex.h) */
+      pvr_g5p_image_a8_linear = true;
+      /* linear colour images' memory to whole 32-row tiles (pvr_g5p_image_a8_tile_pad_image()); PVR_A8_TILE_PAD=0
+       * gives the exact sizes back */
+      pvr_g5p_image_a8_tile_pad = debug_get_bool_option("PVR_A8_TILE_PAD", true);
+      /* texelFetch (g5p_usc.h): Apple's read form, which reads every texel right on the iPod touch 6 at level 0
+       * (RGBA8, RGBA32F, RGBA32I); a level above 0 with PVR_A8_TEXFETCH_LEVEL=level|scale|apple */
+      g5p_usc_g4p_texfetch = 2;
+      const char *level = getenv("PVR_A8_TEXFETCH_LEVEL");
+      g5p_usc_g4p_texfetch_level = !level ? 0 : !strcmp(level, "level") ? 1 : !strcmp(level, "scale") ? 2 :
+                                   !strcmp(level, "apple") ? 3 : 0;
+      /* vertex textures in Apple's form, on by default: on the iPod (through Zink) its vertex read passed through a
+       * smooth varying and through the position. PVR_A8_VTEX_APPLE=0 turns them off (refused, as before); with it,
+       * PVR_A8_VTEX=1 takes the A9's recipe, which read zeros for a vertex texelFetch and whose textureLod locked the
+       * TA (g5p_usc.h) */
+      g5p_usc_g4p_vtex_apple = debug_get_bool_option("PVR_A8_VTEX_APPLE", true);
+      g5p_usc_g4p_vtex = debug_get_bool_option("PVR_A8_VTEX", false) || g5p_usc_g4p_vtex_apple;
+      /* fragment texel-buffer reads (g5p_usc.h) */
+      g5p_usc_g4p_tbo = debug_get_bool_option("PVR_A8_TBO", true);
+   }
+
+   /* The A8 skips refused work by default: a refused program or pass loses its draws (named on stderr) instead of
+    * failing the command buffer, which Zink turns into a lost context for the whole application. PVR_A8_STRICT=1
+    * restores the failure. */
    pdevice->skip_refused_work = PVR_HAS_FEATURE(&pdevice->dev_info, apple_g5p) &&
-                                 instance->drirc.misc.pvr_skip_refused_work;
+                                 (instance->drirc.misc.pvr_skip_refused_work ||
+                                  (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g4p) &&
+                                   !debug_get_bool_option("PVR_A8_STRICT", false)));
 
    pdevice->sync_type = ws->syncobj_type;
    if (ws->job_sync_size) {

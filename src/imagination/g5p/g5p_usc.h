@@ -22,6 +22,56 @@
 
 extern _Thread_local const char *g5p_usc_error;
 
+/*
+ * Encode for the A8 (G4P) instead of the A9: set once by the driver for an A8
+ * device (one process drives one Apple GPU). The forms that differ, from
+ * Apple's A8 compiler output (iPod touch 6, iOS 12.4, a8-shadercap): emitpix
+ * takes an extension halfword, varyings iterate with opcode 0x18, and texture
+ * samples have another form (refused until decoded). Everything else Apple's
+ * A8 compiler emits the A9's way (the vertex programs byte for byte).
+ */
+extern bool g5p_usc_g4p;
+/*
+ * On the A8, the A9's instruction where the A8 form captured from Apple cannot express the operands (today: a
+ * texture sample whose image is not at common qword 0, or whose sampler is beyond common dword 7). Set by the
+ * driver for an A8 (PVR_A8_A9_FORMS, default on). These are A9 instructions no A8 capture has witnessed.
+ */
+extern bool g5p_usc_g4p_a9_forms;
+/*
+ * texelFetch on the A8: a fragment 2D fetch is drawn as the A8's sample with a point, non-normalized, clamped copy of
+ * the texture's sampler, as Apple's read (an iOS capture of a Metal read()): the integer coordinate as a float,
+ * byte 6 bit 2 set (g5p_usc_g4p_texfetch = 2; 1, the texel's centre without the bit, reads the same on the iPod
+ * touch 6). A constant level above 0 (the sampler's LOD range clamped to it) only with PVR_A8_TEXFETCH_LEVEL:
+ *   1 ("level"): the coordinate in the level's texels; 2 ("scale"): in level 0's texels (times 2^level);
+ *   3 ("apple"): every fetch in Apple's read form (AGXCompilerCore's read(): an explicit level, 0 when the source
+ *   names none): byte 6 0xac (mode 2 + bit 2), the level as an f32 in the register after the coordinate (byte 7
+ *   0x09, as in an iOS capture of a Metal sample at a varying level), through Apple's constant read sampler
+ *   (normalized, clamped to the edge, point, LOD 0..max; PCO_G5P_UPLOAD_SAMPLER_READ), the coordinate unscaled.
+ *   Not yet run on the hardware.
+ */
+extern int g5p_usc_g4p_texfetch;
+extern int g5p_usc_g4p_texfetch_level;
+/*
+ * Vertex-stage textures on the A8, in Apple's form by default (PVR_A8_VTEX_APPLE, below; PVR_A8_VTEX_APPLE=0 refuses
+ * them). With PVR_A8_VTEX_APPLE=0, PVR_A8_VTEX=1 takes the A9's qualified vertex recipe over the A8's four-dword image
+ * and sampler words. That does not work: on the iPod touch 6 its vertex texelFetch read zeros and its textureLod
+ * locked the TA. Its sample is the A9's own instruction (1a f5 .. 01 08 85 c6 01 80 81, a coupled f16 level), which
+ * Apple's A8 programs never contain.
+ */
+extern bool g5p_usc_g4p_vtex;
+/*
+ * PVR_A8_VTEX_APPLE (on by default; its vertex read passed on the iPod): Apple's vertex form, as an iOS capture shows
+ * it for AGXMetalA8's vertex programs (a sample, a read of RGBA32Float and of RGBA32Sint): the A8's 12-byte sample
+ * with the coordinate and the result in bank 1 and Apple's constant level 0.0 from the common store,
+ * 1a 7d 00 41 00 01 a8|ac|a4 05 00 01 LL 80 (g5p_tex.vtx, LL the level's half index), the image and sampler at
+ * common dwords 0 and 4, each block by its own DOUTD; a read takes Apple's vertex read sampler
+ * (pvr_g5p_a8_vread_sampler()).
+ */
+extern bool g5p_usc_g4p_vtex_apple;
+/* A fragment texel-buffer read on the A8 (st/mesa's pixel-buffer uploads) as a 2D texelFetch of the buffer's linear
+ * state (PVR_A8_TBO, on by default; 0 refuses it) */
+extern bool g5p_usc_g4p_tbo;
+
 enum g5p_binop {
    G5P_BIN_FADD, G5P_BIN_FMUL, G5P_BIN_IADD, G5P_BIN_IMUL,
    G5P_BIN_AND, G5P_BIN_OR, G5P_BIN_XOR, G5P_BIN_ISHR,
@@ -122,7 +172,8 @@ unsigned g5p_usc_iterator_flags(uint8_t *out, unsigned dst_half, unsigned slot, 
                                 bool narrow, bool saturate, unsigned flags);
 /* Flat varying component: load the C coefficient of a coefficient set,
  * `14 23 DD 01 AA 01 00 02` (AA = coefficient dword 4 * set + 2; b0 bit 0 =
- * the second dependent-read counter). */
+ * the second dependent-read counter). The A8 form is Apple's `18 09 DD 01 AA
+ * 01 60 00` (f_iter), on the first counter only. */
 unsigned g5p_usc_coeff_load(uint8_t *out, unsigned dst_half, unsigned coeff_dword, bool drc1);
 unsigned g5p_usc_coord_iterator(uint8_t *out, unsigned dst_half, unsigned slot, unsigned count);
 unsigned g5p_usc_emit(uint8_t *out, unsigned words, unsigned source_half);
@@ -158,6 +209,23 @@ struct g5p_tex {
    unsigned lod_bank, lod_dword;
    bool gradient, lod_control;
    unsigned length; /* 0 = minimum */
+   /* The A8's multi-image form (Apple's, from an iOS capture): byte 4 = the image's common dword * 2, the
+    * sampler's four-dword slot in byte 1 bits 7:6 and byte 5 bits 2:1. image_qword and sampler_qword then hold
+    * dwords. */
+   bool a8_slots;
+   /* g5p_usc_g4p_texfetch = 2: Apple's read flag, byte 6 bit 2 */
+   bool read_flag;
+   /* Apple's explicit level in a register (an iOS capture of a Metal sample at a varying level:
+    * 1a 59 00 41 00 01 a8 09 00 01 00 80): mode 2, byte 7 0x09, the level an f32 in the register after the
+    * coordinate's two */
+   bool lod_reg;
+   /* Apple's vertex-stage sample (an iOS capture, AGXMetalA8's v_sample / v_read_f32 / v_read_i32:
+    * 1a 7d 00 41 00 01 a8|ac|a4 05 00 01 1c 80): the coordinate and the result in bank 1 (byte 1 bit 2, byte 7
+    * bit 2), mode 2 with Apple's constant level 0 (byte 10 0x1c); byte 6 0xa8 for a sample, 0xac for a read of a float
+    * or normalized texture, 0xa4 (int_result) for a read of an integer one */
+   bool vtx;
+   bool int_result;
+   unsigned lod_common; /* vtx: the common dword holding the f32 level (byte 10 = its half index, 2 * dword) */
 };
 unsigned g5p_usc_sample(uint8_t *out, const struct g5p_tex *t);
 /* The 2D-multisample fetch's sample operand "the task's own sample" (a sample-rate program reads the
@@ -201,6 +269,7 @@ struct g5p_tex_ext {
    unsigned extras_half;
    enum g5p_tex_tuple tuple;
    bool lod_shared; /* prefix level source: common store instead of register */
+   bool vertex;     /* a vertex-stage sample (the A8 takes the A9's recipe there, g5p_usc_g4p_vtex) */
 };
 /* A9 compute's register-level array or cube sample and fetch: the coupled temporary-level tuple, the fetch's
  * coordinate kept live (fields at the encoder). */
@@ -236,6 +305,14 @@ unsigned g5p_usc_f2u16_half(uint8_t *out, unsigned dst_half, unsigned src_half, 
  * end-of-tile program's state moves (g5p_mrt_programs.h). */
 unsigned g5p_usc_mov_shared_half(uint8_t *out, unsigned dst_half, unsigned src_dword);
 unsigned g5p_usc_unorm8_byte(uint8_t *out, unsigned dst_half, unsigned byte, unsigned src_dword);
+/* Integer min/max of a short literal and common-store dword c_dword (group 1) into the 32-bit register at
+ * dst_half, bank 0 (fields at the encoder): the A8's RGBA8UI clear clamps each channel with umin(255, c). */
+unsigned g5p_usc_minmax_literal_shared(uint8_t *out, enum g5p_minmax op, unsigned dst_half, unsigned dst_control,
+                                       uint32_t value, unsigned c_dword);
+/* The 16-bit dst_half of bank 0 = half b_half | half c_half << 8 (fields at the encoder): the A8's RGBA8UI clear
+ * packs two clamped channels into one half with it. */
+unsigned g5p_usc_pack_byte_half(uint8_t *out, unsigned dst_half, unsigned b_half, unsigned c_half,
+                                unsigned shift);
 /* length 0 = minimum */
 unsigned g5p_usc_buffer_load(uint8_t *out, unsigned dst_half, unsigned byte_count,
                              unsigned base_common_dword, unsigned index, unsigned length);

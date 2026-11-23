@@ -22,6 +22,8 @@
 
 #include "pvr_cmd_buffer.h"
 #include "pvr_csb.h"
+#include "pvr_device.h"
+#include "pvr_physical_device.h"
 #include "pvr_g5p_ds.h"
 #include "pvr_g5p_shader_dump.h"
 #include "pvr_g5p_tex_encode.h"
@@ -41,6 +43,13 @@ PVR_PER_ARCH(g5p_ds_admit)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_r
    const struct pvr_image *image = pvr_image_view_get_image(iview);
    const struct pvr_g5p_ds_format *f = pvr_g5p_ds_format(iview->vk.format);
    struct pvr_g5p_ds_plane plane;
+
+   /* The A8: what a8-passcap captured (iPod touch 6, iOS 12.4): D32F
+    * and D32F_S8 at one sample, clear/load and store */
+   if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g4p) &&
+       (!pvr_g5p_ds_a8_attachment(iview->vk.format) || image->vk.samples != 1))
+      return G5P_REFUSE(cmd_buffer, "A8 depth/stencil %s at %u samples (D32F and D32F_S8 at one sample are captured)",
+                        vk_Format_to_str(iview->vk.format), image->vk.samples);
 
    if (!f)
       return G5P_REFUSE(cmd_buffer, "depth/stencil format %s (the ZLS stores D16, D32F, S8, D32F_S8)",
@@ -76,7 +85,7 @@ PVR_PER_ARCH(g5p_ds_admit)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_r
 }
 
 void
-PVR_PER_ARCH(g5p_ds_pass)(const struct pvr_render_job *job, struct pvr_g5p_zls_words *out)
+PVR_PER_ARCH(g5p_ds_pass)(const struct pvr_render_job *job, bool g4p, struct pvr_g5p_zls_words *out)
 {
    if (!job->ds.iview || !(job->has_depth_attachment || job->has_stencil_attachment)) {
       pvr_g5p_ds_zls_none(out);
@@ -101,6 +110,7 @@ PVR_PER_ARCH(g5p_ds_pass)(const struct pvr_render_job *job, struct pvr_g5p_zls_w
       .sstore = job->ds.store.s,
       .depth_clear = job->ds_clear_value.depth,
       .stencil_clear = (uint8_t)job->ds_clear_value.stencil,
+      .g4p = g4p,
    };
    /* g5p_ds_admit() refused what pvr_g5p_ds_zls() cannot build */
    const char *why = pvr_g5p_ds_zls(&t, out);

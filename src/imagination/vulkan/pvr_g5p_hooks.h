@@ -25,8 +25,11 @@
 #include "pvr_g5p_compute_hooks.h"
 
 /* Uniform buffer textures: independent R5 probe; no storage exposure. */
+/* The A8 (apple_g4p) keeps upstream's Rogue texture, sampler and texel-buffer state: its TPU is Rogue's (the
+ * a8-passcap load pass's TEXSTATE words); the A9's own forms are below. */
 #define PVR_G5P_HOOK_texel_state(device, info, state) \
-   if (PVR_HAS_FEATURE(&(device)->pdevice->dev_info, apple_g5p) && (info)->buffer_elems) \
+   if (PVR_HAS_FEATURE(&(device)->pdevice->dev_info, apple_g5p) && \
+       !PVR_HAS_FEATURE(&(device)->pdevice->dev_info, apple_g4p) && (info)->buffer_elems) \
       return pvr_g5p_tbo_pack(device, info, state);
 #define PVR_G5P_HOOK_texel_features(pdevice, format, flags) \
    if (PVR_HAS_FEATURE(&(pdevice)->dev_info, apple_g5p)) \
@@ -43,13 +46,14 @@
  * the A9's three-qword image state (pvr_arch_g5p_pack_image_view()).
  */
 #define PVR_G5P_HOOK_image_view(device, iview)                              \
-   if (PVR_HAS_FEATURE(&(device)->pdevice->dev_info, apple_g5p))           \
+   if (PVR_HAS_FEATURE(&(device)->pdevice->dev_info, apple_g5p) &&         \
+       !PVR_HAS_FEATURE(&(device)->pdevice->dev_info, apple_g4p))          \
       pvr_arch_g5p_pack_image_view(                                         \
          iview, &(iview)->image_state[PVR_TEXTURE_STATE_SAMPLE]);
 
 /* Only storage descriptors reinterpret cube faces as a 2D array. */
 #define PVR_G5P_HOOK_storage_image(dev_info, iview, desc) \
-   if (PVR_HAS_FEATURE(dev_info, apple_g5p) && \
+   if (PVR_HAS_FEATURE(dev_info, apple_g5p) && !PVR_HAS_FEATURE(dev_info, apple_g4p) && \
        ((iview)->vk.view_type == VK_IMAGE_VIEW_TYPE_CUBE || \
         (iview)->vk.view_type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY)) \
       pvr_arch_g5p_pack_storage_image_view(iview, desc);
@@ -75,7 +79,8 @@
  * forms (pvr_arch_g5p_pack_sampler()).
  */
 #define PVR_G5P_HOOK_sampler(device, create_info, sampler)                 \
-   if (PVR_HAS_FEATURE(&(device)->pdevice->dev_info, apple_g5p))           \
+   if (PVR_HAS_FEATURE(&(device)->pdevice->dev_info, apple_g5p) &&         \
+       !PVR_HAS_FEATURE(&(device)->pdevice->dev_info, apple_g4p))          \
       pvr_arch_g5p_pack_sampler(create_info, &(sampler)->descriptor);
 
 /* pvr_arch_descriptor_set.c, write_image_sampler(): a combined descriptor
@@ -84,7 +89,10 @@
 #define PVR_G5P_HOOK_image_sampler(set, image_info, desc)                     \
    if (PVR_HAS_FEATURE(&container_of((set)->base.device, struct pvr_device, \
                                      vk)->pdevice->dev_info,                \
-                       apple_g5p))                                          \
+                       apple_g5p) &&                                        \
+       !PVR_HAS_FEATURE(&container_of((set)->base.device, struct pvr_device, \
+                                      vk)->pdevice->dev_info,               \
+                        apple_g4p))                                         \
       pvr_arch_g5p_combine_sampler(                                         \
          desc, (image_info)->imageView                                      \
                   ? pvr_image_view_from_handle((image_info)->imageView)     \

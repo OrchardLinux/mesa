@@ -24,6 +24,7 @@
 
 #include "pvr_g5p_format_table.h"
 #include "pvr_g5p_formats.h"
+#include "g5p/g5p_usc.h"
 
 /* Formats that have not run on the device are not advertised */
 bool
@@ -44,6 +45,16 @@ static bool
 row_probe(VkFormat format)
 {
    return pvr_g5p_formats_probe() || tex16_row(format);
+}
+
+/* Colour targets the A8 renders beyond the A9 table's: RGBA8UI and R32F. AGXMetalA8's passes for them
+ * (a8-passcap rgba8u, r32f) are the float pass shape with their own end-of-tile state word, and our fragment,
+ * clear and end-of-tile programs for them match Apple's byte for byte (pvr_arch_g5p.c, g5p_mrt_programs.h).
+ * On the A9, RGBA8UI stays a probe row and R32F is not rendered. */
+static bool
+a8_render_row(VkFormat format)
+{
+   return g5p_usc_g4p && (format == VK_FORMAT_R8G8B8A8_UINT || format == VK_FORMAT_R32_SFLOAT);
 }
 
 bool
@@ -69,6 +80,12 @@ pvr_g5p_packed_word_pbe_key(void)
 bool
 pvr_g5p_format_pbe(VkFormat format, uint32_t *key, bool *srgb)
 {
+   if (a8_render_row(format)) {
+      const struct pvr_g5p_format *f = pvr_g5p_format_find(format);
+      *key = f->key;
+      *srgb = f->srgb;
+      return true;
+   }
    return pvr_g5p_format_pbe_key(format, row_probe(format), key, srgb);
 }
 
@@ -79,7 +96,11 @@ pvr_g5p_color_format_features(VkFormat format, VkImageTiling tiling, VkFormatFea
 
    /* the A9's own answer; upstream's flags only say the format exists */
    (void)flags;
-   return pvr_g5p_format_features(f, tiling == VK_IMAGE_TILING_LINEAR, row_probe(format));
+   VkFormatFeatureFlags2 r = pvr_g5p_format_features(f, tiling == VK_IMAGE_TILING_LINEAR, row_probe(format));
+   if (a8_render_row(format))
+      r |= VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_2_BLIT_DST_BIT |
+           VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT;
+   return r;
 }
 
 VkResult

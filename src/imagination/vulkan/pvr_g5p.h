@@ -27,25 +27,68 @@ static inline VkResult pvr_refusal_to_api(VkResult result)
    return result == VK_ERROR_FEATURE_NOT_PRESENT ? VK_ERROR_OUT_OF_HOST_MEMORY : result;
 }
 
+#include <stdio.h>
 #include "util/log.h"
 #include "util/u_atomic.h"
 #include "vk_log.h"
 
+/* Whether a refusal's text is new at its call site: a small table of text hashes (racing threads can at worst
+ * print one twice); a full table leaves only the count rule below. */
+static inline bool pvr_g5p_refusal_new(uint32_t *seen, unsigned n, const char *text)
+{
+   uint32_t h = 2166136261u;
+   for (const char *p = text; *p; p++)
+      h = (h ^ (uint8_t)*p) * 16777619u;
+   h |= !h;
+   for (unsigned i = 0; i < n; i++) {
+      const uint32_t v = p_atomic_read(&seen[i]);
+      if (v == h)
+         return false;
+      if (!v && p_atomic_cmpxchg(&seen[i], 0, h) == 0)
+         return true;
+   }
+   return false;
+}
+
 /* Refusal kinds are keyed by their call site (pipeline validation or pass/draw
- * validation). Count atomically across recording threads; warn on occurrences
- * 1, 2, 4, ... so tolerant workloads cannot emit one warning per draw. Keep
- * vk_errorf for debug callbacks and preserve the internal refusal result. */
+ * validation). Every distinct reason is printed once; a repeated one on
+ * occurrences 1, 2, 4, ... of its call site, so tolerant workloads cannot emit
+ * one warning per draw (a pipeline refused again for the same program is such
+ * a repeat). Keep vk_errorf for debug callbacks and preserve the internal
+ * refusal result. */
 #define G5P_REFUSE(obj, ...)                                                  \
    ({                                                                        \
-      static uint32_t refusal_count;                                         \
+      static uint32_t refusal_count, refusal_seen[32];                       \
+      char refusal_text[768];                                                \
+      snprintf(refusal_text, sizeof(refusal_text), __VA_ARGS__);             \
       uint32_t occurrence = p_atomic_inc_return(&refusal_count);              \
-      if (occurrence && !(occurrence & (occurrence - 1)))                     \
-         mesa_logw("G5P refuses: " __VA_ARGS__);                              \
-      vk_errorf((obj), VK_ERROR_FEATURE_NOT_PRESENT, "G5P: " __VA_ARGS__);     \
+      if (pvr_g5p_refusal_new(refusal_seen, 32, refusal_text) ||             \
+          (occurrence && !(occurrence & (occurrence - 1))))                   \
+         mesa_logw("G5P refuses: %s", refusal_text);                          \
+      vk_errorf((obj), VK_ERROR_FEATURE_NOT_PRESENT, "G5P: %s", refusal_text); \
    })
 
 #include "pvr_common.h"
 #include "pvr_limits.h"
+
+/* The pdsc features of a PDS program: the A9 encodes DOUT in Apple's extended
+ * form (src0 at bits 3-9, src1 at 10-17), as the A10 does; the A8 in Rogue's
+ * (src0 at 8-14, src1 at 16-23). The A8's form is decoded from Metal's PDS
+ * programs on an A8 (OrchardLinux/gpu a8/M2-IOS-CAPTURE.md): DOUTW of temps q0
+ * with the control in data dword 2 is 0xf0024001 there, 0xf0000a01 on the A10.
+ * Data words (DOUTU/DOUTD/DOUTW sources and controls) are the same in both.
+ * For files that include pdsc.h. */
+/* The base DOUTU's USC offsets count from. The A9's firmware has a PDS and a USC execution base (PLATFORM
+ * +0x10/+0x18, powervr's two heap bases). The A8's has one: Apple writes 0x3_00000000 to both of its pair
+ * (PLATFORM +0x20/+0x28; Apple's code runs there and faults at 0x1_ on the device), so its USC code
+ * counts from the PDS heap's base: the kernel puts the PDS heap at that base and the USC heap above it in the
+ * same 4 GiB window. For files that include pvr_device.h. */
+#define PVR_G5P_USC_EXEC_BASE(device) \
+   (PVR_HAS_FEATURE(&(device)->pdevice->dev_info, apple_g4p) ? (device)->heaps.pds_heap->base_addr.addr \
+                                                             : (device)->heaps.usc_heap->base_addr.addr)
+
+#define PVR_G5P_PDS_FEATURES(dev_info) \
+   (PVR_HAS_FEATURE(dev_info, apple_g4p) ? (enum pdsc_feature)0 : PDSC_FEATURE_DOUT_EXT)
 
 /* A sampler's mipLodBias, clamped to +-maxSamplerLodBias, as an f32 in its descriptor's metadata
  * (pvr_sampler_descriptor::meta): the A9 sampler word has no bias field, so the LOD-bias program variant adds
@@ -95,6 +138,15 @@ struct pvr_g5p_programs {
    struct pvr_suballoc_bo *eot_usc[PVR_G5P_MRT_VARIANTS];
    /* PDS kicks of the clear programs (PDS_BGRND0's shader) */
    struct pvr_pds_upload clear_kick[PVR_G5P_MRT_VARIANTS];
+   /* the A8's background programs for one R8 [0] or RG8 [1] target (g5p_mrt_clear_usc_g4p_narrow()) */
+   struct pvr_suballoc_bo *clear_usc_narrow[2];
+   struct pvr_pds_upload clear_kick_narrow[2];
+   /* the A8's background program for one RGBA8UI target (g5p_mrt_clear_usc_g4p_rgba8ui()) */
+   struct pvr_suballoc_bo *clear_usc_rgba8ui;
+   struct pvr_pds_upload clear_kick_rgba8ui;
+   /* the A8's background program for one R32F target (g5p_mrt_clear_usc_g4p_r32f()) */
+   struct pvr_suballoc_bo *clear_usc_r32f;
+   struct pvr_pds_upload clear_kick_r32f;
    /* PDS code: the clear colour's DOUTD (PDS_BGRND0's texunicode; its data,
     * {floats, control}, is per render) and the end of tile, DOUTD of the PBE
     * words then DOUTU of the end-of-tile program (data per render) */
@@ -133,6 +185,9 @@ struct pvr_g5p_programs {
    struct pvr_g5p_programs *mrt_load[8];
    /* Lazy 4x LOAD (one UNORM/float target, pvr_g5p_compile_load_ms()), kicked at sample rate */
    struct pvr_g5p_programs *ms_load;
+   /* the A8's colour LOAD background (g5p_mrt_load_usc_g4p()): its USC, kick and the three-DOUTD loader */
+   struct pvr_suballoc_bo *a8_load_usc;
+   struct pvr_pds_upload a8_load_kick, a8_load_dma;
    /* raw clear programs by total output words: 2, 4, 8 (two 32-bit integer targets) */
    struct pvr_suballoc_bo *raw_clear_usc[4]; /*2/4/8 words, then scalar1 */
    /* raw end-of-tile programs by target count: 1, 2 */
@@ -143,12 +198,18 @@ struct pvr_g5p_programs {
 
 /*
  * The parameter buffer of a render (bytes): what the device's free list asks
- * the kernel for. On the A9 the list holds no pages; its size is the size of
- * the parameter manager's pool, which the kernel raises to what the render
- * target's tiles need and which does not grow during a render. 4 MiB (32
- * blocks of 128 KiB) is the pool the device's renders ran with.
+ * the kernel for. On the A9 the list holds no pages; its size is the smallest
+ * parameter manager pool the kernel builds for the render, which it raises to
+ * what the render target's tiles need, at most 128 blocks of 128 KiB.
+ *
+ * The pool does not grow during a scene, and the kernel has no partial
+ * render: a scene whose geometry needs more parameter memory than the pool
+ * stops the geometry job without a fault, and the job times out. A pool sized
+ * from a small target's tiles (4 MiB, 32 blocks, below 974 tiles) can be too
+ * small for a 3D scene drawn into it. Ask for the largest pool the kernel
+ * builds, 16 MiB. PVR_G5P_FREE_LIST_MB overrides it.
  */
-#define PVR_G5P_FREE_LIST_SIZE (4U * 1024U * 1024U)
+#define PVR_G5P_FREE_LIST_SIZE (16U * 1024U * 1024U)
 
 /* G5P's per-device state (pvr_device::g5p), allocated by g5p_device_init() */
 struct pvr_g5p_device {
@@ -177,6 +238,13 @@ struct pvr_g5p_job {
    uint64_t vdm_va;             /* the control stream, one block */
    uint32_t background[8];      /* PDS_BGRND0..3 (64-bit registers: 8-byte aligned) */
    uint32_t eot[4];             /* EVENT_PIXEL_PDS data, code, info */
+   uint64_t a8_pbe[2];          /* the A8: target 0's PBESTATE_REG_WORD0/1 (g5p_pbe_a8_reg_words()) */
+   uint32_t a8_eot_format;      /* the A8: the EOT state's format word, PBE packmode << 16 | conversion */
+   uint8_t a8_narrow_halves;    /* the A8: one R8 (1) or RG8 (2) target: one-word output (Apple's 111c) */
+   /* the A8's second colour target (MRT2): its PBE words, address and EOT format word */
+   uint64_t a8_pbe_t1[2];
+   uint64_t a8_t1_addr;
+   uint32_t a8_eot_format_t1;
    uint32_t vdm_bytes;          /* through STREAM_TERMINATE */
    uint32_t width, height;
    unsigned targets;            /* colour targets, 1, 2 or 4 */
@@ -186,6 +254,7 @@ struct pvr_g5p_job {
    uint32_t scissor_count;      /* entries of upstream's scissor table, 0 without one */
    uint32_t samples;            /* 1 or 4 (hw_render->sample_count) */
    bool msaa_resolve;           /* 4x: the PBE resolves target 0 into a one-sample view */
+   bool skip_empty_tiles;
    bool enabled;
 };
 
@@ -486,6 +555,9 @@ VkResult PVR_PER_ARCH(g5p_device_init)(struct pvr_device *device);
 VkResult PVR_PER_ARCH(g5p_meta_init)(struct pvr_device *device);
 void PVR_PER_ARCH(g5p_meta_finish)(struct pvr_device *device);
 bool PVR_PER_ARCH(g5p_meta_blit)(struct pvr_cmd_buffer *cmd_buffer, const VkBlitImageInfo2 *info);
+bool PVR_PER_ARCH(g5p_meta_clear_color)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_image *image,
+                                        VkImageLayout layout, const VkClearColorValue *color, uint32_t range_count,
+                                        const VkImageSubresourceRange *ranges);
 void PVR_PER_ARCH(g5p_device_finish)(struct pvr_device *device);
 VkResult PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer,
                                     struct pvr_sub_cmd_gfx *sub_cmd,
@@ -503,6 +575,7 @@ uint32_t PVR_PER_ARCH(g5p_compute_stream)(const struct pvr_device *device, uint6
 
 #   define pvr_arch_g5p_device_init PVR_PER_ARCH(g5p_device_init)
 #   define pvr_arch_g5p_meta_blit PVR_PER_ARCH(g5p_meta_blit)
+#   define pvr_arch_g5p_meta_clear_color PVR_PER_ARCH(g5p_meta_clear_color)
 #   define pvr_arch_g5p_device_finish PVR_PER_ARCH(g5p_device_finish)
 #   define pvr_arch_g5p_job_init PVR_PER_ARCH(g5p_job_init)
 #   define pvr_arch_g5p_geom_stream PVR_PER_ARCH(g5p_geom_stream)

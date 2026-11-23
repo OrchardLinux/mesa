@@ -154,6 +154,7 @@ struct blitter_context_priv
    bool has_stencil_export;
    bool has_texture_multisample;
    bool has_txf_txq;
+   bool blit_no_txf; /* util_blitter_set_txf(): single-sample blits sample, never fetch */
    bool has_sample_shading;
    bool cube_as_2darray;
    bool has_texrect;
@@ -549,6 +550,13 @@ void util_blitter_set_texture_multisample(struct blitter_context *blitter,
    struct blitter_context_priv *ctx = (struct blitter_context_priv*)blitter;
 
    ctx->has_texture_multisample = supported;
+}
+
+void util_blitter_set_txf(struct blitter_context *blitter, bool supported)
+{
+   struct blitter_context_priv *ctx = (struct blitter_context_priv*)blitter;
+
+   ctx->blit_no_txf = !supported;
 }
 
 void util_blitter_set_running_flag(struct blitter_context *blitter)
@@ -2038,7 +2046,7 @@ bool util_blitter_blit_with_txf(struct blitter_context *blitter,
    bool use_txf = false;
 
    /* Don't support scaled blits. The TXF shader uses F2I for rounding. */
-   if (ctx->has_txf_txq &&
+   if (ctx->has_txf_txq && !ctx->blit_no_txf &&
        !is_scaled &&
        filter == PIPE_TEX_FILTER_NEAREST &&
        src->target != PIPE_TEXTURE_CUBE &&

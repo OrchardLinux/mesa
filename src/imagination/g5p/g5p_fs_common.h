@@ -17,12 +17,16 @@ static inline unsigned g5p_common_align(unsigned n, unsigned a)
    return (n + a - 1) & ~(a - 1);
 }
 
+/* image_stride: the compact layout's dwords per image (0: the image state rounded up to eight dwords) */
 static inline bool
-g5p_stage_common_plan(unsigned start, unsigned textures, unsigned samplers,
+g5p_stage_common_plan_stride(unsigned start, unsigned textures, unsigned samplers, unsigned image_dwords,
+                   unsigned sampler_dwords, unsigned image_stride,
                    bool compact, unsigned dynamic_ptrs,
                    unsigned size_queries, unsigned ubos, uint64_t ubo_dwords,
                    uint64_t push_dwords, struct g5p_fs_common_plan *p)
 {
+   if (!image_stride)
+      image_stride = g5p_common_align(image_dwords, 8);
    if (start > 4 || textures > 16 || samplers > 17 ||
        dynamic_ptrs > 16 || size_queries > 4 || ubos > 13)
       return false;
@@ -39,10 +43,12 @@ g5p_stage_common_plan(unsigned start, unsigned textures, unsigned samplers,
          p->pointer_end = next;
       }
       if (textures && p->compact) {
-         next = g5p_common_align(next, 8) + 8 * textures + 2 * samplers;
+         /* compact images sit eight dwords apart (pco_g5p_general.c plan_common: the A9's eight-dword state,
+          * the A8's four-dword state padded) */
+         next = g5p_common_align(next, 8) + image_stride * textures + sampler_dwords * samplers;
       } else {
          for (unsigned i = 0; i < textures; i++)
-            next = g5p_common_align(next, 8) + 10;
+            next = g5p_common_align(next, 8) + image_dwords + sampler_dwords;
       }
       unsigned dynamic_end = next;
       if (!p->low_pointers)
@@ -71,11 +77,22 @@ g5p_stage_common_plan(unsigned start, unsigned textures, unsigned samplers,
 }
 
 static inline bool
+g5p_stage_common_plan(unsigned start, unsigned textures, unsigned samplers, unsigned image_dwords,
+                   unsigned sampler_dwords,
+                   bool compact, unsigned dynamic_ptrs,
+                   unsigned size_queries, unsigned ubos, uint64_t ubo_dwords,
+                   uint64_t push_dwords, struct g5p_fs_common_plan *p)
+{
+   return g5p_stage_common_plan_stride(start, textures, samplers, image_dwords, sampler_dwords, 0, compact,
+                                       dynamic_ptrs, size_queries, ubos, ubo_dwords, push_dwords, p);
+}
+
+static inline bool
 g5p_fs_common_plan(unsigned start, unsigned textures, unsigned dynamic_ptrs,
                    unsigned size_queries, unsigned ubos, uint64_t ubo_dwords,
                    uint64_t push_dwords, struct g5p_fs_common_plan *p)
 {
-   return g5p_stage_common_plan(start, textures, textures, textures > 4,
+   return g5p_stage_common_plan(start, textures, textures, 8, 2, textures > 4,
                                 dynamic_ptrs, size_queries, ubos, ubo_dwords,
                                 push_dwords, p);
 }

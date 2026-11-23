@@ -733,6 +733,11 @@ zink_init_screen_caps(struct zink_screen *screen)
 
    u_init_pipe_screen_caps(&screen->base, screen->is_cpu ? 0 : 1);
    caps->r11g11b10f_requires_color_buffer_float = screen->is_g5p;
+   /* The A8 (G5P): u_blitter's texture-fetch shaders iterate their coordinate with perspective. Its quads have
+    * w = 1 at every vertex, where perspective-correct and screen-linear interpolation give the same value (the
+    * 1/w plane is the constant 1.0). The A8 has no captured no-perspective iterator, and a refused blit shader
+    * failed every glReadPixels from an XRGB8888 (BGRX) buffer: the desktop's GPU probe. */
+   caps->prefer_persp = screen->is_g5p_a8;
    caps->throttle_frames = screen->frames_in_flight;
 
    /* Vulkan spec says the builtins count, so make GL count them towards
@@ -3889,6 +3894,7 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
    /* Apple A9 (G5P, the PowerVR Vulkan driver): its memory, synchronization and lost-device handling */
    screen->is_g5p = screen->info.driver_props.driverID == VK_DRIVER_ID_IMAGINATION_OPEN_SOURCE_MESA &&
                     !strcmp(screen->info.driver_props.driverName, "Mesa PowerVR G5P");
+   screen->is_g5p_a8 = screen->is_g5p && !strcmp(screen->info.props.deviceName, "PowerVR Apple A8");
    screen->precise_sync = screen->is_g5p;
    screen->frames_in_flight = zink_default_frames_in_flight(screen->info.driver_props.driverID);
 

@@ -86,6 +86,9 @@ enum pco_g5p_color_output {
     * bytes B,G,R,A), stored through a physical R32UI PBE */
    PCO_G5P_COLOR_PACKED_BGRA8,
    PCO_G5P_COLOR_PACKED_RGBA8,
+   /* The A8's R32F target: the red channel's 32-bit float bits as the only output word (emitpix 111c,
+    * AGXMetalA8's r32f fragment program, a8-passcap) */
+   PCO_G5P_COLOR_F32,
 };
 
 struct pco_g5p_rt_blend {
@@ -120,6 +123,12 @@ struct pco_g5p_fs_key {
    bool packed_sint; /* saturate signed channels, then preserve low bits */
    bool packed_scalar8; /* R8: one scalar source; never pack unused G/B/A */
    uint8_t packed_uint_bits; /* 8/10/16: packed output, scalar8 is one word; full mask only */
+   /* The A8, one R8 (1) or RG8 (2) UNORM target: the f16 output is one word, halves 0..1, R8's half 1 zero
+    * (AGXMetalA8's 111c fragment programs, a8-passcap) */
+   uint8_t a8_narrow_halves;
+   /* The A8, one RGBA8UI target: the packed word (R | G << 8 | B << 16 | A << 24) is the only output word,
+    * emitpix 111c (AGXMetalA8's rgba8u fragment program, a8-passcap); the A9 pads it to two */
+   bool a8_packed_word;
    /* Apple's masked form (enabled): no blending, write mask RGB, one 4-byte UNORM8 target, one
     * sample. AGXMetalA9 runs it OPAQUE (FAST_PUNCH_THROUGH with a discard) with ISPCTL upass 7, the program
     * keeping the destination alpha from a tile read issued before its kill. 1: the program may discard;
@@ -156,6 +165,9 @@ enum pco_g5p_upload_kind {
     * pvr_sampler_descriptor::meta (load_smp_meta_pco; the LOD-bias variant reads the sampler's mipLodBias,
     * PVR_G5P_SAMPLER_META_LOD_BIAS) */
    PCO_G5P_UPLOAD_SAMPLER_META,
+   /* `dwords` zero dwords: the A8 vertex sample's constant level 0.0 (Apple's AGXMetalA8 vertex programs read it from
+    * the common store, byte 10 of the sample = its half index: 0x1c = common dword 14 in an iOS capture) */
+   PCO_G5P_UPLOAD_ZERO,
 };
 /* nir_tex_instr.backend_flags, set by the driver's LOD-bias lowering (pvr_g5p_nir.c lod_bias_lower()): the
  * sample adds its sampler's mipLodBias (pco_g5p_program::lod_samplers[].biased) */
@@ -170,6 +182,16 @@ enum pco_g5p_upload_kind {
 /* PCO_G5P_UPLOAD_SSBO_ADDR at this offset: not the buffer's address but its
  * bound size in bytes (one dword; get_ssbo_size, WGSL arrayLength) */
 #define PCO_G5P_SSBO_SIZE_OFFSET 0xfffcu
+/* PCO_G5P_UPLOAD_SAMPLER offset flag (the A8's texelFetch): the binding's sampler made a point, non-normalized,
+ * clamped sampler at level 0 for a texelFetch drawn as a sample (the offset's other bits: the sampler's place) */
+#define PCO_G5P_UPLOAD_SAMPLER_FETCH 0x4000u
+/* with it, the level the fetch reads in offset bits 8-11 (the sampler's LOD range clamped to it) */
+#define PCO_G5P_UPLOAD_SAMPLER_FETCH_LEVEL_SHIFT 8
+/* with it (PVR_A8_TEXFETCH_LEVEL=apple, PVR_A8_VTEX_APPLE): not the binding's sampler but Apple's constant read()
+ * sampler (AGXCompilerCore's constant sampler 0x807bff0000002049, encoded by AGXMetalA8 into the program's constant
+ * data: clamp to edge, point, nearest mip, normalized, LOD 0..max; vulkan/pvr_g5p_a8_fetch.h); the sample takes its
+ * level in a register */
+#define PCO_G5P_UPLOAD_SAMPLER_READ 0x8000u
 #define PCO_G5P_UPLOAD_IMAGE_AS_2D 1u
 #define PCO_G5P_UPLOAD_IMAGE_ARRAY 2u
 /* ONE_LAYER: an array sample at any layer of a one-layer view, drawn as a 2D

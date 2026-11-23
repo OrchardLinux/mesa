@@ -38,6 +38,7 @@
 #include "pvr_utrace.h"
 #include "pvr_errlog.h"
 #include "util/os_misc.h"
+#include "util/u_debug.h"
 
 #define PVR_GLOBAL_FREE_LIST_INITIAL_SIZE (2U * 1024U * 1024U)
 #define PVR_GLOBAL_FREE_LIST_MAX_SIZE (256U * 1024U * 1024U)
@@ -796,7 +797,7 @@ VkResult PVR_PER_ARCH(create_device)(struct pvr_physical_device *pdevice,
    assert(pCreateInfo->sType == VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO);
 
    result = pvr_winsys_create(pdevice->render_path,
-                              pdevice->display_path, false,
+                              pdevice->display_path, false, false,
                               pAllocator ? pAllocator : &instance->vk.alloc,
                               &ws);
    if (result != VK_SUCCESS)
@@ -885,6 +886,20 @@ VkResult PVR_PER_ARCH(create_device)(struct pvr_physical_device *pdevice,
                             device->heaps.vis_test_heap,
                             device,
                             PVR_SUBALLOCATOR_VIS_TEST_SIZE);
+
+   device->cmd_suballoc = debug_get_bool_option("PVR_CMD_SUBALLOC", true);
+   pvr_bo_suballocator_init(&device->suballoc_cmd_general,
+                            device->heaps.general_heap,
+                            device,
+                            device->suballoc_general.default_size);
+   pvr_bo_suballocator_init(&device->suballoc_cmd_pds,
+                            device->heaps.pds_heap,
+                            device,
+                            device->suballoc_pds.default_size);
+   pvr_bo_suballocator_init(&device->suballoc_cmd_usc,
+                            device->heaps.usc_heap,
+                            device,
+                            device->suballoc_usc.default_size);
 
    if (p_atomic_inc_return(&instance->active_device_count) >
        PVR_SECONDARY_DEVICE_THRESHOLD) {
@@ -1064,6 +1079,9 @@ err_dec_device_count:
       pvr_bo_log_summary(device, "destroy");
       pvr_bo_log_device_finish(device);
    }
+   pvr_bo_suballocator_fini(&device->suballoc_cmd_usc);
+   pvr_bo_suballocator_fini(&device->suballoc_cmd_pds);
+   pvr_bo_suballocator_fini(&device->suballoc_cmd_general);
    pvr_bo_suballocator_fini(&device->suballoc_vis_test);
    pvr_bo_suballocator_fini(&device->suballoc_usc);
    pvr_bo_suballocator_fini(&device->suballoc_transfer);
@@ -1140,6 +1158,9 @@ void PVR_PER_ARCH(destroy_device)(struct pvr_device *device,
       pvr_bo_log_summary(device, "destroy");
       pvr_bo_log_device_finish(device);
    }
+   pvr_bo_suballocator_fini(&device->suballoc_cmd_usc);
+   pvr_bo_suballocator_fini(&device->suballoc_cmd_pds);
+   pvr_bo_suballocator_fini(&device->suballoc_cmd_general);
    pvr_bo_suballocator_fini(&device->suballoc_vis_test);
    pvr_bo_suballocator_fini(&device->suballoc_usc);
    pvr_bo_suballocator_fini(&device->suballoc_transfer);

@@ -140,10 +140,17 @@ g9p_code_word(struct g9p_code *c, unsigned at)
  * half @count_half, i.e. dword @count_half / 2, both halves = threads per
  * group) with r0 and disables the lanes past it.
  */
+extern bool g5p_usc_g4p;
+
+/*
+ * @common: the kernel's record has a common store (threadgroup words: it reads the workgroup ID or threadgroup
+ * memory). The A8 clears bit 15 of the second word then: AGXMetalA8's 25 kernels have 8189 (+8 per buffer)
+ * under common size 0 (k_store_one, k_atomic) and 0189.. under common size 1 or more (the other 23)
+ */
 static inline void
-g9p_prologue(struct g9p_code *c, unsigned count_half)
+g9p_prologue(struct g9p_code *c, unsigned count_half, bool common)
 {
-   G9P_EMIT(c, 0x1181, 0x8181 | 2 * count_half, 0x4100, 0xacb7);
+   G9P_EMIT(c, 0x1181, ((g5p_usc_g4p && common) ? 0x0181 : 0x8181) | 2 * count_half, 0x4100, 0xacb7);
 }
 
 /*
@@ -318,6 +325,20 @@ g9p_add_imm(struct g9p_code *c, unsigned dst, unsigned src, unsigned imm)
 static inline void
 g9p_tg_load(struct g9p_code *c, unsigned dst, unsigned word)
 {
+   if (g5p_usc_g4p && !c->fragment) {
+      /*
+       * The A8's load of threadgroup word 0, where the kernel task's PDS writes the workgroup ID: AGXMetalA8's
+       * every ID-reading kernel starts with it (k_store_const/tid 1516 0004 into r2, k_threadgroup 1516 0002
+       * into r1; then 004d). Only offset 0 has a captured form; a read of y or z is refused by name.
+       */
+      if (word) {
+         if (!c->error)
+            c->error = "A8: a workgroup-ID y/z read (only the threadgroup word-0 load is captured)";
+         return;
+      }
+      G9P_EMIT(c, 0x1516, 2 * dst);
+      return;
+   }
    G9P_EMIT(c, 0x2314, 0x0100 | 2 * dst, 0x8100 | (word & 0xff),
             0x0200 | (word >> 8));
 }
@@ -402,6 +423,34 @@ static inline void
 g9p_addr(struct g9p_code *c, unsigned dst, unsigned base_dword, unsigned idx,
          unsigned shift, bool kill)
 {
+   if (g5p_usc_g4p && !c->fragment && !shift) {
+      /*
+       * The A8 has no 64-bit add of a uniform pair: AGXMetalA8 (k_store_tid, iPod touch 6 capture, USC heap 0x1ec0;
+       * also 0x1700) forms base + offset from 32-bit adds:
+       *   9911 0203 8585 4100 00a1   r1 = s1 + r1            (the offset's high word; ours is 32-bit: s1 alone)
+       *   9d11 0403 0101 4100 00a5   r2 = carry(s0 + r0)     the carry is the result's HIGH half, r2.hi
+       *   9931 0203 8b84 08a1        r1 = r1 + r2.hi         register A and B (header 0x31), B = half 2t + 1
+       *   9911 0003 8181 4100 00a1   r0 = s0 + r0
+       * Our offset is a 32-bit byte offset, so the high word starts as s1 alone, moved with Apple's common-store
+       * move (98 01 DD 03 85 01 00 41 54 01 38 00, the base-only address of the same capture). Order: the carry
+       * into r[dst + 1], s1 into r[dst], r[dst + 1] = r[dst] + r[dst + 1].hi, then the low add, which reads the
+       * offset last. Adding the carry's low half (half 2t, the previous form) put s0[31:16] into the high word: on
+       * the device, stores landed at 0x11_00100000 for 0x1_00100000. The A9 form below
+       * (1189 .. 01a1 0600) faults on the A8.
+       */
+      const unsigned u = base_dword, hi = dst + 1;
+      const uint16_t u_ext = 0x4100 | ((u >> 5) & 7) << 1, u1_ext = 0x4100 | (((u + 1) >> 5) & 7) << 1;
+      if (idx == dst || idx == hi) {
+         c->error = "A8 address build: the offset register is in the destination pair";
+         return;
+      }
+      G9P_EMIT(c, 0x119d, g9p_dst(c, hi), 0x0101 | (u & 31) << 2 | idx << 10, u_ext, 0x00a5);
+      G9P_EMIT(c, 0x0198, g9p_dst(c, dst), 0x0181 | ((u + 1) & 31) << 2, u1_ext, 0x0154, 0x0038);
+      G9P_EMIT(c, 0x3199, g9p_dst(c, hi), (0x81 | (2 * hi + 1) << 1) << 8 | 0x80 | (2 * dst) << 1, 0x08a1);
+      G9P_EMIT(c, 0x1199, g9p_dst(c, dst), 0x0181 | (u & 31) << 2 | idx << 10 | (kill ? 0x8000 : 0), u_ext,
+               G9P_IADD);
+      return;
+   }
    G9P_EMIT(c, g9p_w0(c, 0x1189), g9p_dst(c, dst),
             (kill ? 0x8000 : 0) | (1 | idx << 2) << 8 | 0x81 | 4 * (base_dword & 31),
             0x4100 | (base_dword >> 5) << 1, 0x01a1, 0x0600 | shift << 13);
@@ -412,10 +461,25 @@ g9p_addr(struct g9p_code *c, unsigned dst, unsigned base_dword, unsigned idx,
  * bits 8-9 are the load's bank bits: fragment code clears them (Apple's
  * fragment loads are 2012/3812 where compute has 2312, probes/fsload.metal)
  */
+/* the A8 (set by the device for the A8's G5P path, g5p_usc.c) */
+extern bool g5p_usc_g4p;
+
 static inline void
 g9p_mem_at(struct g9p_code *c, bool store, unsigned size, unsigned reg,
            unsigned pair)
 {
+   if (g5p_usc_g4p && !c->fragment) {
+      /*
+       * The A8's compute load/store (AGXMetalA8's output, iPod touch 6 capture, every load and store of the
+       * 25 kernels): W0 size << 11 | 0x0510; W1 0x0500 | data register << 1; W2 the address pair's first
+       * register << 1 | 0x0100, with 0x8000 for a store; W3 0x0020, 0x4000 for a store. k_store_one's store
+       * of r2 to [r0:r1] is 2510 0504 8100 4020. The A9 form (2310, store bit 7 in W1, 8800) stores nothing
+       * on the A8 (Mesa's k_store_lid completes inside Apple's job without a store).
+       */
+      G9P_EMIT(c, size << 11 | 0x0510, 0x0500 | reg << 1, (store ? 0x8100 : 0x0100) | pair << 1,
+               store ? 0x4020 : 0x0020);
+      return;
+   }
    G9P_EMIT(c, size << 11 | (c->fragment ? 0x0010 : 0x0310),
             (1 | pair << 2) << 8 | (store ? 0x80 : 0) | reg << 1, 0x8800);
 }
@@ -508,6 +572,18 @@ g9p_convert(struct g9p_code *c, unsigned dst, unsigned src, unsigned op)
 {
    G9P_EMIT(c, g9p_w0(c, 0x1199), g9p_dst(c, dst), 0x0101 | op | src << 10, 0x0120,
             (op & 4) ? 0x0468 : 0x0460);
+}
+
+/*
+ * dst = a << n (left) or a >> n (logical), n a literal: the A8's shifts (AGXMetalA8 k_store_const/tid,
+ * k_threadgroup, k_iadd: 119a 8300 8101 0120 0105 0120 14f0 is r0 = r0 << 2, 519e 0302 0101 0120 013d 0120
+ * 14f4 is r1 = r0 >> 30). Apple never shifts by a register on the A8; its left shift sets W1 bit 15.
+ */
+static inline void
+g9p_shift_imm(struct g9p_code *c, unsigned dst, unsigned a, unsigned n, bool right)
+{
+   G9P_EMIT(c, right ? 0x519e : 0x119a, (right ? 0 : 0x8000) | g9p_dst(c, dst), 0x0101 | a << 10, 0x0120,
+            0x0101 | (n & 31) << 1, 0x0120, right ? 0x14f4 : 0x14f0);
 }
 
 /* dst = a << b (left) or a >> b (logical), b a register */

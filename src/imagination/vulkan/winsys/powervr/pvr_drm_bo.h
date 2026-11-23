@@ -65,6 +65,8 @@ pvr_drm_winsys_buffer_create_from_fd(struct pvr_winsys *ws,
                                      int fd,
                                      struct pvr_winsys_bo **const bo_out);
 void pvr_drm_winsys_buffer_destroy(struct pvr_winsys_bo *bo);
+VkResult pvr_drm_winsys_buffer_set_purgeable(struct pvr_winsys_bo *bo,
+                                             bool purgeable, bool *retained);
 
 VkResult pvr_drm_winsys_buffer_get_fd(struct pvr_winsys_bo *bo,
                                       int *const fd_out);
@@ -89,6 +91,7 @@ VkResult pvr_drm_winsys_vma_map(struct pvr_winsys_vma *vma,
                                 uint64_t size,
                                 pvr_dev_addr_t *dev_addr_out);
 void pvr_drm_winsys_vma_unmap(struct pvr_winsys_vma *vma);
+VkResult pvr_drm_winsys_vma_map_mirror(struct pvr_winsys_vma *vma, struct pvr_winsys_bo *bo);
 
 /*******************************************
    helper macros
