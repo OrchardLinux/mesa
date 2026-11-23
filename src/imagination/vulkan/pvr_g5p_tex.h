@@ -75,5 +75,8 @@ void pvr_g5p_image_layout(struct pvr_image *image, unsigned stride_align);
 /* On the A8, single-level colour images whose sides are not both powers of two stay linear
  * (pvr_g5p_image_layout()) */
 extern bool pvr_g5p_image_a8_linear;
+/* On the A8, a linear colour image's memory runs to whole 32-row tiles (pvr_g5p_image_a8_tile_pad_image()) */
+extern bool pvr_g5p_image_a8_tile_pad;
+void pvr_g5p_image_a8_tile_pad_image(struct pvr_image *image, const VkImageCreateInfo *create_info);
 
 #endif /* PVR_G5P_TEX_H */

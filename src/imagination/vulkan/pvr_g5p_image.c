@@ -48,8 +48,45 @@
 #include "pvr_image.h"
 #include "pvr_physical_device.h"
 #include "g5p/g5p_usc.h"
+#include "vk_util.h"
 
 bool pvr_g5p_image_a8_linear;
+bool pvr_g5p_image_a8_tile_pad;
+
+/*
+ * The A8: a linear colour image's memory runs to whole 32-row tiles, and to the end of the last tile's columns.
+ * Its rows, pitch and layout stay as they are; only the size grows. Apple sizes a one-level 800x600 texture this
+ * way (a8-passcap tex_npot1: allocatedSize 1945600 = 3200 bytes x 608 rows, 600 rounded up to 32 [or 16]). A
+ * 640x1136 swapchain image (1136 = 35.5 tiles) was exactly 640 x 1136 x 4 bytes, and vkmark on Wayland at that
+ * size faulted on a fragment write just past a BO; a store of the whole last tile row would write 16 rows past
+ * the image. Images bound to imported memory (an explicit modifier, or an external image without a modifier)
+ * keep their exact size: the exporter sized the memory.
+ */
+void
+pvr_g5p_image_a8_tile_pad_image(struct pvr_image *image, const VkImageCreateInfo *create_info)
+{
+   const struct pvr_image_plane *plane = &image->planes[0];
+   const struct pvr_mip_level *level = &plane->mip_levels[0];
+
+   if (!pvr_g5p_image_a8_tile_pad || image->memlayout != PVR_MEMLAYOUT_LINEAR || image->plane_count != 1 ||
+       image->vk.image_type != VK_IMAGE_TYPE_2D || image->vk.mip_levels != 1 || image->vk.array_layers != 1 ||
+       image->vk.samples != VK_SAMPLE_COUNT_1_BIT || !vk_format_is_color(image->vk.format) ||
+       vk_format_is_compressed(image->vk.format) || !level->pitch ||
+       vk_find_struct_const(create_info->pNext, IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT) ||
+       (image->vk.external_handle_types && image->vk.tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT))
+      return;
+
+   const unsigned cpp = vk_format_get_blocksize(image->vk.format);
+   const uint32_t row_px = level->pitch / cpp;
+   const VkDeviceSize start = plane->offset + level->offset;
+   const VkDeviceSize natural = start + (VkDeviceSize)level->pitch * image->vk.extent.height;
+   const VkDeviceSize end = start + (VkDeviceSize)level->pitch * align(image->vk.extent.height, 32) +
+                            (VkDeviceSize)(align(row_px, 32) - row_px) * cpp;
+
+   if (end <= natural)
+      return;
+   image->total_size = MAX2(image->total_size, align64(end, image->alignment));
+}
 
 void
 pvr_g5p_image_layout(struct pvr_image *image, unsigned stride_align)

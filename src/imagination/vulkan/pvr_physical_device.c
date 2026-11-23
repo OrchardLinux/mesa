@@ -1406,6 +1406,9 @@ VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
       pvr_g5p_ds_rect_planes = true;
       /* single-level non-power-of-two colour images stay linear (pvr_g5p_tex.h) */
       pvr_g5p_image_a8_linear = true;
+      /* linear colour images' memory to whole 32-row tiles (pvr_g5p_image_a8_tile_pad_image()); PVR_A8_TILE_PAD=0
+       * gives the exact sizes back */
+      pvr_g5p_image_a8_tile_pad = debug_get_bool_option("PVR_A8_TILE_PAD", true);
       /* texelFetch (g5p_usc.h): Apple's read form, which reads every texel right on the iPod touch 6 at level 0
        * (RGBA8, RGBA32F, RGBA32I); a level above 0 with PVR_A8_TEXFETCH_LEVEL=level|scale|apple */
       g5p_usc_g4p_texfetch = 2;

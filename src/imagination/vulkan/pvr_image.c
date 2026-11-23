@@ -29,6 +29,7 @@
 #include <stdint.h>
 #include <string.h>
 #include "pvr_g5p_ds_hooks.h"
+#include "pvr_g5p_tex.h"
 #include "drm-uapi/drm_fourcc.h"
 #include "pvr_buffer.h"
 #include "pvr_device.h"
@@ -426,6 +427,9 @@ VkResult pvr_image_init(struct pvr_device *device,
    if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p))
       pvr_g5p_image_layout(image, pbe_stride_align);
    PVR_G5P_HOOK(ds_image, device, image)
+   /* the A8: linear colour images run to whole tiles (pvr_g5p_tex.h) */
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p))
+      pvr_g5p_image_a8_tile_pad_image(image, pCreateInfo);
    return VK_SUCCESS;
 }
 
