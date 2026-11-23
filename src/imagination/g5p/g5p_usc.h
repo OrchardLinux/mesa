@@ -85,6 +85,9 @@ extern bool g5p_usc_g4p_r8_load;
 /* The A8's cube sample with 32-bit results that ALU reads after the wait, Apple's
  * 1a 79 00 41 00 01 c8 01 CC 01 00 80 (sample_g4p(); PVR_A8_CUBE_ALU, on by default; 0 refuses it, as before) */
 extern bool g5p_usc_g4p_cube_alu;
+/* That cube sample in Apple's multi-image layout (sample_g4p() with g5p_tex.a8_slots): images in four-dword slots, one
+ * shared sampler after them (PVR_A8_CUBE_SLOTS, on by default; 0 refuses it, as before) */
+extern bool g5p_usc_g4p_cube_slots;
 
 enum g5p_binop {
    G5P_BIN_FADD, G5P_BIN_FMUL, G5P_BIN_IADD, G5P_BIN_IMUL,

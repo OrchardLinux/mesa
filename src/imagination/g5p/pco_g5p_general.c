@@ -192,6 +192,8 @@ struct gctx {
    unsigned tex_batch;
    bool a8_slots; /* the A8's multi-image layout (plan_common) */
    unsigned tex_batch_image; /* a8_slots: the common dword of the batch's last sampled image */
+   bool a8_cube; /* the A8 program samples a cube (a8_cube_tex()) */
+   bool a8_one_sampler; /* a8_slots: one sampler slot after the images, every sample's */
    nir_shader *nir;
    nir_function_impl *impl;
    bool vs, half_output;
@@ -2262,6 +2264,7 @@ static void plan_common(struct gctx *c)
          } else {
             tex_for(c, t);
             record_lod_sampler(c, t);
+            c->a8_cube |= a8_cube_tex(t);
          }
          continue;
       }
@@ -2445,8 +2448,20 @@ static void plan_common(struct gctx *c)
     * and the A9 form. */
    const unsigned slot_base = next ? align(next, 4) : 0, base_slot = slot_base / 4;
    const bool a8_multi = g5p_usc_g4p && !c->vs && !qualified && c->ntex && (next || c->ntex >= 2);
-   const bool a8_each = base_slot + 2 * c->ntex - 1 <= 11, a8_shared = base_slot + c->ntex <= 11;
+   /* A program that samples a cube and names one sampler for every image (a separate sampler, not combined) takes
+    * Apple's shared form: the images, then that sampler in the slot after them, as a8-passcap tex2d_cube_mul
+    * (iOS 12.4: a 2D image to common 0..3 and the cube's to 4..7 in one eight-dword DOUTD, the sampler to 8..11,
+    * both samples naming slot 2). The cube sample is captured only this way (emit_tex_cube_g4p()); 2D-only
+    * programs keep their flown layout. */
+   bool one_sampler = c->a8_cube && g5p_usc_g4p_cube_slots;
+   for (unsigned i = 0; one_sampler && i < c->ntex; i++)
+      one_sampler = !c->tex[i].fetch && c->tex[i].needs_sampler && c->tex[i].sset == c->tex[0].sset &&
+                    c->tex[i].sbinding == c->tex[0].sbinding && c->tex[i].selement == c->tex[0].selement;
+   const bool a8_shared = base_slot + c->ntex <= 11;
+   const bool a8_each = !(one_sampler && a8_shared) && base_slot + 2 * c->ntex - 1 <= 11;
    c->a8_slots = a8_multi && (a8_each || a8_shared);
+   /* one image, or the shared form chosen above; not the shared fallback of seven images with distinct samplers */
+   c->a8_one_sampler = c->a8_slots && (c->ntex == 1 || (one_sampler && !a8_each));
    c->fetch_sampler_common = sampler_base + sdw * sampler_count;
    for (unsigned i = 0; c->a8_slots && i < c->ntex; i++) {
       struct tex_bind *t = &c->tex[i];
@@ -5498,7 +5513,8 @@ static void emit_tex_ms_own_sample(struct gctx *c, nir_tex_instr *t, struct tex_
  * move, no cube-coordinate instruction; the hardware selects the face), then the sample in mode 4: narrow when the
  * result goes straight to the output, else (PVR_A8_CUBE_ALU) Apple's 32-bit form, as f_tex_cube_mul (a8-passcap
  * tex_cube_mul, USC heap 0x1bf6): 1a 79 00 41 00 01 c8 01 00 01 00 80, the wait 4d 00, then the ALU that reads the
- * four 32-bit results. Only Apple's single-image layout (image at common dword 0, sampler at dword 4) is captured. */
+ * four 32-bit results. In Apple's multi-image layout (PVR_A8_CUBE_SLOTS), as f_tex2d_cube_mul: the 2D sample, 4d 04,
+ * 1a b9 0a 41 08 01 c8 01 08 01 00 80 (the cube's image at dword 4, the shared sampler in slot 2), 4d 00. */
 static void emit_tex_cube_g4p(struct gctx *c, nir_tex_instr *t)
 {
    uint8_t raw[G5P_USC_MAX];
@@ -5506,10 +5522,14 @@ static void emit_tex_cube_g4p(struct gctx *c, nir_tex_instr *t)
    const bool narrow = c->narrow_tex == t;
    if (!narrow && !g5p_usc_g4p_cube_alu)
       refuse(c, "A8 cube sample whose result feeds arithmetic (PVR_A8_CUBE_ALU=0)");
-   if (c->a8_slots)
-      refuse(c, "A8 cube sample in Apple's multi-image layout (image at common dword %u, sampler at %u, %u images; "
-                "%s result): the cube sample is captured only with the image at dword 0 and the sampler at dword 4",
-             b->image, b->sampler, c->ntex, narrow ? "narrow" : "32-bit");
+   /* In Apple's multi-image layout (other images, or other common data first) the cube sample is captured with a
+    * 32-bit result and one sampler shared by every image (a8-passcap tex2d_cube_mul): the image in its four-dword
+    * slot, that sampler in the slot after the images. A sampler per texture, or a narrow result, is not. */
+   if (c->a8_slots && (!g5p_usc_g4p_cube_slots || narrow || !c->a8_one_sampler))
+      refuse(c, "A8 cube sample in Apple's multi-image layout (image at common dword %u, sampler at %u, %u images, "
+                "%s; %s result): captured only with a 32-bit result and one sampler shared by every image%s",
+             b->image, b->sampler, c->ntex, c->a8_one_sampler ? "one shared sampler" : "a sampler per texture",
+             narrow ? "narrow" : "32-bit", g5p_usc_g4p_cube_slots ? "" : " (PVR_A8_CUBE_SLOTS=0)");
    nir_def *cd = nir_get_tex_src(t, nir_tex_src_coord);
    struct ref r[3];
    unsigned reg[3];
@@ -5534,9 +5554,11 @@ static void emit_tex_cube_g4p(struct gctx *c, nir_tex_instr *t)
    if (!narrow)
       dst = alloc_run(c, 4, "cube sample result");
    s.dst_half = 2 * dst;
+   a8_image_order(c, b->image); /* Apple's 4d 04 after the 2D sample, before the cube's */
    put(c, raw, g5p_usc_sample(raw, &s), "cube sample");
    c->tex_coord_pending |= BITFIELD64_RANGE(coord, 3);
    c->tex_batch++;
+   c->tex_batch_image = b->image;
    if (!narrow) {
       /* Apple waits right after the sample, before the ALU that reads it */
       c->tex_pending |= BITFIELD64_RANGE(dst, 4);
