@@ -1178,7 +1178,9 @@ static unsigned sample_g4p(uint8_t *out, const struct g5p_tex *t)
        * at 4, one shared sampler at 8): 1a b9 00 41 00 01 88 01 00 01 00 80 for the 2D sample, 4d 04, then
        * 1a b9 0a 41 08 01 c8 01 08 01 00 80 and 4d 00. The cube's image and sampler fields are the 2D sample's
        * (byte 4 = image dword * 2, slot 2 in byte 1 bits 7:6) and byte 6 carries mode 4 over 0x88, as the
-       * single-image form does over 0x80. Only the 32-bit result is captured in this form. */
+       * single-image form does over 0x80. With a sampler per texture (tex2d_cube_mul2s, samplers at 8 and 12) the
+       * cube's names its own, slot 3: 1a f9 0a 41 08 01 c8 01 08 01 00 80. Only the 32-bit result is captured in
+       * this form. */
       CHECK(t->dim == G5P_TEX_2D || (t->dim == G5P_TEX_CUBE && g5p_usc_g4p_cube_slots),
             "A8 multi-image sample: 2D or (PVR_A8_CUBE_SLOTS) cube only");
       CHECK(t->dim != G5P_TEX_CUBE || (!t->narrow && !t->lod_reg && !t->read_flag && !t->vtx),

@@ -1430,7 +1430,7 @@ VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
       /* an R8 target's LOAD and a cube sample read by ALU, both in Apple's form from an iOS capture (g5p_usc.h) */
       g5p_usc_g4p_r8_load = debug_get_bool_option("PVR_A8_R8_LOAD", true);
       g5p_usc_g4p_cube_alu = debug_get_bool_option("PVR_A8_CUBE_ALU", true);
-      /* and that cube sample with 2D samples, one shared sampler (Apple's multi-image layout, an iOS capture) */
+      /* and that cube sample with 2D samples, one shared sampler or one each (Apple's multi-image layout, iOS captures) */
       g5p_usc_g4p_cube_slots = g5p_usc_g4p_cube_alu && debug_get_bool_option("PVR_A8_CUBE_SLOTS", true);
    }
 
