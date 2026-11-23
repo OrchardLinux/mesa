@@ -298,7 +298,11 @@ g5p_xfb_mem(struct pvr_device *device, const struct g5p_xfb_range *range, struct
    const struct pvr_winsys_vma *vma = range->buffer->vma;
    if (!vma || !vma->bo)
       return false;
-   if (!vma->bo->map && device->ws->ops->buffer_map(vma->bo, NULL) != VK_SUCCESS)
+   /* the CPU transfers' and pvr_MapMemory2()'s lock: one BO is mapped once */
+   simple_mtx_lock(&device->g9p_vmas.lock);
+   const bool mapped = vma->bo->map || device->ws->ops->buffer_map(vma->bo, NULL) == VK_SUCCESS;
+   simple_mtx_unlock(&device->g9p_vmas.lock);
+   if (!mapped)
       return false;
    mem->va = range->buffer->dev_addr.addr;
    mem->map = (uint8_t *)vma->bo->map + vma->bo_offset;

@@ -121,6 +121,10 @@ struct pvr_winsys_bo {
    uint64_t size;
 
    bool is_imported;
+   /* More than one memory object owns this BO: a dma-buf imported again, or one exported from this device and
+    * imported back (one GEM handle, one BO; pvr_drm_winsys_buffer_create_from_fd()). Its CPU mapping is theirs
+    * together. */
+   bool is_shared;
 
 #if defined(HAVE_VALGRIND)
    char *vbits;

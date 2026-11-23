@@ -445,8 +445,23 @@ void pvr_FreeMemory(VkDevice _device,
    /* From the Vulkan spec (§11.2.13. Freeing Device Memory):
     *   If a memory object is mapped at the time it is freed, it is implicitly
     *   unmapped.
+    *
+    * On G9P and G5P a dma-buf's CPU mapping is not this memory object's
+    * alone. Every import of one dma-buf is the same winsys BO, and so is
+    * the memory it was exported from on this device
+    * (pvr_drm_winsys_buffer_create_from_fd()): one mapping, which the other
+    * owners still use, through their CPU transfers on a queue thread
+    * (g5p_surface_init()) and the application's maps of them. Unmapping it
+    * here pulled it from under a transfer writing through it (most likely
+    * Firefox's SIGSEGV on the zink flush thread in g5p_convert()). The
+    * winsys drops the mapping with the BO's last reference
+    * (pvr_drm_buffer_release()). A placed mapping is the application's
+    * address range and is still unmapped here.
     */
-   if (mem->bo->map)
+   const bool shared_map = (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p) ||
+                            PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p)) &&
+                           (mem->bo->is_imported || mem->bo->is_shared) && !mem->map_placed;
+   if (mem->bo->map && !shared_map)
       device->ws->ops->buffer_unmap(mem->bo, false);
 
    if (unlikely(device->bo_log))
@@ -493,6 +508,15 @@ VkResult pvr_MapMemory2(VkDevice _device,
    assert(size > 0);
    assert(offset + size <= mem->bo->size);
 
+   /* G9P's and G5P's CPU transfers map memory on the queue thread, under
+    * g9p_vmas.lock (g5p_surface_init()): the same lock orders this map
+    * against theirs, so one BO is never mapped twice.
+    */
+   const bool cpu_transfers = PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p) ||
+                              PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p);
+   if (cpu_transfers)
+      simple_mtx_lock(&device->g9p_vmas.lock);
+
    /* From the Vulkan 1.2.194 spec:
     *
     *    "memory must not be currently host mapped"
@@ -502,12 +526,13 @@ VkResult pvr_MapMemory2(VkDevice _device,
        * mapped; that mapping stays until the memory is freed, see
        * pvr_UnmapMemory2().
        */
-      if ((PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p) ||
-           PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p)) &&
-          !addr) {
+      if (cpu_transfers && !addr) {
          *ppData = (uint8_t *)mem->bo->map + offset;
+         simple_mtx_unlock(&device->g9p_vmas.lock);
          return VK_SUCCESS;
       }
+      if (cpu_transfers)
+         simple_mtx_unlock(&device->g9p_vmas.lock);
       return vk_errorf(device,
                        VK_ERROR_MEMORY_MAP_FAILED,
                        "Memory object already mapped.");
@@ -519,13 +544,14 @@ VkResult pvr_MapMemory2(VkDevice _device,
 
    /* Map it all at once */
    result = device->ws->ops->buffer_map(mem->bo, addr);
-   if (result != VK_SUCCESS)
-      return result;
+   if (result == VK_SUCCESS) {
+      mem->map_placed = addr != NULL;
+      *ppData = (uint8_t *)mem->bo->map + offset;
+   }
+   if (cpu_transfers)
+      simple_mtx_unlock(&device->g9p_vmas.lock);
 
-   mem->map_placed = addr != NULL;
-   *ppData = (uint8_t *)mem->bo->map + offset;
-
-   return VK_SUCCESS;
+   return result;
 }
 
 VkResult pvr_UnmapMemory2(VkDevice _device,

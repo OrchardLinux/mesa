@@ -148,7 +148,20 @@ static void pvr_drm_buffer_release(struct pvr_drm_winsys_bo *drm_bo)
 
    u_rwlock_rdlock(&drm_ws->dmabuf_bo_lock);
 
-   if (p_atomic_dec_return(&drm_bo->ref_count) == 0) {
+   int refs = p_atomic_dec_return(&drm_bo->ref_count);
+
+   /* Every import of one dma-buf is this BO (pvr_drm_winsys_buffer_create_from_fd()), the memory it was exported
+    * from too, and its CPU mapping, which holds a reference (pvr_drm_winsys_buffer_map()), is shared by all of
+    * them: freeing one owner leaves it to the others on G9P and G5P (pvr_FreeMemory()). When the mapping is all
+    * that still holds the BO, drop it. A new import of the dma-buf waits for the write side of dmabuf_bo_lock. */
+   if (refs == 1 && (drm_bo->base.is_imported || drm_bo->base.is_shared) && drm_bo->base.map) {
+      pvr_munmap(drm_bo->base.map, drm_bo->base.size, false);
+      VG(VALGRIND_FREELIKE_BLOCK(drm_bo->base.map, 0));
+      drm_bo->base.map = NULL;
+      refs = p_atomic_dec_return(&drm_bo->ref_count);
+   }
+
+   if (refs == 0) {
       uint32_t handle = drm_bo->handle;
 
       if (PVR_IS_DEBUG_SET(BO_LOG) && drm_bo->count_kind < 2)
@@ -312,6 +325,8 @@ pvr_drm_winsys_buffer_create_from_fd(struct pvr_winsys *ws,
       p_atomic_set(&drm_bo->ref_count, 1);
       g9p_bolog('i', handle, (uint64_t)size);
    } else {
+      /* a BO this device already holds: imported before, or allocated here and exported */
+      drm_bo->base.is_shared = true;
       pvr_drm_buffer_acquire(drm_bo);
    }
 
