@@ -1423,6 +1423,8 @@ VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
       g5p_usc_g4p_vtex = debug_get_bool_option("PVR_A8_VTEX", false) || g5p_usc_g4p_vtex_apple;
       /* fragment texel-buffer reads (g5p_usc.h) */
       g5p_usc_g4p_tbo = debug_get_bool_option("PVR_A8_TBO", true);
+      /* float ge selects without the ge relation extension (g5p_usc.h) */
+      g5p_usc_g4p_fge_swap = debug_get_bool_option("PVR_A8_FGE_SWAP", true);
    }
 
    /* The A8 skips refused work by default: a refused program or pass loses its draws (named on stderr) instead of

@@ -3044,7 +3044,9 @@ struct gsrc4 { unsigned a, b, t, f; };
  * false value first. */
 static bool cmp_swaps(nir_op op)
 {
-   return op == nir_op_fneu || op == nir_op_ige || op == nir_op_ine || op == nir_op_uge;
+   /* the A8's float ge is the lt compare with the values swapped, as the integer ge (PVR_A8_FGE_SWAP) */
+   return op == nir_op_fneu || op == nir_op_ige || op == nir_op_ine || op == nir_op_uge ||
+          (op == nir_op_fge && g5p_usc_g4p_fge_swap);
 }
 
 static void cmp_select_regs(struct gctx *c, nir_op op, unsigned a, unsigned b, unsigned t, unsigned f, unsigned dst,
@@ -3064,8 +3066,12 @@ static void cmp_select_regs(struct gctx *c, nir_op op, unsigned a, unsigned b, u
    case nir_op_ult: code = G5P_ULT; break;
    default: code = G5P_ULT; ge = true; break; /* uge */
    }
-   unsigned rc = fl && ge ? 0x10 : 0;
-   bool swap = fl ? ne : (ge || ne);
+   /* The ge relation extension (`.. 59 61 00 10`) has no A8 capture, and the A8 ignores it: a float ge select
+    * through it gives lt's value. On the A8 the lt compare with the values swapped (PVR_A8_FGE_SWAP); an unordered
+    * compare then selects the true value, where ge selects the false one. */
+   const bool ge_swap = fl && ge && g5p_usc_g4p_fge_swap;
+   unsigned rc = fl && ge && !ge_swap ? 0x10 : 0;
+   bool swap = fl ? (ne || ge_swap) : (ge || ne);
    if (swap) {
       unsigned tmp = t;
       t = f;

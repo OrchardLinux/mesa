@@ -71,6 +71,10 @@ extern bool g5p_usc_g4p_vtex_apple;
 /* A fragment texel-buffer read on the A8 (st/mesa's pixel-buffer uploads) as a 2D texelFetch of the buffer's linear
  * state (PVR_A8_TBO, on by default; 0 refuses it) */
 extern bool g5p_usc_g4p_tbo;
+/* The A8's float ge select as the lt compare/write with the selected values swapped, without the ge relation
+ * extension (`00 10` after `59 61`), which no A8 capture has and which the A8 ignores: a float ge select through it
+ * runs as lt on the iPod touch 6. PVR_A8_FGE_SWAP, on by default; 0 gives the extension form. */
+extern bool g5p_usc_g4p_fge_swap;
 
 enum g5p_binop {
    G5P_BIN_FADD, G5P_BIN_FMUL, G5P_BIN_IADD, G5P_BIN_IMUL,
