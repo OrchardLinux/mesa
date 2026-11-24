@@ -238,6 +238,8 @@ g5p_free_programs(struct pvr_device *device, struct pvr_g5p_programs *p)
    pvr_bo_suballoc_free(p->a8_load_usc);
    pvr_bo_suballoc_free(p->a8_load_kick.pvr_bo);
    pvr_bo_suballoc_free(p->a8_load_dma.pvr_bo);
+   pvr_bo_suballoc_free(p->a8_load_r8_usc);
+   pvr_bo_suballoc_free(p->a8_load_r8_kick.pvr_bo);
    for (unsigned i = 0; i < ARRAY_SIZE(p->raw_load); i++) {
       if (p->raw_load[i]) {
          g5p_free_programs(device, p->raw_load[i]);
@@ -722,11 +724,12 @@ g5p_load_background(struct pvr_cmd_buffer *cmd_buffer, const uint64_t state[][4]
  * three DOUTDs of 4 + 4 + 6 dwords into common dwords 0, 4 and 8, the target's texture state (its first two qwords),
  * Apple's load sampler (00000fff 02022400 0 0: the passcap's words) and the 2x3 matrix from the fragment position to the
  * sample coordinate (identity: 1, 0, 0, 1, 0, 0). Data controls 10000004, 10008004, 90010006; uniform size 3 units,
- * common-store size 14 dwords, as Apple's record has them.
+ * common-store size 14 dwords, as Apple's record has them. An R8 target (a8-passcap r8_load) has the same uploads,
+ * controls and sampler, with Apple's R8 program behind the kick.
  */
 static VkResult
 g5p_load_background_g4p(struct pvr_cmd_buffer *cmd_buffer, const uint64_t state[4], uint64_t bgnd[4],
-                        const struct pvr_g5p_programs *p)
+                        const struct pvr_g5p_programs *p, const struct pvr_pds_upload *kick)
 {
    static const uint32_t sampler[4] = { 0x00000fff, 0x02022400, 0, 0 };
    static const float matrix[6] = { 1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f };
@@ -749,7 +752,7 @@ g5p_load_background_g4p(struct pvr_cmd_buffer *cmd_buffer, const uint64_t state[
    if (result != VK_SUCCESS)
       return result;
    pvr_csb_pack (&bgnd[0], CR_PDS_BGRND0_BASE, b0) {
-      b0.shader_addr = PVR_DEV_ADDR(p->a8_load_kick.data_offset);
+      b0.shader_addr = PVR_DEV_ADDR(kick->data_offset);
       b0.texunicode_addr = PVR_DEV_ADDR(p->a8_load_dma.code_offset);
    }
    pvr_csb_pack (&bgnd[2], CR_PDS_BGRND2_BASE, b2) {
@@ -1246,12 +1249,37 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
       /* a linear target loads through its stride texture state (above): Apple's load program samples whatever the
        * state describes. Without it, a compositor's damage-only redraw into its (linear, shared) output buffer was
        * refused and the frame never drawn. */
-      if (nt != 1 || raw || compact || g->samples != 1 || g->a8_narrow_halves ||
-          (f != VK_FORMAT_B8G8R8A8_UNORM && f != VK_FORMAT_R8G8B8A8_UNORM))
+      /* one twiddled R8 target: Apple's R8 load program (a8-passcap r8_load), the same three uploads. A linear R8
+       * target and RG8 are not captured. */
+      const bool r8 = f == VK_FORMAT_R8_UNORM && g->a8_narrow_halves == 1 && a8_load_twiddled && g5p_usc_g4p_r8_load;
+      if (nt != 1 || raw || compact || g->samples != 1 || (g->a8_narrow_halves && !r8) ||
+          (f != VK_FORMAT_B8G8R8A8_UNORM && f != VK_FORMAT_R8G8B8A8_UNORM && !r8))
          return G5P_REFUSE(cmd_buffer, "A8 LOAD of %s (%u targets, %u samples%s): one single-sample "
-                           "BGRA8/RGBA8 target is captured", vk_Format_to_str(f), nt, g->samples,
-                           a8_load_twiddled ? "" : ", linear");
-      result = g5p_load_background_g4p(cmd_buffer, load_state[0], bgnd, p);
+                           "BGRA8/RGBA8 target or one twiddled R8 target is captured%s", vk_Format_to_str(f), nt,
+                           g->samples, a8_load_twiddled ? "" : ", linear",
+                           f == VK_FORMAT_R8_UNORM && !g5p_usc_g4p_r8_load ? " (PVR_A8_R8_LOAD=0)" : "");
+      if (r8) {
+         struct pvr_g5p_programs *programs = &device->g5p->programs;
+         VkResult lr = VK_SUCCESS;
+         simple_mtx_lock(&device->g5p->clear_lock);
+         if (!programs->a8_load_r8_usc) {
+            uint8_t code[G5P_A8_LOAD_R8_USC_BYTES + 8];
+            const unsigned size = g5p_mrt_load_usc_g4p_r8(code);
+            lr = !size ? vk_errorf(device, VK_ERROR_UNKNOWN, "G5P: A8 R8 load: %s", g5p_usc_error)
+                       : pvr_gpu_upload_usc(device, code, size, 64, &programs->a8_load_r8_usc);
+            if (lr == VK_SUCCESS)
+               lr = g5p_upload_kick(device, programs->a8_load_r8_usc, 1, &programs->a8_load_r8_kick);
+            if (lr != VK_SUCCESS) {
+               pvr_bo_suballoc_free(programs->a8_load_r8_usc);
+               programs->a8_load_r8_usc = NULL;
+            }
+         }
+         simple_mtx_unlock(&device->g5p->clear_lock);
+         if (lr != VK_SUCCESS)
+            return lr;
+      }
+      result = g5p_load_background_g4p(cmd_buffer, load_state[0], bgnd, p,
+                                       r8 ? &p->a8_load_r8_kick : &p->a8_load_kick);
       if (result != VK_SUCCESS)
          return result;
    } else if (load) {

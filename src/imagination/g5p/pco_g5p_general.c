@@ -192,6 +192,9 @@ struct gctx {
    unsigned tex_batch;
    bool a8_slots; /* the A8's multi-image layout (plan_common) */
    unsigned tex_batch_image; /* a8_slots: the common dword of the batch's last sampled image */
+   bool a8_cube; /* the A8 program samples a cube (a8_cube_tex()) */
+   bool a8_one_sampler; /* a8_slots: one sampler slot after the images, every sample's */
+   bool a8_sampler_each; /* a8_slots: texture j's own sampler in slot N + j after the N images */
    nir_shader *nir;
    nir_function_impl *impl;
    bool vs, half_output;
@@ -2262,6 +2265,7 @@ static void plan_common(struct gctx *c)
          } else {
             tex_for(c, t);
             record_lod_sampler(c, t);
+            c->a8_cube |= a8_cube_tex(t);
          }
          continue;
       }
@@ -2445,8 +2449,22 @@ static void plan_common(struct gctx *c)
     * and the A9 form. */
    const unsigned slot_base = next ? align(next, 4) : 0, base_slot = slot_base / 4;
    const bool a8_multi = g5p_usc_g4p && !c->vs && !qualified && c->ntex && (next || c->ntex >= 2);
-   const bool a8_each = base_slot + 2 * c->ntex - 1 <= 11, a8_shared = base_slot + c->ntex <= 11;
+   /* A program that samples a cube and names one sampler for every image (a separate sampler, not combined) takes
+    * Apple's shared form: the images, then that sampler in the slot after them, as a8-passcap tex2d_cube_mul
+    * (iOS 12.4: a 2D image to common 0..3 and the cube's to 4..7 in one eight-dword DOUTD, the sampler to 8..11,
+    * both samples naming slot 2). With a sampler per texture the cube takes the per-texture form below, as
+    * tex2d_cube_mul2s (the images to 0..7, the two samplers to 8..15 in one eight-dword DOUTD, the cube naming
+    * slot 3). 2D-only programs keep their flown layout. */
+   bool one_sampler = c->a8_cube && g5p_usc_g4p_cube_slots;
+   for (unsigned i = 0; one_sampler && i < c->ntex; i++)
+      one_sampler = !c->tex[i].fetch && c->tex[i].needs_sampler && c->tex[i].sset == c->tex[0].sset &&
+                    c->tex[i].sbinding == c->tex[0].sbinding && c->tex[i].selement == c->tex[0].selement;
+   const bool a8_shared = base_slot + c->ntex <= 11;
+   const bool a8_each = !(one_sampler && a8_shared) && base_slot + 2 * c->ntex - 1 <= 11;
    c->a8_slots = a8_multi && (a8_each || a8_shared);
+   /* one image, or the shared form chosen above; not the shared fallback of seven images with distinct samplers */
+   c->a8_one_sampler = c->a8_slots && (c->ntex == 1 || (one_sampler && !a8_each));
+   c->a8_sampler_each = c->a8_slots && a8_each;
    c->fetch_sampler_common = sampler_base + sdw * sampler_count;
    for (unsigned i = 0; c->a8_slots && i < c->ntex; i++) {
       struct tex_bind *t = &c->tex[i];
@@ -3044,7 +3062,9 @@ struct gsrc4 { unsigned a, b, t, f; };
  * false value first. */
 static bool cmp_swaps(nir_op op)
 {
-   return op == nir_op_fneu || op == nir_op_ige || op == nir_op_ine || op == nir_op_uge;
+   /* the A8's float ge is the lt compare with the values swapped, as the integer ge (PVR_A8_FGE_SWAP) */
+   return op == nir_op_fneu || op == nir_op_ige || op == nir_op_ine || op == nir_op_uge ||
+          (op == nir_op_fge && g5p_usc_g4p_fge_swap);
 }
 
 static void cmp_select_regs(struct gctx *c, nir_op op, unsigned a, unsigned b, unsigned t, unsigned f, unsigned dst,
@@ -3064,8 +3084,12 @@ static void cmp_select_regs(struct gctx *c, nir_op op, unsigned a, unsigned b, u
    case nir_op_ult: code = G5P_ULT; break;
    default: code = G5P_ULT; ge = true; break; /* uge */
    }
-   unsigned rc = fl && ge ? 0x10 : 0;
-   bool swap = fl ? ne : (ge || ne);
+   /* The ge relation extension (`.. 59 61 00 10`) has no A8 capture, and the A8 ignores it: a float ge select
+    * through it gives lt's value. On the A8 the lt compare with the values swapped (PVR_A8_FGE_SWAP); an unordered
+    * compare then selects the true value, where ge selects the false one. */
+   const bool ge_swap = fl && ge && g5p_usc_g4p_fge_swap;
+   unsigned rc = fl && ge && !ge_swap ? 0x10 : 0;
+   bool swap = fl ? (ne || ge_swap) : (ge || ne);
    if (swap) {
       unsigned tmp = t;
       t = f;
@@ -5489,15 +5513,32 @@ static void emit_tex_ms_own_sample(struct gctx *c, nir_tex_instr *t, struct tex_
 }
 
 /* The A8's cube sample, as AGXMetalA8's f_tex_cube: the direction in three consecutive temps (computed: FMAs and a
- * move, no cube-coordinate instruction; the hardware selects the face), then the narrow sample in mode 4 */
+ * move, no cube-coordinate instruction; the hardware selects the face), then the sample in mode 4: narrow when the
+ * result goes straight to the output, else (PVR_A8_CUBE_ALU) Apple's 32-bit form, as f_tex_cube_mul (a8-passcap
+ * tex_cube_mul, USC heap 0x1bf6): 1a 79 00 41 00 01 c8 01 00 01 00 80, the wait 4d 00, then the ALU that reads the
+ * four 32-bit results. In Apple's multi-image layout (PVR_A8_CUBE_SLOTS), as f_tex2d_cube_mul: the 2D sample, 4d 04,
+ * 1a b9 0a 41 08 01 c8 01 08 01 00 80 (the cube's image at dword 4, the shared sampler in slot 2), 4d 00; with a
+ * sampler per texture, as f_tex2d_cube_mul2s: the same with the cube's own sampler in slot 3,
+ * 1a f9 0a 41 08 01 c8 01 08 01 00 80. */
 static void emit_tex_cube_g4p(struct gctx *c, nir_tex_instr *t)
 {
    uint8_t raw[G5P_USC_MAX];
    struct tex_bind *b = tex_for(c, t);
    const bool narrow = c->narrow_tex == t;
-   if (!narrow)
-      refuse(c, "A8 cube sample whose result feeds arithmetic (only the narrow form, straight to the output, is "
-                "captured)");
+   if (!narrow && !g5p_usc_g4p_cube_alu)
+      refuse(c, "A8 cube sample whose result feeds arithmetic (PVR_A8_CUBE_ALU=0)");
+   /* In Apple's multi-image layout (other images, or other common data first) the cube sample is captured with a
+    * 32-bit result, the image in its four-dword slot and the samplers after the images: one shared by every image
+    * (a8-passcap tex2d_cube_mul, slot N) or one per texture (tex2d_cube_mul2s, texture j's in slot N + j; what GL
+    * through Zink's combined samplers gives). A narrow result is not captured in this layout, and the planner's
+    * shared fallback (texture 0's sampler for images that name distinct samplers) would sample with the wrong one. */
+   if (c->a8_slots && (!g5p_usc_g4p_cube_slots || narrow || !(c->a8_one_sampler || c->a8_sampler_each)))
+      refuse(c, "A8 cube sample in Apple's multi-image layout (image at common dword %u, sampler at %u, %u images, "
+                "%s; %s result): captured only with a 32-bit result and one shared sampler or a sampler per texture%s",
+             b->image, b->sampler, c->ntex,
+             c->a8_one_sampler ? "one shared sampler" : c->a8_sampler_each ? "a sampler per texture"
+                                                                           : "texture 0's sampler for distinct samplers",
+             narrow ? "narrow" : "32-bit", g5p_usc_g4p_cube_slots ? "" : " (PVR_A8_CUBE_SLOTS=0)");
    nir_def *cd = nir_get_tex_src(t, nir_tex_src_coord);
    struct ref r[3];
    unsigned reg[3];
@@ -5517,12 +5558,28 @@ static void emit_tex_cube_g4p(struct gctx *c, nir_tex_instr *t)
       c->scratch |= BITFIELD64_RANGE(coord, 3);
    }
    struct g5p_tex s = {.image_qword = c->a8_slots ? b->image : b->image / 2, .a8_slots = c->a8_slots, .sampler_qword = b->sampler, .coord_dword = coord,
-                       .coord_control = true, .dim = G5P_TEX_CUBE, .narrow = true};
+                       .coord_control = true, .dim = G5P_TEX_CUBE, .narrow = narrow};
+   unsigned dst = 0;
+   if (!narrow)
+      dst = alloc_run(c, 4, "cube sample result");
+   s.dst_half = 2 * dst;
+   a8_image_order(c, b->image); /* Apple's 4d 04 after the 2D sample, before the cube's */
    put(c, raw, g5p_usc_sample(raw, &s), "cube sample");
    c->tex_coord_pending |= BITFIELD64_RANGE(coord, 3);
    c->tex_batch++;
+   c->tex_batch_image = b->image;
+   if (!narrow) {
+      /* Apple waits right after the sample, before the ALU that reads it */
+      c->tex_pending |= BITFIELD64_RANGE(dst, 4);
+      for (unsigned k = 0; k < 4; k++) {
+         struct val *v = V(c, &t->def, k);
+         v->state = VAL_REG;
+         v->reg = dst + k;
+         v->held = true;
+      }
+   }
    tex_flush(c);
-   c->p->evidence |= PCO_G5P_EV_TEX_CAPTURE;
+   c->p->evidence |= narrow ? PCO_G5P_EV_TEX_CAPTURE : PCO_G5P_EV_TEX_F32;
 }
 
 /* The A8's vertex-stage sample in Apple's form (PVR_A8_VTEX_APPLE), as AGXMetalA8 compiles v_sample, v_read_f32 and

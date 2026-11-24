@@ -71,6 +71,23 @@ extern bool g5p_usc_g4p_vtex_apple;
 /* A fragment texel-buffer read on the A8 (st/mesa's pixel-buffer uploads) as a 2D texelFetch of the buffer's linear
  * state (PVR_A8_TBO, on by default; 0 refuses it) */
 extern bool g5p_usc_g4p_tbo;
+/* The A8's float ge select as the lt compare/write with the selected values swapped, without the ge relation
+ * extension (`00 10` after `59 61`), which no A8 capture has and which the A8 ignores: a float ge select through it
+ * runs as lt on the iPod touch 6. PVR_A8_FGE_SWAP, on by default; 0 gives the extension form. */
+extern bool g5p_usc_g4p_fge_swap;
+/* The A8's gl_FragCoord.z/.w read in Apple's form: the varying iterator `18 09 ..` without perspective on the W/Z
+ * coefficient sets (g5p_usc_position_zw()), in place of the A9's position iterator `08 09 ..`, which no A8 capture
+ * has and which reads 0 on the iPod touch 6. PVR_A8_POS_ITER, on by default; 0 gives the A9 form. */
+extern bool g5p_usc_g4p_pos_iter;
+/* An R8 colour target with loadOp LOAD on the A8, in Apple's form (g5p_mrt_load_usc_g4p_r8(); PVR_A8_R8_LOAD, on by
+ * default; 0 refuses it, as before) */
+extern bool g5p_usc_g4p_r8_load;
+/* The A8's cube sample with 32-bit results that ALU reads after the wait, Apple's
+ * 1a 79 00 41 00 01 c8 01 CC 01 00 80 (sample_g4p(); PVR_A8_CUBE_ALU, on by default; 0 refuses it, as before) */
+extern bool g5p_usc_g4p_cube_alu;
+/* That cube sample in Apple's multi-image layout (sample_g4p() with g5p_tex.a8_slots): images in four-dword slots, then
+ * one shared sampler or a sampler per texture after them (PVR_A8_CUBE_SLOTS, on by default; 0 refuses it, as before) */
+extern bool g5p_usc_g4p_cube_slots;
 
 enum g5p_binop {
    G5P_BIN_FADD, G5P_BIN_FMUL, G5P_BIN_IADD, G5P_BIN_IMUL,

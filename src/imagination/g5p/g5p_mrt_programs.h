@@ -225,6 +225,28 @@ static inline unsigned g5p_mrt_load_usc_g4p(uint8_t *out)
    return sizeof(usc);
 }
 
+/* The A8's LOAD background for one R8 target (AGXMetalA8, a8-passcap r8_load: an R8Unorm target with loadAction
+ * Load, USC heap 0x1fc0; the same bytes are in the r8 pass's heap at 0x2140): BGRA8's program up to the wait after the
+ * sample (its first 116 bytes), then, as R8's clear and fragment programs, a zero into half 1
+ * (0188 0101 0101 0120 0128 0039) and the one-word emitpix 111c 0900 8200 and END. 136 bytes. The texture state, the
+ * sampler, the matrix and their three DOUTDs (10000004 10008004 90010006) are BGRA8's; only the state's format
+ * differs. */
+#define G5P_A8_LOAD_R8_USC_BYTES 136
+static inline unsigned g5p_mrt_load_usc_g4p_r8(uint8_t *out)
+{
+   static const uint8_t zero_g[12] = {0x88, 0x01, 0x01, 0x01, 0x01, 0x01, 0x20, 0x01, 0x28, 0x01, 0x39, 0x00};
+   uint8_t bgra[G5P_A8_LOAD_USC_BYTES];
+   g5p_mrt_load_usc_g4p(bgra);
+   unsigned o = G5P_A8_LOAD_USC_BYTES - 8; /* up to and with the wait (4d 00); BGRA8's two-word emitpix and END after */
+   memcpy(out, bgra, o);
+   memcpy(out + o, zero_g, sizeof(zero_g));
+   o += sizeof(zero_g);
+   const unsigned len = g5p_usc_emit(out + o, 1, 0);
+   if (!len)
+      return 0;
+   return o + len + g5p_usc_special(out + o + len, true);
+}
+
 static inline unsigned g5p_mrt_clear_usc(uint8_t *out, unsigned n)
 {
    if (n > 4)

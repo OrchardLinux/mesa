@@ -16,6 +16,11 @@ int g5p_usc_g4p_texfetch_level;
 bool g5p_usc_g4p_vtex;
 bool g5p_usc_g4p_vtex_apple;
 bool g5p_usc_g4p_tbo;
+bool g5p_usc_g4p_fge_swap;
+bool g5p_usc_g4p_pos_iter;
+bool g5p_usc_g4p_r8_load;
+bool g5p_usc_g4p_cube_alu;
+bool g5p_usc_g4p_cube_slots;
 
 const char *const g5p_binop_name[G5P_BIN_COUNT] = {"fadd", "fmul", "iadd", "imul", "and", "or", "xor", "ishr",
                                                        "isub"};
@@ -1147,8 +1152,11 @@ static unsigned sample_g4p(uint8_t *out, const struct g5p_tex *t)
          "A8 sample captured only as a 2D or cube sample with an implicit LOD");
    /* the cube sample: mode 4 (byte 6 0xc8 with the sampler at dword 4), the direction in three temps from the
     * coordinate dword, no cube-coordinate instruction (AGXMetalA8's f_tex_cube, passcap USC 0x6076: two FMAs and a
-    * move build r0..r2, then 1a 59 00 41 00 01 c8 01 00 01 00 80). Only the narrow form is captured. */
-   CHECK(t->dim != G5P_TEX_CUBE || t->narrow, "A8 cube sample captured only in the narrow form (result straight to the output)");
+    * move build r0..r2, then 1a 59 00 41 00 01 c8 01 00 01 00 80). The 32-bit form is byte 1 0x79, as for 2D
+    * (f_tex_cube_mul, an iOS capture: 1a 79 00 41 00 01 c8 01 00 01 00 80, then 4d 00 and the multiply); with
+    * PVR_A8_CUBE_ALU=0 only the narrow form is taken. */
+   CHECK(t->dim != G5P_TEX_CUBE || t->narrow || g5p_usc_g4p_cube_alu,
+         "A8 cube sample: the 32-bit form is off (PVR_A8_CUBE_ALU=0)");
    /* the explicit level in the register after the coordinate (Apple's sample at a varying level, iOS capture, USC
     * heap 0x1_02328000 + 0x8814: the iterated coordinate in r0..r1, r2 = r0 * 4.0, then
     * 1a 59 00 41 00 01 a8 09 00 01 00 80): byte 6 mode 2, byte 7 0x09, byte 10 0. 2D only. */
@@ -1166,7 +1174,18 @@ static unsigned sample_g4p(uint8_t *out, const struct g5p_tex *t)
     * test passed with it. */
    if (t->a8_slots) {
       const unsigned image_dword = t->image_qword, sampler_dword = t->sampler_qword; /* dwords (g5p_tex) */
-      CHECK(t->dim == G5P_TEX_2D, "A8 multi-image sample: 2D only (Apple's form is captured for 2D)");
+      /* The cube sample in this form (a8-passcap tex2d_cube_mul, iOS 12.4: a 2D image at common dword 0, the cube's
+       * at 4, one shared sampler at 8): 1a b9 00 41 00 01 88 01 00 01 00 80 for the 2D sample, 4d 04, then
+       * 1a b9 0a 41 08 01 c8 01 08 01 00 80 and 4d 00. The cube's image and sampler fields are the 2D sample's
+       * (byte 4 = image dword * 2, slot 2 in byte 1 bits 7:6) and byte 6 carries mode 4 over 0x88, as the
+       * single-image form does over 0x80. With a sampler per texture (tex2d_cube_mul2s, samplers at 8 and 12) the
+       * cube's names its own, slot 3: 1a f9 0a 41 08 01 c8 01 08 01 00 80. Only the 32-bit result is captured in
+       * this form. */
+      CHECK(t->dim == G5P_TEX_2D || (t->dim == G5P_TEX_CUBE && g5p_usc_g4p_cube_slots),
+            "A8 multi-image sample: 2D or (PVR_A8_CUBE_SLOTS) cube only");
+      CHECK(t->dim != G5P_TEX_CUBE || (!t->narrow && !t->lod_reg && !t->read_flag && !t->vtx),
+            "A8 multi-image cube sample: captured only with a 32-bit result and an implicit level");
+      const uint8_t mode = t->dim == G5P_TEX_CUBE ? 4 << 4 : lod_mode;
       CHECK(!(image_dword % 4) && image_dword <= 124, "A8 multi-image sample: image dword a multiple of 4 below 128");
       CHECK(!(sampler_dword % 4) && sampler_dword / 4 <= 11, "A8 multi-image sample: sampler slot 0..11");
       CHECK(t->coord_dword <= 31 && !(t->dst_half & 1) && t->dst_half < 64, "A8 sample: coordinate/destination range");
@@ -1183,7 +1202,7 @@ static unsigned sample_g4p(uint8_t *out, const struct g5p_tex *t)
       }
       const uint8_t raw[12] = {0x1a, (uint8_t)((slot & 3) << 6 | (t->narrow ? 0x19 : 0x39)), (uint8_t)t->dst_half,
                                0x41, (uint8_t)(2 * image_dword), (uint8_t)(1 | (slot >> 2) << 1),
-                               (uint8_t)(0x88 | lod_mode | (t->read_flag ? 4 : 0)), lod_byte7,
+                               (uint8_t)(0x88 | mode | (t->read_flag ? 4 : 0)), lod_byte7,
                                (uint8_t)(t->coord_dword << 1), 0x01, 0x00, 0x80};
       return finish_g4p(out, raw, sizeof(raw));
    }
@@ -1975,6 +1994,17 @@ unsigned g5p_usc_position_zw(uint8_t *out, unsigned dst_half, bool set1, bool bo
    bool minimum = dst_half || set1 || both;
    bool wide = long_form < 0 ? minimum : long_form;
    CHECK(!(minimum && !wide), "short position iterator omits nonzero fields");
+   if (g5p_usc_g4p && g5p_usc_g4p_pos_iter) {
+      /* The A8: Apple's A8 compiler reads the position's W and Z with its varying iterator `18 ..`, screen-linear
+       * (byte 3 without 0x80), one f32 component. Set 0 is `18 09 DD 00` with no slot byte, as Apple reads W next
+       * to a perspective varying. Set 1 (Z after W) is inferred: the slot byte set << 2 after byte 3 = 0x01, the
+       * f32 screen-linear shape of Apple's varying reads at other sets (Apple's own set-1 position read is the f16
+       * pair `18 11 02 01 00 01 04 00`). The coefficient side (DOUTI items, TA_OUTPUT_SEL with unclamped Z) is the
+       * A9's, the same words as Apple's A8 output. */
+      CHECK(!both, "A8 position iterator: both sets in one read not captured in f32");
+      const uint8_t g4[6] = {0x18, 0x09, (uint8_t)dst_half, set1 ? 0x01 : 0x00, 0x04, 0x00};
+      return finish_g4p(out, g4, set1 ? 6 : 4);
+   }
    uint8_t raw[4] = {8, (both ? 0x10 : 8) | wide, dst_half, set1 ? 2 : 0};
    return finish(out, raw, wide ? 4 : 2);
 }
