@@ -17,6 +17,7 @@ bool g5p_usc_g4p_vtex;
 bool g5p_usc_g4p_vtex_apple;
 bool g5p_usc_g4p_tbo;
 bool g5p_usc_g4p_fge_swap;
+bool g5p_usc_g4p_pos_iter;
 
 const char *const g5p_binop_name[G5P_BIN_COUNT] = {"fadd", "fmul", "iadd", "imul", "and", "or", "xor", "ishr",
                                                        "isub"};
@@ -1976,6 +1977,17 @@ unsigned g5p_usc_position_zw(uint8_t *out, unsigned dst_half, bool set1, bool bo
    bool minimum = dst_half || set1 || both;
    bool wide = long_form < 0 ? minimum : long_form;
    CHECK(!(minimum && !wide), "short position iterator omits nonzero fields");
+   if (g5p_usc_g4p && g5p_usc_g4p_pos_iter) {
+      /* The A8: Apple's A8 compiler reads the position's W and Z with its varying iterator `18 ..`, screen-linear
+       * (byte 3 without 0x80), one f32 component. Set 0 is `18 09 DD 00` with no slot byte, as Apple reads W next
+       * to a perspective varying. Set 1 (Z after W) is inferred: the slot byte set << 2 after byte 3 = 0x01, the
+       * f32 screen-linear shape of Apple's varying reads at other sets (Apple's own set-1 position read is the f16
+       * pair `18 11 02 01 00 01 04 00`). The coefficient side (DOUTI items, TA_OUTPUT_SEL with unclamped Z) is the
+       * A9's, the same words as Apple's A8 output. */
+      CHECK(!both, "A8 position iterator: both sets in one read not captured in f32");
+      const uint8_t g4[6] = {0x18, 0x09, (uint8_t)dst_half, set1 ? 0x01 : 0x00, 0x04, 0x00};
+      return finish_g4p(out, g4, set1 ? 6 : 4);
+   }
    uint8_t raw[4] = {8, (both ? 0x10 : 8) | wide, dst_half, set1 ? 2 : 0};
    return finish(out, raw, wide ? 4 : 2);
 }

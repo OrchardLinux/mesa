@@ -1425,6 +1425,8 @@ VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
       g5p_usc_g4p_tbo = debug_get_bool_option("PVR_A8_TBO", true);
       /* float ge selects without the ge relation extension (g5p_usc.h) */
       g5p_usc_g4p_fge_swap = debug_get_bool_option("PVR_A8_FGE_SWAP", true);
+      /* gl_FragCoord.z/w by the A8's varying iterator (g5p_usc.h) */
+      g5p_usc_g4p_pos_iter = debug_get_bool_option("PVR_A8_POS_ITER", true);
    }
 
    /* The A8 skips refused work by default: a refused program or pass loses its draws (named on stderr) instead of

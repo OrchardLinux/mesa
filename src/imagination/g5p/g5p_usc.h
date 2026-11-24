@@ -75,6 +75,10 @@ extern bool g5p_usc_g4p_tbo;
  * extension (`00 10` after `59 61`), which no A8 capture has and which the A8 ignores: a float ge select through it
  * runs as lt on the iPod touch 6. PVR_A8_FGE_SWAP, on by default; 0 gives the extension form. */
 extern bool g5p_usc_g4p_fge_swap;
+/* The A8's gl_FragCoord.z/.w read in Apple's form: the varying iterator `18 09 ..` without perspective on the W/Z
+ * coefficient sets (g5p_usc_position_zw()), in place of the A9's position iterator `08 09 ..`, which no A8 capture
+ * has and which reads 0 on the iPod touch 6. PVR_A8_POS_ITER, on by default; 0 gives the A9 form. */
+extern bool g5p_usc_g4p_pos_iter;
 
 enum g5p_binop {
    G5P_BIN_FADD, G5P_BIN_FMUL, G5P_BIN_IADD, G5P_BIN_IMUL,
