@@ -2590,6 +2590,26 @@ pvr_sub_cmd_gfx_geom_only_job_init(struct pvr_cmd_buffer *cmd_buffer,
    job->run_frag = false;
 }
 
+/* G5P: a render the driver refused and skips (skip_refused_work): named once per target format and extent, so a
+ * log shows which renders a workload loses (the refusal itself is named by G5P_REFUSE where it is decided) */
+static void
+g5p_log_skipped_render(const struct pvr_cmd_buffer *cmd_buffer, const struct pvr_sub_cmd_gfx *sub_cmd)
+{
+   static uint32_t seen[32];
+   const struct pvr_render_pass_info *info = &cmd_buffer->state.render_pass_info;
+   const struct pvr_renderpass_hwsetup_render *hw_render =
+      pvr_arch_pass_info_get_hw_render(info, sub_cmd->hw_render_idx);
+   const struct pvr_image_view *iview =
+      hw_render->eot_surface_count ? info->attachments[hw_render->eot_surfaces[0].attachment_idx] : NULL;
+   char text[160];
+
+   snprintf(text, sizeof(text), "G5P skips a refused render: %u targets, target 0 %s %ux%u",
+            hw_render->eot_surface_count, iview ? vk_Format_to_str(iview->vk.format) : "none",
+            iview ? iview->vk.extent.width : 0, iview ? iview->vk.extent.height : 0);
+   if (pvr_g5p_refusal_new(seen, ARRAY_SIZE(seen), text))
+      mesa_logw("%s", text);
+}
+
 VkResult pvr_arch_cmd_buffer_end_sub_cmd(struct pvr_cmd_buffer *cmd_buffer)
 {
    struct pvr_cmd_buffer_state *state = &cmd_buffer->state;
@@ -2706,6 +2726,7 @@ VkResult pvr_arch_cmd_buffer_end_sub_cmd(struct pvr_cmd_buffer *cmd_buffer)
          if (result == VK_ERROR_FEATURE_NOT_PRESENT &&
              device->pdevice->skip_refused_work) {
             gfx_sub_cmd->g5p_refused = true;
+            g5p_log_skipped_render(cmd_buffer, gfx_sub_cmd);
             break;
          }
          if (result != VK_SUCCESS)
@@ -5186,7 +5207,7 @@ void PVR_PER_ARCH(CmdBeginRendering)(VkCommandBuffer commandBuffer,
 
          if (!iv)
             continue;
-         fprintf(stderr, " c%u img %p", i, (void *)iv->vk.image);
+         fprintf(stderr, " c%u img %p %s", i, (void *)iv->vk.image, vk_Format_to_str(iv->vk.format));
          fprintf(stderr, " %ux%u x%u load %d store %d resolve %d%s", iv->vk.extent.width,
                  iv->vk.extent.height, iv->vk.image->samples, a->loadOp, a->storeOp,
                  a->resolveMode, rv ? (rv->vk.image->external_handle_types ? "->ext" : "->img") : "");

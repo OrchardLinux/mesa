@@ -574,6 +574,9 @@ pvr_get_buffer_format_features2(struct pvr_physical_device *pdevice,
                   * vertex formats and the texel buffers below */
                  VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT);
    PVR_G5P_HOOK(texel_features, pdevice, vk_format, flags)
+   /* the A8: no integer texel buffer (pvr_g5p_a8_int_target_refused()) */
+   if (PVR_HAS_FEATURE(&pdevice->dev_info, apple_g4p) && pvr_g5p_a8_int_target_refused(vk_format))
+      flags &= ~VK_FORMAT_FEATURE_2_UNIFORM_TEXEL_BUFFER_BIT;
    if (flags & VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_BIT) {
       flags |= VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |
                VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;

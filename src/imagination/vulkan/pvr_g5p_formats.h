@@ -35,6 +35,14 @@ bool pvr_g5p_format_pbe(VkFormat format, uint32_t *key, bool *srgb);
 /* Physical one-dword stores for already packed bytes; no public format admission. */
 uint32_t pvr_g5p_packed_word_pbe_key(void);
 
+/* The A8 renders no integer colour target but RGBA8UI: its integer pass (the raw end of tile) is captured on the A9
+ * only, and the A8's render job refuses it (pvr_arch_g5p.c g5p_raw_programs()), so the pass is skipped. Such a
+ * format has no uniform texel buffer on the A8 (pvr_formats.c): st/mesa's pixel-buffer upload into an integer
+ * texture is a texel-buffer read drawn into that texture, and without the texel buffer it takes the CPU copy, which
+ * the A8 does. The colour attachment stays advertised: desktop GL 3.0's EXT_texture_integer needs RGBA32UI/I render
+ * targets, and taking it away drops Zink's desktop GL from 3.2 to 2.1 (fakepvr, round 11). */
+bool pvr_g5p_a8_int_target_refused(VkFormat format);
+
 /* pvr_get_image_format_features2(): the features of a colour format on
  * the A9, in place of upstream's (flags) */
 VkFormatFeatureFlags2 pvr_g5p_color_format_features(VkFormat format, VkImageTiling tiling,
