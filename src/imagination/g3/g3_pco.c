@@ -13,11 +13,10 @@
  *    after every st (pco_schedule()), and on the A7 stores write-through, the
  *    only cache mode that ran. g3_pco_check() refuses a 4-byte (extended) st;
  *    compute/tools/a7dec.py checks the rest on the bytes;
- *  - bitwise groups: pco's encoding plus the A7's phase-0 bit
- *    (pco_igrp_a7_phase0_bit()), with which Apple's A7 and Imagination's
- *    Series6 bitwise groups decode. Not yet run on the A7: they are refused
- *    unless PVR_G3_BITWISE=1, and then only in the three shapes the a7-cdm R8
- *    rungs test (and/or/xor, lsl/shr, a 32-bit immediate; g3_bitwise_why_not()).
+ *  - bitwise groups in the three shapes the a7-cdm R8 rungs ran on the J71
+ *    (and/or/xor, lsl/shr, a 32-bit immediate; g3_bitwise_why_not()), with the
+ *    phase-0 bit Apple's A7 programs set (pco_igrp_a7_phase0_bit(); the A7
+ *    also runs them without it, r8pand0). PVR_G3_BITWISE=0 refuses them.
  *    Shifts left by a constant still become multiplies, and 32-bit constants
  *    outside Rogue's table (0..31) come from the unified store (a pool the PDS
  *    writes);
@@ -388,8 +387,9 @@ g3_bitwise_why_not(const pco_igrp *igrp)
 {
    const pco_instr *p0 = igrp->instrs[PCO_OP_PHASE_0], *p1 = igrp->instrs[PCO_OP_PHASE_1],
                    *p2 = igrp->instrs[PCO_OP_PHASE_2];
-   if (!getenv("PVR_G3_BITWISE"))
-      return "not yet run on the A7 (PVR_G3_BITWISE=1 admits the R8 shapes)";
+   const char *env = getenv("PVR_G3_BITWISE");
+   if (env && !strcmp(env, "0"))
+      return "PVR_G3_BITWISE=0";
    if (!p0)
       return "no phase 0";
    if (p0->op == PCO_OP_BBYP0BM_IMM32 && !p1 && !p2)
