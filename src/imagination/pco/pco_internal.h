@@ -390,6 +390,9 @@ typedef struct _pco_shader {
 
    pco_data data; /** Shader data. */
    struct util_dynarray binary; /** Shader binary. */
+
+   /** Apple A7: a group needed a form the A7 has no encoding for (pco_binary.c). */
+   bool a7_unencodable;
 } pco_shader;
 
 /** Op info. */
@@ -1564,6 +1567,31 @@ static inline pco_instr *pco_prev_instr(pco_instr *instr)
  * \param[in] block The block.
  * \return The first instruction group, or NULL if the block is empty.
  */
+/**
+ * \brief Whether an igrp is for the Apple A7 (S5L8960X, has_apple_g3): Rogue
+ * with Apple's A7 encoding deltas, measured on the device (apple-a7.h).
+ */
+static inline bool pco_igrp_is_a7(const pco_igrp *igrp)
+{
+   return PVR_HAS_FEATURE(igrp->parent_func->parent_shader->ctx->dev_info, apple_g3);
+}
+
+/**
+ * \brief The A7 encodes a single source with a 3-bit bank in 2 bytes, pco's
+ * 1up_3b11i and 1lo_3b11i_2m without their third byte (Apple's A7 programs,
+ * ds.A7: an imadd64's upper source and a mov's lower one; the 3-byte reading
+ * does not end the group at its length). The third byte must be zero (an
+ * index below 256, mux s0); a program that needs it is marked a7_unencodable.
+ */
+#define PCO_A7_SHORT_SRC_BYTES 2
+
+static inline bool pco_igrp_a7_short_src(const pco_igrp *igrp, bool upper)
+{
+   return pco_igrp_is_a7(igrp) &&
+          (upper ? igrp->variant.upper_src == PCO_SRC_1UP_3B11I
+                 : igrp->variant.lower_src == PCO_SRC_1LO_3B11I_2M);
+}
+
 static inline pco_igrp *pco_first_igrp(pco_block *block)
 {
    if (list_is_empty(&block->instrs))

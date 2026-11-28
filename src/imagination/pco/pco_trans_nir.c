@@ -206,7 +206,9 @@ static enum pco_mcu_cache_mode_ld get_ld_cache_mode(nir_intrinsic_instr *intr)
 static enum pco_mcu_cache_mode_st get_st_cache_mode(nir_intrinsic_instr *intr,
                                                     trans_ctx *tctx)
 {
-   if (PCO_DEBUG(NO_DMA_CACHE) || !nir_intrinsic_has_access(intr))
+   /* the A7 (apple-a7.h): only write-through stores ran there */
+   if (PCO_DEBUG(NO_DMA_CACHE) || !nir_intrinsic_has_access(intr) ||
+       PVR_HAS_FEATURE(tctx->pco_ctx->dev_info, apple_g3))
       return PCO_MCU_CACHE_MODE_ST_WRITE_THROUGH;
 
    enum gl_access_qualifier access_qual = nir_intrinsic_access(intr);
