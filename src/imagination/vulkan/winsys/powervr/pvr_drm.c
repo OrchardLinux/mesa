@@ -24,6 +24,7 @@
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <vulkan/vulkan.h>
 #include <xf86drm.h>
 
@@ -464,6 +465,16 @@ pvr_drm_winsys_device_info_init(struct pvr_winsys *ws,
       goto err_out;
 
    runtime_info->num_phantoms = gpu_info.num_phantoms;
+   /* The A7 (apple-a7.h): 4 clusters, one phantom. Kernels before "drm/imagination: apple: Report the A7's 4
+    * clusters" report 6 clusters and 2 phantoms, which upstream's Rogue render path asserts against
+    * (pvr_get_simultaneous_num_allocs(); J71 overlay 9). */
+   if (PVR_HAS_FEATURE(dev_info, apple_g3)) {
+      const uint32_t n = DIV_ROUND_UP(PVR_GET_FEATURE_VALUE(dev_info, num_clusters, 1U), 4U);
+      if (runtime_info->num_phantoms != n)
+         mesa_logw("pvr/g3: the kernel reports %" PRIu64 " phantoms; the A7 has %u (4 clusters)",
+                   runtime_info->num_phantoms, n);
+      runtime_info->num_phantoms = n;
+   }
 
    result = pvr_drm_get_runtime_info(drm_ws, &kmd_runtime_info);
    if (result != VK_SUCCESS)

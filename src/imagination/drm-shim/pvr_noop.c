@@ -153,6 +153,12 @@ static int pvr_dev_query_gpu_info_get(struct drm_pvr_ioctl_dev_query_args *args)
 
    gpu_info->gpu_id = pvr_get_packed_bvnc(&device_info);
    gpu_info->num_phantoms = rogue_num_phantoms(&device_info);
+   /* the Apple kernels' answer (pvr_apple_device_info_init(): 6 clusters, so 2 phantoms) unless
+    * PVR_SHIM_NUM_PHANTOMS says otherwise; the A7's kernel reports 2 up to "Report the A7's 4 clusters" */
+   if (getenv("PVR_SHIM_NUM_PHANTOMS"))
+      gpu_info->num_phantoms = strtoul(getenv("PVR_SHIM_NUM_PHANTOMS"), NULL, 0);
+   else if (PVR_HAS_FEATURE(&device_info, apple_g5p))
+      gpu_info->num_phantoms = 2;
 
 dev_query_gpu_info_set_size:
    args->size = sizeof(*gpu_info);
