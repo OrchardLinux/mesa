@@ -68,9 +68,13 @@ static inline void calc_lengths(pco_igrp *igrp, unsigned *offset_bytes)
    total_length += igrp->enc.len.hdr;
 
    igrp->enc.len.lower_srcs = pco_src_bytes(igrp->variant.lower_src);
+   if (pco_igrp_a7_short_src(igrp, false))
+      igrp->enc.len.lower_srcs = PCO_A7_SHORT_SRC_BYTES;
    total_length += igrp->enc.len.lower_srcs;
 
    igrp->enc.len.upper_srcs = pco_src_bytes(igrp->variant.upper_src);
+   if (pco_igrp_a7_short_src(igrp, true))
+      igrp->enc.len.upper_srcs = PCO_A7_SHORT_SRC_BYTES;
    total_length += igrp->enc.len.upper_srcs;
 
    igrp->enc.len.iss = pco_iss_bytes(igrp->variant.iss);

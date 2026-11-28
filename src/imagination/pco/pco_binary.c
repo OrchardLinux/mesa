@@ -19,6 +19,7 @@
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 /**
  * \brief Encodes instruction group alignment.
@@ -75,14 +76,25 @@ static unsigned pco_encode_igrp(struct util_dynarray *buf, pco_igrp *igrp)
    }
 
    /* I/O. */
-   if (igrp->enc.len.lower_srcs) {
-      ptr = util_dynarray_grow(buf, uint8_t, igrp->enc.len.lower_srcs);
-      bytes_encoded += pco_srcs_map_encode(ptr, igrp, false);
-   }
 
-   if (igrp->enc.len.upper_srcs) {
-      ptr = util_dynarray_grow(buf, uint8_t, igrp->enc.len.upper_srcs);
-      bytes_encoded += pco_srcs_map_encode(ptr, igrp, true);
+   for (unsigned u = 0; u < 2; u++) {
+      const bool upper = u;
+      const unsigned len = upper ? igrp->enc.len.upper_srcs : igrp->enc.len.lower_srcs;
+      if (!len)
+         continue;
+      ptr = util_dynarray_grow(buf, uint8_t, len);
+      if (pco_igrp_a7_short_src(igrp, upper)) {
+         /* the A7's 2-byte form: pco's 3-byte one without its third byte, which must be zero */
+         uint8_t full[8] = { 0 };
+         ASSERTED unsigned n = pco_srcs_map_encode(full, igrp, upper);
+         assert(n == 3);
+         if (full[2])
+            igrp->parent_func->parent_shader->a7_unencodable = true;
+         memcpy(ptr, full, PCO_A7_SHORT_SRC_BYTES);
+         bytes_encoded += PCO_A7_SHORT_SRC_BYTES;
+      } else {
+         bytes_encoded += pco_srcs_map_encode(ptr, igrp, upper);
+      }
    }
 
    if (igrp->enc.len.iss) {

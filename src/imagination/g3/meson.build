@@ -6,7 +6,7 @@ inc_powervr_g3 = include_directories(['.'])
 
 libpowervr_g3 = static_library(
   'powervr_g3',
-  files('g3_compute.c'),
+  files('g3_compute.c', 'g3_pco.c'),
   include_directories : [inc_imagination, inc_powervr_g3, inc_powervr_compiler,
                          inc_include, inc_compiler, inc_src],
   c_args : [imagination_c_args, no_override_init_args, '-Wno-psabi'],
@@ -25,7 +25,7 @@ g3_selftest = executable(
   'g3_selftest',
   files('g3_selftest.c'),
   include_directories : [inc_imagination, inc_powervr_g3, inc_include, inc_src],
-  link_with : [libpowervr_g3],
+  link_with : [libpowervr_g3, libpowervr_compiler],
   dependencies : [idep_mesautil, idep_nir],
   install : false,
 )
