@@ -382,6 +382,14 @@ struct pvr_device_features {
     */
    bool has_apple_g4p : 1;
 
+   /*
+    * Apple A7 GPU (G3): set together with has_apple_g5p and has_apple_g4p by
+    * the A7 entry, which takes the A8's job, stream, PDS and memory glue. Its
+    * shader ISA is Rogue (Apple's agx0), not the A8's: no Apple-agx1 USC
+    * program may reach it (apple-a7.h).
+    */
+   bool has_apple_g3 : 1;
+
    /* Only set where Apple's compute residency parameters are established. */
    bool has_apple_compute_dispatch : 1;
    struct pvr_apple_compute_dispatch_limits apple_compute_dispatch;

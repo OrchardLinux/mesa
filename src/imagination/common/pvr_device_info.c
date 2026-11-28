@@ -44,6 +44,7 @@
 #include "device_info/apple-a10.h"
 #include "device_info/apple-a9.h"
 #include "device_info/apple-a8.h"
+#include "device_info/apple-a7.h"
 
 #include "util/u_string.h"
 
@@ -85,6 +86,7 @@ int pvr_device_info_init(struct pvr_device_info *info, uint64_t bvnc)
       return 0
 
    switch (bvnc) {
+      CASE_PACKED_BVNC_DEVICE_INFO(1, 70, 4, 3);
       CASE_PACKED_BVNC_DEVICE_INFO(3, 10, 4, 5);
       CASE_PACKED_BVNC_DEVICE_INFO(4, 40, 2, 51);
       CASE_PACKED_BVNC_DEVICE_INFO(4, 45, 2, 58);
