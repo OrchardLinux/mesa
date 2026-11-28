@@ -2105,7 +2105,7 @@ fs_uploads(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_g5p_pipeline *g, 
          }
          break;
       case PCO_G5P_UPLOAD_IMAGE_SIZE:
-         if (u->dwords != 4 || !pvr_g5p_tex_size(desc, u->offset, out))
+         if (u->dwords != 4 || !pvr_g5p_image_size(&cmd_buffer->device->pdevice->dev_info, desc, u->offset, out))
             return G5P_REFUSE(cmd_buffer, "set %u binding %u: an image size without A9 texture state", u->set,
                               u->binding);
          break;

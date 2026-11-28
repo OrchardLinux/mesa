@@ -366,8 +366,8 @@ g5p_raw_programs_unlocked(struct pvr_device *device, unsigned raw, unsigned word
    struct pvr_g5p_programs *p = &device->g5p->programs;
    VkResult result;
    if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p))
-      return vk_errorf(device, VK_ERROR_FEATURE_NOT_PRESENT,
-                       "G5P: an integer colour pass on the A8 (its end of tile is captured for float targets only)");
+      return G5P_REFUSE(device, "an integer colour pass on the A8 (its end of tile is captured for float targets "
+                        "only; pvr_g5p_a8_int_target_refused())");
    const unsigned variant = g5p_raw_variant(words);
    if (!p->raw_clear_usc[variant]) {
       uint8_t code[6 * G5P_USC_MAX];

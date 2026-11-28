@@ -30,6 +30,7 @@
 #include "pvr_pipeline.h"
 #include "pvr_g5p.h"
 #include "pvr_g5p_tex_encode.h"
+#include "pvr_g5p_a8_fetch.h"
 #include "pvr_g5p_shader_dump.h"
 #include "pvr_g5p_compute.h"
 #include "pvr_job_context.h"
@@ -513,7 +514,7 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
          memcpy(out,d,4*2);
          break;
       case G9P_A9_UP_SIZE:
-         if(!pvr_g5p_tex_size(d,u->level,out)) {
+         if(!pvr_g5p_image_size(&cmd_buffer->device->pdevice->dev_info,d,u->level,out)) {
             mesa_logw("G5P refuses: compute set %u binding %u: an image size without A9 texture state",u->set,u->binding);
             return vk_errorf(cmd_buffer,VK_ERROR_OUT_OF_HOST_MEMORY,"G5P compute: an image size without A9 texture state");
          }

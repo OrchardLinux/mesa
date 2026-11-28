@@ -58,6 +58,12 @@ a8_render_row(VkFormat format)
 }
 
 bool
+pvr_g5p_a8_int_target_refused(VkFormat format)
+{
+   return g5p_usc_g4p && vk_format_is_int(format) && !a8_render_row(format);
+}
+
+bool
 pvr_g5p_format_tex(VkFormat format, uint32_t *key, bool *srgb)
 {
    const struct pvr_g5p_format *f = pvr_g5p_format_find(format);

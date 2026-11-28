@@ -4084,11 +4084,22 @@ static void emit_alu_body(struct gctx *c, nir_alu_instr *a)
  * vertex forms, a dying operand sits in B and gives its register. */
 /* The witnessed literal shift-add reads bank1. For a bank0 source,
  * repeated native register IADD computes exactly x << shift modulo32,
- * without allocating a bank1 staging word or inventing a shift encoding. */
+ * without allocating a bank1 staging word or inventing a shift encoding.
+ * The A8 has no shift-add (it ran as x << 0 on the iPod): a bank1 source takes
+ * the immediate shift, Apple's A8 x << s (AGXMetalA8's compute programs,
+ * `9a 11 DD 03 01 SS 20 01 (s<<1|1) 01 20 01 f0 14`) and the left twin of the
+ * vertex x >> s that reads right on the iPod (`.. f4 14`, WebRender's
+ * fetch_from_gpu_buffer_4i()). */
 static void vs_shift_literal(struct gctx *c, unsigned dst, unsigned src, unsigned group, unsigned shift)
 {
    assert(shift >= 1 && shift <= 4);
    uint8_t raw[G5P_USC_MAX];
+   if (vbank(c, src) && g5p_usc_g4p) {
+      put(c, raw, g5p_usc_shift(raw, true, H(c, dst), H(c, src), shift, true, vbank(c, dst), group, 1,
+                                vhdr(c, 0x11, -1, src, -1)),
+          "A8 immediate shl");
+      return;
+   }
    if (vbank(c, src)) {
       put(c, raw, g5p_usc_shl_literal(raw, H(c, dst), H(c, src), vbank(c, dst), group, shift), "shift-add");
       return;

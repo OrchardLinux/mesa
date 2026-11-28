@@ -157,7 +157,7 @@ vtex_descriptor(struct pvr_cmd_buffer *cmd, const struct pco_g5p_upload *u, uint
          return VTEX_REFUSE(cmd, "set %u binding %u has no A9 sampler state", u->set, u->binding);
       memcpy(out, desc, 8);
    } else {
-      if (!image || u->dwords != 4 || !pvr_g5p_tex_size(desc, u->offset, out))
+      if (!image || u->dwords != 4 || !pvr_g5p_image_size(&cmd->device->pdevice->dev_info, desc, u->offset, out))
          return VTEX_REFUSE(cmd, "set %u binding %u has no A9 image size", u->set, u->binding);
    }
    return VK_SUCCESS;

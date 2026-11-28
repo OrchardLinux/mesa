@@ -2415,6 +2415,10 @@ unsigned g5p_usc_shl_literal(uint8_t *out, unsigned dst_half, unsigned src_half,
                              unsigned src_group, unsigned shift)
 {
    CHECK(shift >= 1 && shift <= 4, "vertex shift-add amounts 1..4 are witnessed");
+   /* The A8 runs this as x << 0 (the iPod, 2026-11-26: WebRender's get_fetch_uv() 8 * (2 & 127) gave 2, 2 * 5
+    * gave 5), and Apple's A8 code never has the shift field: its x << s is the immediate shift (`9a .. f0 14`,
+    * g5p_usc_shift()), as the 64-bit address add's shift field is A9-only (G5P_A8_NO_ADDR_ADD). */
+   CHECK(!g5p_usc_g4p, "the A8 has no shift-add (its x << s is the immediate shift)");
    uint8_t raw[G5P_USC_MAX];
    unsigned n = literal_prefix(raw, 0x99, dst_half, bank, 0, src_half, src_group, 0x11, 0);
    if (!n)
