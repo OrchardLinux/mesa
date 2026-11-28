@@ -84,18 +84,37 @@ PVR_PER_ARCH(g3_compute_pipeline_compile)(struct pvr_device *device,
    nir_shader *nir;
    VkResult result;
 
-   result = vk_pipeline_shader_stage_to_nir(&device->vk, pipeline->base.pipeline_flags, &create_info->stage,
-                                            g9p_spirv_options(), g9p_nir_options(), mem_ctx, &nir);
-   if (result != VK_SUCCESS)
-      goto out;
+   /* PVR_G3_PATH=narrow|pco|auto (default auto): the narrow path first, whose forms all ran on the A7, then
+    * pco's pipeline (g3_pco.c) for what it refuses */
+   const char *path = getenv("PVR_G3_PATH") ? getenv("PVR_G3_PATH") : "auto";
+   const bool try_narrow = strcmp(path, "pco"), try_pco = strcmp(path, "narrow");
+   char narrow_refusal[sizeof(p->refusal)] = "not tried";
+   bool compiled = false;
 
    p = vk_zalloc(&device->vk.alloc, sizeof(*p), 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
    if (!p) {
       result = vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
       goto out;
    }
-   if (!g3_compile_compute(nir, p)) {
-      mesa_logw("pvr/g3: compute pipeline refused: %s", p->refusal);
+   if (try_narrow) {
+      result = vk_pipeline_shader_stage_to_nir(&device->vk, pipeline->base.pipeline_flags, &create_info->stage,
+                                               g9p_spirv_options(), g9p_nir_options(), mem_ctx, &nir);
+      if (result != VK_SUCCESS)
+         goto out;
+      compiled = g3_compile_compute(nir, p);
+      if (!compiled)
+         snprintf(narrow_refusal, sizeof(narrow_refusal), "%s", p->refusal);
+   }
+   if (!compiled && try_pco) {
+      result = vk_pipeline_shader_stage_to_nir(&device->vk, pipeline->base.pipeline_flags, &create_info->stage,
+                                               g3_pco_spirv_options(), g3_pco_nir_options(), mem_ctx, &nir);
+      if (result != VK_SUCCESS)
+         goto out;
+      compiled = g3_compile_pco(device->pdevice->pco_ctx, nir, p);
+   }
+   if (!compiled) {
+      mesa_logw("pvr/g3: compute pipeline refused: narrow path: %s; %s", narrow_refusal,
+                try_pco ? p->refusal : "pco: not tried");
       result = vk_errorf(device, VK_ERROR_FEATURE_NOT_PRESENT, "A7 compute: %s", p->refusal);
       goto out;
    }
@@ -103,7 +122,11 @@ PVR_PER_ARCH(g3_compute_pipeline_compile)(struct pvr_device *device,
       char d[512];
       uint32_t code[G3_MAX_PDS_CODE];
       g3_describe(p, d, sizeof(d));
-      mesa_logi("pvr/g3: pipeline %s; registers %u", d, p->unified_regs);
+      if (p->pco)
+         mesa_logi("pvr/g3: pipeline (pco) local %u, %u buffer(s), %u temps, entry %#x; registers %u",
+                   p->local_size, p->num_buffers, p->usc_temps, p->entry_offset, p->unified_regs);
+      else
+         mesa_logi("pvr/g3: pipeline %s; registers %u", d, p->unified_regs);
       g3_dump_bytes("usc", p->code, p->code_size);
       g3_dump_words("pds", code, g3_pds_code(p, code));
    }
@@ -123,8 +146,9 @@ out:
 
 /* The address of store i's buffer, from the bound descriptor set */
 static VkResult
-g3_buffer_address(struct pvr_cmd_buffer *cmd, const struct g3_store *s, uint64_t *addr)
+g3_buffer_address(struct pvr_cmd_buffer *cmd, unsigned set_index, unsigned binding, uint64_t *addr)
 {
+   const struct { unsigned set, binding; } st = { set_index, binding }, *s = &st;
    const struct pvr_descriptor_state *desc = &cmd->state.compute_desc_state;
    const struct pvr_descriptor_set *set = s->set < PVR_MAX_DESCRIPTOR_SETS ? desc->sets[s->set] : NULL;
 
@@ -157,7 +181,7 @@ PVR_PER_ARCH(g3_cmd_dispatch)(struct pvr_cmd_buffer *cmd, struct pvr_sub_cmd_com
 {
    struct pvr_device *device = cmd->device;
    const struct g3_program *p = cmd->state.compute_pipeline->g3;
-   uint64_t buffer[G3_MAX_STORES];
+   uint64_t buffer[MAX2(G3_MAX_STORES, G3_MAX_BUFFERS)];
    uint32_t code[G3_MAX_PDS_CODE], data[G3_MAX_PDS_DATA];
    struct pvr_pds_upload first = { 0 };
    VkResult result;
@@ -179,10 +203,15 @@ PVR_PER_ARCH(g3_cmd_dispatch)(struct pvr_cmd_buffer *cmd, struct pvr_sub_cmd_com
                        "A7 compute: %u workgroups (at most %u: one CDM record each, one control stream block)",
                        group_count[0], G3_MAX_WORKGROUPS);
    /* no store: no observable invocation (the A8 omits such a dispatch too) */
-   if (!p->num_stores)
+   if (!p->pco && !p->num_stores)
       return VK_SUCCESS;
    for (unsigned j = 0; j < p->num_stores; j++) {
-      result = g3_buffer_address(cmd, &p->stores[j], &buffer[j]);
+      result = g3_buffer_address(cmd, p->stores[j].set, p->stores[j].binding, &buffer[j]);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+   for (unsigned k = 0; p->pco && k < p->num_buffers; k++) {
+      result = g3_buffer_address(cmd, p->buffers[k].set, p->buffers[k].binding, &buffer[k]);
       if (result != VK_SUCCESS)
          return result;
    }
@@ -193,7 +222,7 @@ PVR_PER_ARCH(g3_cmd_dispatch)(struct pvr_cmd_buffer *cmd, struct pvr_sub_cmd_com
    struct pvr_csb *csb = &sub->control_stream;
 
    for (uint32_t g = 0; g < group_count[0]; g++) {
-      const unsigned ndata = g3_pds_data(p, usc, buffer, base_group[0] + g, data);
+      const unsigned ndata = g3_pds_data(p, usc, buffer, base_group[0] + g, group_count[0], data);
       struct pvr_pds_upload up;
 
       /* the code once, with workgroup 0's data; the other workgroups' data alone */

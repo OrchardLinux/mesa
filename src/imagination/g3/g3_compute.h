@@ -41,11 +41,15 @@ extern "C" {
 #endif
 
 struct nir_shader;
+struct spirv_to_nir_options;
+struct nir_shader_compiler_options;
 
 #define G3_MAX_STORES 4
 #define G3_MAX_COMPONENTS 4
-#define G3_MAX_USC_BYTES 256
-#define G3_MAX_PDS_WRITES (2 * G3_MAX_STORES + 2)
+#define G3_MAX_USC_BYTES 8192
+#define G3_MAX_BUFFERS 8
+#define G3_MAX_POOL 16
+#define G3_MAX_PDS_WRITES (4 * G3_MAX_STORES + 2 + G3_MAX_POOL / 2)
 #define G3_MAX_PDS_CODE (G3_MAX_PDS_WRITES + 4)
 /* DOUTU q0, a 64-bit pair per data write, a control word per write, 16-byte aligned */
 #define G3_MAX_PDS_DATA (2 + 3 * G3_MAX_PDS_WRITES + 4)
@@ -62,6 +66,9 @@ enum g3_pds_src {
    G3_PDS_ADDRESS,   /* 64 bits: buffer address + offset.wg * wgid + offset.c */
    G3_PDS_ADDEND,    /* 64 bits: {value.wg * wgid + value.c, 0} */
    G3_PDS_CONSTANTS, /* 64 bits: two of the store's constant components */
+   G3_PDS_WGID,      /* 64 bits: {workgroup ID x, workgroup count x} (g3_pco.c) */
+   G3_PDS_BUFFER,    /* 64 bits: buffer[store]'s address (g3_pco.c: store is the buffer index) */
+   G3_PDS_POOL,      /* 64 bits: pool[2 * pair], pool[2 * pair + 1] (g3_pco.c's constants) */
 };
 
 /* One DOUTW of the kernel's PDS program into unified register ao */
@@ -90,6 +97,18 @@ struct g3_program {
    unsigned local_size;    /* x; y and z are 1 */
    unsigned unified_regs;  /* registers vi0..vi(n-1) the program reads or writes */
    bool uses_wgid;         /* a store depends on the workgroup ID */
+
+   /* compiled by pco (g3_pco.c) rather than the narrow path; then buffer[i] of g3_pds_data() is buffers[i]'s */
+   bool pco;
+   unsigned usc_temps;     /* USC temporaries the program allocates */
+   unsigned entry_offset;  /* the entry point's offset in code */
+   unsigned num_pool;      /* 32-bit constants outside Rogue's table 0..31, from the unified store */
+   uint32_t pool[G3_MAX_POOL];
+   unsigned num_buffers;
+   struct {
+      uint8_t set, binding;
+   } buffers[G3_MAX_BUFFERS];
+
    char refusal[160];
 };
 
@@ -108,7 +127,16 @@ unsigned g3_pds_code(const struct g3_program *p, uint32_t code[G3_MAX_PDS_CODE])
  * buffer[i] is store i's buffer address. Returns its dwords (a multiple of 4).
  */
 unsigned g3_pds_data(const struct g3_program *p, uint32_t usc_offset, const uint64_t *buffer,
-                     uint32_t wgid, uint32_t data[G3_MAX_PDS_DATA]);
+                     uint32_t wgid, uint32_t num_wg, uint32_t data[G3_MAX_PDS_DATA]);
+
+/*
+ * NIR -> A7 USC through pco's pipeline with the A7's deltas (g3_pco.c), for
+ * shaders the narrow path refuses. pco_ctx is the device's pco_ctx; nir comes
+ * from spirv_to_nir with g3_pco_spirv_options()/g3_pco_nir_options().
+ */
+bool g3_compile_pco(void *pco_ctx, struct nir_shader *nir, struct g3_program *out);
+const struct spirv_to_nir_options *g3_pco_spirv_options(void);
+const struct nir_shader_compiler_options *g3_pco_nir_options(void);
 
 /* KERNEL0 of the program's CDM kernel record for pds_dwords of PDS data */
 uint32_t g3_cdm_kernel0(const struct g3_program *p, unsigned pds_dwords);

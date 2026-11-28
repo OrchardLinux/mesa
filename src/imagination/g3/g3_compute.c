@@ -334,7 +334,7 @@ g3_pds_code(const struct g3_program *p, uint32_t code[G3_MAX_PDS_CODE])
 
 unsigned
 g3_pds_data(const struct g3_program *p, uint32_t usc_offset, const uint64_t *buffer, uint32_t wgid,
-            uint32_t data[G3_MAX_PDS_DATA])
+            uint32_t num_wg, uint32_t data[G3_MAX_PDS_DATA])
 {
    const unsigned ctrl0 = 2 + 2 * g3_pairs(p);
    const unsigned n = ALIGN_POT(ctrl0 + p->num_writes, 4);
@@ -342,8 +342,9 @@ g3_pds_data(const struct g3_program *p, uint32_t usc_offset, const uint64_t *buf
 
    assert(n <= G3_MAX_PDS_DATA);
    memset(data, 0, n * sizeof(*data));
-   data[0] = usc_offset;
-   data[1] = 0x10;
+   data[0] = usc_offset + p->entry_offset;
+   /* DOUTU source 0's upper word: USC temps in units of 4 << 3 (Rogue's DOUTU TEMPS at bit 35); 0x10 (8) ran */
+   data[1] = MAX2(DIV_ROUND_UP(p->usc_temps, 4), 2) << 3;
    for (unsigned i = 0; i < p->num_writes; i++) {
       const struct g3_pds_write *w = &p->writes[i];
       const struct g3_store *s = &p->stores[w->store];
@@ -358,6 +359,15 @@ g3_pds_data(const struct g3_program *p, uint32_t usc_offset, const uint64_t *buf
          break;
       case G3_PDS_ADDEND:
          v = (uint32_t)(s->value[0].wg * wgid + s->value[0].c);
+         break;
+      case G3_PDS_WGID:
+         v = wgid | (uint64_t)num_wg << 32;
+         break;
+      case G3_PDS_BUFFER:
+         v = buffer[w->store];
+         break;
+      case G3_PDS_POOL:
+         v = p->pool[2 * w->pair] | (uint64_t)(2 * w->pair + 1 < p->num_pool ? p->pool[2 * w->pair + 1] : 0) << 32;
          break;
       case G3_PDS_CONSTANTS: {
          const unsigned c = 2 * w->pair;
