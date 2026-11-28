@@ -45,6 +45,9 @@
 #include "pvr_physical_device.h"
 #include "pvr_free_list.h"
 #include "pvr_g5p.h"
+#include "pvr_formats.h"
+#include "pvr_image.h"
+#include "pvr_usc.h"
 #include "pvr_g5p_dgl.h"
 #include "pvr_g5p_ds.h"
 #include "pvr_g5p_formats.h"
@@ -797,6 +800,108 @@ g5p_load_background_g4p(struct pvr_cmd_buffer *cmd_buffer, const uint64_t state[
    return VK_SUCCESS;
 }
 
+/*
+ * The A7 (rung g1, PVR_G3_GFX=clear): a render whose one 32-bit colour target is CLEARed and STOREd, no depth or
+ * stencil, one sample, no draw. Everything is Rogue and kicked by DOUTU alone (the A8's kick, which ran on the A7
+ * for compute and the TA): no PDS DMA, no shared registers.
+ *  - background: pvr_usc_a7_clear(), output register 0 = the packed colour as an immediate (movi32, r8pimm);
+ *    its texture/uniform program the device's HALT;
+ *  - end of tile: upstream's pvr_usc_eot() with the PBE emit words as immediates (emitpix), built in
+ *    pvr_sub_cmd_gfx_per_job_fragment_programs_create_and_upload() and kicked by g5p_a7_kick(); g->eot[0..1] are
+ *    filled there;
+ *  - PBE register words: upstream's (job->pbe_reg_words), which the kernel puts at the A7 3D record's +0xd8.
+ */
+void
+PVR_PER_ARCH(g5p_a7_dump)(const char *what, const void *code, unsigned size, unsigned temps)
+{
+   char hex[2 * 1024 + 1];
+   const uint8_t *b = code;
+   unsigned n = MIN2(size, 1024);
+   for (unsigned i = 0; i < n; i++)
+      snprintf(hex + 2 * i, 3, "%02x", b[i]);
+   hex[2 * n] = 0;
+   mesa_logi("pvr/g3: %s usc (%u temps) %s", what, temps, hex);
+}
+
+static VkResult
+g5p_a7_clear(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_renderpass_hwsetup_render *hw_render,
+             struct pvr_render_job *job)
+{
+   struct pvr_device *device = cmd_buffer->device;
+   const struct pvr_g5p_programs *p = &device->g5p->programs;
+   const struct pvr_render_pass_info *info = &cmd_buffer->state.render_pass_info;
+   struct pvr_g5p_job *g = &job->g5p;
+
+   if (hw_render->eot_surface_count != 1 || hw_render->color_init_count != 1 ||
+       hw_render->color_init[0].op != VK_ATTACHMENT_LOAD_OP_CLEAR ||
+       hw_render->ds_attach_idx != VK_ATTACHMENT_UNUSED || MAX2(hw_render->sample_count, 1) != 1)
+      return G5P_REFUSE(cmd_buffer, "an A7 render other than one CLEARed single-sample colour target "
+                        "without depth/stencil (rung g1)");
+   const struct pvr_image_view *iview = info->attachments[hw_render->eot_surfaces[0].attachment_idx];
+   const VkFormat f = iview->vk.format;
+   if (pvr_get_pbe_accum_format_size_in_bytes(f) != 4 || hw_render->color_init[0].index >= info->clear_value_count)
+      return G5P_REFUSE(cmd_buffer, "an A7 clear of %s (32-bit accumulation formats only)", vk_Format_to_str(f));
+
+   uint32_t packed[4] = { 0 };
+   pvr_get_hw_clear_color(f, info->clear_values[hw_render->color_init[0].index].color, packed);
+   pco_shader *clear = pvr_usc_a7_clear(device->pdevice->pco_ctx, packed[0]);
+   struct pvr_suballoc_bo *usc;
+   VkResult result = pvr_gpu_upload_usc(device, pco_shader_binary_data(clear), pco_shader_binary_size(clear), 64,
+                                        &usc);
+   const unsigned temps = pco_shader_data(clear)->common.temps;
+   if (getenv("PVR_G3_DUMP"))
+      pvr_g5p_a7_dump("clear", pco_shader_binary_data(clear), pco_shader_binary_size(clear), temps);
+   ralloc_free(clear);
+   if (result != VK_SUCCESS)
+      return result;
+   list_add(&usc->link, &cmd_buffer->bo_list);
+   struct pvr_pds_upload kick;
+   result = PVR_PER_ARCH(g5p_a7_kick)(cmd_buffer, usc, temps, &kick);
+   if (result != VK_SUCCESS)
+      return result;
+
+   uint64_t bgnd[4] = { 0 };
+   pvr_csb_pack (&bgnd[0], CR_PDS_BGRND0_BASE, b0) {
+      b0.shader_addr = PVR_DEV_ADDR(kick.data_offset);
+      b0.texunicode_addr = PVR_DEV_ADDR(p->halt.code_offset);
+   }
+   pvr_csb_pack (&bgnd[2], CR_PDS_BGRND2_BASE, b2) {
+      b2.uniformdata_addr = PVR_DEV_ADDR(p->halt.data_offset);
+   }
+   pvr_csb_pack (&bgnd[3], CR_PDS_BGRND3_SIZEINFO, b3) {
+      b3.pds_uniformsize = 0;
+      b3.usc_sharedsize = 0;
+   }
+   memcpy(g->background, bgnd, sizeof(g->background));
+   g->targets = 1;
+   g->samples = 1;
+   g->skip_empty_tiles = false;
+   g->a7_clear = true;
+   /* EVENT_PIXEL_PDS_INFO: const_size 2 (the kick's data, as the A8's), no shared registers */
+   g->eot[2] = 2;
+   g->enabled = true;
+   return VK_SUCCESS;
+}
+
+/* The A7: a DOUTU kick of a USC program (the A8's form: data {DOUTU src0}, its code at data + 0x20) in the
+ * command buffer, for the A7's render programs (g5p_a7_clear()) */
+VkResult
+PVR_PER_ARCH(g5p_a7_kick)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_suballoc_bo *usc, unsigned temps,
+                          struct pvr_pds_upload *out)
+{
+   struct pvr_device *device = cmd_buffer->device;
+   const uint64_t doutu = g5p_doutu_src0(g5p_usc_off(device, usc), MAX2(temps, G5P_TEMPS));
+   const uint32_t data[4] = { (uint32_t)doutu, (uint32_t)(doutu >> 32), 0, 0 };
+   uint32_t code[8];
+   const unsigned n = g5p_pds_kick_code(code, PVR_G5P_PDS_FEATURES(&device->pdevice->dev_info));
+   VkResult result = pvr_arch_cmd_buffer_upload_pds(cmd_buffer, data, ARRAY_SIZE(data), 16, code, n,
+                                                    G5P_KICK_CODE, 64, out);
+   if (result == VK_SUCCESS && out->code_offset != out->data_offset + G5P_KICK_CODE)
+      return vk_errorf(device, VK_ERROR_INITIALIZATION_FAILED, "A7: a kick's code is at data + %#x, not + %#x",
+                       out->code_offset - out->data_offset, G5P_KICK_CODE);
+   return result;
+}
+
 VkResult
 PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd_gfx *sub_cmd,
                            const struct pvr_renderpass_hwsetup_render *hw_render,
@@ -856,17 +961,19 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
    if (vdm != VK_SUCCESS)
       return vdm;
 
-   /* the A7, rung g0 (PVR_G3_GFX=ta): the geometry job alone; nothing below has Rogue programs yet */
+   /* the A7 (rungs g0, g1): PVR_G3_GFX=ta the geometry job alone; =clear also a fragment job (g5p_a7_clear()) */
    if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g3)) {
       const char *gfx = pvr_g3_gfx();
-      if (!gfx || strcmp(gfx, "ta"))
-         return G5P_REFUSE(cmd_buffer, "an A7 render%s: only its geometry job is built (PVR_G3_GFX=ta)",
-                           gfx ? " with a fragment job" : "");
       g->width = info->render_area.extent.width;
       g->height = info->render_area.extent.height;
-      g->a7_ta_only = true;
-      g->enabled = true;
-      return VK_SUCCESS;
+      if (gfx && !strcmp(gfx, "ta")) {
+         g->a7_ta_only = true;
+         g->enabled = true;
+         return VK_SUCCESS;
+      }
+      if (gfx && !strcmp(gfx, "clear"))
+         return g5p_a7_clear(cmd_buffer, hw_render, job);
+      return G5P_REFUSE(cmd_buffer, "an A7 render: PVR_G3_GFX=ta or clear (no other Rogue programs yet)");
    }
 
    /* targets: PBE words and clear colours */
@@ -1520,7 +1627,13 @@ PVR_PER_ARCH(g5p_frag_stream)(const struct pvr_device *device, const struct pvr_
    g5p_put64(&s, 0); /* ZLSCTL and the load/store bases: in the extension */
    g5p_put64(&s, 0);
    g5p_put64(&s, 0);
-   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p)) {
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g3)) {
+      /* the A7: upstream's Rogue PBE register words (pvr_setup_pbe_state()); the kernel copies words 0-1 of each
+       * to the A7 3D record's +0xd8 + 16 i */
+      for (unsigned i = 0; i < 8; i++)
+         for (unsigned w = 0; w < 3; w++)
+            g5p_put64(&s, g->a7_clear && i < PVR_MAX_COLOR_ATTACHMENTS ? job->pbe_reg_words[i][w] : 0);
+   } else if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g4p)) {
       /* The A8's PBE words, Rogue's pbe_word[8][3]: target 0's REG_WORD0/1, then the empty pair Apple writes for
        * every unused target; word 2 is 0 (the kernel copies words 0-1 to W+0x118 + 16 i) */
       for (unsigned i = 0; i < 8; i++) {

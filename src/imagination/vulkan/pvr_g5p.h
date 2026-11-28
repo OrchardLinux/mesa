@@ -260,6 +260,7 @@ struct pvr_g5p_job {
    bool skip_empty_tiles;
    bool enabled;
    bool a7_ta_only;             /* the A7, PVR_G3_GFX=ta: the geometry job alone (pvr_g3_gfx()) */
+   bool a7_clear;               /* the A7, PVR_G3_GFX=clear: Rogue background and end of tile (g5p_a7_clear()) */
 };
 
 /*
@@ -578,6 +579,12 @@ VkResult PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer,
                                     struct pvr_sub_cmd_gfx *sub_cmd,
                                     const struct pvr_renderpass_hwsetup_render *hw_render,
                                     struct pvr_render_job *job);
+struct pvr_pds_upload;
+struct pvr_suballoc_bo;
+void PVR_PER_ARCH(g5p_a7_dump)(const char *what, const void *code, unsigned size, unsigned temps);
+#   define pvr_g5p_a7_dump PVR_PER_ARCH(g5p_a7_dump)
+VkResult PVR_PER_ARCH(g5p_a7_kick)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_suballoc_bo *usc,
+                                   unsigned temps, struct pvr_pds_upload *out);
 uint32_t PVR_PER_ARCH(g5p_geom_stream)(const struct pvr_device *device,
                                        const struct pvr_render_job *job, uint8_t *buf,
                                        uint32_t size);

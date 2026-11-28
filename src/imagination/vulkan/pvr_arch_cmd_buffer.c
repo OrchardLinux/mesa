@@ -736,6 +736,8 @@ static VkResult pvr_sub_cmd_gfx_per_job_fragment_programs_create_and_upload(
    eot =
       pvr_usc_eot(device->pdevice->pco_ctx, &props, &device->pdevice->dev_info);
    usc_temp_count = pco_shader_data(eot)->common.temps;
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g3) && getenv("PVR_G3_DUMP"))
+      pvr_g5p_a7_dump("eot", pco_shader_binary_data(eot), pco_shader_binary_size(eot), usc_temp_count);
 
    result = pvr_cmd_buffer_upload_usc(cmd_buffer,
                                       pco_shader_binary_data(eot),
@@ -747,6 +749,11 @@ static VkResult pvr_sub_cmd_gfx_per_job_fragment_programs_create_and_upload(
 
    if (result != VK_SUCCESS)
       return result;
+
+   /* the A7 (PVR_G3_GFX=clear): the A8's DOUTU kick of the end of tile, its code at data + 0x20 (the render's
+    * g5p.eot[0..1]); no static pixel event program */
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g3))
+      return PVR_PER_ARCH(g5p_a7_kick)(cmd_buffer, usc_eot_program, usc_temp_count, pds_upload_out);
 
    pvr_pds_setup_doutu(&pixel_event_program.task_control,
                        usc_eot_program->dev_addr.addr,
@@ -1781,6 +1788,9 @@ static VkResult pvr_sub_cmd_gfx_job_init(const struct pvr_device_info *dev_info,
       result = pvr_arch_g5p_job_init(cmd_buffer, sub_cmd, hw_render, job);
       if (result != VK_SUCCESS)
          return result;
+   }
+   /* the A7's clear render (g5p_a7_clear()) takes upstream's PBE words and end of tile below */
+   if (PVR_HAS_FEATURE(dev_info, apple_g5p) && !job->g5p.a7_clear) {
    } else
    if (PVR_HAS_FEATURE(dev_info, apple_g9p)) {
       result = pvr_arch_g9p_job_init(cmd_buffer, hw_render, job);
@@ -1842,6 +1852,11 @@ static VkResult pvr_sub_cmd_gfx_job_init(const struct pvr_device_info *dev_info,
          /* Configure the job view state */
          job->view_state.view[view_idx].pds_pixel_event_data_offset =
             pds_pixel_event_program.data_offset;
+         /* the A7's render (g5p_a7_clear()): its end of tile is that kick */
+         if (PVR_HAS_FEATURE(dev_info, apple_g3) && job->g5p.a7_clear) {
+            job->g5p.eot[0] = pds_pixel_event_program.data_offset;
+            job->g5p.eot[1] = pds_pixel_event_program.code_offset;
+         }
       }
 
       job->z_only_render = !hw_render->eot_surface_count &&
