@@ -261,6 +261,7 @@ struct pvr_g5p_job {
    bool enabled;
    bool a7_ta_only;             /* the A7, PVR_G3_GFX=ta: the geometry job alone (pvr_g3_gfx()) */
    bool a7_clear;               /* the A7, PVR_G3_GFX=clear: Rogue background and end of tile (g5p_a7_clear()) */
+   bool a7_pbe_a8;              /* the A7, PVR_G3_A7_PBE=a8: the A8's PBE register words (diagnostics) */
 };
 
 /*

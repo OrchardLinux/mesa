@@ -739,9 +739,13 @@ static VkResult pvr_sub_cmd_gfx_per_job_fragment_programs_create_and_upload(
    if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g3) && getenv("PVR_G3_DUMP"))
       pvr_g5p_a7_dump("eot", pco_shader_binary_data(eot), pco_shader_binary_size(eot), usc_temp_count);
 
+   /* the A7, diagnostics (overlay 7): PVR_G3_A7_EOT=nop runs a nop.end as the end of tile */
+   static const uint8_t a7_nop_end[8] = { 0x04, 0x80, 0xee, 0x00, 0xf2, 0xff, 0xff, 0xff };
+   const bool a7_eot_nop = PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g3) && getenv("PVR_G3_A7_EOT") &&
+                           !strcmp(getenv("PVR_G3_A7_EOT"), "nop");
    result = pvr_cmd_buffer_upload_usc(cmd_buffer,
-                                      pco_shader_binary_data(eot),
-                                      pco_shader_binary_size(eot),
+                                      a7_eot_nop ? (const void *)a7_nop_end : pco_shader_binary_data(eot),
+                                      a7_eot_nop ? sizeof(a7_nop_end) : pco_shader_binary_size(eot),
                                       4,
                                       &usc_eot_program);
 
