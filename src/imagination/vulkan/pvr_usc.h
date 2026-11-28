@@ -48,6 +48,9 @@ struct pvr_tq_props {};
 
 pco_shader *pvr_usc_tq(pco_ctx *ctx, struct pvr_tq_props *props);
 
+/* The Apple A7's background program: output register 0 = packed (pvr_usc.c) */
+pco_shader *pvr_usc_a7_clear(pco_ctx *ctx, const uint32_t *words, unsigned count);
+
 /* Legacy transfer queue and loadop shader gen. */
 enum pvr_int_coord_set_floats {
    PVR_INT_COORD_SET_FLOATS_0 = 0,

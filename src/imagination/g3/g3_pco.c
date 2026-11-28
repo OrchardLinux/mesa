@@ -13,12 +13,13 @@
  *    after every st (pco_schedule()), and on the A7 stores write-through, the
  *    only cache mode that ran. g3_pco_check() refuses a 4-byte (extended) st;
  *    compute/tools/a7dec.py checks the rest on the bytes;
- *  - no bitwise groups: pco's bitwise encoding does not parse the bitwise
- *    groups of Apple's A7 or Imagination's 6XT programs (compute/R7.md). Shifts
- *    left by a constant become multiplies, 32-bit constants outside Rogue's
- *    table (0..31) come from the unified store (a pool the PDS writes), and
- *    anything else that needs a bitwise group (other shifts, and/or/xor, ..)
- *    is refused after grouping;
+ *  - bitwise groups in the three shapes the a7-cdm R8 rungs ran on the J71
+ *    (and/or/xor, lsl/shr, a 32-bit immediate; g3_bitwise_why_not()), with the
+ *    phase-0 bit Apple's A7 programs set (pco_igrp_a7_phase0_bit(); the A7
+ *    also runs them without it, r8pand0). PVR_G3_BITWISE=0 refuses them.
+ *    Shifts left by a constant still become multiplies, and 32-bit constants
+ *    outside Rogue's table (0..31) come from the unified store (a pool the PDS
+ *    writes);
  *  - inputs: no coefficient registers, no common (shared) store. Everything a
  *    shader reads comes from the unified store, written by the kernel's PDS
  *    program (g3_pds_code()): vi0 = the workgroup ID along x (CPU-folded, one
@@ -27,7 +28,10 @@
  *    k's address, then the constant pool. Shaders use them through
  *    load_vtxin_pco.
  *
- * Refused by name: shared memory, barriers, atomics, push constants, uniform
+ *  - threadgroup memory in a buffer slice per workgroup, barriers removed,
+ *    storage-buffer and threadgroup atomics as the dma atomic (lower_shmem());
+ *
+ * Refused by name: compare-exchange atomics, push constants, uniform
  * buffers, images, textures, subgroup operations, buffer sizes, spilling and
  * scratch, workgroups other than Nx1x1 with N <= 32.
  */
@@ -164,6 +168,63 @@ lower_sysvals(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return true;
 }
 
+/*
+ * Threadgroup memory on the A7: a buffer slice per workgroup (g3_cmd_dispatch() allocates shmem_size bytes a
+ * workgroup; the PDS writes the slice's address, G3_PDS_SHMEM), accessed with the ld/st/wdf and dma atomic forms
+ * that ran on the J71: r9stld (a ld sees the lane's own st), r9xlane (lanes 0-15 see lanes 16-31's st of the
+ * previous group, no barrier), r9atomadd (32 lanes' atomic add, distinct old values). pco would put it in
+ * coefficient registers with indexed access (not run); the buffer needs no new form.
+ * Barriers: a workgroup is one task of at most 32 instances that run each group together, and every st is
+ * followed by its wdf (pco_schedule()), so a barrier needs no instruction (r9xlane); they are removed.
+ */
+struct shmem_state {
+   unsigned reg;    /* the slice address's unified register pair */
+   bool failed;
+   struct g3_program *p;
+};
+
+static bool
+lower_shmem(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   struct shmem_state *st = data;
+   b->cursor = nir_before_instr(&intr->instr);
+   switch (intr->intrinsic) {
+   case nir_intrinsic_barrier:
+      nir_instr_remove(&intr->instr);
+      return true;
+   case nir_intrinsic_load_shared:
+   case nir_intrinsic_store_shared:
+   case nir_intrinsic_shared_atomic:
+      break;
+   case nir_intrinsic_shared_atomic_swap:
+      st->failed = !refuse(st->p, "a threadgroup compare-exchange (pco emulates it under a mutex: not built)");
+      return false;
+   default:
+      return false;
+   }
+   const bool store = intr->intrinsic == nir_intrinsic_store_shared;
+   nir_def *off = nir_iadd_imm(b, intr->src[store ? 1 : 0].ssa, nir_intrinsic_base(intr));
+   nir_def *base = vtxin(b, st->reg, 2);
+   /* no carry: the slices lie in one buffer that does not cross 4 GiB (the general heap, pvr_device.c) */
+   nir_def *addr = nir_vec2(b, nir_iadd(b, nir_channel(b, base, 0), off), nir_channel(b, base, 1));
+   if (store) {
+      nir_store_global_2x32(b, intr->src[0].ssa, addr, .write_mask = nir_intrinsic_write_mask(intr),
+                            .align_mul = nir_intrinsic_align_mul(intr),
+                            .align_offset = nir_intrinsic_align_offset(intr));
+      nir_instr_remove(&intr->instr);
+   } else if (intr->intrinsic == nir_intrinsic_load_shared) {
+      nir_def *v = nir_load_global_2x32(b, intr->def.num_components, intr->def.bit_size, addr,
+                                        .align_mul = nir_intrinsic_align_mul(intr),
+                                        .align_offset = nir_intrinsic_align_offset(intr));
+      nir_def_replace(&intr->def, v);
+   } else {
+      nir_def *v = nir_global_atomic_2x32(b, intr->def.bit_size, addr, intr->src[1].ssa,
+                                          .atomic_op = nir_intrinsic_atomic_op(intr));
+      nir_def_replace(&intr->def, v);
+   }
+   return true;
+}
+
 /* pco's instance check (pco_nir_compute_instance_check()) is lane < local size: always true here, as the CDM
  * starts only local size instances (KERNEL8 size_x; the 16-lane rungs ran with 16 stores) */
 static bool
@@ -202,10 +263,10 @@ fix_load_global(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 }
 
 /*
- * pco encodes shifts, logical ops and 32-bit immediates in bitwise groups, whose encoding does not parse Apple's or
- * Imagination's Series6/6XT bitwise groups (compute/R7.md): on the A7 none is emitted. A shift left by a constant
- * becomes a multiply (main ALU), and every 32-bit constant outside Rogue's constant table (0..31) comes from the
- * unified store (the pool after the buffers, written by the PDS). Other bitwise work is refused after grouping.
+ * pco encodes shifts, logical ops and 32-bit immediates in bitwise groups, none of which has run on the A7 yet
+ * (g3_bitwise_why_not()). A shift left by a constant becomes a multiply (main ALU), and every 32-bit constant
+ * outside Rogue's constant table (0..31) comes from the unified store (the pool after the buffers, written by the
+ * PDS). Other bitwise work is checked after grouping.
  */
 struct pool_state {
    struct g3_program *p;
@@ -300,6 +361,8 @@ check_intrinsics(nir_shader *nir, struct g3_program *p)
             switch (in->intrinsic) {
             case nir_intrinsic_load_global_2x32:
             case nir_intrinsic_store_global_2x32:
+            /* the dma atomic (r9atomadd ran add; the op is a field of the same form) */
+            case nir_intrinsic_global_atomic_pco:
             case nir_intrinsic_load_vtxin_pco:
             case nir_intrinsic_decl_reg:
             case nir_intrinsic_load_reg:
@@ -315,8 +378,44 @@ check_intrinsics(nir_shader *nir, struct g3_program *p)
 }
 
 /*
- * The A7's rules on the final program (after grouping): no bitwise group, no
- * 4-byte (tiled/extended) st, a wdf right after every st.
+ * The bitwise group shapes the a7-cdm R8 rungs test (compute/R8.md), with the A7's phase-0 bit: pco's O_LOGICAL
+ * (phase 0 bypass of s2, phase 1 and/or/xor with s3, no masks; r8pand/r8pxor), O_SHIFT (phase 0 bypass of s1,
+ * phase 2 lsl/shr by s4, no test; r8pshl/r8pshr) and O_MOVI32 (phase 0 imm32; r8pimm). NULL if allowed, else why not.
+ */
+static const char *
+g3_bitwise_why_not(const pco_igrp *igrp)
+{
+   const pco_instr *p0 = igrp->instrs[PCO_OP_PHASE_0], *p1 = igrp->instrs[PCO_OP_PHASE_1],
+                   *p2 = igrp->instrs[PCO_OP_PHASE_2];
+   const char *env = getenv("PVR_G3_BITWISE");
+   if (env && !strcmp(env, "0"))
+      return "PVR_G3_BITWISE=0";
+   if (!p0)
+      return "no phase 0";
+   if (p0->op == PCO_OP_BBYP0BM_IMM32 && !p1 && !p2)
+      return NULL;
+   if (p0->op == PCO_OP_BBYP0S1 && p1 && !p2 && p1->op == PCO_OP_LOGICAL) {
+      const enum pco_logiop op = pco_instr_get_mod(p1, PCO_OP_MOD_LOGIOP);
+      if (op != PCO_LOGIOP_OR && op != PCO_LOGIOP_AND && op != PCO_LOGIOP_XOR)
+         return "a logical op other than or/and/xor";
+      if (!pco_ref_is_null(p1->src[0]) || !pco_ref_is_null(p1->src[2]))
+         return "a masked logical op";
+      return NULL;
+   }
+   if (p0->op == PCO_OP_BBYP0BM && !p1 && p2 && p2->op == PCO_OP_SHIFT) {
+      const enum pco_shiftop op = pco_instr_get_mod(p2, PCO_OP_MOD_SHIFTOP);
+      if (op != PCO_SHIFTOP_LSL && op != PCO_SHIFTOP_SHR)
+         return "a shift other than lsl/shr";
+      if (!pco_ref_is_null(p2->src[2]))
+         return "a shift with a test source";
+      return NULL;
+   }
+   return "a bitwise shape the R8 rungs do not test";
+}
+
+/*
+ * The A7's rules on the final program (after grouping): bitwise groups only in
+ * the R8 shapes, no 4-byte (tiled/extended) st, a wdf right after every st.
  */
 static bool
 g3_pco_check(pco_shader *s, struct g3_program *p)
@@ -324,12 +423,12 @@ g3_pco_check(pco_shader *s, struct g3_program *p)
    pco_foreach_func_in_shader (func, s) {
       pco_foreach_block_in_func (block, func) {
          pco_foreach_igrp_in_block (igrp, block) {
-            if (igrp->hdr.alutype == PCO_ALUTYPE_BITWISE) {
+            const char *why = igrp->hdr.alutype == PCO_ALUTYPE_BITWISE ? g3_bitwise_why_not(igrp) : NULL;
+            if (why) {
                const pco_instr *bi = igrp->instrs[PCO_OP_PHASE_0] ? igrp->instrs[PCO_OP_PHASE_0]
                                      : igrp->instrs[PCO_OP_PHASE_1] ? igrp->instrs[PCO_OP_PHASE_1]
                                                                     : igrp->instrs[PCO_OP_PHASE_2];
-               return refuse(p, "a bitwise group (%s; pco's bitwise encoding does not parse the A7-era groups, "
-                             "compute/R7.md)", bi ? pco_op_info[bi->op].str : "?");
+               return refuse(p, "a bitwise group (%s: %s)", bi ? pco_op_info[bi->op].str : "?", why);
             }
             /* the A7's test op is 3 bits (see trans_cmp()): no less/lequal, whose fourth bit it ignores */
             const pco_instr *tst =
@@ -377,14 +476,6 @@ g3_compile_pco(void *pco, struct nir_shader *nir, struct g3_program *out)
              nir->info.workgroup_size[1], nir->info.workgroup_size[2]);
       goto out;
    }
-   nir_foreach_variable_with_modes (var, nir, nir_var_mem_shared) {
-      refuse(out, "shared memory (Rogue keeps it in the common store; no common-store path on the A7 yet)");
-      goto out;
-   }
-   if (nir->info.shared_size) {
-      refuse(out, "shared memory (Rogue keeps it in the common store; no common-store path on the A7 yet)");
-      goto out;
-   }
    out->local_size = nir->info.workgroup_size[0];
    for (unsigned i = 0; i < 3; i++)
       data.cs.workgroup_size[i] = nir->info.workgroup_size[i];
@@ -402,6 +493,27 @@ g3_compile_pco(void *pco, struct nir_shader *nir, struct g3_program *out)
       goto out;
    NIR_PASS(_, nir, nir_opt_dce);
    {
+      /* threadgroup memory: a buffer slice per workgroup, barriers removed (lower_shmem()) */
+      NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_mem_shared, glsl_get_natural_size_align_bytes);
+      NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_shared, nir_address_format_32bit_offset);
+      out->shmem_size = ALIGN_POT(nir->info.shared_size, 16);
+      struct shmem_state ss = { .p = out };
+      if (out->shmem_size) {
+         if (out->num_buffers == G3_MAX_BUFFERS) {
+            refuse(out, "threadgroup memory and %u storage buffers", G3_MAX_BUFFERS);
+            goto out;
+         }
+         ss.reg = G3_PCO_BUFFER0 + 2 * out->num_buffers;
+         out->buffers[out->num_buffers].set = G3_SHMEM_SET;
+         out->buffers[out->num_buffers++].binding = 0;
+      }
+      NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_shmem, nir_metadata_control_flow, &ss);
+      if (ss.failed)
+         goto out;
+      nir->info.shared_size = 0;
+      NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_mem_shared, NULL);
+   }
+   {
       /* one pass both, so that NIR validates only the fixed loads */
       bool progress = false;
       nir_lower_explicit_io(nir, nir_var_mem_ssbo, nir_address_format_2x32bit_global);
@@ -412,7 +524,7 @@ g3_compile_pco(void *pco, struct nir_shader *nir, struct g3_program *out)
    pco_lower_nir(ctx, nir, &data);
    pco_postprocess_nir(ctx, nir, &data);
    {
-      /* no bitwise groups on the A7 (see shl_to_mul()) */
+      /* as few bitwise groups as possible on the A7 (see shl_to_mul()) */
       struct pool_state ps = { .p = out, .base = G3_PCO_BUFFER0 + 2 * out->num_buffers };
       nir_shader_instructions_pass(nir, shl_to_mul, nir_metadata_control_flow, NULL);
       nir_shader_instructions_pass(nir, lower_min, nir_metadata_control_flow, NULL);
@@ -470,7 +582,8 @@ g3_compile_pco(void *pco, struct nir_shader *nir, struct g3_program *out)
    out->num_writes = 0;
    out->writes[out->num_writes++] = (struct g3_pds_write){ G3_PDS_WGID, 0, 0, G3_PCO_WGID };
    for (unsigned k = 0; k < out->num_buffers; k++)
-      out->writes[out->num_writes++] = (struct g3_pds_write){ G3_PDS_BUFFER, k, 0, G3_PCO_BUFFER0 + 2 * k };
+      out->writes[out->num_writes++] = (struct g3_pds_write){
+         out->buffers[k].set == G3_SHMEM_SET ? G3_PDS_SHMEM : G3_PDS_BUFFER, k, 0, G3_PCO_BUFFER0 + 2 * k };
    for (unsigned i = 0; i < out->num_pool; i += 2)
       out->writes[out->num_writes++] =
          (struct g3_pds_write){ G3_PDS_POOL, 0, i / 2, G3_PCO_BUFFER0 + 2 * out->num_buffers + i };

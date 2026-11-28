@@ -16,6 +16,7 @@
  * PVR_G3_DUMP=1 logs each pipeline's USC and PDS code and each record.
  */
 #include <inttypes.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -211,6 +212,23 @@ PVR_PER_ARCH(g3_cmd_dispatch)(struct pvr_cmd_buffer *cmd, struct pvr_sub_cmd_com
          return result;
    }
    for (unsigned k = 0; p->pco && k < p->num_buffers; k++) {
+      if (p->buffers[k].set == G3_SHMEM_SET) {
+         /* threadgroup memory: shmem_size bytes for each workgroup ID up to the last (g3_pco.c lower_shmem()) */
+         const uint64_t size = (uint64_t)p->shmem_size * (base_group[0] + group_count[0]);
+         if (size > (1u << 20))
+            return vk_errorf(cmd, VK_ERROR_FEATURE_NOT_PRESENT, "A7 compute: %" PRIu64 " bytes of threadgroup "
+                             "memory in one dispatch (at most 1 MiB)", size);
+         void *zero = calloc(1, size);
+         struct pvr_suballoc_bo *bo;
+         if (!zero)
+            return vk_error(cmd, VK_ERROR_OUT_OF_HOST_MEMORY);
+         result = pvr_arch_cmd_buffer_upload_general(cmd, zero, size, &bo);
+         free(zero);
+         if (result != VK_SUCCESS)
+            return result;
+         buffer[k] = bo->dev_addr.addr;
+         continue;
+      }
       result = g3_buffer_address(cmd, p->buffers[k].set, p->buffers[k].binding, &buffer[k]);
       if (result != VK_SUCCESS)
          return result;

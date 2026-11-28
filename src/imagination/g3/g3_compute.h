@@ -69,7 +69,11 @@ enum g3_pds_src {
    G3_PDS_WGID,      /* 64 bits: {workgroup ID x, workgroup count x} (g3_pco.c) */
    G3_PDS_BUFFER,    /* 64 bits: buffer[store]'s address (g3_pco.c: store is the buffer index) */
    G3_PDS_POOL,      /* 64 bits: pool[2 * pair], pool[2 * pair + 1] (g3_pco.c's constants) */
+   G3_PDS_SHMEM,     /* 64 bits: buffer[store] + shmem_size * wgid: the workgroup's threadgroup memory */
 };
+
+/* g3_program.buffers[] entry that is the dispatch's threadgroup memory, not a descriptor (g3_pco.c) */
+#define G3_SHMEM_SET 0xff
 
 /* One DOUTW of the kernel's PDS program into unified register ao */
 struct g3_pds_write {
@@ -104,6 +108,7 @@ struct g3_program {
    unsigned entry_offset;  /* the entry point's offset in code */
    unsigned num_pool;      /* 32-bit constants outside Rogue's table 0..31, from the unified store */
    uint32_t pool[G3_MAX_POOL];
+   unsigned shmem_size;    /* threadgroup memory bytes per workgroup, in a buffer the dispatch allocates */
    unsigned num_buffers;
    struct {
       uint8_t set, binding;

@@ -64,6 +64,9 @@
 #include "vk_alloc.h"
 #include "vk_blend.h"
 #include "vk_format.h"
+#include "pvr_job_common.h"
+#include "pvr_iface.h"
+#include "util/format/u_format.h"
 #include "vk_internal_exts.h"
 #include "vk_graphics_state.h"
 #include "vk_log.h"
@@ -1313,7 +1316,8 @@ pvr_graphics_pipeline_destroy(struct pvr_device *const device,
    struct pvr_fragment_shader_state *fragment_state =
       &gfx_pipeline->shader_state.fragment;
 
-   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p)) {
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p) &&
+       !pvr_g3_tri(PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g3))) {
       /* G5P: the programs of pvr_arch_g5p_graphics_pipeline_compile() */
       pvr_arch_g5p_graphics_pipeline_destroy(device, gfx_pipeline);
       pvr_pipeline_finish(device, &gfx_pipeline->base);
@@ -2016,6 +2020,56 @@ static void pvr_alloc_fs_varyings(pco_data *data, nir_shader *nir)
                      false,
                      0,
                      ROGUE_USC_COEFFICIENT_SET_SIZE);
+}
+
+/*
+ * The A7 (pvr_g3_tri()): without usc_f16sop_u8 upstream's PBE state takes an 8-bit target's source as F16 per
+ * channel (pvr_arch_pbe_get_src_format_and_gamma()), while pco would pack the output to the 8-bit format: give pco
+ * F16 outputs for those (the A7 clear wrote F16 pairs and the PBE stored them right: overlay 8).
+ */
+static void g3_fs_outputs_f16(pco_data *data)
+{
+   for (unsigned l = FRAG_RESULT_DATA0; l < FRAG_RESULT_DATA0 + PVR_MAX_COLOR_ATTACHMENTS; l++) {
+      const enum pipe_format pf = data->fs.output_formats[l];
+      if (pf == PIPE_FORMAT_NONE)
+         continue;
+      const VkFormat vf = vk_format_from_pipe_format(pf);
+      uint32_t src;
+      enum pvr_pbe_gamma gamma;
+      pvr_arch_pbe_get_src_format_and_gamma(vf, PVR_PBE_GAMMA_NONE, false, &src, &gamma);
+      if (src == ROGUE_PBESTATE_SOURCE_FORMAT_F16_PER_CHANNEL && util_format_get_blocksizebits(pf) <= 32)
+         data->fs.output_formats[l] = PIPE_FORMAT_R16G16B16A16_FLOAT;
+   }
+}
+
+/* The A7: the fragment shader's fs_meta (sample mask, colour write enables, alpha to coverage/one) as the static
+ * default instead of a shared register the PDS would DMA (the common-store input path is not trusted on the A7) */
+static bool g3_fs_meta_const(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_fs_meta_pco)
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   const uint32_t meta = 0xffffu << PVR_FS_META_SAMPLE_MASK_OFFSET | 0xffu << PVR_FS_META_COLOR_WRITE_ENABLE_OFFSET;
+   nir_def_replace(&intr->def, nir_imm_int(b, meta));
+   return true;
+}
+
+/* The A7: pco's min tests "less" in its own encoding, which the A7's 3-bit test op lacks (g3_pco.c lower_min());
+ * a select of a comparison instead, which pco's trans_cmp() swaps on the A7 */
+static bool g3_lower_min(nir_builder *b, nir_instr *instr, void *data)
+{
+   if (instr->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+   if (alu->op != nir_op_imin && alu->op != nir_op_umin && alu->op != nir_op_fmin)
+      return false;
+   b->cursor = nir_before_instr(instr);
+   nir_def *x = nir_mov_alu(b, alu->src[0], alu->def.num_components);
+   nir_def *y = nir_mov_alu(b, alu->src[1], alu->def.num_components);
+   nir_def *lt = alu->op == nir_op_imin ? nir_ilt(b, x, y) : alu->op == nir_op_umin ? nir_ult(b, x, y)
+                                                                                     : nir_flt(b, x, y);
+   nir_def_replace(&alu->def, nir_bcsel(b, lt, x, y));
+   return true;
 }
 
 static void
@@ -3131,7 +3185,8 @@ pvr_graphics_pipeline_compile(struct pvr_device *const device,
    struct usc_mrt_setup mrt_setup = { 0 };
 
    /* G5P: its own compile, the G5P backend from NIR (pvr_arch_g5p_gfx.c) */
-   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p))
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p) &&
+       !pvr_g3_tri(PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g3)))
       return pvr_arch_g5p_graphics_pipeline_compile(device, pCreateInfo, gfx_pipeline,
                                                     state);
    if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g9p))
@@ -3223,6 +3278,9 @@ pvr_graphics_pipeline_compile(struct pvr_device *const device,
                                  nir_shaders[stage],
                                  pCreateInfo,
                                  device);
+      /* the A7 (pvr_g3_tri()): the device reports the Apple paths' subgroup size 1, which pco does not take */
+      if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g3))
+         nir_shaders[stage]->info.api_subgroup_size = 0;
       pco_preprocess_nir(pco_ctx, nir_shaders[stage], &shader_data[stage]);
    }
 
@@ -3282,15 +3340,30 @@ pvr_graphics_pipeline_compile(struct pvr_device *const device,
                nir_pvr_lower_ycbcr_tex,
                lookup_ycbcr_conversion,
                &ycbcr_state);
+      const bool a7 = PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g3);
+      if (a7 && stage == MESA_SHADER_FRAGMENT)
+         g3_fs_outputs_f16(&shader_data[stage]);
       pco_lower_nir(pco_ctx, nir_shaders[stage], &shader_data[stage]);
+      if (a7 && stage == MESA_SHADER_FRAGMENT)
+         NIR_PASS(_, nir_shaders[stage], nir_shader_intrinsics_pass, g3_fs_meta_const, nir_metadata_control_flow,
+                  NULL);
 
       pco_postprocess_nir(pco_ctx, nir_shaders[stage], &shader_data[stage]);
+      if (a7)
+         NIR_PASS(_, nir_shaders[stage], nir_shader_instructions_pass, g3_lower_min, nir_metadata_control_flow,
+                  NULL);
 
       pvr_postprocess_shader_data(&shader_data[stage],
                                   nir_shaders[stage],
                                   pCreateInfo,
                                   layout,
                                   &mrt_setup);
+      /* the A7: no fs_meta shared register (g3_fs_meta_const()), so no PDS DMA of it */
+      if (a7 && stage == MESA_SHADER_FRAGMENT && shader_data[stage].fs.meta.count) {
+         if (shader_data[stage].fs.meta.start + 1 == shader_data[stage].common.shareds)
+            shader_data[stage].common.shareds--;
+         shader_data[stage].fs.meta.count = 0;
+      }
    }
 
    if (!pCreateInfo->renderPass)
@@ -3344,6 +3417,13 @@ pvr_graphics_pipeline_compile(struct pvr_device *const device,
                                           vtx_dma_descriptions,
                                           &vtx_dma_count);
 
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g3) && getenv("PVR_G3_DUMP")) {
+      pvr_g5p_a7_dump("vs", pco_shader_binary_data(*vs), pco_shader_binary_size(*vs),
+                      pco_shader_data(*vs)->common.temps);
+      if (*fs)
+         pvr_g5p_a7_dump("fs", pco_shader_binary_data(*fs), pco_shader_binary_size(*fs),
+                         pco_shader_data(*fs)->common.temps);
+   }
    result = pvr_gpu_upload_usc(device,
                                pco_shader_binary_data(*vs),
                                pco_shader_binary_size(*vs),

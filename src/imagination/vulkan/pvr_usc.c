@@ -182,6 +182,36 @@ pco_shader *pvr_usc_eot(pco_ctx *ctx,
 }
 
 /**
+ * The Apple A7's background (clear) program for one target: output registers 0..count-1 = the colour words as
+ * immediates (the packed colour, or F16 pairs when the PBE takes F16 per channel) (pco's movi32, a bitwise group that ran on the A7: a7-cdm r8pimm). No shared registers,
+ * so its PDS kick needs no DOUTD (the common-store input path has wedged the A7's firmware once).
+ *
+ * \param ctx PCO context.
+ * \param words The colour in the PBE's source format: one packed dword, or two dwords of F16 pairs.
+ * \param count 1 or 2.
+ * \return The background shader.
+ */
+pco_shader *pvr_usc_a7_clear(pco_ctx *ctx, const uint32_t *words, unsigned count)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT, pco_nir_options(), "a7clear");
+   pco_data data = { 0 };
+   static const enum pipe_format fmt[] = { PIPE_FORMAT_R32_UINT, PIPE_FORMAT_R32G32_UINT };
+   nir_def *v[2];
+
+   assert(count >= 1 && count <= 2);
+   for (unsigned i = 0; i < count; i++)
+      v[i] = nir_imm_int(&b, words[i]);
+   data.fs.output_formats[FRAG_RESULT_DATA0] = fmt[count - 1];
+   data.fs.outputs[FRAG_RESULT_DATA0] = (pco_range){ .start = 0, .count = count };
+   nir_create_variable_with_location(b.shader, nir_var_shader_out, FRAG_RESULT_DATA0, glsl_uvec_type(count));
+   nir_store_output(&b, nir_vec(&b, v, count), nir_imm_int(&b, 0), .base = 0, .component = 0,
+                    .src_type = nir_type_uint32, .write_mask = BITFIELD_MASK(count),
+                    .io_semantics.location = FRAG_RESULT_DATA0, .io_semantics.num_slots = 1);
+   nir_jump(&b, nir_jump_return);
+   return build_shader(ctx, b.shader, &data);
+}
+
+/**
  * Generate a transfer queue shader.
  *
  * \param ctx PCO context.

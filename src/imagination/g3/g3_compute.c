@@ -366,6 +366,9 @@ g3_pds_data(const struct g3_program *p, uint32_t usc_offset, const uint64_t *buf
       case G3_PDS_BUFFER:
          v = buffer[w->store];
          break;
+      case G3_PDS_SHMEM:
+         v = buffer[w->store] + (uint64_t)p->shmem_size * wgid;
+         break;
       case G3_PDS_POOL:
          v = p->pool[2 * w->pair] | (uint64_t)(2 * w->pair + 1 < p->num_pool ? p->pool[2 * w->pair + 1] : 0) << 32;
          break;

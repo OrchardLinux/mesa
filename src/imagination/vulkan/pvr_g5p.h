@@ -259,7 +259,30 @@ struct pvr_g5p_job {
    bool msaa_resolve;           /* 4x: the PBE resolves target 0 into a one-sample view */
    bool skip_empty_tiles;
    bool enabled;
+   bool a7_ta_only;             /* the A7, PVR_G3_GFX=ta: the geometry job alone (pvr_g3_gfx()) */
+   bool a7_clear;               /* the A7, PVR_G3_GFX=clear: Rogue background and end of tile (g5p_a7_clear()) */
+   bool a7_pbe_a8;              /* the A7, PVR_G3_A7_PBE=a8: the A8's PBE register words (diagnostics) */
 };
+
+/*
+ * The A7 (apple_g3): render jobs are not built unless PVR_G3_GFX is set (GRAPHICS-PLAN.md phase B, rung g0):
+ * "ta" admits a render pass and submits its geometry job alone, with the TA state program a Rogue nop.end
+ * (pvr_arch_g5p.c); no background, end of tile or fragment job, no graphics pipeline. NULL when unset.
+ */
+static inline const char *pvr_g3_gfx(void)
+{
+   const char *v = getenv("PVR_G3_GFX");
+   return v && *v ? v : NULL;
+}
+
+/* The A7, PVR_G3_GFX=tri (rung g2): graphics pipelines and draws take upstream's Rogue path (pco vertex and
+ * fragment shaders, Rogue PDS programs, PPP state) instead of G5P's agx1 one; the job, streams, background and
+ * end of tile stay the A7's (g5p_a7_clear()). has_g3 is PVR_HAS_FEATURE(dev_info, apple_g3). */
+static inline bool pvr_g3_tri(bool has_g3)
+{
+   const char *v = pvr_g3_gfx();
+   return has_g3 && v && !strcmp(v, "tri");
+}
 
 /* ---- graphics (pvr_arch_g5p_gfx.c, pvr_g5p_nir.c) ---- */
 
@@ -566,6 +589,12 @@ VkResult PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer,
                                     struct pvr_sub_cmd_gfx *sub_cmd,
                                     const struct pvr_renderpass_hwsetup_render *hw_render,
                                     struct pvr_render_job *job);
+struct pvr_pds_upload;
+struct pvr_suballoc_bo;
+void PVR_PER_ARCH(g5p_a7_dump)(const char *what, const void *code, unsigned size, unsigned temps);
+#   define pvr_g5p_a7_dump PVR_PER_ARCH(g5p_a7_dump)
+VkResult PVR_PER_ARCH(g5p_a7_kick)(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_suballoc_bo *usc,
+                                   unsigned temps, struct pvr_pds_upload *out);
 uint32_t PVR_PER_ARCH(g5p_geom_stream)(const struct pvr_device *device,
                                        const struct pvr_render_job *job, uint8_t *buf,
                                        uint32_t size);

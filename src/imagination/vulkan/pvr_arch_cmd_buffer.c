@@ -736,10 +736,16 @@ static VkResult pvr_sub_cmd_gfx_per_job_fragment_programs_create_and_upload(
    eot =
       pvr_usc_eot(device->pdevice->pco_ctx, &props, &device->pdevice->dev_info);
    usc_temp_count = pco_shader_data(eot)->common.temps;
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g3) && getenv("PVR_G3_DUMP"))
+      pvr_g5p_a7_dump("eot", pco_shader_binary_data(eot), pco_shader_binary_size(eot), usc_temp_count);
 
+   /* the A7, diagnostics (overlay 7): PVR_G3_A7_EOT=nop runs a nop.end as the end of tile */
+   static const uint8_t a7_nop_end[8] = { 0x04, 0x80, 0xee, 0x00, 0xf2, 0xff, 0xff, 0xff };
+   const bool a7_eot_nop = PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g3) && getenv("PVR_G3_A7_EOT") &&
+                           !strcmp(getenv("PVR_G3_A7_EOT"), "nop");
    result = pvr_cmd_buffer_upload_usc(cmd_buffer,
-                                      pco_shader_binary_data(eot),
-                                      pco_shader_binary_size(eot),
+                                      a7_eot_nop ? (const void *)a7_nop_end : pco_shader_binary_data(eot),
+                                      a7_eot_nop ? sizeof(a7_nop_end) : pco_shader_binary_size(eot),
                                       4,
                                       &usc_eot_program);
 
@@ -747,6 +753,11 @@ static VkResult pvr_sub_cmd_gfx_per_job_fragment_programs_create_and_upload(
 
    if (result != VK_SUCCESS)
       return result;
+
+   /* the A7 (PVR_G3_GFX=clear): the A8's DOUTU kick of the end of tile, its code at data + 0x20 (the render's
+    * g5p.eot[0..1]); no static pixel event program */
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g3))
+      return PVR_PER_ARCH(g5p_a7_kick)(cmd_buffer, usc_eot_program, usc_temp_count, pds_upload_out);
 
    pvr_pds_setup_doutu(&pixel_event_program.task_control,
                        usc_eot_program->dev_addr.addr,
@@ -1781,6 +1792,9 @@ static VkResult pvr_sub_cmd_gfx_job_init(const struct pvr_device_info *dev_info,
       result = pvr_arch_g5p_job_init(cmd_buffer, sub_cmd, hw_render, job);
       if (result != VK_SUCCESS)
          return result;
+   }
+   /* the A7's clear render (g5p_a7_clear()) takes upstream's PBE words and end of tile below */
+   if (PVR_HAS_FEATURE(dev_info, apple_g5p) && !job->g5p.a7_clear) {
    } else
    if (PVR_HAS_FEATURE(dev_info, apple_g9p)) {
       result = pvr_arch_g9p_job_init(cmd_buffer, hw_render, job);
@@ -1842,6 +1856,11 @@ static VkResult pvr_sub_cmd_gfx_job_init(const struct pvr_device_info *dev_info,
          /* Configure the job view state */
          job->view_state.view[view_idx].pds_pixel_event_data_offset =
             pds_pixel_event_program.data_offset;
+         /* the A7's render (g5p_a7_clear()): its end of tile is that kick */
+         if (PVR_HAS_FEATURE(dev_info, apple_g3) && job->g5p.a7_clear) {
+            job->g5p.eot[0] = pds_pixel_event_program.data_offset;
+            job->g5p.eot[1] = pds_pixel_event_program.code_offset;
+         }
       }
 
       job->z_only_render = !hw_render->eot_surface_count &&
@@ -2151,6 +2170,9 @@ static VkResult pvr_sub_cmd_gfx_job_init(const struct pvr_device_info *dev_info,
              PVR_SUB_CMD_TYPE_GRAPHICS);
       job->geometry_terminate = true;
       job->run_frag = true;
+      /* the A7, rung g0: the geometry job alone (pvr_g3_gfx()) */
+      if (PVR_HAS_FEATURE(dev_info, apple_g3) && job->g5p.a7_ta_only)
+         job->run_frag = false;
    }
 
    /* TODO: Enable pixel merging when it's safe to do. */
@@ -2956,7 +2978,7 @@ VkResult pvr_arch_cmd_buffer_start_sub_cmd(struct pvr_cmd_buffer *cmd_buffer,
    /* The A7 (apple-a7.h): compute only. Its render and transfer jobs would run the A8's Apple-agx1 USC
     * programs, which the A7 (Rogue) cannot execute; they are not built (g5p_upload_programs()). */
    if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g3) &&
-       (type == PVR_SUB_CMD_TYPE_GRAPHICS || type == PVR_SUB_CMD_TYPE_TRANSFER)) {
+       ((type == PVR_SUB_CMD_TYPE_GRAPHICS && !pvr_g3_gfx()) || type == PVR_SUB_CMD_TYPE_TRANSFER)) {
       mesa_logw("pvr/g3: a %s command refused: the A7 driver is compute only",
                 type == PVR_SUB_CMD_TYPE_GRAPHICS ? "render" : "transfer");
       return vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
@@ -9775,7 +9797,8 @@ void PVR_PER_ARCH(CmdDraw)(VkCommandBuffer commandBuffer,
 
    PVR_TRACE_BEGIN_DRAW(cmd_buffer, PVR_DRAW);
 
-   if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g5p)) {
+   if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g5p) &&
+       !pvr_g3_tri(PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g3))) {
       /* G5P: the draw's VDM/PPP words and programs (pvr_arch_g5p_gfx.c) */
       const struct pvr_g5p_draw g5p_draw = {
          .count = vertexCount,
@@ -9864,7 +9887,8 @@ void PVR_PER_ARCH(CmdDrawIndexed)(VkCommandBuffer commandBuffer,
 
    PVR_TRACE_BEGIN_DRAW(cmd_buffer, PVR_DRAW_INDEXED);
 
-   if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g5p)) {
+   if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g5p) &&
+       !pvr_g3_tri(PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g3))) {
       /* G5P: the draw with an index list (pvr_arch_g5p_vertex.c) */
       result = pvr_flush_push_descriptors(cmd_buffer, &cmd_buffer->state.gfx_desc_state);
       if (result == VK_SUCCESS)

@@ -73,6 +73,8 @@ static unsigned pco_encode_igrp(struct util_dynarray *buf, pco_igrp *igrp)
    pco_foreach_phase_in_igrp_rev (igrp, p) {
       ptr = util_dynarray_grow(buf, uint8_t, igrp->enc.len.instrs[p]);
       bytes_encoded += pco_instr_map_encode(ptr, igrp, p);
+      if (pco_igrp_a7_phase0_bit(igrp, p))
+         ptr[0] |= PCO_A7_PHASE0_BIT;
    }
 
    /* I/O. */
