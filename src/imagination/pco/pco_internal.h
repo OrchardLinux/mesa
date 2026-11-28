@@ -1592,6 +1592,20 @@ static inline bool pco_igrp_a7_short_src(const pco_igrp *igrp, bool upper)
                  : igrp->variant.lower_src == PCO_SRC_1LO_3B11I_2M);
 }
 
+/**
+ * \brief On the A7 a bitwise group's phase-0 instruction byte has bit 7 set
+ * (Imagination's old Rogue compiler: "phase0", rogue_isa.h); pco writes 0.
+ * Apple's A7 programs (ds.A7, ten bitwise groups in four programs) and
+ * Imagination's Series6 pvr_cdm_load_sr decode end to end only with it.
+ */
+#define PCO_A7_PHASE0_BIT 0x80
+
+static inline bool pco_igrp_a7_phase0_bit(const pco_igrp *igrp, unsigned phase)
+{
+   return pco_igrp_is_a7(igrp) && igrp->hdr.alutype == PCO_ALUTYPE_BITWISE &&
+          phase == PCO_OP_PHASE_0;
+}
+
 static inline pco_igrp *pco_first_igrp(pco_block *block)
 {
    if (list_is_empty(&block->instrs))

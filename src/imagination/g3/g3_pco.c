@@ -13,12 +13,14 @@
  *    after every st (pco_schedule()), and on the A7 stores write-through, the
  *    only cache mode that ran. g3_pco_check() refuses a 4-byte (extended) st;
  *    compute/tools/a7dec.py checks the rest on the bytes;
- *  - no bitwise groups: pco's bitwise encoding does not parse the bitwise
- *    groups of Apple's A7 or Imagination's 6XT programs (compute/R7.md). Shifts
- *    left by a constant become multiplies, 32-bit constants outside Rogue's
- *    table (0..31) come from the unified store (a pool the PDS writes), and
- *    anything else that needs a bitwise group (other shifts, and/or/xor, ..)
- *    is refused after grouping;
+ *  - bitwise groups: pco's encoding plus the A7's phase-0 bit
+ *    (pco_igrp_a7_phase0_bit()), with which Apple's A7 and Imagination's
+ *    Series6 bitwise groups decode. Not yet run on the A7: they are refused
+ *    unless PVR_G3_BITWISE=1, and then only in the three shapes the a7-cdm R8
+ *    rungs test (and/or/xor, lsl/shr, a 32-bit immediate; g3_bitwise_why_not()).
+ *    Shifts left by a constant still become multiplies, and 32-bit constants
+ *    outside Rogue's table (0..31) come from the unified store (a pool the PDS
+ *    writes);
  *  - inputs: no coefficient registers, no common (shared) store. Everything a
  *    shader reads comes from the unified store, written by the kernel's PDS
  *    program (g3_pds_code()): vi0 = the workgroup ID along x (CPU-folded, one
@@ -202,10 +204,10 @@ fix_load_global(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 }
 
 /*
- * pco encodes shifts, logical ops and 32-bit immediates in bitwise groups, whose encoding does not parse Apple's or
- * Imagination's Series6/6XT bitwise groups (compute/R7.md): on the A7 none is emitted. A shift left by a constant
- * becomes a multiply (main ALU), and every 32-bit constant outside Rogue's constant table (0..31) comes from the
- * unified store (the pool after the buffers, written by the PDS). Other bitwise work is refused after grouping.
+ * pco encodes shifts, logical ops and 32-bit immediates in bitwise groups, none of which has run on the A7 yet
+ * (g3_bitwise_why_not()). A shift left by a constant becomes a multiply (main ALU), and every 32-bit constant
+ * outside Rogue's constant table (0..31) comes from the unified store (the pool after the buffers, written by the
+ * PDS). Other bitwise work is checked after grouping.
  */
 struct pool_state {
    struct g3_program *p;
@@ -315,8 +317,43 @@ check_intrinsics(nir_shader *nir, struct g3_program *p)
 }
 
 /*
- * The A7's rules on the final program (after grouping): no bitwise group, no
- * 4-byte (tiled/extended) st, a wdf right after every st.
+ * The bitwise group shapes the a7-cdm R8 rungs test (compute/R8.md), with the A7's phase-0 bit: pco's O_LOGICAL
+ * (phase 0 bypass of s2, phase 1 and/or/xor with s3, no masks; r8pand/r8pxor), O_SHIFT (phase 0 bypass of s1,
+ * phase 2 lsl/shr by s4, no test; r8pshl/r8pshr) and O_MOVI32 (phase 0 imm32; r8pimm). NULL if allowed, else why not.
+ */
+static const char *
+g3_bitwise_why_not(const pco_igrp *igrp)
+{
+   const pco_instr *p0 = igrp->instrs[PCO_OP_PHASE_0], *p1 = igrp->instrs[PCO_OP_PHASE_1],
+                   *p2 = igrp->instrs[PCO_OP_PHASE_2];
+   if (!getenv("PVR_G3_BITWISE"))
+      return "not yet run on the A7 (PVR_G3_BITWISE=1 admits the R8 shapes)";
+   if (!p0)
+      return "no phase 0";
+   if (p0->op == PCO_OP_BBYP0BM_IMM32 && !p1 && !p2)
+      return NULL;
+   if (p0->op == PCO_OP_BBYP0S1 && p1 && !p2 && p1->op == PCO_OP_LOGICAL) {
+      const enum pco_logiop op = pco_instr_get_mod(p1, PCO_OP_MOD_LOGIOP);
+      if (op != PCO_LOGIOP_OR && op != PCO_LOGIOP_AND && op != PCO_LOGIOP_XOR)
+         return "a logical op other than or/and/xor";
+      if (!pco_ref_is_null(p1->src[0]) || !pco_ref_is_null(p1->src[2]))
+         return "a masked logical op";
+      return NULL;
+   }
+   if (p0->op == PCO_OP_BBYP0BM && !p1 && p2 && p2->op == PCO_OP_SHIFT) {
+      const enum pco_shiftop op = pco_instr_get_mod(p2, PCO_OP_MOD_SHIFTOP);
+      if (op != PCO_SHIFTOP_LSL && op != PCO_SHIFTOP_SHR)
+         return "a shift other than lsl/shr";
+      if (!pco_ref_is_null(p2->src[2]))
+         return "a shift with a test source";
+      return NULL;
+   }
+   return "a bitwise shape the R8 rungs do not test";
+}
+
+/*
+ * The A7's rules on the final program (after grouping): bitwise groups only in
+ * the R8 shapes, no 4-byte (tiled/extended) st, a wdf right after every st.
  */
 static bool
 g3_pco_check(pco_shader *s, struct g3_program *p)
@@ -324,12 +361,12 @@ g3_pco_check(pco_shader *s, struct g3_program *p)
    pco_foreach_func_in_shader (func, s) {
       pco_foreach_block_in_func (block, func) {
          pco_foreach_igrp_in_block (igrp, block) {
-            if (igrp->hdr.alutype == PCO_ALUTYPE_BITWISE) {
+            const char *why = igrp->hdr.alutype == PCO_ALUTYPE_BITWISE ? g3_bitwise_why_not(igrp) : NULL;
+            if (why) {
                const pco_instr *bi = igrp->instrs[PCO_OP_PHASE_0] ? igrp->instrs[PCO_OP_PHASE_0]
                                      : igrp->instrs[PCO_OP_PHASE_1] ? igrp->instrs[PCO_OP_PHASE_1]
                                                                     : igrp->instrs[PCO_OP_PHASE_2];
-               return refuse(p, "a bitwise group (%s; pco's bitwise encoding does not parse the A7-era groups, "
-                             "compute/R7.md)", bi ? pco_op_info[bi->op].str : "?");
+               return refuse(p, "a bitwise group (%s: %s)", bi ? pco_op_info[bi->op].str : "?", why);
             }
             /* the A7's test op is 3 bits (see trans_cmp()): no less/lequal, whose fourth bit it ignores */
             const pco_instr *tst =
@@ -412,7 +449,7 @@ g3_compile_pco(void *pco, struct nir_shader *nir, struct g3_program *out)
    pco_lower_nir(ctx, nir, &data);
    pco_postprocess_nir(ctx, nir, &data);
    {
-      /* no bitwise groups on the A7 (see shl_to_mul()) */
+      /* as few bitwise groups as possible on the A7 (see shl_to_mul()) */
       struct pool_state ps = { .p = out, .base = G3_PCO_BUFFER0 + 2 * out->num_buffers };
       nir_shader_instructions_pass(nir, shl_to_mul, nir_metadata_control_flow, NULL);
       nir_shader_instructions_pass(nir, lower_min, nir_metadata_control_flow, NULL);
