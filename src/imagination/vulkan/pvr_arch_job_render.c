@@ -725,7 +725,19 @@ VkResult pvr_arch_render_target_dataset_create(
    } else if (PVR_HAS_FEATURE(dev_info, apple_g5p)) {
       /* Apple G5P: the list holds no pages (the kernel owns the parameter
        * manager's memory); the device's one list says how large the pool
-       * is (pvr_arch_g5p_device_init()). */
+       * is (pvr_arch_g5p_device_init()).
+       *
+       * The A7 (apple_g3) sets apple_g5p too and takes this branch, also for
+       * the dummy render target that vkCreateDevice builds
+       * (pvr_device_dummy_rt_init()). So pvr_arch_g5p_device_init() must
+       * create device->g5p->free_list on the A7, even though it builds none
+       * of the A8's programs there. If it does not, local_free_list is NULL
+       * and pvr_rt_get_mlist_size() reads ->size at address 0x8. That
+       * happened on 2026-11-28 in a7-vk-smoke under drm-shim (SIGSEGV,
+       * SEGV_MAPERR at 0x8, inside vkCreateDevice), with uncommitted A7 work
+       * that later became the pvr/g3 commits; rebuilds minutes later got
+       * past device creation. The assert in pvr_rt_get_mlist_size() is
+       * compiled out in release builds, so nothing catches this earlier. */
       rt_dataset->local_free_list = device->g5p->free_list;
       result = VK_SUCCESS;
    } else {

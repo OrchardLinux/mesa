@@ -431,6 +431,10 @@ g5p_upload_programs(struct pvr_device *device, struct pvr_g5p_programs *p)
    if (p->halt.code_offset != p->halt.data_offset + 16)
       return vk_errorf(device, VK_ERROR_INITIALIZATION_FAILED, "G5P: the HALT's code is at data + %#x, not + 0x10",
                        p->halt.code_offset - p->halt.data_offset);
+   /* The A7 (apple-a7.h): the HALT is the compute job's context program; every program below is Apple-agx1
+    * USC (or kicks one) for render jobs, which the A7 refuses. None of it is built. */
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g3))
+      return VK_SUCCESS;
 
    /* The A8 builds the forms captured on it: one colour target, one sample, no LOAD (its texture sample
     * is not decoded); the others stay unbuilt and their passes are refused by name */

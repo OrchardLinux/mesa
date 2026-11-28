@@ -220,6 +220,8 @@ struct pvr_compute_pipeline {
    struct pvr_pipeline base;
 
    struct pvr_g9p_compute_state g9p;
+   /* the Apple A7's program (pvr_arch_g3_compute.c), apple_g3 only */
+   struct g3_program *g3;
 
    pco_data cs_data;
 

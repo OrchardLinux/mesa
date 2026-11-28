@@ -33,6 +33,8 @@
 #include "pvr_g5p_a8_fetch.h"
 #include "pvr_g5p_shader_dump.h"
 #include "pvr_g5p_compute.h"
+#include "pvr_g3_compute.h"
+#include "g3_compute.h"
 #include "pvr_job_context.h"
 #include "pvr_winsys.h"
 #define G9P_KERNEL_DATA_DWORDS 8
@@ -72,6 +74,9 @@ PVR_PER_ARCH(g5p_compute_pipeline_compile)(
    const VkComputePipelineCreateInfo *create_info,
    struct pvr_compute_pipeline *pipeline)
 {
+   /* the A7: its own USC (g3/g3_compute.c), never the A8/A9 compilers' Apple-agx1 code */
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g3))
+      return pvr_arch_g3_compute_pipeline_compile(device, create_info, pipeline);
    struct pvr_g9p_compute_state *state = &pipeline->g9p;
    state->a9_compute_log = pvr_g5p_compute_log();
    pvr_g5p_shader_id(&create_info->stage, state->a9_pipeline_id);
@@ -340,6 +345,8 @@ PVR_PER_ARCH(g5p_cmd_dispatch)(struct pvr_cmd_buffer *cmd_buffer,
    unsigned bind_dwords, ctrl0, nc = 0;
    VkResult result;
 
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g3))
+      return pvr_refusal_to_api(pvr_arch_g3_cmd_dispatch(cmd_buffer, sub_cmd, indirect_va, base_group, group_count));
    if (state->a9_compute_log) {
       result = g5p_record_dispatch(cmd_buffer, sub_cmd, indirect_va, indirect_offset, group_count);
       if (result != VK_SUCCESS) return result;
@@ -896,12 +903,19 @@ g5p_compute_end_pass_g4p(struct pvr_cmd_buffer *cmd, struct pvr_sub_cmd_compute 
 {
    struct pvr_pds_upload kick, fence;
    sub->g5p_kernel_since_end = false;
-   /* the empty USC program: a branch to END, padded to 64 bytes (upload_cdm_task) */
+   /* the empty USC program: a branch to END, padded to 64 bytes (upload_cdm_task); on the A7 Rogue's
+    * nop.end, the empty program that ran there (g3_usc_nop_end) */
    uint8_t usc[128] = {0};
-   unsigned at = g5p_usc_branch(usc, 64, false);
-   while (at < 64)
-      at += g5p_usc_special(usc + at, false);
-   at += g5p_usc_special(usc + at, true);
+   unsigned at;
+   if (PVR_HAS_FEATURE(&cmd->device->pdevice->dev_info, apple_g3)) {
+      memcpy(usc, g3_usc_nop_end, sizeof(g3_usc_nop_end));
+      at = sizeof(g3_usc_nop_end);
+   } else {
+      at = g5p_usc_branch(usc, 64, false);
+      while (at < 64)
+         at += g5p_usc_special(usc + at, false);
+      at += g5p_usc_special(usc + at, true);
+   }
    struct pvr_suballoc_bo *bo;
    VkResult r = pvr_gpu_upload_usc(cmd->device, usc, ALIGN_POT(at, 64), 64, &bo);
    if (r != VK_SUCCESS) return r;

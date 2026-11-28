@@ -58,6 +58,17 @@ Where the A8 differs and this driver has no A8 form yet, it refuses by
 name: texture samples other than the narrow implicit-LOD 2D one (`sample_g4p()`),
 several colour targets, integer targets, 4x, LOAD.
 
+## The A7
+
+The Apple A7's GPU (S5L8960X, BVNC 1.70.4.3, `common/device_info/apple-a7.h`)
+sets `apple_g5p`, `apple_g4p` and `apple_g3`: it takes the A8's job, stream,
+CDM, PDS and memory glue, which the kernel runs for it unchanged, but its
+shader ISA is Rogue (Apple's `agx0`), not this backend's. With `apple_g3` no
+program of this backend is built or run: compute goes to `g3/g3_compute.c`
+(a narrow store-only backend on pco's encoders with the A7's deltas), the A8's
+end of pass kicks Rogue's nop.end, and render, transfer and query work is
+refused by name.
+
 ## Origin
 
 The A9 driver is Berkay Kösebay's: the shader backend, the state packing, the

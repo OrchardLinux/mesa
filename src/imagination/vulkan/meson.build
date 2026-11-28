@@ -154,6 +154,7 @@ endif
 common_per_arch_files += files(
   'pvr_arch_g5p.c',
   'pvr_arch_g5p_compute.c',
+  'pvr_arch_g3_compute.c',
   'pvr_arch_g5p_query.c',
   'pvr_arch_g5p_blend.c',
   'pvr_arch_g5p_gfx.c',
@@ -182,6 +183,9 @@ pvr_files += files(
   'pvr_g5p_vertex_nir.c',
 )
 pvr_includes += inc_powervr_g5p
+# the A7 (G3): its compute backend
+pvr_includes += inc_powervr_g3
+pvr_deps += [idep_powervr_g3]
 # pvr_arch_g5p.c builds its PDS programs with pdsc (the A9 ICD's way)
 pvr_includes += inc_powervr_pdsc
 pvr_deps += [idep_powervr_g5p]

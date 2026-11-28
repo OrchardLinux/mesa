@@ -4,15 +4,22 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <errno.h>
+#include <inttypes.h>
 #include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/mman.h>
 #include <stdint.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "common/pvr_device_info.h"
 #include "drm-shim/drm_shim.h"
 #include "drm-uapi/pvr_drm.h"
 #include "hwdef/rogue_hw_utils.h"
 #include "util/macros.h"
+#include "util/u_math.h"
 #include "util/u_debug.h"
 
 #define DEFAULT_DEVICE_BVNC PVR_BVNC_PACK(36, 53, 104, 796)
@@ -279,11 +286,52 @@ static const struct drm_pvr_heap pvr_heaps[DRM_PVR_HEAP_COUNT] = {
    },
 };
 
+/*
+ * The Apple A7/A8 (has_apple_g4p): the kernel's Apple glue reports the A8's
+ * heaps (t7000_heaps in pvr_apple_s8003.c), with one code base for PDS and
+ * USC, so USC offsets in DOUTU count from the PDS heap. Emulate them so a
+ * shimmed A7 or A8 builds the same code addresses as the device.
+ */
+static const struct drm_pvr_heap pvr_heaps_apple_g4p[DRM_PVR_HEAP_COUNT] = {
+   [DRM_PVR_HEAP_GENERAL] = {
+      .base = UINT64_C(0x100000000),
+      .size = UINT64_C(0xf0000000),
+      .page_size_log2 = 12,
+   },
+   [DRM_PVR_HEAP_PDS_CODE_DATA] = {
+      .base = UINT64_C(0x300000000),
+      .size = UINT64_C(0x10000000),
+      .page_size_log2 = 12,
+   },
+   [DRM_PVR_HEAP_USC_CODE] = {
+      .base = UINT64_C(0x380000000),
+      .size = UINT64_C(0x10000000),
+      .page_size_log2 = 12,
+   },
+   [DRM_PVR_HEAP_RGNHDR] = {
+      .base = UINT64_C(0x500000000),
+      .size = UINT64_C(0x10000000),
+      .page_size_log2 = 12,
+   },
+   [DRM_PVR_HEAP_VIS_TEST] = {
+      .base = UINT64_C(0x580000000),
+      .size = UINT64_C(0x10000000),
+      .page_size_log2 = 12,
+   },
+   [DRM_PVR_HEAP_TRANSFER_FRAG] = {
+      .base = UINT64_C(0x600000000),
+      .size = UINT64_C(0x10000000),
+      .page_size_log2 = 12,
+   },
+};
+
 static int
 pvr_dev_query_heap_info_get(struct drm_pvr_ioctl_dev_query_args *args)
 {
    struct drm_pvr_dev_query_heap_info *heap_info =
       (struct drm_pvr_dev_query_heap_info *)args->pointer;
+   const struct drm_pvr_heap *heaps =
+      PVR_HAS_FEATURE(&device_info, apple_g4p) ? pvr_heaps_apple_g4p : pvr_heaps;
 
    if (!heap_info)
       goto dev_query_heap_info_set_size;
@@ -298,8 +346,25 @@ pvr_dev_query_heap_info_get(struct drm_pvr_ioctl_dev_query_args *args)
       heap_info->heaps.count = ARRAY_SIZE(pvr_heaps);
 
    memcpy((void *)heap_info->heaps.array,
-          pvr_heaps,
+          heaps,
           heap_info->heaps.stride * heap_info->heaps.count);
+
+   /* The winsys requires each heap's page size to be the CPU's: it asserts
+    * so in pvr_drm_setup_heaps() ("winsys_heaps[i]->page_size ==
+    * drm_ws->base.page_size"). The tables above say 4 KiB, which is the
+    * device's, but the shim runs on the build host, and on a 16 KiB-page
+    * host (Asahi on Apple Silicon) the fixed 4 KiB killed every Vulkan
+    * program at instance/device enumeration, before any job: vulkaninfo
+    * --summary died with that assert on 2026-11-28 (core dump signal
+    * SIGTRAP). So report the CPU's page size in every heap; this changes
+    * only alignment, not the heap bases that set the code addresses.
+    */
+   for (unsigned i = 0; i < heap_info->heaps.count; i++) {
+      struct drm_pvr_heap *h =
+         (struct drm_pvr_heap *)((uint8_t *)(uintptr_t)heap_info->heaps.array +
+                                 i * heap_info->heaps.stride);
+      h->page_size_log2 = util_logbase2(getpagesize());
+   }
 
 dev_query_heap_info_set_size:
    args->size = sizeof(*heap_info);
@@ -434,6 +499,149 @@ pvr_ioctl_get_bo_mmap_offset(int fd, UNUSED unsigned long request, void *arg)
    return 0;
 }
 
+/*
+ * PVR_SHIM_A7_EMU=COMMAND: run each compute job through an external emulator
+ * (the A7 bring-up's a7emu.py) instead of dropping it. The shim keeps the
+ * VM_MAP table, writes a dump of the job (its firmware stream and every
+ * mapped range) to a file and runs "COMMAND DUMP WRITES"; the emulator
+ * writes the job's stores as (u64 device address, u32 value) pairs to WRITES,
+ * which the shim applies to the mapped memory. A failing emulator fails the
+ * submission (-EIO).
+ */
+struct pvr_shim_mapping {
+   uint64_t device_addr, size;
+   uint8_t *host;
+};
+
+static struct pvr_shim_mapping *shim_maps;
+static unsigned shim_num_maps, shim_max_maps;
+static unsigned shim_job_count;
+
+static int
+pvr_ioctl_vm_map(int fd, UNUSED unsigned long request, void *arg)
+{
+   struct drm_pvr_ioctl_vm_map_args *args = arg;
+   struct shim_fd *shim_fd = drm_shim_fd_lookup(fd);
+
+   if (!getenv("PVR_SHIM_A7_EMU"))
+      return 0;
+   struct shim_bo *bo = drm_shim_bo_lookup(shim_fd, args->handle);
+   if (!bo)
+      return -EINVAL;
+   uint8_t *host = drm_shim_mmap(shim_fd, bo->size, PROT_READ | PROT_WRITE, MAP_SHARED, -1,
+                                 drm_shim_bo_get_mmap_offset(shim_fd, bo));
+   drm_shim_bo_put(bo);
+   if (host == MAP_FAILED)
+      return -ENOMEM;
+   if (shim_num_maps == shim_max_maps) {
+      shim_max_maps = MAX2(16, 2 * shim_max_maps);
+      shim_maps = realloc(shim_maps, shim_max_maps * sizeof(*shim_maps));
+   }
+   shim_maps[shim_num_maps++] = (struct pvr_shim_mapping){
+      args->device_addr, args->size, host + args->offset,
+   };
+   return 0;
+}
+
+static int
+pvr_ioctl_vm_unmap(UNUSED int fd, UNUSED unsigned long request, void *arg)
+{
+   struct drm_pvr_ioctl_vm_unmap_args *args = arg;
+
+   for (unsigned i = 0; i < shim_num_maps; i++) {
+      if (shim_maps[i].device_addr == args->device_addr) {
+         shim_maps[i] = shim_maps[--shim_num_maps];
+         break;
+      }
+   }
+   return 0;
+}
+
+static uint8_t *
+shim_host(uint64_t va, uint64_t size)
+{
+   for (unsigned i = 0; i < shim_num_maps; i++) {
+      if (va >= shim_maps[i].device_addr && va + size <= shim_maps[i].device_addr + shim_maps[i].size)
+         return shim_maps[i].host + (va - shim_maps[i].device_addr);
+   }
+   return NULL;
+}
+
+/* dump: "A7EMU1\0\0", u32 stream length, stream, u32 ranges, then (u64 va, u64 size, bytes) each */
+static int
+shim_emulate(const struct drm_pvr_job *job)
+{
+   const char *emu = getenv("PVR_SHIM_A7_EMU");
+   const char *dir = getenv("PVR_SHIM_A7_EMU_DIR") ? getenv("PVR_SHIM_A7_EMU_DIR") : "/tmp";
+   char dump[256], writes[256], cmd[1024];
+   const unsigned n = shim_job_count++;
+
+   snprintf(dump, sizeof(dump), "%s/a7emu-job%u.bin", dir, n);
+   snprintf(writes, sizeof(writes), "%s/a7emu-job%u.out", dir, n);
+   FILE *f = fopen(dump, "wb");
+   if (!f)
+      return -EIO;
+   const uint32_t len = job->cmd_stream_len, count = shim_num_maps;
+   fwrite("A7EMU1\0\0", 1, 8, f);
+   fwrite(&len, 4, 1, f);
+   fwrite((const void *)(uintptr_t)job->cmd_stream, 1, len, f);
+   fwrite(&count, 4, 1, f);
+   for (unsigned i = 0; i < shim_num_maps; i++) {
+      fwrite(&shim_maps[i].device_addr, 8, 1, f);
+      fwrite(&shim_maps[i].size, 8, 1, f);
+      fwrite(shim_maps[i].host, 1, shim_maps[i].size, f);
+   }
+   fclose(f);
+   snprintf(cmd, sizeof(cmd), "%s %s %s 1>&2", emu, dump, writes);
+   const int rc = system(cmd);
+   if (rc) {
+      fprintf(stderr, "pvr-drm-shim: emulator failed (%d) on job %u\n", rc, n);
+      return -EIO;
+   }
+   f = fopen(writes, "rb");
+   if (!f)
+      return -EIO;
+   uint64_t va;
+   uint32_t v;
+   unsigned applied = 0;
+   while (fread(&va, 8, 1, f) == 1 && fread(&v, 4, 1, f) == 1) {
+      uint8_t *p = shim_host(va, 4);
+      if (!p) {
+         fprintf(stderr, "pvr-drm-shim: emulated store to unmapped %#" PRIx64 "\n", va);
+         fclose(f);
+         return -EIO;
+      }
+      memcpy(p, &v, 4);
+      applied++;
+   }
+   fclose(f);
+   if (!getenv("PVR_SHIM_A7_EMU_KEEP")) {
+      unlink(dump);
+      unlink(writes);
+   }
+   return 0;
+}
+
+static int
+pvr_ioctl_submit_jobs(UNUSED int fd, UNUSED unsigned long request, void *arg)
+{
+   const struct drm_pvr_ioctl_submit_jobs_args *args = arg;
+
+   if (!getenv("PVR_SHIM_A7_EMU"))
+      return 0;
+   for (unsigned i = 0; i < args->jobs.count; i++) {
+      struct drm_pvr_job job = { 0 };
+      memcpy(&job, (const uint8_t *)(uintptr_t)args->jobs.array + i * args->jobs.stride,
+             MIN2(sizeof(job), args->jobs.stride));
+      if (job.type != DRM_PVR_JOB_TYPE_COMPUTE)
+         continue;
+      const int r = shim_emulate(&job);
+      if (r)
+         return r;
+   }
+   return 0;
+}
+
 #define PVR_IOC_NR(_name) (_IOC_NR(DRM_IOCTL_PVR_##_name) - DRM_COMMAND_BASE)
 
 static ioctl_fn_t driver_ioctls[] = {
@@ -442,15 +650,15 @@ static ioctl_fn_t driver_ioctls[] = {
    [PVR_IOC_NR(GET_BO_MMAP_OFFSET)] = pvr_ioctl_get_bo_mmap_offset,
    [PVR_IOC_NR(CREATE_VM_CONTEXT)] = pvr_ioctl_noop,
    [PVR_IOC_NR(DESTROY_VM_CONTEXT)] = pvr_ioctl_noop,
-   [PVR_IOC_NR(VM_MAP)] = pvr_ioctl_noop,
-   [PVR_IOC_NR(VM_UNMAP)] = pvr_ioctl_noop,
+   [PVR_IOC_NR(VM_MAP)] = pvr_ioctl_vm_map,
+   [PVR_IOC_NR(VM_UNMAP)] = pvr_ioctl_vm_unmap,
    [PVR_IOC_NR(CREATE_CONTEXT)] = pvr_ioctl_noop,
    [PVR_IOC_NR(DESTROY_CONTEXT)] = pvr_ioctl_noop,
    [PVR_IOC_NR(CREATE_FREE_LIST)] = pvr_ioctl_noop,
    [PVR_IOC_NR(DESTROY_FREE_LIST)] = pvr_ioctl_noop,
    [PVR_IOC_NR(CREATE_HWRT_DATASET)] = pvr_ioctl_noop,
    [PVR_IOC_NR(DESTROY_HWRT_DATASET)] = pvr_ioctl_noop,
-   [PVR_IOC_NR(SUBMIT_JOBS)] = pvr_ioctl_noop,
+   [PVR_IOC_NR(SUBMIT_JOBS)] = pvr_ioctl_submit_jobs,
 };
 
 static unsigned count_elems(const char *str, const char *delims)
