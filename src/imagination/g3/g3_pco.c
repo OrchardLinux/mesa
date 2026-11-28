@@ -29,7 +29,10 @@
  *    k's address, then the constant pool. Shaders use them through
  *    load_vtxin_pco.
  *
- * Refused by name: shared memory, barriers, atomics, push constants, uniform
+ *  - threadgroup memory in a buffer slice per workgroup, barriers removed,
+ *    storage-buffer and threadgroup atomics as the dma atomic (lower_shmem());
+ *
+ * Refused by name: compare-exchange atomics, push constants, uniform
  * buffers, images, textures, subgroup operations, buffer sizes, spilling and
  * scratch, workgroups other than Nx1x1 with N <= 32.
  */
@@ -163,6 +166,63 @@ lower_sysvals(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    if (intr->def.bit_size != 32)
       return false;
    nir_def_replace(&intr->def, nir_trim_vector(b, v, intr->def.num_components));
+   return true;
+}
+
+/*
+ * Threadgroup memory on the A7: a buffer slice per workgroup (g3_cmd_dispatch() allocates shmem_size bytes a
+ * workgroup; the PDS writes the slice's address, G3_PDS_SHMEM), accessed with the ld/st/wdf and dma atomic forms
+ * that ran on the J71: r9stld (a ld sees the lane's own st), r9xlane (lanes 0-15 see lanes 16-31's st of the
+ * previous group, no barrier), r9atomadd (32 lanes' atomic add, distinct old values). pco would put it in
+ * coefficient registers with indexed access (not run); the buffer needs no new form.
+ * Barriers: a workgroup is one task of at most 32 instances that run each group together, and every st is
+ * followed by its wdf (pco_schedule()), so a barrier needs no instruction (r9xlane); they are removed.
+ */
+struct shmem_state {
+   unsigned reg;    /* the slice address's unified register pair */
+   bool failed;
+   struct g3_program *p;
+};
+
+static bool
+lower_shmem(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   struct shmem_state *st = data;
+   b->cursor = nir_before_instr(&intr->instr);
+   switch (intr->intrinsic) {
+   case nir_intrinsic_barrier:
+      nir_instr_remove(&intr->instr);
+      return true;
+   case nir_intrinsic_load_shared:
+   case nir_intrinsic_store_shared:
+   case nir_intrinsic_shared_atomic:
+      break;
+   case nir_intrinsic_shared_atomic_swap:
+      st->failed = !refuse(st->p, "a threadgroup compare-exchange (pco emulates it under a mutex: not built)");
+      return false;
+   default:
+      return false;
+   }
+   const bool store = intr->intrinsic == nir_intrinsic_store_shared;
+   nir_def *off = nir_iadd_imm(b, intr->src[store ? 1 : 0].ssa, nir_intrinsic_base(intr));
+   nir_def *base = vtxin(b, st->reg, 2);
+   /* no carry: the slices lie in one buffer that does not cross 4 GiB (the general heap, pvr_device.c) */
+   nir_def *addr = nir_vec2(b, nir_iadd(b, nir_channel(b, base, 0), off), nir_channel(b, base, 1));
+   if (store) {
+      nir_store_global_2x32(b, intr->src[0].ssa, addr, .write_mask = nir_intrinsic_write_mask(intr),
+                            .align_mul = nir_intrinsic_align_mul(intr),
+                            .align_offset = nir_intrinsic_align_offset(intr));
+      nir_instr_remove(&intr->instr);
+   } else if (intr->intrinsic == nir_intrinsic_load_shared) {
+      nir_def *v = nir_load_global_2x32(b, intr->def.num_components, intr->def.bit_size, addr,
+                                        .align_mul = nir_intrinsic_align_mul(intr),
+                                        .align_offset = nir_intrinsic_align_offset(intr));
+      nir_def_replace(&intr->def, v);
+   } else {
+      nir_def *v = nir_global_atomic_2x32(b, intr->def.bit_size, addr, intr->src[1].ssa,
+                                          .atomic_op = nir_intrinsic_atomic_op(intr));
+      nir_def_replace(&intr->def, v);
+   }
    return true;
 }
 
@@ -302,6 +362,8 @@ check_intrinsics(nir_shader *nir, struct g3_program *p)
             switch (in->intrinsic) {
             case nir_intrinsic_load_global_2x32:
             case nir_intrinsic_store_global_2x32:
+            /* the dma atomic (r9atomadd ran add; the op is a field of the same form) */
+            case nir_intrinsic_global_atomic_pco:
             case nir_intrinsic_load_vtxin_pco:
             case nir_intrinsic_decl_reg:
             case nir_intrinsic_load_reg:
@@ -414,14 +476,6 @@ g3_compile_pco(void *pco, struct nir_shader *nir, struct g3_program *out)
              nir->info.workgroup_size[1], nir->info.workgroup_size[2]);
       goto out;
    }
-   nir_foreach_variable_with_modes (var, nir, nir_var_mem_shared) {
-      refuse(out, "shared memory (Rogue keeps it in the common store; no common-store path on the A7 yet)");
-      goto out;
-   }
-   if (nir->info.shared_size) {
-      refuse(out, "shared memory (Rogue keeps it in the common store; no common-store path on the A7 yet)");
-      goto out;
-   }
    out->local_size = nir->info.workgroup_size[0];
    for (unsigned i = 0; i < 3; i++)
       data.cs.workgroup_size[i] = nir->info.workgroup_size[i];
@@ -438,6 +492,27 @@ g3_compile_pco(void *pco, struct nir_shader *nir, struct g3_program *out)
    if (st.failed)
       goto out;
    NIR_PASS(_, nir, nir_opt_dce);
+   {
+      /* threadgroup memory: a buffer slice per workgroup, barriers removed (lower_shmem()) */
+      NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_mem_shared, glsl_get_natural_size_align_bytes);
+      NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_shared, nir_address_format_32bit_offset);
+      out->shmem_size = ALIGN_POT(nir->info.shared_size, 16);
+      struct shmem_state ss = { .p = out };
+      if (out->shmem_size) {
+         if (out->num_buffers == G3_MAX_BUFFERS) {
+            refuse(out, "threadgroup memory and %u storage buffers", G3_MAX_BUFFERS);
+            goto out;
+         }
+         ss.reg = G3_PCO_BUFFER0 + 2 * out->num_buffers;
+         out->buffers[out->num_buffers].set = G3_SHMEM_SET;
+         out->buffers[out->num_buffers++].binding = 0;
+      }
+      NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_shmem, nir_metadata_control_flow, &ss);
+      if (ss.failed)
+         goto out;
+      nir->info.shared_size = 0;
+      NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_mem_shared, NULL);
+   }
    {
       /* one pass both, so that NIR validates only the fixed loads */
       bool progress = false;
@@ -507,7 +582,8 @@ g3_compile_pco(void *pco, struct nir_shader *nir, struct g3_program *out)
    out->num_writes = 0;
    out->writes[out->num_writes++] = (struct g3_pds_write){ G3_PDS_WGID, 0, 0, G3_PCO_WGID };
    for (unsigned k = 0; k < out->num_buffers; k++)
-      out->writes[out->num_writes++] = (struct g3_pds_write){ G3_PDS_BUFFER, k, 0, G3_PCO_BUFFER0 + 2 * k };
+      out->writes[out->num_writes++] = (struct g3_pds_write){
+         out->buffers[k].set == G3_SHMEM_SET ? G3_PDS_SHMEM : G3_PDS_BUFFER, k, 0, G3_PCO_BUFFER0 + 2 * k };
    for (unsigned i = 0; i < out->num_pool; i += 2)
       out->writes[out->num_writes++] =
          (struct g3_pds_write){ G3_PDS_POOL, 0, i / 2, G3_PCO_BUFFER0 + 2 * out->num_buffers + i };

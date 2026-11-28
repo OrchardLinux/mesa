@@ -433,12 +433,23 @@ g5p_upload_programs(struct pvr_device *device, struct pvr_g5p_programs *p)
                        p->halt.code_offset - p->halt.data_offset);
    /* The A7 (apple-a7.h): the HALT is the compute job's context program; every program below is Apple-agx1
     * USC (or kicks one) for render jobs, which the A7 cannot run. With PVR_G3_GFX (rung g0) it gets a Rogue TA
-    * state program instead: nop.end (04 80 ee 00 f2 ff ff ff, the A7 ran it as compute's empty task) behind the
-    * A8's DOUTU kick, and the pools the geometry stream names. No clear, end of tile or PDS DMA. */
+    * end-of-stream program behind the A8's DOUTU kick, and the pools the geometry stream names. No clear, end of
+    * tile or PDS DMA.
+    *
+    * The program: the A8/A9's is a task end that writes no output (g5p_usc_task_end(), agx1's UVSW end-task,
+    * pvr_arch_g5p_compute.c), so the Rogue one is pco's uvsw.endtask with the end flag (main header, backend op;
+    * pco_map.py O_UVSW_ENDTASK; 44 a0 80 04 00 00 00 ff). A plain nop.end (the first try) locked the TA on the J71
+    * (overlay 4, 28 Nov: firmware fault type 4, TA/3D watchdog, geometry submitted 1 done 0, PM taken 1 page).
+    * PVR_G3_TA_PROG=emit takes uvsw.emit.endtask, =nop the nop.end, for the rung's variants. */
    if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g3)) {
       if (!pvr_g3_gfx())
          return VK_SUCCESS;
-      uint8_t usc[64] = { 0x04, 0x80, 0xee, 0x00, 0xf2, 0xff, 0xff, 0xff };
+      const char *prog = getenv("PVR_G3_TA_PROG");
+      uint8_t usc[64] = { 0x44, 0xa0, 0x80, 0x04, 0x00, 0x00, 0x00, 0xff };
+      if (prog && !strcmp(prog, "emit"))
+         usc[3] = 0x05;
+      if (prog && !strcmp(prog, "nop"))
+         memcpy(usc, (const uint8_t[8]){ 0x04, 0x80, 0xee, 0x00, 0xf2, 0xff, 0xff, 0xff }, 8);
       result = pvr_gpu_upload_usc(device, usc, 8, 64, &p->ta_usc);
       if (result == VK_SUCCESS)
          result = g5p_upload_kick(device, p->ta_usc, 1, &p->ta_kick);
