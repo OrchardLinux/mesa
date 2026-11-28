@@ -432,9 +432,26 @@ g5p_upload_programs(struct pvr_device *device, struct pvr_g5p_programs *p)
       return vk_errorf(device, VK_ERROR_INITIALIZATION_FAILED, "G5P: the HALT's code is at data + %#x, not + 0x10",
                        p->halt.code_offset - p->halt.data_offset);
    /* The A7 (apple-a7.h): the HALT is the compute job's context program; every program below is Apple-agx1
-    * USC (or kicks one) for render jobs, which the A7 refuses. None of it is built. */
-   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g3))
-      return VK_SUCCESS;
+    * USC (or kicks one) for render jobs, which the A7 cannot run. With PVR_G3_GFX (rung g0) it gets a Rogue TA
+    * state program instead: nop.end (04 80 ee 00 f2 ff ff ff, the A7 ran it as compute's empty task) behind the
+    * A8's DOUTU kick, and the pools the geometry stream names. No clear, end of tile or PDS DMA. */
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g3)) {
+      if (!pvr_g3_gfx())
+         return VK_SUCCESS;
+      uint8_t usc[64] = { 0x04, 0x80, 0xee, 0x00, 0xf2, 0xff, 0xff, 0xff };
+      result = pvr_gpu_upload_usc(device, usc, 8, 64, &p->ta_usc);
+      if (result == VK_SUCCESS)
+         result = g5p_upload_kick(device, p->ta_usc, 1, &p->ta_kick);
+      if (result == VK_SUCCESS)
+         result = g5p_upload_zeroed(device, G5P_SCRATCH_BYTES, &p->scratch);
+      if (result == VK_SUCCESS)
+         result = g5p_upload_zeroed(device, G5P_NULL_RT_PITCH4 * G5P_NULL_RT_SIDE, &p->null_rt);
+      if (result == VK_SUCCESS)
+         result = g5p_upload_zeroed(device, G5P_SCISSOR_POOL_BYTES, &p->scissor_pool);
+      if (result == VK_SUCCESS)
+         result = g5p_upload_zeroed(device, G5P_DBIAS_POOL_BYTES, &p->dbias_pool);
+      return result;
+   }
 
    /* The A8 builds the forms captured on it: one colour target, one sample, no LOAD (its texture sample
     * is not decoded); the others stay unbuilt and their passes are refused by name */
@@ -827,6 +844,19 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
    VkResult vdm = pvr_arch_g5p_vdm_stream(cmd_buffer, &sub_cmd->control_stream, &g->vdm_va, &g->vdm_bytes);
    if (vdm != VK_SUCCESS)
       return vdm;
+
+   /* the A7, rung g0 (PVR_G3_GFX=ta): the geometry job alone; nothing below has Rogue programs yet */
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g3)) {
+      const char *gfx = pvr_g3_gfx();
+      if (!gfx || strcmp(gfx, "ta"))
+         return G5P_REFUSE(cmd_buffer, "an A7 render%s: only its geometry job is built (PVR_G3_GFX=ta)",
+                           gfx ? " with a fragment job" : "");
+      g->width = info->render_area.extent.width;
+      g->height = info->render_area.extent.height;
+      g->a7_ta_only = true;
+      g->enabled = true;
+      return VK_SUCCESS;
+   }
 
    /* targets: PBE words and clear colours */
    uint64_t pbe[G5P_MRT_MAX][3];

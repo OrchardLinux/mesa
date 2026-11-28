@@ -2151,6 +2151,9 @@ static VkResult pvr_sub_cmd_gfx_job_init(const struct pvr_device_info *dev_info,
              PVR_SUB_CMD_TYPE_GRAPHICS);
       job->geometry_terminate = true;
       job->run_frag = true;
+      /* the A7, rung g0: the geometry job alone (pvr_g3_gfx()) */
+      if (PVR_HAS_FEATURE(dev_info, apple_g3) && job->g5p.a7_ta_only)
+         job->run_frag = false;
    }
 
    /* TODO: Enable pixel merging when it's safe to do. */
@@ -2956,7 +2959,7 @@ VkResult pvr_arch_cmd_buffer_start_sub_cmd(struct pvr_cmd_buffer *cmd_buffer,
    /* The A7 (apple-a7.h): compute only. Its render and transfer jobs would run the A8's Apple-agx1 USC
     * programs, which the A7 (Rogue) cannot execute; they are not built (g5p_upload_programs()). */
    if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g3) &&
-       (type == PVR_SUB_CMD_TYPE_GRAPHICS || type == PVR_SUB_CMD_TYPE_TRANSFER)) {
+       ((type == PVR_SUB_CMD_TYPE_GRAPHICS && !pvr_g3_gfx()) || type == PVR_SUB_CMD_TYPE_TRANSFER)) {
       mesa_logw("pvr/g3: a %s command refused: the A7 driver is compute only",
                 type == PVR_SUB_CMD_TYPE_GRAPHICS ? "render" : "transfer");
       return vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_OUT_OF_HOST_MEMORY);

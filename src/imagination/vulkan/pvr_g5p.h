@@ -259,7 +259,19 @@ struct pvr_g5p_job {
    bool msaa_resolve;           /* 4x: the PBE resolves target 0 into a one-sample view */
    bool skip_empty_tiles;
    bool enabled;
+   bool a7_ta_only;             /* the A7, PVR_G3_GFX=ta: the geometry job alone (pvr_g3_gfx()) */
 };
+
+/*
+ * The A7 (apple_g3): render jobs are not built unless PVR_G3_GFX is set (GRAPHICS-PLAN.md phase B, rung g0):
+ * "ta" admits a render pass and submits its geometry job alone, with the TA state program a Rogue nop.end
+ * (pvr_arch_g5p.c); no background, end of tile or fragment job, no graphics pipeline. NULL when unset.
+ */
+static inline const char *pvr_g3_gfx(void)
+{
+   const char *v = getenv("PVR_G3_GFX");
+   return v && *v ? v : NULL;
+}
 
 /* ---- graphics (pvr_arch_g5p_gfx.c, pvr_g5p_nir.c) ---- */
 
