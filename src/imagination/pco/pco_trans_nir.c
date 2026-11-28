@@ -3396,6 +3396,16 @@ trans_cmp(trans_ctx *tctx, nir_op op, pco_ref dest, pco_ref src0, pco_ref src1)
    enum pco_tst_op_main tst_op_main = to_tst_op_main(op);
    enum pco_tst_type_main tst_type_main = to_tst_type_main(op, src0);
 
+   /* The A7 (Series6): its test op is 3 bits, the 6XT's 4-bit "less" (1000) and "lequal" (1001) read as zero and
+    * gzero there (on the J71 every a < b with a in 40..50 came out false). Test b > a or b >= a instead. */
+   if (PVR_HAS_FEATURE(tctx->pco_ctx->dev_info, apple_g3) &&
+       (tst_op_main == PCO_TST_OP_MAIN_LESS || tst_op_main == PCO_TST_OP_MAIN_LEQUAL)) {
+      tst_op_main = tst_op_main == PCO_TST_OP_MAIN_LESS ? PCO_TST_OP_MAIN_GREATER : PCO_TST_OP_MAIN_GEQUAL;
+      pco_ref t = src0;
+      src0 = src1;
+      src1 = t;
+   }
+
    return is_scmp(op)
              ? pco_scmp(&tctx->b, dest, src0, src1, .tst_op_main = tst_op_main)
              : pco_bcmp(&tctx->b,

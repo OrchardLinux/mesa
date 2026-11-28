@@ -40,6 +40,7 @@
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_builder.h"
 #include "pco.h"
+#include "pco_builder.h"
 #include "pco_internal.h"
 #include "util/macros.h"
 #include "util/ralloc.h"
@@ -227,6 +228,24 @@ shl_to_mul(nir_builder *b, nir_instr *instr, void *data)
    return true;
 }
 
+/* pco's min (O_MIN) tests "less" in its own encoding: as a select of a comparison, which trans_cmp() swaps */
+static bool
+lower_min(nir_builder *b, nir_instr *instr, void *data)
+{
+   if (instr->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+   if (alu->op != nir_op_imin && alu->op != nir_op_umin && alu->op != nir_op_fmin)
+      return false;
+   b->cursor = nir_before_instr(instr);
+   nir_def *x = nir_mov_alu(b, alu->src[0], alu->def.num_components);
+   nir_def *y = nir_mov_alu(b, alu->src[1], alu->def.num_components);
+   nir_def *lt = alu->op == nir_op_imin ? nir_ilt(b, x, y) : alu->op == nir_op_umin ? nir_ult(b, x, y)
+                                                                                     : nir_flt(b, x, y);
+   nir_def_replace(&alu->def, nir_bcsel(b, lt, x, y));
+   return true;
+}
+
 static bool
 const_to_pool(nir_builder *b, nir_instr *instr, void *data)
 {
@@ -312,6 +331,15 @@ g3_pco_check(pco_shader *s, struct g3_program *p)
                return refuse(p, "a bitwise group (%s; pco's bitwise encoding does not parse the A7-era groups, "
                              "compute/R7.md)", bi ? pco_op_info[bi->op].str : "?");
             }
+            /* the A7's test op is 3 bits (see trans_cmp()): no less/lequal, whose fourth bit it ignores */
+            const pco_instr *tst =
+               igrp->hdr.alutype == PCO_ALUTYPE_MAIN ? igrp->instrs[PCO_OP_PHASE_2_TST] : NULL;
+            if (tst && pco_instr_has_mod(tst, PCO_OP_MOD_TST_OP_MAIN)) {
+               const enum pco_tst_op_main op = pco_instr_get_tst_op_main(tst);
+               if (op == PCO_TST_OP_MAIN_LESS || op == PCO_TST_OP_MAIN_LEQUAL)
+                  return refuse(p, "a %s test (the A7's test op has no fourth bit)",
+                                op == PCO_TST_OP_MAIN_LESS ? "less" : "lequal");
+            }
             pco_instr *be = igrp->hdr.alutype == PCO_ALUTYPE_MAIN ? igrp->instrs[PCO_OP_PHASE_BACKEND] : NULL;
             if (!be || be->op != PCO_OP_ST32)
                continue;
@@ -387,6 +415,7 @@ g3_compile_pco(void *pco, struct nir_shader *nir, struct g3_program *out)
       /* no bitwise groups on the A7 (see shl_to_mul()) */
       struct pool_state ps = { .p = out, .base = G3_PCO_BUFFER0 + 2 * out->num_buffers };
       nir_shader_instructions_pass(nir, shl_to_mul, nir_metadata_control_flow, NULL);
+      nir_shader_instructions_pass(nir, lower_min, nir_metadata_control_flow, NULL);
       nir_shader_instructions_pass(nir, const_to_pool, nir_metadata_control_flow, &ps);
       nir_opt_dce(nir);
       if (ps.failed) {
