@@ -1006,7 +1006,8 @@ PVR_PER_ARCH(g5p_job_init)(struct pvr_cmd_buffer *cmd_buffer, struct pvr_sub_cmd
          g->enabled = true;
          return VK_SUCCESS;
       }
-      if (gfx && !strcmp(gfx, "clear"))
+      /* clear: the background alone; tri: with upstream's draws in the VDM stream (pvr_g3_tri()) */
+      if (gfx && (!strcmp(gfx, "clear") || !strcmp(gfx, "tri")))
          return g5p_a7_clear(cmd_buffer, hw_render, job);
       return G5P_REFUSE(cmd_buffer, "an A7 render: PVR_G3_GFX=ta or clear (no other Rogue programs yet)");
    }

@@ -9797,7 +9797,8 @@ void PVR_PER_ARCH(CmdDraw)(VkCommandBuffer commandBuffer,
 
    PVR_TRACE_BEGIN_DRAW(cmd_buffer, PVR_DRAW);
 
-   if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g5p)) {
+   if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g5p) &&
+       !pvr_g3_tri(PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g3))) {
       /* G5P: the draw's VDM/PPP words and programs (pvr_arch_g5p_gfx.c) */
       const struct pvr_g5p_draw g5p_draw = {
          .count = vertexCount,
@@ -9886,7 +9887,8 @@ void PVR_PER_ARCH(CmdDrawIndexed)(VkCommandBuffer commandBuffer,
 
    PVR_TRACE_BEGIN_DRAW(cmd_buffer, PVR_DRAW_INDEXED);
 
-   if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g5p)) {
+   if (PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g5p) &&
+       !pvr_g3_tri(PVR_HAS_FEATURE(&cmd_buffer->device->pdevice->dev_info, apple_g3))) {
       /* G5P: the draw with an index list (pvr_arch_g5p_vertex.c) */
       result = pvr_flush_push_descriptors(cmd_buffer, &cmd_buffer->state.gfx_desc_state);
       if (result == VK_SUCCESS)

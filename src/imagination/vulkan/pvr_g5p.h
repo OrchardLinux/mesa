@@ -275,6 +275,15 @@ static inline const char *pvr_g3_gfx(void)
    return v && *v ? v : NULL;
 }
 
+/* The A7, PVR_G3_GFX=tri (rung g2): graphics pipelines and draws take upstream's Rogue path (pco vertex and
+ * fragment shaders, Rogue PDS programs, PPP state) instead of G5P's agx1 one; the job, streams, background and
+ * end of tile stay the A7's (g5p_a7_clear()). has_g3 is PVR_HAS_FEATURE(dev_info, apple_g3). */
+static inline bool pvr_g3_tri(bool has_g3)
+{
+   const char *v = pvr_g3_gfx();
+   return has_g3 && v && !strcmp(v, "tri");
+}
+
 /* ---- graphics (pvr_arch_g5p_gfx.c, pvr_g5p_nir.c) ---- */
 
 struct pco_g5p_fs_key;
