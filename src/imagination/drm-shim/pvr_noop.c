@@ -349,7 +349,16 @@ pvr_dev_query_heap_info_get(struct drm_pvr_ioctl_dev_query_args *args)
           heaps,
           heap_info->heaps.stride * heap_info->heaps.count);
 
-   /* the winsys requires each heap's page size to be the CPU's */
+   /* The winsys requires each heap's page size to be the CPU's: it asserts
+    * so in pvr_drm_setup_heaps() ("winsys_heaps[i]->page_size ==
+    * drm_ws->base.page_size"). The tables above say 4 KiB, which is the
+    * device's, but the shim runs on the build host, and on a 16 KiB-page
+    * host (Asahi on Apple Silicon) the fixed 4 KiB killed every Vulkan
+    * program at instance/device enumeration, before any job: vulkaninfo
+    * --summary died with that assert on 2026-11-28 (core dump signal
+    * SIGTRAP). So report the CPU's page size in every heap; this changes
+    * only alignment, not the heap bases that set the code addresses.
+    */
    for (unsigned i = 0; i < heap_info->heaps.count; i++) {
       struct drm_pvr_heap *h =
          (struct drm_pvr_heap *)((uint8_t *)(uintptr_t)heap_info->heaps.array +
