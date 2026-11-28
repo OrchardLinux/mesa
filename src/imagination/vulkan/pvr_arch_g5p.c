@@ -46,6 +46,7 @@
 #include "pvr_free_list.h"
 #include "pvr_g5p.h"
 #include "pvr_formats.h"
+#include "pvr_job_common.h"
 #include "pvr_image.h"
 #include "pvr_usc.h"
 #include "pvr_g5p_dgl.h"
@@ -842,9 +843,26 @@ g5p_a7_clear(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_renderpass_hwse
    if (pvr_get_pbe_accum_format_size_in_bytes(f) != 4 || hw_render->color_init[0].index >= info->clear_value_count)
       return G5P_REFUSE(cmd_buffer, "an A7 clear of %s (32-bit accumulation formats only)", vk_Format_to_str(f));
 
-   uint32_t packed[4] = { 0 };
-   pvr_get_hw_clear_color(f, info->clear_values[hw_render->color_init[0].index].color, packed);
-   pco_shader *clear = pvr_usc_a7_clear(device->pdevice->pco_ctx, packed[0]);
+   /* the colour in the PBE's source format (upstream pvr_setup_pbe_state()): without usc_f16sop_u8, as on the A7,
+    * an 8-bit UNORM target takes F16 per channel, two output registers {R | G << 16, B | A << 16}. Overlay 7
+    * (g7info202): the packed 0xff0033ff came out as 0x0000003f, R from the low half 0x33ff (0.2499), G from 0xff00
+    * (NaN), B and A from the unwritten register 1. */
+   const VkClearColorValue *cv = &info->clear_values[hw_render->color_init[0].index].color;
+   uint32_t words[4] = { 0 }, src_format;
+   enum pvr_pbe_gamma gamma;
+   pvr_arch_pbe_get_src_format_and_gamma(f, PVR_PBE_GAMMA_NONE,
+                                         PVR_HAS_FEATURE(&device->pdevice->dev_info, usc_f16sop_u8) &&
+                                            (vk_format_is_unorm(f) || vk_format_is_snorm(f)),
+                                         &src_format, &gamma);
+   unsigned nwords = 1;
+   if (src_format == ROGUE_PBESTATE_SOURCE_FORMAT_F16_PER_CHANNEL) {
+      for (unsigned c = 0; c < 4; c++)
+         words[c / 2] |= (uint32_t)_mesa_float_to_half(cv->float32[c]) << (16 * (c % 2));
+      nwords = 2;
+   } else {
+      pvr_get_hw_clear_color(f, *cv, words);
+   }
+   pco_shader *clear = pvr_usc_a7_clear(device->pdevice->pco_ctx, words, nwords);
    struct pvr_suballoc_bo *usc;
    /* diagnostics (overlay 7): PVR_G3_A7_BG=nop runs a nop.end as the background program */
    static const uint8_t nop_end[8] = { 0x04, 0x80, 0xee, 0x00, 0xf2, 0xff, 0xff, 0xff };
@@ -892,9 +910,10 @@ g5p_a7_clear(struct pvr_cmd_buffer *cmd_buffer, const struct pvr_renderpass_hwse
    g->samples = 1;
    g->skip_empty_tiles = false;
    g->a7_clear = true;
-   /* EVENT_PIXEL_PDS_INFO: const_size 2 (the kick's data, as the A8's), no shared registers; PVR_G3_EOT_INFO
-    * overrides it (diagnostics) */
-   g->eot[2] = getenv("PVR_G3_EOT_INFO") ? (uint32_t)strtoul(getenv("PVR_G3_EOT_INFO"), NULL, 0) : 2;
+   /* EVENT_PIXEL_PDS_INFO 0x202: const_size 2 and usc_sr_size 1 unit at bit 9, the A8's captured word. With
+    * usc_sr_size 0 (0x2, 0x1) the fragment job locked the 3D on the J71 (overlay 7: eight variants, one fault
+    * each); with 0x202 it retired and wrote all 4096 pixels. PVR_G3_EOT_INFO overrides it. */
+   g->eot[2] = getenv("PVR_G3_EOT_INFO") ? (uint32_t)strtoul(getenv("PVR_G3_EOT_INFO"), NULL, 0) : 0x202;
    g->enabled = true;
    return VK_SUCCESS;
 }
