@@ -18,6 +18,7 @@
 #define PVR_G5P_HOOK_compute_pipeline_destroy() \
    if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g5p)) { \
       pvr_bo_suballoc_free(compute_pipeline->g9p.shader_bo); \
+      vk_free(&device->vk.alloc, compute_pipeline->g3); \
       pvr_pipeline_finish(device, &compute_pipeline->base); \
       vk_free2(&device->vk.alloc, allocator, compute_pipeline); \
       return; \

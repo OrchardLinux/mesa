@@ -1064,6 +1064,14 @@ static bool pvr_physical_device_get_properties(
 
    if (PVR_HAS_FEATURE(dev_info, apple_g5p))
       snprintf(properties->driverName, sizeof(properties->driverName), "Mesa PowerVR G5P");
+   /* the A7: compute only, one task (32 lanes) per workgroup, Nx1x1 (g3/g3_compute.h) */
+   if (PVR_HAS_FEATURE(dev_info, apple_g3)) {
+      snprintf(properties->driverName, sizeof(properties->driverName), "Mesa PowerVR G3 (A7, compute only)");
+      properties->maxComputeWorkGroupInvocations = 32U;
+      properties->maxComputeWorkGroupSize[0] = 32U;
+      properties->maxComputeWorkGroupSize[1] = 1U;
+      properties->maxComputeWorkGroupSize[2] = 1U;
+   }
 
    if (strlen(pdevice->instance->drirc.debug.force_vk_devicename) > 0) {
       snprintf(properties->deviceName,

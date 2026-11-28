@@ -1520,6 +1520,11 @@ PVR_PER_ARCH(g5p_graphics_pipeline_compile)(struct pvr_device *device,
                                             struct pvr_graphics_pipeline *pipeline,
                                             const struct vk_graphics_pipeline_state *vk_state)
 {
+   /* the A7 (apple-a7.h): no graphics yet; the A8's programs are Apple-agx1 code, not the A7's Rogue */
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g3)) {
+      mesa_logw("pvr/g3: graphics pipeline refused: the A7 driver is compute only");
+      return pvr_refusal_to_api(vk_errorf(device, VK_ERROR_FEATURE_NOT_PRESENT, "A7: graphics pipelines"));
+   }
    struct pco_g5p_program vs = { 0 }, fs = { 0 };
    struct pvr_g5p_pipeline *g =
       g5p_node_alloc(device);

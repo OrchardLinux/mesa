@@ -18,6 +18,7 @@
 #include "pvr_cmd_buffer.h"
 #include "pvr_csb.h"
 #include "pvr_device.h"
+#include "pvr_g5p.h"
 #include "pvr_g5p_query.h"
 #include "pvr_physical_device.h"
 #include "pvr_query.h"
@@ -280,6 +281,9 @@ out:
 
 VkResult PVR_PER_ARCH(g5p_query_programs_create)(struct pvr_device *device)
 {
+   /* the A7: these are A9-compiler (Apple-agx1) programs; its queries are refused (g5p_add_query_program()) */
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g3))
+      return VK_SUCCESS;
    VkResult result = compile_query_program(device,
                                            G5P_QUERY_AVAILABILITY,
                                            &device->availability_shader);
@@ -499,6 +503,10 @@ PVR_PER_ARCH(g5p_add_query_program)(struct pvr_cmd_buffer *cmd_buffer,
    uint64_t buffers[3] = { 0 };
    unsigned buffer_count;
    VkResult result;
+
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g3))
+      return pvr_refusal_to_api(
+         vk_errorf(cmd_buffer, VK_ERROR_FEATURE_NOT_PRESENT, "A7: query pools (no A7 query program yet)"));
 
    result =
       pvr_arch_cmd_buffer_start_sub_cmd(cmd_buffer, PVR_SUB_CMD_TYPE_QUERY);

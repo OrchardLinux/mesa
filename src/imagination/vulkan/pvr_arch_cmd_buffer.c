@@ -2932,6 +2932,15 @@ VkResult pvr_arch_cmd_buffer_start_sub_cmd(struct pvr_cmd_buffer *cmd_buffer,
    if (vk_command_buffer_has_error(&cmd_buffer->vk))
       return vk_command_buffer_get_record_result(&cmd_buffer->vk);
 
+   /* The A7 (apple-a7.h): compute only. Its render and transfer jobs would run the A8's Apple-agx1 USC
+    * programs, which the A7 (Rogue) cannot execute; they are not built (g5p_upload_programs()). */
+   if (PVR_HAS_FEATURE(&device->pdevice->dev_info, apple_g3) &&
+       (type == PVR_SUB_CMD_TYPE_GRAPHICS || type == PVR_SUB_CMD_TYPE_TRANSFER)) {
+      mesa_logw("pvr/g3: a %s command refused: the A7 driver is compute only",
+                type == PVR_SUB_CMD_TYPE_GRAPHICS ? "render" : "transfer");
+      return vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+   }
+
    if (cmd_buffer->state.g9p_merge.pending && getenv("G9P_RPLOG"))
       fprintf(stderr, "g9p: rp merge ended by sub-command %d\n", type);
    pvr_arch_g9p_merge_flush(cmd_buffer);
